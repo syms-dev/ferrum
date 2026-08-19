@@ -1,0 +1,35 @@
+name: VM tests
+
+on:
+  pull_request:
+  schedule:
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+jobs:
+  # Phase 1.0 probe 0.1: confirms NixOS VM tests actually run on a hosted
+  # GitHub runner before anything else is built on that assumption. See
+  # tests/smoke.nix and the plan's "Known risks" section.
+  smoke:
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            system: x86_64-linux
+          - runner: ubuntu-24.04-arm
+            system: aarch64-linux
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: DeterminateSystems/nix-installer-action@main
+
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+
+      - name: /dev/kvm is available and accessible
+        run: |
+          ls -l /dev/kvm
+          test -r /dev/kvm && test -w /dev/kvm
+
+      - name: Build and run the smoke VM test
+        run: nix build .#checks.${{ matrix.system }}.smoke-vm --print-build-logs
