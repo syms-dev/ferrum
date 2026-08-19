@@ -1,0 +1,24 @@
+# Nix
+result
+result-*
+.direnv/
+
+# Rust (crates/ arrives in Phase 1.5)
+target/
+Cargo.lock.bak
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Local agent/tooling config -- not part of the ferrum project
+.claude/
+.serena/
+CLAUDE.md
+
+# Secrets should never land unencrypted
+*.env
+*.env.local

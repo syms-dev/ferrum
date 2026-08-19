@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "proxy": {
+    "baseDomain": "example.invalid",
+    "acme": {
+      "email": "admin@example.invalid"
+    }
+  },
+  "apps": {
+    "sonarr": {
+      "enable": true
+    }
+  }
+}
