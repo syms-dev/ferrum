@@ -15,5 +15,18 @@ jobs:
 
       - uses: DeterminateSystems/magic-nix-cache-action@main
 
-      - name: nix flake check
-        run: nix flake check --print-build-logs
+      # Deliberately not `nix flake check`: that also pulls in the
+      # KVM-dependent smoke-vm check (see tests/smoke.nix), which belongs in
+      # vm-tests.yml's job instead so this one stays fast and so a VM-test
+      # failure can't be conflated with an eval failure. `nix flake check
+      # --no-build` still catches flake-metadata and cross-system eval
+      # errors that building individual checks would miss.
+      - name: nix flake check (metadata + eval only)
+        run: nix flake check --no-build --print-build-logs
+
+      - name: cheap checks
+        run: |
+          nix build --print-build-logs \
+            .#checks.x86_64-linux.catalog-consistency \
+            .#checks.x86_64-linux.schema-uniformity \
+            .#checks.x86_64-linux.eval-example-hosts
