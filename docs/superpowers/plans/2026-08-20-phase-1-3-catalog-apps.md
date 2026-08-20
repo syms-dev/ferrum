@@ -519,19 +519,20 @@ let
   claimToken = app.settings.claimToken or "";
 in
 lib.mkIf app.enable {
-  # nixpkgs' plexmediaserver package is licensed unfree; without this, the
-  # ENTIRE host config fails to evaluate the moment ferrum.apps.plex.enable
-  # is true, on any real host (caught during Task 4's real verification --
-  # none of Sonarr/Radarr/Prowlarr/Jellyfin are unfree, so nothing in this
-  # plan surfaced it before Plex specifically). Scoped to just this one
-  # package, not a blanket `nixpkgs.config.allowUnfree = true`.
-  # nixpkgs.config is collected globally across every imported module
-  # before pkgs is constructed, so setting it here (rather than in some
-  # more "central" module) is safe regardless of import order -- verified
-  # directly, not assumed.
-  nixpkgs.config.allowUnfreePredicate = pkg:
-    builtins.elem (lib.getName pkg) [ "plexmediaserver" ];
-
+  # UPDATE (during Task 5): originally this block set its own
+  # nixpkgs.config.allowUnfreePredicate directly (plexmediaserver is
+  # unfree; without allowing it the whole host config fails to evaluate
+  # once Plex is enabled). That approach doesn't compose: when Task 5
+  # needed the SAME mechanism for SABnzbd's unrar dependency,
+  # nixpkgs.config.allowUnfreePredicate (a single function value, unlike
+  # the list-valued nixpkgs.overlays) can't hold two independently-set
+  # predicates from two different modules -- both apps enabled together
+  # produces a conflicting-definitions eval error. Fixed by centralizing:
+  # every catalog app's meta.nix may declare `unfreePackages = [ "name" ];`,
+  # and modules/core/overlays.nix aggregates the union into ONE predicate.
+  # See modules/apps/plex/meta.nix's `unfreePackages` and
+  # modules/core/overlays.nix. Nothing app-specific belongs in this file
+  # any more.
   services.plex = {
     enable = true;
     dataDir = app.stateDir;
@@ -585,6 +586,8 @@ git commit -m "Add Plex to the catalog, with its claim-token mechanism"
 ---
 
 ## Task 5: SABnzbd
+
+**UPDATE (found during this task's real verification, not anticipated by the original brief below):** SABnzbd's own package is free-licensed, but it depends on `unrar` (RAR extraction), which is unfree -- the same class of eval-blocking gap Task 4 found for Plex's `plexmediaserver`. Fixing it the same way Task 4 originally did (an app-local `nixpkgs.config.allowUnfreePredicate`) would conflict with Plex's, since that option holds a single function value that doesn't compose across modules the way `nixpkgs.overlays`' list does -- confirmed for real, since this example host enables both apps together. Fixed by centralizing: `modules/apps/sabnzbd/meta.nix` declares `unfreePackages = [ "unrar" ];` (a new, optional, catalog-metadata-only field -- not a NixOS option, so `checks.schema-uniformity` is untouched), and `modules/core/overlays.nix` aggregates `unfreePackages` across the whole catalog into one predicate. Plex's `meta.nix`/`service.nix` were retroactively updated the same way (see Task 4's `service.nix` code block above). `service.nix` below needs no `nixpkgs.config` reference at all.
 
 **Files:**
 - Create: `modules/apps/sabnzbd/meta.nix`
