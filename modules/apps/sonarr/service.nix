@@ -15,7 +15,21 @@ let
 in
 lib.mkIf app.enable {
   sops.secrets."sonarr-apikey" = {
-    sopsFile = "${ferrum.secretsDir}/sonarr-apikey.sops";
+    # `/. + "string"` (path-concatenation), NOT `"${ferrum.secretsDir}/..."`
+    # (plain string interpolation) -- sops.validateSopsFiles (on by
+    # default) asserts sopsFile is either a genuine Nix path VALUE
+    # (builtins.isPath) or a string already prefixed with /nix/store; a
+    # plain interpolated string satisfies neither, even though it looks
+    # like a path and points at a real file (found for real during this
+    # task's own verification: the string form built and evaluated fine
+    # under Phase 1.3's eval-only validateSopsFiles=false example host,
+    # but failed this exact assertion the moment a real host actually
+    # validates its secrets). `/. + "str"` is confirmed via a real `nix
+    # eval` to produce a value with builtins.isPath == true even though
+    # ferrum.secretsDir is a runtime-configurable string, which is what
+    # actually satisfies the assertion while keeping secretsDir
+    # configurable.
+    sopsFile = /. + "${ferrum.secretsDir}/sonarr-apikey.sops";
     format = "binary";
     owner = "sonarr";
   };

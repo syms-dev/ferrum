@@ -17,7 +17,11 @@ let
 in
 lib.mkIf app.enable {
   sops.secrets."prowlarr-apikey" = {
-    sopsFile = "${ferrum.secretsDir}/prowlarr-apikey.sops";
+    # See modules/apps/sonarr/service.nix's comment on this exact line --
+    # `/. + "string"`, not plain string interpolation, is what satisfies
+    # sops.validateSopsFiles' isPath-or-store-prefixed-string assertion
+    # while keeping ferrum.secretsDir configurable.
+    sopsFile = /. + "${ferrum.secretsDir}/prowlarr-apikey.sops";
     format = "binary";
   };
 
