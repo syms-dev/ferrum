@@ -65,12 +65,21 @@ pkgs.testers.runNixOSTest {
       snapshotDir = "/var/lib/ferrum/snapshots";
     };
 
-    fileSystems."/var/lib/ferrum/state" = {
+    # `virtualisation.fileSystems`, NOT plain `fileSystems`: the VM test
+    # framework (nixos/modules/virtualisation/qemu-vm.nix) regenerates the
+    # entire top-level `fileSystems` option itself, at VM-override priority,
+    # from `virtualisation.fileSystems` plus its own defaults (/, /boot,
+    # /tmp/shared, /tmp/xchg) -- a plain `fileSystems."/foo" = {...}`
+    # declared here is silently discarded rather than merged in. Confirmed
+    # by evaluating this exact test's config directly: with plain
+    # `fileSystems.*`, `config.fileSystems` contained only the four
+    # framework defaults, none of what's declared below.
+    virtualisation.fileSystems."/var/lib/ferrum/state" = {
       device = "/dev/vdb";
       fsType = "btrfs";
       options = [ "subvol=@state" "compress=zstd" "noatime" ];
     };
-    fileSystems."/var/lib/ferrum/snapshots" = {
+    virtualisation.fileSystems."/var/lib/ferrum/snapshots" = {
       device = "/dev/vdb";
       fsType = "btrfs";
       options = [ "subvol=@snapshots" "noatime" ];
@@ -136,7 +145,18 @@ pkgs.testers.runNixOSTest {
       };
     };
 
-    environment.systemPackages = [ pkgs.ferrum-apply pkgs.curl pkgs.sqlite ];
+    # ferrum-testapp included so the testScript's ad-hoc upgrade-simulation
+    # invocation (below) can call it by bare command name -- referencing
+    # `pkgs.ferrum-testapp` from testScript's own scope doesn't work, since
+    # that string is built by the OUTER `{ pkgs, ... }:` function argument
+    # (checks.nix's flake-level pkgs), which never has the ferrum overlay
+    # applied. Only pkgs *inside* this NixOS module evaluation does
+    # (modules/core/overlays.nix's nixpkgs.overlays only takes effect within
+    # a NixOS system evaluation) -- confirmed by hand: the outer pkgs threw
+    # "attribute 'ferrum-testapp' missing" when this test first ran for
+    # real. environment.systemPackages sidesteps the scope mismatch
+    # entirely by putting the binary on the VM's own PATH.
+    environment.systemPackages = [ pkgs.ferrum-apply pkgs.ferrum-testapp pkgs.curl pkgs.sqlite ];
   };
 
   testScript = ''
@@ -182,7 +202,7 @@ pkgs.testers.runNixOSTest {
         machine.succeed("systemctl stop ferrum-testapp")
         machine.succeed(
             "systemd-run --unit=ferrum-testapp-v2 --collect "
-            "${pkgs.lib.getExe pkgs.ferrum-testapp} --app-version 2 "
+            "ferrum-testapp --app-version 2 "
             "--db-path /var/lib/ferrum/state/testapp/app.db --listen 127.0.0.1:8099"
         )
         machine.wait_for_open_port(8099)
