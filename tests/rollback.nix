@@ -216,6 +216,10 @@ pkgs.testers.runNixOSTest {
             "curl -sf -X POST -H 'Content-Type: application/json' "
             "-d '{\"text\":\"after\"}' http://127.0.0.1:8099/notes"
         )
+        # A positive control: confirm the write actually persisted before
+        # the rollback happens, so "after is gone" later can only mean the
+        # rollback removed it -- not that it was never really there.
+        machine.succeed("curl -sf http://127.0.0.1:8099/rows | grep -q after")
         machine.succeed("systemctl stop ferrum-testapp-v2")
 
     with subtest(
@@ -245,6 +249,27 @@ pkgs.testers.runNixOSTest {
 
     with subtest("the boot-time state restore did not flag a failure"):
         machine.succeed("test ! -e /run/ferrum/state-restore-failed")
+
+    with subtest(
+        "the restore actually ran, against the specific snapshot this test "
+        "took -- not just 'no failure marker', which is equally true if "
+        "restore_state::run returned early because no intent existed at all"
+    ):
+        machine.succeed("test ! -e /var/lib/ferrum/rollback-intent.json")
+        result_json = machine.succeed("cat /var/lib/ferrum/rollback-result.json")
+        # Derived from the journal directory (on the persistent state disk,
+        # unlike /tmp which this test never assumes survives the reboot)
+        # rather than re-reading /tmp/snapshot_name post-reboot -- this test
+        # only ever creates one journal entry, so its filename IS the
+        # snapshot name this whole test revolves around.
+        expected_snapshot = machine.succeed(
+            "basename /var/lib/ferrum/journal/*.json .json"
+        ).strip()
+        assert '"ok": true' in result_json, result_json
+        assert expected_snapshot in result_json, (
+            f"rollback-result.json doesn't name the snapshot this test took "
+            f"({expected_snapshot!r}): {result_json!r}"
+        )
 
     with subtest(
         "v1 starts cleanly against the restored database -- via the REAL "
