@@ -11,5 +11,6 @@
     ./core/state-restore.nix
     ./apps/sonarr/service.nix
     ./apps/radarr/service.nix
+    ./apps/prowlarr/service.nix
   ];
 }

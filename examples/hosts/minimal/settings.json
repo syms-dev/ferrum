@@ -12,6 +12,9 @@
     },
     "radarr": {
       "enable": true
+    },
+    "prowlarr": {
+      "enable": true
     }
   }
 }
