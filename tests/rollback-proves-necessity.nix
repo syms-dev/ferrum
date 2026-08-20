@@ -67,9 +67,20 @@ pkgs.testers.runNixOSTest {
         "HTTP server ever binds, so the process exits immediately rather "
         "than hanging"
     ):
-        machine.fail(
+        # 2>&1 is required: the refusal message goes to stderr
+        # (nix/pkgs/testapp/src/main.rs's eprintln!), and machine.fail()'s
+        # returned output does not include stderr on its own -- confirmed by
+        # hand: without the redirect, the assertion below saw an empty
+        # string even though the message was visible in the console log.
+        output = machine.fail(
             "${ferrum-testapp}/bin/ferrum-testapp --app-version 1 "
-            "--db-path /tmp/app.db --listen 127.0.0.1:8099"
+            "--db-path /tmp/app.db --listen 127.0.0.1:8099 2>&1"
+        )
+        # A bare non-zero exit isn't enough -- this test's entire purpose is
+        # to prove this SPECIFIC failure mode, not just "v1 exits nonzero"
+        # for any reason (a port conflict, a future flag rename, etc.).
+        assert "newer than this binary supports" in output, (
+            f"v1 failed, but not with the expected schema-version refusal: {output!r}"
         )
   '';
 }
