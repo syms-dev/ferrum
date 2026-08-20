@@ -67,7 +67,13 @@ Torrent traffic must never leak onto the host's normal network path if the VPN t
 
 ## Secrets Tooling Considered
 
-`itsasecret` (rockydotsystems/itsasecret-client) was evaluated as a possible alternative to sops-nix for Phase 1.4, at the user's suggestion. Its trust model is genuinely good — client-side end-to-end encryption, keys derived from a master password, server only ever stores ciphertext. It was not adopted: it depends on a hosted backend (`itsasecret.dev`) with no documented self-hosting option, which conflicts with ferrum's foundational "the box and its git repo are self-contained, no external service required" design. sops-nix remains the plan for Phase 1.4. Worth revisiting only if itsasecret ships self-hosting, or if a user explicitly wants that trade-off for their own instance.
+`itsasecret` (rockydotsystems) was evaluated as a possible alternative to sops-nix for Phase 1.4, at the user's suggestion. It genuinely is self-hostable (a two-container Docker Compose stack — `itsasecret/web` + Postgres — with a real backup/restore story, documented at itsasecret.dev/self-hosting), and its trust model is good (client-side end-to-end encryption, server only ever stores ciphertext). Not adopted as ferrum's default, for three concrete reasons found once the self-hosting docs were actually reviewed:
+
+1. It's two more always-running services per box (a web app + Postgres) that must stay up for any other app to retrieve its secrets at boot/apply time — a new internal single point of failure, versus sops-nix's zero-services, static-file-decrypt model.
+2. It complicates ferrum's rollback story: a Postgres database holding secrets is new stateful infrastructure whose snapshot/rollback semantics need explicit design (does it roll back with `@state`, or get excluded like Authelia's user database?) — sops-nix avoids this entirely since secrets are just files in the same git repo as everything else.
+3. Its CLI exposes symmetric read+write secret access (`shh secret get`/`set`), with no apparent equivalent to sops-nix's write-only property that ferrumd's threat model depends on (a compromised ferrumd can never read back a secret it wrote).
+
+It's a well-built tool for a different job — team secret-sharing across many projects/environments — than what ferrum needs on a single box. sops-nix remains the Phase 1.4 default. Self-hosted itsasecret could be revisited as an optional, non-default backend if a user explicitly wants that trade-off, but that's real added complexity (pluggable secrets backends) not planned by default.
 
 ## Verification
 
