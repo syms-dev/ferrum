@@ -101,8 +101,11 @@ fn main() -> anyhow::Result<()> {
             1
         }
         Command::RestoreState => {
-            let root_device = std::env::var("FERRUM_ROOT_DEVICE")
-                .expect("FERRUM_ROOT_DEVICE must be set by the systemd unit");
+            // Must not panic: an unresolvable device (e.g. a bind-mounted
+            // state dir with no `device`) means NixOS omits this var
+            // entirely. An empty string is handled as a real failure inside
+            // restore_state::run's fail-closed flow, not here.
+            let root_device = std::env::var("FERRUM_ROOT_DEVICE").unwrap_or_default();
             let storage = restore_state::StorageConfig {
                 intent_path: "/var/lib/ferrum/rollback-intent.json".into(),
                 result_path: "/var/lib/ferrum/rollback-result.json".into(),

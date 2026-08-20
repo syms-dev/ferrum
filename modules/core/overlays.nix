@@ -9,10 +9,5 @@
 # the flake's own outputs), so a NixOS module can't reach it that way.
 { ... }:
 {
-  nixpkgs.overlays = [
-    (final: prev: {
-      ferrum-apply = final.callPackage ../../nix/pkgs/ferrum-apply { };
-      ferrum-testapp = final.callPackage ../../nix/pkgs/testapp { };
-    })
-  ];
+  nixpkgs.overlays = [ (import ../../nix/overlays) ];
 }
