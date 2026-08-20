@@ -98,6 +98,12 @@ fn main() -> anyhow::Result<()> {
                 failure_marker_path: std::env::var("FERRUM_FAILURE_MARKER_PATH")
                     .unwrap_or_else(|_| "/var/lib/ferrum/state-restore-failed".to_string())
                     .into(),
+                health_check_timeout: std::time::Duration::from_secs(
+                    std::env::var("FERRUM_HEALTH_CHECK_TIMEOUT_SEC")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(120),
+                ),
             };
             let flake_ref = std::env::var("FERRUM_FLAKE_REF")
                 .unwrap_or_else(|_| "/etc/ferrum#nixosConfigurations.default.config.system.build.toplevel".to_string());
