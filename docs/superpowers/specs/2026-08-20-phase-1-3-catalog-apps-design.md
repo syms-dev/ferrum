@@ -8,13 +8,13 @@ Full background: `docs/design/2026-08-19-phase-1-design.md`. This document only 
 
 ## Scope
 
-**In scope:** six new `modules/apps/<id>/{meta.nix,service.nix}` pairs, each following Sonarr's established pattern (uniform submodule instantiation, `mediaGroup` membership when `mediaAccess != "none"`, wired under `ferrum-apps.target` with `wantedBy`/`partOf`/`unitConfig.ConditionPathExists`), plus one new option (`ferrum.apps.plex.claimToken`) and its systemd wiring.
+**In scope:** six new `modules/apps/<id>/{meta.nix,service.nix}` pairs, each following Sonarr's established pattern (uniform submodule instantiation, `mediaGroup` membership when `mediaAccess != "none"`, wired under `ferrum-apps.target` with `wantedBy`/`partOf`/`unitConfig.ConditionPathExists`); one new option (`ferrum.apps.plex.claimToken`) and its systemd wiring; and a VPN-gated network namespace for qBittorrent (`ferrum.apps.qbittorrent.vpn.*`), covered in its own section below.
 
 **Explicitly out of scope**, matching the original plan's own phase boundaries and confirmed during this design's brainstorm:
 
 - **Jackett, NZBHydra2** — Prowlarr is the modern unified replacement for both; add either later only if a specific indexer setup actually needs it.
 - **The reconciler** (Phase 1.4) — `integrations.providesTo`/`consumes` metadata gets populated correctly by each app's `meta.nix`, but nothing in this phase acts on it. Cross-app API-key registration is Phase 1.4's job.
-- **`ferrum.secrets`/sops wiring** (Phase 1.4) — apps generate their own credentials on first start, same as Sonarr does today.
+- **`ferrum.secrets`/sops wiring** (Phase 1.4) — apps generate their own credentials on first start, same as Sonarr does today. The one exception is qBittorrent's VPN WireGuard config, which genuinely needs to exist in this phase and is handled as flagged tech debt — see the qBittorrent VPN Kill Switch section below.
 - **The proxy/auth layer actually enforcing `authBypassPaths`/`exposure`** (Phase 1.4) — nginx and Authelia don't exist yet. This phase declares the metadata correctly so 1.4 has it ready; nothing routes through a real reverse proxy yet.
 - **The web UI** (Phase 1.5), including the "slick input box" for Plex's claim token — this phase only builds the option and systemd mechanism underneath it.
 - **Per-app VM tests** — `checks.catalog-consistency` and `checks.schema-uniformity` already guard structural correctness (every catalog entry has both `meta.nix` and `service.nix`, every option stays JSON-expressible). Real boot/health-check verification for each app happens once the daemon (1.5) exercises it for real, or in a later dedicated hardening pass — not six new KVM-boot VM tests in this phase.
@@ -26,7 +26,7 @@ Full background: `docs/design/2026-08-19-phase-1-design.md`. This document only 
 |---|---|---|---|---|
 | Radarr | `services.radarr` (servarr framework, same module directory as Sonarr) | `readwrite` | `/api`, `/feed`, `/ping` | Near-identical to Sonarr — same framework, same API-key-in-`environmentFiles` pattern once secrets land in 1.4. |
 | Prowlarr | `services.prowlarr` (servarr framework) | `none` | `/api`, `/ping` | Indexer manager — never touches media files directly, so no media group membership. `integrations.consumes` will eventually list every app it needs to register indexers into. |
-| qBittorrent | `services.qbittorrent` | `readwrite` | none needed | WebUI has its own auth (not forward-auth-bypassable the same way); `serverConfig` (a freeform attrset the module already exposes) can set WebUI credentials declaratively once 1.4 wires secrets in. |
+| qBittorrent | `services.qbittorrent` | `readwrite` | none needed | WebUI has its own auth (not forward-auth-bypassable the same way); `serverConfig` (a freeform attrset the module already exposes) can set WebUI credentials declaratively once 1.4 wires secrets in. Runs inside a VPN-gated network namespace — see below. |
 | SABnzbd | `services.sabnzbd` | `readwrite` | none needed | **Known gap for Phase 1.4, not this phase**: the module only exposes `configFile` (a path), not inline declarative settings the way servarr's `.settings` attrset does — SABnzbd's own API key lives in an INI file the module doesn't manage. Phase 1.4's reconciler will need to either write that file directly or find another route; noting it now so it isn't a surprise later. |
 | Jellyfin | `services.jellyfin` | `read` | native-client paths (exact set determined during implementation — Jellyfin's own clients need unauthenticated access to specific API routes to function, matching the existing app-submodule.nix comment: "apps that cannot follow an auth redirect") | No external account/claim step. |
 | Plex | `services.plex` | `read` | native-client paths (same reasoning as Jellyfin) | See claim-token mechanism below — the one genuinely novel piece of this phase. |
@@ -47,12 +47,35 @@ Two mechanisms were considered:
 - Once the token is consumed (Plex claims itself on that start), it's inert on every subsequent start — no cleanup needed, no risk in it lingering in `settings.json` history.
 - Phase 1.5's UI need only render a text input bound to this one option — "the slick input box" is a UI-layer concern with no new mechanism underneath it.
 
+## qBittorrent VPN Kill Switch
+
+Torrent traffic must never leak onto the host's normal network path if the VPN tunnel is down — this is a real privacy/legal concern, not a nicety, and was a hard requirement carried over from how qBittorrent is run today (behind `qbittorrentvpn`/`gluetun` on Saltbox, both of which use kernel-level network isolation, not application-level tricks).
+
+**Isolation mechanism: a dedicated network namespace, not application-level interface binding.** qBittorrent's own "bind to interface" setting was considered and rejected — it's simpler to build, but has known historical leak classes (DHT/UDP tracker traffic bypassing app-level binding in some qBittorrent versions), which is exactly why the wider self-hosted community moved to namespace/container-based isolation (gluetun, qbittorrentvpn) in the first place. A network namespace is kernel-enforced: the qBittorrent process has literally no route to anywhere except what exists inside its namespace, full stop — no app-level trust required.
+
+**Mechanics:**
+- A `qbt-vpn` network namespace, brought up by a new `systemd.services.qbt-vpn-netns-setup` oneshot unit (`RemainAfterExit = true`): creates the namespace, then runs `wg-quick up` *inside* it against the pasted WireGuard config (see below) — reusing `wg-quick`'s own handling of `Address`/`DNS`/routing rather than hand-parsing the config.
+- `systemd.services.qbittorrent` joins that namespace via `serviceConfig.NetworkNamespacePath = "/var/run/netns/qbt-vpn"` (a real, documented systemd feature — no container runtime needed), ordered `after`/`requires`/`bindsTo` the setup unit so qBittorrent never starts with stale or absent networking.
+- **Kill switch ON (default)**: the namespace contains *only* the WireGuard interface and loopback. If the tunnel drops, qBittorrent has zero route out — not "detected and cut," structurally incapable of leaking.
+- **Kill switch OFF**: the setup unit additionally creates a veth pair back to the host's normal network, with the WireGuard route preferred and a small health-check step that only activates the veth's fallback route once the tunnel is confirmed down (exact health-check heuristic — WireGuard handshake latency vs. a ping probe — determined during implementation; the requirement is "explicit, confirmed-down fallback," not "both routes exist and something wins").
+
+**New options** (`modules/apps/qbittorrent/`, following the JSON-scalar-only constraint `checks.schema-uniformity` enforces):
+- `ferrum.apps.qbittorrent.vpn.wireguardConfig` (`types.str`, default `""`) — the whole `wg-quick`-format config, pasted verbatim (e.g. what ProtonVPN's dashboard generates for a given server). The entire VPN mechanism is `lib.mkIf (app.vpn.wireguardConfig != "")` — empty means qBittorrent runs on the host's normal network, no namespace at all.
+- `ferrum.apps.qbittorrent.vpn.killSwitch` (`types.bool`, default `true`) — the ON/OFF toggle described above. Phase 1.5's UI renders this as the visible kill-switch control the operator can flip.
+
+**Known tech debt, explicitly flagged, must be resolved before production use:** `wireguardConfig` is a genuine long-lived secret — unlike Plex's claim token (worthless within 4 minutes regardless of exposure), a leaked WireGuard private key grants real ongoing VPN access. Storing it as a plain string option means it sits in `settings.json` unencrypted until Phase 1.4's `ferrum.secrets`/sops mechanism exists to hold it properly. This is a deliberate, scoped trade-off (keeps Phase 1.3 self-contained rather than pulling secrets infrastructure forward), not an oversight — but it must migrate to sops-nix as part of Phase 1.4, not be left as-is.
+
+## Secrets Tooling Considered
+
+`itsasecret` (rockydotsystems/itsasecret-client) was evaluated as a possible alternative to sops-nix for Phase 1.4, at the user's suggestion. Its trust model is genuinely good — client-side end-to-end encryption, keys derived from a master password, server only ever stores ciphertext. It was not adopted: it depends on a hosted backend (`itsasecret.dev`) with no documented self-hosting option, which conflicts with ferrum's foundational "the box and its git repo are self-contained, no external service required" design. sops-nix remains the plan for Phase 1.4. Worth revisiting only if itsasecret ships self-hosting, or if a user explicitly wants that trade-off for their own instance.
+
 ## Verification
 
 - `checks.catalog-consistency` — every new `modules/apps/<id>/` directory has both `meta.nix` and `service.nix`, and every catalog entry (from `meta.nix`) has a matching module.
 - `checks.schema-uniformity` — every new option (including `plex.claimToken`) stays JSON-expressible.
 - `checks.eval-example-hosts` — the example host(s) evaluate cleanly with the new apps enabled (at least one example host should enable a representative subset, e.g. Radarr + qBittorrent + Jellyfin, to catch cross-app eval issues like the `mediaGroup`/`authBypassPaths` wiring actually working, without needing to enable all eight — sorry, six — apps everywhere).
 - Real KVM verification on `ferrum-dev` (per [[reference-ferrum-dev-vm]]) for each app's `nix build`/eval, matching the rigor applied to every prior phase in this project — but no new VM *test* files, per the scope decision above.
+- The VPN kill switch's *structural* property (no route out when `wireguardConfig` is unset or the tunnel is down) can be verified for real on `ferrum-dev` without needing live VPN credentials — bring up the namespace with an intentionally-unreachable peer endpoint and confirm qBittorrent has no route. Verifying it actually reaches ProtonVPN and torrents flow through the tunnel requires real credentials and is a manual check, not something CI or an eval check can cover.
 
 ## Open Items for Future Phases
 
