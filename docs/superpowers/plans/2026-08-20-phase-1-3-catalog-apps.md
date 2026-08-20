@@ -622,7 +622,12 @@ git commit -m "Add Plex to the catalog, with its claim-token mechanism"
   defaultMediaAccess = "readwrite";
   defaultAuthPolicy = "two_factor";
 
-  authBypassPaths = [ ];
+  # /api must reach SABnzbd without a forward-auth redirect, same
+  # reasoning as Radarr/Sonarr/Prowlarr's identical bypass entry:
+  # `integrations.providesTo` below lists exactly those three apps as
+  # callers that push jobs into this API (caught during this task's
+  # review; the original brief left this empty).
+  authBypassPaths = [ "/api" ];
 
   healthCheck = {
     path = "/api?mode=version";
@@ -750,7 +755,13 @@ git commit -m "Add SABnzbd to the catalog"
   defaultMediaAccess = "readwrite";
   defaultAuthPolicy = "two_factor";
 
-  authBypassPaths = [ ];
+  # /api/v2 (qBittorrent's actual versioned API prefix, matching
+  # healthCheck.path below) must reach it without a forward-auth redirect
+  # -- Radarr/Sonarr/Prowlarr's own `integrations.consumes` all list
+  # "qbittorrent", meaning they call into this API to push torrents, the
+  # same reasoning as SABnzbd's identical fix (caught during Task 5's
+  # review; fixed here before Task 6 is dispatched so it isn't repeated).
+  authBypassPaths = [ "/api/v2" ];
 
   healthCheck = {
     path = "/api/v2/app/version";
