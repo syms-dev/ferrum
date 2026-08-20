@@ -1,5 +1,7 @@
 use clap::{Parser, Subcommand};
 
+mod preflight;
+
 #[derive(Parser)]
 #[command(name = "ferrum-apply")]
 struct Cli {
@@ -28,8 +30,25 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let exit_code = match cli.command {
         Command::Preflight => {
-            eprintln!("preflight: not yet implemented");
-            1
+            let state_dir = std::env::var("FERRUM_STATE_DIR")
+                .unwrap_or_else(|_| "/var/lib/ferrum/state".to_string());
+            let snapshot_dir = std::env::var("FERRUM_SNAPSHOT_DIR")
+                .unwrap_or_else(|_| "/var/lib/ferrum/snapshots".to_string());
+            let min_free_gib: u64 = std::env::var("FERRUM_MIN_FREE_GIB")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(10);
+            match preflight::run(
+                std::path::Path::new(&state_dir),
+                std::path::Path::new(&snapshot_dir),
+                min_free_gib,
+            ) {
+                Ok(()) => 0,
+                Err(e) => {
+                    eprintln!("preflight failed: {e}");
+                    1
+                }
+            }
         }
         Command::Apply => {
             eprintln!("apply: not yet implemented");
