@@ -5,6 +5,9 @@ use std::path::Path;
 pub struct JournalEntry {
     pub snapshot: String,
     pub generation: u32,
+    /// The toplevel store path that `generation` was ACTUALLY running (read
+    /// from `/run/current-system` at snapshot time) -- not the newly-built
+    /// toplevel being switched to.
     pub toplevel: String,
     pub taken_at: String,
     pub quiesced: bool,
