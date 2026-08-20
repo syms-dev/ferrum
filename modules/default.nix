@@ -15,5 +15,6 @@
     ./apps/jellyfin/service.nix
     ./apps/plex/service.nix
     ./apps/sabnzbd/service.nix
+    ./apps/qbittorrent/service.nix
   ];
 }
