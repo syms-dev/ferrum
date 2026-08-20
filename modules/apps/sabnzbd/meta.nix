@@ -14,6 +14,17 @@
   defaultMediaAccess = "readwrite";
   defaultAuthPolicy = "two_factor";
 
+  # SABnzbd's own package is free-licensed, but it depends on `unrar`
+  # (to extract RAR archives from Usenet downloads), which is unfree --
+  # without allowing it, the whole host config fails to evaluate the
+  # moment this app is enabled. Collected centrally by
+  # modules/core/overlays.nix -- see that file's comment for why (found
+  # for real during this task's controller verification: enabling this
+  # app alongside Plex, which has its own unfree dependency, is exactly
+  # the scenario that would otherwise produce a conflicting-definitions
+  # eval error if each app set its own predicate).
+  unfreePackages = [ "unrar" ];
+
   authBypassPaths = [ ];
 
   healthCheck = {
