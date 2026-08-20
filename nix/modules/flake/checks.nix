@@ -92,6 +92,13 @@
         rollback = import ../../../tests/rollback.nix { inherit pkgs; };
         rollback-proves-necessity = import ../../../tests/rollback-proves-necessity.nix { inherit pkgs; };
 
+        # Proves systemd itself honors ConditionPathExists and holds
+        # ferrum-managed apps down when the (durable, per Fix 1) failure
+        # marker is present -- the property the interlock actually depends
+        # on, which neither rollback.nix nor the restore_state.rs unit tests
+        # exercise directly.
+        state-restore-interlock = import ../../../tests/state-restore-interlock.nix { inherit pkgs; };
+
         # Not a separate runCommand: Nix's build sandbox has no network
         # access, so a hand-rolled `cd crates && cargo test` derivation can
         # never fetch crates.io and fails every time (verified: it does).

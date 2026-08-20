@@ -248,7 +248,7 @@ pkgs.testers.runNixOSTest {
         machine.wait_for_unit("ferrum-apps.target")
 
     with subtest("the boot-time state restore did not flag a failure"):
-        machine.succeed("test ! -e /run/ferrum/state-restore-failed")
+        machine.succeed("test ! -e /var/lib/ferrum/state-restore-failed")
 
     with subtest(
         "the restore actually ran, against the specific snapshot this test "

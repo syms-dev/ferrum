@@ -41,6 +41,13 @@ lib.mkIf app.enable {
     # snapshot) actually controls it.
     wantedBy = lib.mkForce [ "ferrum-apps.target" ];
     partOf = [ "ferrum-apps.target" ];
+    # Every app service must carry this condition itself, not just the
+    # target -- verified against real systemd (tests/state-restore-interlock.nix):
+    # WantedBy=/Wants= start-propagation from a target does NOT check the
+    # target's own ConditionPathExists result, so putting the condition only
+    # on ferrum-apps.target lets this unit start anyway when the target is
+    # skipped. See modules/core/generations.nix for the full explanation.
+    unitConfig.ConditionPathExists = "!/var/lib/ferrum/state-restore-failed";
     serviceConfig = lib.filterAttrs (_: v: v != null) {
       MemoryMax = app.resources.memoryMax;
       CPUQuota = app.resources.cpuQuota;

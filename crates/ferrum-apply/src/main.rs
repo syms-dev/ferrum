@@ -65,10 +65,13 @@ fn main() -> anyhow::Result<()> {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(10);
+            let failure_marker_path = std::env::var("FERRUM_FAILURE_MARKER_PATH")
+                .unwrap_or_else(|_| "/var/lib/ferrum/state-restore-failed".to_string());
             match preflight::run(
                 std::path::Path::new(&state_dir),
                 std::path::Path::new(&snapshot_dir),
                 min_free_gib,
+                std::path::Path::new(&failure_marker_path),
             ) {
                 Ok(()) => 0,
                 Err(e) => {
@@ -92,6 +95,9 @@ fn main() -> anyhow::Result<()> {
                     .ok()
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(10),
+                failure_marker_path: std::env::var("FERRUM_FAILURE_MARKER_PATH")
+                    .unwrap_or_else(|_| "/var/lib/ferrum/state-restore-failed".to_string())
+                    .into(),
             };
             let flake_ref = std::env::var("FERRUM_FLAKE_REF")
                 .unwrap_or_else(|_| "/etc/ferrum#nixosConfigurations.default.config.system.build.toplevel".to_string());
@@ -102,7 +108,14 @@ fn main() -> anyhow::Result<()> {
                 .unwrap_or_else(|_| "/var/lib/ferrum/journal".to_string());
             let intent_path = std::env::var("FERRUM_ROLLBACK_INTENT_PATH")
                 .unwrap_or_else(|_| "/var/lib/ferrum/rollback-intent.json".to_string());
-            match rollback::run(to, std::path::Path::new(&journal_dir), std::path::Path::new(&intent_path)) {
+            let snapshot_dir = std::env::var("FERRUM_SNAPSHOT_DIR")
+                .unwrap_or_else(|_| "/var/lib/ferrum/snapshots".to_string());
+            match rollback::run(
+                to,
+                std::path::Path::new(&journal_dir),
+                std::path::Path::new(&intent_path),
+                std::path::Path::new(&snapshot_dir),
+            ) {
                 Ok(()) => 0,
                 Err(e) => {
                     eprintln!("rollback failed: {e}");
@@ -116,10 +129,14 @@ fn main() -> anyhow::Result<()> {
             // entirely. An empty string is handled as a real failure inside
             // restore_state::run's fail-closed flow, not here.
             let root_device = std::env::var("FERRUM_ROOT_DEVICE").unwrap_or_default();
+            let intent_path = std::env::var("FERRUM_ROLLBACK_INTENT_PATH")
+                .unwrap_or_else(|_| "/var/lib/ferrum/rollback-intent.json".to_string());
+            let failure_marker_path = std::env::var("FERRUM_FAILURE_MARKER_PATH")
+                .unwrap_or_else(|_| "/var/lib/ferrum/state-restore-failed".to_string());
             let storage = restore_state::StorageConfig {
-                intent_path: "/var/lib/ferrum/rollback-intent.json".into(),
+                intent_path: intent_path.into(),
                 result_path: "/var/lib/ferrum/rollback-result.json".into(),
-                failure_marker_path: "/run/ferrum/state-restore-failed".into(),
+                failure_marker_path: failure_marker_path.into(),
             };
             restore_state::run(&root_device, &storage);
             0 // always exits 0 -- see Global Constraints

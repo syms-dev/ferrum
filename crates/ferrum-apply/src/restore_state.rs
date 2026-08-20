@@ -29,11 +29,15 @@ pub struct StorageConfig {
 }
 
 /// Writes the boot-time failure marker that `ferrum-apps.target`'s
-/// ConditionPathExists uses to hold managed apps down. Always creates the
-/// marker's parent directory first -- this runs very early in boot and
-/// `/run/ferrum` is not guaranteed to exist yet, so a plain `fs::write`
-/// would silently fail (ENOENT) and leave the interlock fail-OPEN. Safe to
-/// call at any point, including before anything else has touched disk.
+/// ConditionPathExists uses to hold managed apps down. Lives on durable
+/// storage (`@root`, NOT the snapshotted `@state` subvolume) specifically so
+/// that a failed restore stays flagged across a later, unrelated reboot --
+/// tmpfs would silently disarm the interlock on the very next boot, even one
+/// with no rollback pending. Always creates the marker's parent directory
+/// first -- this runs very early in boot and its parent directory is not
+/// guaranteed to exist yet, so a plain `fs::write` would silently fail
+/// (ENOENT) and leave the interlock fail-OPEN. Safe to call at any point,
+/// including before anything else has touched disk.
 fn write_failure_marker(path: &Path, reason: &str) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -105,11 +109,26 @@ fn perform_swap(scratch_mount: &Path, snapshot: &str) -> anyhow::Result<PathBuf>
 /// `run` so the empty-root-device case is just another failure inside the
 /// normal fail-closed flow, not a special case checked before the marker is
 /// written.
-fn attempt_restore(root_device: &str, snapshot: &str) -> anyhow::Result<()> {
+fn attempt_restore(root_device: &str, snapshot: &str, target_generation: u32) -> anyhow::Result<()> {
     if root_device.is_empty() {
         anyhow::bail!(
             "FERRUM_ROOT_DEVICE is not set (or resolved empty) -- cannot mount the \
              top-level btrfs volume to perform the restore"
+        );
+    }
+
+    // rollback::prepare writes the intent before `nix-env --switch-generation`
+    // runs, so it's possible in principle for what actually booted to differ
+    // from what the intent expected -- a bug in the switch step, or manual
+    // operator intervention. Check before touching any state: swapping in a
+    // snapshot for a generation that isn't the one running would be wrong no
+    // matter how cheaply it failed.
+    let (actual_generation, _) = crate::apply::current_generation()?;
+    if actual_generation != target_generation {
+        anyhow::bail!(
+            "intent targets generation {target_generation} but generation {actual_generation} \
+             is what's currently running -- refusing to restore state for a generation that \
+             isn't booted"
         );
     }
 
@@ -166,7 +185,7 @@ pub fn run(root_device: &str, storage: &StorageConfig) {
         "restore in progress or did not complete",
     );
 
-    let result = attempt_restore(root_device, &intent.snapshot);
+    let result = attempt_restore(root_device, &intent.snapshot, intent.target_generation);
 
     match &result {
         Ok(()) => {

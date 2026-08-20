@@ -28,7 +28,23 @@ pub fn check_is_subvolume(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn run(state_dir: &Path, snapshot_dir: &Path, min_free_gib: u64) -> anyhow::Result<()> {
+pub fn run(
+    state_dir: &Path,
+    snapshot_dir: &Path,
+    min_free_gib: u64,
+    failure_marker_path: &Path,
+) -> anyhow::Result<()> {
+    // First check, before anything else: if a prior boot's state restore
+    // failed, the state on disk is already known-untrustworthy. Snapshotting
+    // it now would journal that bad state as a legitimate rollback target,
+    // baking it permanently into the rollback history as if it were fine.
+    if failure_marker_path.exists() {
+        anyhow::bail!(
+            "a prior boot's state restore failed (marker present at {}) -- state is not \
+             trustworthy; resolve the restore failure before applying",
+            failure_marker_path.display()
+        );
+    }
     check_free_space(state_dir, min_free_gib)?;
     check_is_subvolume(state_dir)?;
     check_is_subvolume(snapshot_dir)?;
@@ -60,5 +76,15 @@ mod tests {
         // A plain tempdir is never a btrfs subvolume.
         let err = check_is_subvolume(dir.path()).unwrap_err();
         assert!(err.to_string().contains("not a btrfs subvolume"));
+    }
+
+    #[test]
+    fn refuses_when_the_failure_marker_is_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("state-restore-failed");
+        std::fs::write(&marker, "restore failed").unwrap();
+
+        let err = run(dir.path(), dir.path(), 0, &marker).unwrap_err();
+        assert!(err.to_string().contains("restore failed"));
     }
 }

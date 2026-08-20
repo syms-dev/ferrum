@@ -11,6 +11,7 @@ pub fn prepare(
     target_generation: u32,
     journal_dir: &Path,
     intent_path: &Path,
+    snapshot_dir: &Path,
 ) -> anyhow::Result<RollbackIntent> {
     let entries = journal::list(journal_dir)?;
     let matching: Vec<_> = entries
@@ -32,6 +33,21 @@ pub fn prepare(
     is_rollbackable(&info).map_err(|e| anyhow::anyhow!(e))?;
     let snapshot = info.snapshot.unwrap().snapshot;
 
+    // The journal entry surviving doesn't guarantee the snapshot subvolume
+    // it points at still exists on disk (it may have been pruned manually,
+    // or later by `gc`). Check before committing to a reboot that
+    // ferrum-state-restore.service cannot complete -- this is deliberately
+    // a plain existence check, not a "is this really a valid btrfs
+    // subvolume" check (see preflight::check_is_subvolume for that class).
+    let snapshot_path = snapshot_dir.join(&snapshot);
+    if !snapshot_path.exists() {
+        anyhow::bail!(
+            "generation {target_generation}'s snapshot {snapshot:?} is recorded in the \
+             journal but no longer exists at {}",
+            snapshot_path.display()
+        );
+    }
+
     let intent = RollbackIntent {
         target_generation,
         snapshot,
@@ -50,8 +66,13 @@ pub fn prepare(
     Ok(intent)
 }
 
-pub fn run(target_generation: u32, journal_dir: &Path, intent_path: &Path) -> anyhow::Result<()> {
-    prepare(target_generation, journal_dir, intent_path)?;
+pub fn run(
+    target_generation: u32,
+    journal_dir: &Path,
+    intent_path: &Path,
+    snapshot_dir: &Path,
+) -> anyhow::Result<()> {
+    prepare(target_generation, journal_dir, intent_path, snapshot_dir)?;
 
     let status = Command::new("nix-env")
         .args([
@@ -104,7 +125,10 @@ mod tests {
     fn refuses_a_generation_with_no_snapshot() {
         let journal_dir = tempfile::tempdir().unwrap();
         let intent_path = journal_dir.path().join("intent.json");
-        let err = prepare(99, journal_dir.path(), &intent_path).unwrap_err();
+        // No snapshot_dir contents needed -- this fails earlier, on
+        // is_rollbackable, before ever checking the snapshot dir.
+        let snapshot_dir = tempfile::tempdir().unwrap();
+        let err = prepare(99, journal_dir.path(), &intent_path, snapshot_dir.path()).unwrap_err();
         assert!(err.to_string().contains("no state snapshot"));
         assert!(!intent_path.exists());
     }
@@ -114,8 +138,10 @@ mod tests {
         let journal_dir = tempfile::tempdir().unwrap();
         write_journal_entry(journal_dir.path(), "1000-gen1", 1);
         let intent_path = journal_dir.path().join("intent.json");
+        let snapshot_dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(snapshot_dir.path().join("1000-gen1")).unwrap();
 
-        let intent = prepare(1, journal_dir.path(), &intent_path).unwrap();
+        let intent = prepare(1, journal_dir.path(), &intent_path, snapshot_dir.path()).unwrap();
         assert_eq!(intent.target_generation, 1);
         assert_eq!(intent.snapshot, "1000-gen1");
 
@@ -131,8 +157,25 @@ mod tests {
         write_journal_entry(journal_dir.path(), "1000-gen1", 1);
         write_journal_entry(journal_dir.path(), "2000-gen1", 1);
         let intent_path = journal_dir.path().join("intent.json");
+        let snapshot_dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(snapshot_dir.path().join("1000-gen1")).unwrap();
+        std::fs::create_dir_all(snapshot_dir.path().join("2000-gen1")).unwrap();
 
-        let intent = prepare(1, journal_dir.path(), &intent_path).unwrap();
+        let intent = prepare(1, journal_dir.path(), &intent_path, snapshot_dir.path()).unwrap();
         assert_eq!(intent.snapshot, "2000-gen1");
+    }
+
+    #[test]
+    fn refuses_when_the_journal_entry_exists_but_the_snapshot_directory_is_gone() {
+        let journal_dir = tempfile::tempdir().unwrap();
+        write_journal_entry(journal_dir.path(), "1000-gen1", 1);
+        let intent_path = journal_dir.path().join("intent.json");
+        // Deliberately does NOT create snapshot_dir/1000-gen1 -- the
+        // journal entry is recorded but the snapshot itself is gone.
+        let snapshot_dir = tempfile::tempdir().unwrap();
+
+        let err = prepare(1, journal_dir.path(), &intent_path, snapshot_dir.path()).unwrap_err();
+        assert!(err.to_string().contains("no longer exists"));
+        assert!(!intent_path.exists());
     }
 }
