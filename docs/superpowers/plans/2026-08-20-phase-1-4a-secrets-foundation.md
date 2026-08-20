@@ -14,6 +14,7 @@
 
 - Secret values never get Nix-string-interpolated into a systemd unit's script/environment/ExecStart text — this was already the hard rule for qBittorrent's WireGuard config in Phase 1.3; every secret this plan handles follows it.
 - `sops.validateSopsFiles` (a real sops-nix option, defaults to `true`) checks every referenced `.sops` file exists **at Nix evaluation time** — confirmed empirically on ferrum-dev by reading sops-nix's own source (`sopsFileHash = ... builtins.hashFile "sha256" config.sopsFile`, gated on this option). The example host used by `checks.eval-example-hosts` is not a real deployed box and has no real secrets, so it sets this to `false` — matching the existing precedent of that host's fake dual-fstype filesystems, both there purely to satisfy eval-time checks a real box would never need faked.
+- **`sopsFile` must be a genuine Nix `path` value, never a plain interpolated string, even though both look identical when printed.** Read directly from sops-nix's own assertion (`modules/sops/manifest-for.nix`): a secret fails validation unless `builtins.isPath secret.sopsFile` is true, OR it's a string already prefixed with `/nix/store`. `sopsFile = "${ferrum.secretsDir}/<name>.sops";` (plain string interpolation) satisfies neither — it evaluates fine and even passes `builtins.pathExists`, but fails this specific assertion the moment a real host actually validates (this is NOT the same eval-only host that has `validateSopsFiles = false`, so the cheap checks alone cannot catch it). The fix, confirmed via a real `nix eval` on ferrum-dev: `sopsFile = /. + "${ferrum.secretsDir}/<name>.sops";` — Nix's `path + string` concatenation operator produces a genuine path-typed value (`builtins.isPath` true) even when the string operand is a runtime-configurable value, which is what actually satisfies the assertion while keeping `ferrum.secretsDir` a plain configurable option. Every `sopsFile` assignment in this plan uses this form.
 - Encrypting a NEW secret with `sops --encrypt --age <recipient>` needs only the recipient's **public** key — confirmed via `nix run nixpkgs#sops -- --help` on ferrum-dev. Nothing that writes a secret in this plan (ferrum-apply's new preflight step) needs the box's private key at all.
 - The box's age identity is derived from its own SSH host key (`sops.age.sshKeyPaths`, which defaults to `config.services.openssh.hostKeys`'s ed25519 keys) — confirmed by reading sops-nix's source directly. This needs `services.openssh.enable = true`, which nothing in ferrum's module tree sets yet.
 - Every option under `ferrum.*` must stay JSON-expressible — `checks.schema-uniformity` enforces this mechanically. New options this plan adds (`ferrum.secretsDir`, `ferrum.daemon.subdomain`) are plain strings, so this holds automatically.
@@ -588,7 +589,7 @@ let
 in
 lib.mkIf app.enable {
   sops.secrets."sonarr-apikey" = {
-    sopsFile = "${ferrum.secretsDir}/sonarr-apikey.sops";
+    sopsFile = /. + "${ferrum.secretsDir}/sonarr-apikey.sops";
     format = "binary";
     owner = "sonarr";
   };
@@ -654,7 +655,7 @@ let
 in
 lib.mkIf app.enable {
   sops.secrets."radarr-apikey" = {
-    sopsFile = "${ferrum.secretsDir}/radarr-apikey.sops";
+    sopsFile = /. + "${ferrum.secretsDir}/radarr-apikey.sops";
     format = "binary";
     owner = "radarr";
   };
@@ -722,7 +723,7 @@ let
 in
 lib.mkIf app.enable {
   sops.secrets."prowlarr-apikey" = {
-    sopsFile = "${ferrum.secretsDir}/prowlarr-apikey.sops";
+    sopsFile = /. + "${ferrum.secretsDir}/prowlarr-apikey.sops";
     format = "binary";
   };
 
@@ -827,7 +828,7 @@ lib.mkIf app.enable {
     lib.optional (app.mediaAccess != "none") ferrum.storage.mediaGroup;
 
   sops.secrets."qbittorrent-vpn" = lib.mkIf vpnEnabled {
-    sopsFile = "${ferrum.secretsDir}/qbittorrent-vpn.sops";
+    sopsFile = /. + "${ferrum.secretsDir}/qbittorrent-vpn.sops";
     format = "binary";
   };
 
