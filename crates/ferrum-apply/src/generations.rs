@@ -1,10 +1,5 @@
-// This whole module has no caller yet: it's pure groundwork for Tasks 6/7
-// (restore-state, rollback), which are its first real consumers. Every item
-// here is already exercised by this file's own tests, but clippy's default
-// (non-`--tests`) pass only sees the crate's call graph from main(), so
-// without this allow the entire module fails -D warnings until Task 7 wires
-// it in.
-#![allow(dead_code)]
+// Task 7 (rollback) is the first real consumer of this module. Every item
+// here is already exercised by this file's own tests, and Task 7 now wires it in.
 
 use crate::journal::JournalEntry;
 
