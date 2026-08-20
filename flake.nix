@@ -23,6 +23,7 @@
       imports = [
         ./nix/modules/flake/checks.nix
         ./nix/modules/flake/packages.nix
+        ./nix/modules/flake/overlays.nix
         ./nix/modules/flake/devshells.nix
       ];
 
