@@ -19,6 +19,7 @@
             apps = catalog;
           };
         };
+        ferrum-testapp = pkgs.callPackage ../../../nix/pkgs/testapp { };
       };
     };
 }
