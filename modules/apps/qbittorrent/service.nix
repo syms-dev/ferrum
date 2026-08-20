@@ -55,7 +55,10 @@ lib.mkIf app.enable {
       ${lib.optionalString (!killSwitch) ''
         # Kill switch OFF: add a fallback route back to the host's normal
         # network via a veth pair, lower priority than the WireGuard
-        # route so the tunnel is always preferred when it's up.
+        # route so the tunnel is always preferred when it's up. IP
+        # forwarding must be enabled or the MASQUERADE rule below never
+        # actually forwards packets (caught during Task 7's review).
+        echo 1 > /proc/sys/net/ipv4/ip_forward
         ip link add veth-qbt-host type veth peer name veth-qbt-ns
         ip link set veth-qbt-ns netns qbt-vpn
         ip addr add 10.200.1.1/30 dev veth-qbt-host
