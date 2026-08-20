@@ -28,6 +28,28 @@ enum Command {
     Gc,
 }
 
+/// Maps an `apply::run` outcome to a process exit code, printing context to
+/// stderr along the way. `Degraded` gets its own distinct code (3) so a
+/// caller (a systemd unit, future automation) can tell "switched but a unit
+/// is down" apart from a clean success without parsing stderr text.
+fn handle_apply_result(result: anyhow::Result<apply::ApplyResult>) -> i32 {
+    match result {
+        Ok(apply::ApplyResult::Succeeded) => 0,
+        Ok(apply::ApplyResult::Degraded(reason)) => {
+            eprintln!("apply degraded: {reason}");
+            3
+        }
+        Ok(apply::ApplyResult::Failed(reason)) => {
+            eprintln!("apply failed: {reason}");
+            1
+        }
+        Err(e) => {
+            eprintln!("apply error: {e}");
+            1
+        }
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let exit_code = match cli.command {
@@ -70,21 +92,7 @@ fn main() -> anyhow::Result<()> {
             };
             let flake_ref = std::env::var("FERRUM_FLAKE_REF")
                 .unwrap_or_else(|_| "/etc/ferrum#nixosConfigurations.default.config.system.build.toplevel".to_string());
-            match apply::run(&flake_ref, &storage) {
-                Ok(apply::ApplyResult::Succeeded) => 0,
-                Ok(apply::ApplyResult::Degraded(reason)) => {
-                    eprintln!("apply degraded: {reason}");
-                    0 // the switch itself succeeded; degraded is reported, not a process failure
-                }
-                Ok(apply::ApplyResult::Failed(reason)) => {
-                    eprintln!("apply failed: {reason}");
-                    1
-                }
-                Err(e) => {
-                    eprintln!("apply error: {e}");
-                    1
-                }
-            }
+            handle_apply_result(apply::run(&flake_ref, &storage))
         }
         Command::Rollback { to: _ } => {
             eprintln!("rollback: not yet implemented");
@@ -133,5 +141,19 @@ mod tests {
         ] {
             Cli::try_parse_from(args).expect("all five subcommands must parse");
         }
+    }
+
+    #[test]
+    fn apply_result_maps_to_distinct_exit_codes() {
+        assert_eq!(handle_apply_result(Ok(apply::ApplyResult::Succeeded)), 0);
+        assert_eq!(
+            handle_apply_result(Ok(apply::ApplyResult::Degraded("x".to_string()))),
+            3
+        );
+        assert_eq!(
+            handle_apply_result(Ok(apply::ApplyResult::Failed("x".to_string()))),
+            1
+        );
+        assert_eq!(handle_apply_result(Err(anyhow::anyhow!("boom"))), 1);
     }
 }
