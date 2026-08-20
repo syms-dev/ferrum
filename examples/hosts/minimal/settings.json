@@ -9,6 +9,9 @@
   "apps": {
     "sonarr": {
       "enable": true
+    },
+    "radarr": {
+      "enable": true
     }
   }
 }

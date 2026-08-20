@@ -10,5 +10,6 @@
     ./core/generations.nix
     ./core/state-restore.nix
     ./apps/sonarr/service.nix
+    ./apps/radarr/service.nix
   ];
 }

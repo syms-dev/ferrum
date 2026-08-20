@@ -1,0 +1,47 @@
+# Radarr, wired through the uniform ferrum.apps.radarr submodule onto
+# nixpkgs' services.radarr (shares Sonarr's servarr framework -- see
+# nixos/modules/services/misc/servarr/). Phase 1.1 scope only: no
+# ferrum.secrets/sops wiring yet, so Radarr generates its own API key on
+# first start, same as Sonarr.
+{ config, lib, ... }:
+let
+  ferrum = config.ferrum;
+  app = ferrum.apps.radarr or { enable = false; };
+in
+lib.mkIf app.enable {
+  services.radarr = {
+    enable = true;
+    dataDir = app.stateDir;
+    user = "radarr";
+    group = "radarr";
+    settings = {
+      server = {
+        port = app.port;
+        bindaddress = "127.0.0.1";
+      } // lib.optionalAttrs (app.settings ? urlBase && app.settings.urlBase != "") {
+        urlbase = app.settings.urlBase;
+      };
+      log.analyticsenabled = false;
+      update.mechanism = "external";
+    };
+  };
+
+  users.users.radarr.extraGroups =
+    lib.optional (app.mediaAccess != "none") ferrum.storage.mediaGroup;
+
+  systemd.services.radarr = {
+    # Pulled in by ferrum-apps.target instead of multi-user.target directly,
+    # so `systemctl stop ferrum-apps.target` (what apply does before every
+    # snapshot) actually controls it, and the fail-closed interlock (every
+    # app service must carry ConditionPathExists itself -- see
+    # modules/core/generations.nix for why the target's own condition alone
+    # doesn't gate dependents) applies.
+    wantedBy = lib.mkForce [ "ferrum-apps.target" ];
+    partOf = [ "ferrum-apps.target" ];
+    unitConfig.ConditionPathExists = "!/var/lib/ferrum/state-restore-failed";
+    serviceConfig = lib.filterAttrs (_: v: v != null) {
+      MemoryMax = app.resources.memoryMax;
+      CPUQuota = app.resources.cpuQuota;
+    };
+  };
+}
