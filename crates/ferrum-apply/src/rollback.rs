@@ -1,4 +1,4 @@
-use crate::generations::{correlate, is_rollbackable, GenerationInfo};
+use crate::generations::{is_rollbackable, snapshot_ts, GenerationInfo};
 use crate::journal;
 use crate::restore_state::RollbackIntent;
 use std::path::Path;
@@ -25,13 +25,7 @@ pub fn prepare(
         current: false,
         snapshot: matching
             .iter()
-            .max_by_key(|e| {
-                e.snapshot
-                    .split('-')
-                    .next()
-                    .and_then(|s| s.parse::<u64>().ok())
-                    .unwrap_or(0)
-            })
+            .max_by_key(|e| snapshot_ts(&e.snapshot))
             .cloned(),
     };
 
@@ -56,21 +50,6 @@ pub fn prepare(
     Ok(intent)
 }
 
-/// Runs correlate() only as a convenience for a future `list-generations`
-/// consumer -- unused by `run` itself, which validates directly via
-/// `prepare`. Kept here because `generations::correlate`'s only current
-/// caller is this module's tests; removing an unused-import warning by
-/// invoking it in a real (if small) code path is preferable to `#[allow]`.
-#[allow(dead_code)]
-fn all_generations_info(
-    nix_env_output: &str,
-    journal_dir: &Path,
-) -> anyhow::Result<Vec<GenerationInfo>> {
-    let parsed = crate::generations::parse_nix_env_list(nix_env_output);
-    let entries = journal::list(journal_dir)?;
-    Ok(correlate(parsed, entries))
-}
-
 pub fn run(target_generation: u32, journal_dir: &Path, intent_path: &Path) -> anyhow::Result<()> {
     prepare(target_generation, journal_dir, intent_path)?;
 
@@ -83,6 +62,10 @@ pub fn run(target_generation: u32, journal_dir: &Path, intent_path: &Path) -> an
         ])
         .status()?;
     if !status.success() {
+        // A rollback attempt that never touched the Nix profile must leave
+        // no trace -- otherwise a stale intent file triggers a surprise
+        // state restore on some later, unrelated boot.
+        let _ = std::fs::remove_file(intent_path);
         anyhow::bail!("nix-env --switch-generation {target_generation} failed");
     }
 
@@ -90,6 +73,7 @@ pub fn run(target_generation: u32, journal_dir: &Path, intent_path: &Path) -> an
         .arg("boot")
         .status()?;
     if !status.success() {
+        let _ = std::fs::remove_file(intent_path);
         anyhow::bail!("switch-to-configuration boot failed");
     }
 
