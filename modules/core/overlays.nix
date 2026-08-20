@@ -26,8 +26,31 @@
 { config, lib, ... }:
 let
   ferrum = config.ferrum;
+
+  # Aggregated here, not per-app: nixpkgs.config.allowUnfreePredicate holds
+  # a single function value, and NixOS's module system does not compose
+  # two independently-defined functions from different modules the way it
+  # composes nixpkgs.overlays' list -- two apps each setting their own
+  # predicate (as Plex originally did, before this fix) produces a
+  # conflicting-definitions eval error the moment BOTH are enabled on the
+  # same host, not a silent union. Confirmed for real: enabling Plex
+  # (plexmediaserver) and SABnzbd (whose sabnzbd package depends on the
+  # unfree `unrar`) together on the same host is exactly the case that
+  # would trigger it. Every catalog app's meta.nix may declare
+  # `unfreePackages = [ "name" ... ];` (omitted/absent means none); this
+  # collects the union across the WHOLE catalog, regardless of which apps
+  # are actually enabled -- harmless, since an unfree package that's never
+  # referenced (a disabled app) is never built regardless of whether its
+  # name appears in this allowlist.
+  catalog = import ../lib/catalog.nix { inherit lib; };
+  unfreePackageNames = lib.unique (
+    lib.concatMap (app: app.unfreePackages or [ ]) (lib.attrValues catalog)
+  );
 in
 {
+  nixpkgs.config.allowUnfreePredicate = pkg:
+    builtins.elem (lib.getName pkg) unfreePackageNames;
+
   nixpkgs.overlays = [
     (import ../../nix/overlays)
     (final: prev: {

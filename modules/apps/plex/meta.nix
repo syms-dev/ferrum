@@ -16,6 +16,14 @@
   defaultMediaAccess = "read";
   defaultAuthPolicy = "one_factor";
 
+  # nixpkgs' plexmediaserver package is licensed unfree; without allowing
+  # it, the whole host config fails to evaluate the moment this app is
+  # enabled. Collected centrally across the whole catalog by
+  # modules/core/overlays.nix -- see that file's comment for why this
+  # can't be set per-app inside service.nix (it doesn't compose with a
+  # second unfree app's own predicate).
+  unfreePackages = [ "plexmediaserver" ];
+
   # Plex's native apps (smart TVs, game consoles, mobile) cannot follow a
   # forward-auth redirect -- /identity is Plex's own documented
   # unauthenticated endpoint used by clients for server discovery.
