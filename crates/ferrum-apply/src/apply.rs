@@ -1,7 +1,7 @@
 use crate::journal::{self, JournalEntry};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, PartialEq)]
 pub enum ApplyResult {
@@ -111,12 +111,41 @@ fn all_managed_units_active() -> anyhow::Result<bool> {
     Ok(true)
 }
 
+/// Polls `check` until it reports healthy or `timeout` elapses, sleeping
+/// `poll_interval` between attempts. A slow-starting app (Sonarr can take
+/// tens of seconds to become genuinely usable) checked exactly once,
+/// immediately after `systemctl start` returns, would be misclassified as
+/// Degraded far more often than the app is actually unhealthy --
+/// `systemctl start` returns as soon as jobs complete, which for a simple
+/// service is the moment the process is forked, not when it's actually up.
+fn wait_for_healthy_with<F: FnMut() -> anyhow::Result<bool>>(
+    timeout: Duration,
+    poll_interval: Duration,
+    mut check: F,
+) -> anyhow::Result<bool> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if check()? {
+            return Ok(true);
+        }
+        if Instant::now() >= deadline {
+            return Ok(false);
+        }
+        std::thread::sleep(poll_interval);
+    }
+}
+
+fn wait_for_healthy(timeout: Duration) -> anyhow::Result<bool> {
+    wait_for_healthy_with(timeout, Duration::from_millis(500), all_managed_units_active)
+}
+
 pub struct StorageConfig {
     pub state_dir: std::path::PathBuf,
     pub snapshot_dir: std::path::PathBuf,
     pub journal_dir: std::path::PathBuf,
     pub min_free_gib: u64,
     pub failure_marker_path: std::path::PathBuf,
+    pub health_check_timeout: Duration,
 }
 
 pub fn run(flake_ref: &str, storage: &StorageConfig) -> anyhow::Result<ApplyResult> {
@@ -137,7 +166,7 @@ pub fn run(flake_ref: &str, storage: &StorageConfig) -> anyhow::Result<ApplyResu
         // Nothing to switch. But a *prior* apply may have left the system
         // degraded (e.g. an app crashed after activation) -- report real
         // health instead of a bare, potentially-false "succeeded".
-        return Ok(classify(0, all_managed_units_active()?));
+        return Ok(classify(0, wait_for_healthy(storage.health_check_timeout)?));
     }
 
     // 2. Preflight, before touching anything.
@@ -209,7 +238,7 @@ pub fn run(flake_ref: &str, storage: &StorageConfig) -> anyhow::Result<ApplyResu
         anyhow::anyhow!("apply failed mid-sequence (apps have been restarted): {e}")
     })?;
 
-    let healthy = all_managed_units_active()?;
+    let healthy = wait_for_healthy(storage.health_check_timeout)?;
     Ok(classify(switch_exit_code, healthy))
 }
 
@@ -260,5 +289,47 @@ mod tests {
             classify(-1, true),
             ApplyResult::Degraded("switch-to-configuration exited -1".to_string())
         );
+    }
+
+    #[test]
+    fn wait_for_healthy_returns_true_immediately_when_already_healthy() {
+        let mut calls = 0;
+        let result = wait_for_healthy_with(Duration::from_secs(10), Duration::from_millis(1), || {
+            calls += 1;
+            Ok(true)
+        });
+        assert_eq!(result.unwrap(), true);
+        assert_eq!(calls, 1, "must not poll again once healthy");
+    }
+
+    #[test]
+    fn wait_for_healthy_polls_until_healthy_within_the_timeout() {
+        let mut calls_remaining_unhealthy = 2;
+        let result = wait_for_healthy_with(Duration::from_secs(10), Duration::from_millis(1), || {
+            if calls_remaining_unhealthy > 0 {
+                calls_remaining_unhealthy -= 1;
+                Ok(false)
+            } else {
+                Ok(true)
+            }
+        });
+        assert_eq!(result.unwrap(), true);
+    }
+
+    #[test]
+    fn wait_for_healthy_gives_up_and_returns_false_after_the_timeout() {
+        let result = wait_for_healthy_with(Duration::from_millis(20), Duration::from_millis(5), || {
+            Ok(false)
+        });
+        assert_eq!(result.unwrap(), false);
+    }
+
+    #[test]
+    fn wait_for_healthy_propagates_a_check_error_immediately() {
+        let result: anyhow::Result<bool> =
+            wait_for_healthy_with(Duration::from_secs(10), Duration::from_millis(1), || {
+                anyhow::bail!("systemctl unreachable")
+            });
+        assert!(result.is_err());
     }
 }
