@@ -79,6 +79,14 @@ lib.mkIf app.enable {
         exit 1
       fi
 
+      # wg0 is created in the root namespace, ahead of the `ip netns del
+      # qbt-vpn` cleanup above having anything to do with it -- if a prior
+      # run was killed between this line and the `ip link set ... netns`
+      # move below, wg0 would leak into the root namespace and this
+      # command would fail with "File exists" on the next start. Guarded
+      # the same way the netns cleanup above already is (found during the
+      # final whole-branch review's re-review).
+      ip link del wg0 2>/dev/null || true
       ip link add wg0 type wireguard
       wg setconf wg0 <(wg-quick strip /run/qbt-vpn/wg0.conf)
       ip link set wg0 netns qbt-vpn
