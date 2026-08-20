@@ -1,5 +1,4 @@
-# Rust toolchain joins this shell once crates/ exists (Phase 1.5). For now
-# it only needs to support editing and linting the Nix module tree.
+# Rust toolchain and Nix development tools.
 { ... }:
 {
   perSystem = { pkgs, ... }: {
@@ -10,6 +9,10 @@
         statix
         deadnix
         nix-tree
+        cargo
+        rustc
+        clippy
+        rustfmt
       ];
     };
   };

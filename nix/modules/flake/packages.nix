@@ -20,6 +20,7 @@
           };
         };
         ferrum-testapp = pkgs.callPackage ../../../nix/pkgs/testapp { };
+        ferrum-apply = pkgs.callPackage ../../../nix/pkgs/ferrum-apply { };
       };
     };
 }
