@@ -9,6 +9,7 @@
     ./core/overlays.nix
     ./core/generations.nix
     ./core/state-restore.nix
+    ./core/secrets.nix
     ./apps/sonarr/service.nix
     ./apps/radarr/service.nix
     ./apps/prowlarr/service.nix

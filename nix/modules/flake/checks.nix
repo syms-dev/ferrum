@@ -5,7 +5,10 @@
 {
   perSystem = { system, pkgs, lib, self', ... }:
     let
-      ferrumLib = import ../../../modules/lib { nixpkgs = inputs.nixpkgs; };
+      ferrumLib = import ../../../modules/lib {
+        nixpkgs = inputs.nixpkgs;
+        sopsNix = inputs.sops-nix;
+      };
       catalog = import ../../../modules/lib/catalog.nix { inherit lib; };
       appsDir = ../../../modules/apps;
 
@@ -13,7 +16,18 @@
         minimal = ferrumLib.mkHost {
           inherit system;
           settings = builtins.fromJSON (builtins.readFile ../../../examples/hosts/minimal/settings.json);
-          modules = [ ../../../examples/hosts/minimal/configuration.nix ];
+          modules = [
+            ../../../examples/hosts/minimal/configuration.nix
+            # This host is eval-only (see configuration.nix's own "NOT
+            # BOOTABLE" comment) and never has real secrets on disk.
+            # sops.validateSopsFiles defaults to true and requires every
+            # referenced .sops file to physically exist at eval time
+            # (confirmed by reading sops-nix's own source: it computes
+            # builtins.hashFile on each one) -- a real deployed box has
+            # these because ferrum-apply generates them before every
+            # build, but nothing does that for this check.
+            { sops.validateSopsFiles = false; }
+          ];
           revision = "ci";
         };
       };
