@@ -84,6 +84,14 @@
 
         smoke-vm = import ../../../tests/smoke.nix { inherit pkgs; };
 
+        # tests/rollback.nix is the plan's terminal proof: a real rollback
+        # reverts application STATE, not just the system closure.
+        # rollback-proves-necessity.nix is its companion, proving the
+        # failure mode the mechanism exists to prevent is real in the first
+        # place.
+        rollback = import ../../../tests/rollback.nix { inherit pkgs; };
+        rollback-proves-necessity = import ../../../tests/rollback-proves-necessity.nix { inherit pkgs; };
+
         # Not a separate runCommand: Nix's build sandbox has no network
         # access, so a hand-rolled `cd crates && cargo test` derivation can
         # never fetch crates.io and fails every time (verified: it does).
