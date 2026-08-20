@@ -60,6 +60,19 @@ in
       };
     };
 
+    secretsDir = mkOption {
+      type = types.str;
+      default = "/etc/ferrum/secrets";
+      description = ''
+        Where per-secret .sops files live on a real deployed box (this is
+        NOT the decrypted output -- that's sops-nix's own /run/secrets/,
+        entirely outside ferrum's control). /etc/ferrum is the host's own
+        flake root (see the Phase 1.3 design doc), so paths under here get
+        copied into the Nix store at eval time same as settings.json --
+        that's fine, since only ciphertext ever lives here.
+      '';
+    };
+
     proxy = {
       enable = mkEnableOption "the ferrum reverse proxy (nginx + ACME)";
 
@@ -156,6 +169,11 @@ in
       listenAddress = mkOption {
         type = types.str;
         default = "127.0.0.1";
+      };
+      subdomain = mkOption {
+        type = types.str;
+        default = "ferrum";
+        description = "Hostname label under ferrum.proxy.baseDomain for the daemon's own web UI -- same mechanism as every app's own subdomain option, just not tied to the catalog since the daemon isn't a catalog app.";
       };
     };
 

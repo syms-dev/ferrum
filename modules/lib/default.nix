@@ -7,7 +7,7 @@
 # the host-flake level rather than read from a path inside config.ferrum
 # (reading a path out of config.ferrum in order to define config.ferrum is
 # infinite recursion).
-{ nixpkgs }:
+{ nixpkgs, sopsNix }:
 let
   inherit (nixpkgs) lib;
   ferrumModule = import ../default.nix;
@@ -28,6 +28,7 @@ in
       inherit system;
       specialArgs = { inherit revision; };
       modules = [
+        sopsNix.nixosModules.sops
         ferrumModule
         { config.ferrum = settings; }
         { system.stateVersion = lib.mkDefault stateVersion; }

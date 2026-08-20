@@ -30,7 +30,7 @@
       flake = {
         nixosModules.default = import ./modules;
 
-        lib = import ./modules/lib { inherit nixpkgs; };
+        lib = import ./modules/lib { inherit nixpkgs; sopsNix = inputs.sops-nix; };
       };
     };
 }
