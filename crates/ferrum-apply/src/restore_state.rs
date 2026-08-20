@@ -209,6 +209,23 @@ pub fn run(root_device: &str, storage: &StorageConfig) {
                     storage.failure_marker_path.display()
                 );
             }
+            // The intent is only ever removed on confirmed success, matching
+            // the malformed-intent path above (which never removes it
+            // either). A FAILED restore deliberately leaves the intent in
+            // place: the failure marker already holds apps down regardless,
+            // so there's no safety reason to make a failure one-shot, and
+            // every reason not to -- a transient failure (a flaky mount, a
+            // brief resource contention) can self-heal on a later boot
+            // instead of silently never retrying.
+            if let Err(e) = std::fs::remove_file(&storage.intent_path) {
+                eprintln!(
+                    "ferrum-apply restore-state: restore succeeded but failed to remove the \
+                     rollback intent file {}: {e} -- this same intent will re-trigger the same \
+                     restore attempt (a no-op re-establishing the same already-correct state) \
+                     on the next boot; safe, but worth fixing so it stops repeating",
+                    storage.intent_path.display()
+                );
+            }
         }
         Err(e) => {
             eprintln!("ferrum-apply restore-state: {e}");
@@ -222,18 +239,8 @@ pub fn run(root_device: &str, storage: &StorageConfig) {
                 }))
                 .unwrap(),
             );
+            // Intent stays -- see the success branch's comment above for why.
         }
-    }
-
-    if let Err(e) = std::fs::remove_file(&storage.intent_path) {
-        eprintln!(
-            "ferrum-apply restore-state: failed to remove rollback intent file {}: {e} -- \
-             this same intent will re-trigger the same restore attempt on the next boot; \
-             that is safe (each repeat re-establishes the same content from a read-only \
-             snapshot, and the marker above is set correctly regardless) but worth fixing \
-             so restores stop repeating",
-            storage.intent_path.display()
-        );
     }
 }
 
@@ -322,11 +329,12 @@ mod tests {
 
     /// A valid-but-unactionable intent (e.g. no root device resolvable,
     /// reproducing Critical #2's underlying condition of a null device)
-    /// must also leave the marker in place, and must remove the intent
-    /// file so it doesn't loop forever on a doomed attempt without leaving
-    /// any trace of why.
+    /// must also leave the marker in place. The intent itself is left in
+    /// place too (not removed) -- a failed restore retries on the next
+    /// boot instead of being one-shot, so a transient failure can self-heal
+    /// without an operator having to re-trigger the rollback by hand.
     #[test]
-    fn failed_restore_leaves_marker_and_removes_intent() {
+    fn failed_restore_leaves_marker_and_intent_in_place() {
         let dir = tempfile::tempdir().unwrap();
         let storage = StorageConfig {
             intent_path: dir.path().join("var/rollback-intent.json"),
@@ -350,8 +358,8 @@ mod tests {
             "failure marker must exist after a failed restore"
         );
         assert!(
-            !storage.intent_path.exists(),
-            "intent file should be removed after being processed"
+            storage.intent_path.exists(),
+            "intent file must stay in place after a failed restore, so it retries on the next boot"
         );
     }
 
