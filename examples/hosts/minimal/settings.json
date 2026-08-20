@@ -21,6 +21,9 @@
     },
     "plex": {
       "enable": true
+    },
+    "sabnzbd": {
+      "enable": true
     }
   }
 }
