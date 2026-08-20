@@ -51,11 +51,14 @@
   defaultMediaAccess = "readwrite";
   defaultAuthPolicy = "two_factor";
 
-  # /api, /feed, /ping must reach Radarr without a forward-auth redirect,
-  # or every API client (Prowlarr, mobile apps, ferrum's own reconciler)
-  # breaks the moment ferrum.auth.enable flips on. Same reasoning as
-  # Sonarr's identical bypass list.
-  authBypassPaths = [ "/api" "/feed" "/ping" ];
+  # /api, /feed, /ping, /signalr must reach Radarr without a forward-auth
+  # redirect, or every API client (Prowlarr, mobile apps, ferrum's own
+  # reconciler) breaks the moment ferrum.auth.enable flips on, and the web
+  # UI's live updates (SignalR) break too. Same reasoning as Sonarr's
+  # identical bypass list. (The /signalr entry was missing in the original
+  # version of this task, caught by Task 1's review after dispatch -- see
+  # the ledger.)
+  authBypassPaths = [ "/api" "/feed" "/ping" "/signalr" ];
 
   healthCheck = {
     path = "/ping";
@@ -222,7 +225,12 @@ git commit -m "Add Radarr to the catalog"
   defaultMediaAccess = "none";
   defaultAuthPolicy = "two_factor";
 
-  authBypassPaths = [ "/api" "/ping" ];
+  # Same reasoning as Sonarr/Radarr -- Prowlarr shares the identical
+  # Servarr web framework, which uses a SignalR hub for live updates
+  # (indexer test results, task queue). Missing this breaks the web UI's
+  # real-time updates once forward-auth is on (caught in Task 1's review;
+  # fixed here before this task is dispatched).
+  authBypassPaths = [ "/api" "/ping" "/signalr" ];
 
   healthCheck = {
     path = "/ping";
