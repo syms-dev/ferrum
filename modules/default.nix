@@ -14,5 +14,6 @@
     ./apps/prowlarr/service.nix
     ./apps/jellyfin/service.nix
     ./apps/plex/service.nix
+    ./apps/sabnzbd/service.nix
   ];
 }
