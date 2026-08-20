@@ -241,6 +241,7 @@ git commit -m "Wire sops-nix into ferrum; add ferrum.secretsDir and ferrum.daemo
 - Modify: `crates/ferrum-apply/src/main.rs` (add `mod secrets;`, wire env vars)
 - Modify: `crates/ferrum-apply/src/apply.rs` (call `secrets::ensure_all` as a new first step)
 - Modify: `nix/pkgs/ferrum-apply/default.nix` (wrap with `sops`/`ssh-to-age` on PATH, same pattern as the existing `btrfs-progs` wrap)
+- Modify: `modules/core/overlays.nix` (extend the existing `ferrum-apply` `--set-default` wrapper with the two new env vars — see Step 6)
 
 **Interfaces:**
 - Consumes: `crate::apply::run`'s existing pipeline shape (Task 1 confirmed `1. Build → 2. Preflight → 3. Stop apps → ...`); this task inserts a **new step 0, before Build**, since Sonarr/Radarr/Prowlarr's `environmentFiles` reference a decrypted secret path statically, and `nix build` needs the `.sops` file to exist on disk for `sops.validateSopsFiles` (real, on by default) to pass.
@@ -494,24 +495,61 @@ rustPlatform.buildRustPackage {
 }
 ```
 
-- [ ] **Step 6: Run cargo tests**
+- [ ] **Step 6: Wire the two new env vars into the existing `ferrum-apply` wrapper**
+
+`modules/core/overlays.nix` already wraps the base `ferrum-apply` package with `--set-default FERRUM_STATE_DIR ...` etc., baking `ferrum.storage.*`/`ferrum.apply.*` into the CLI so it can never silently disagree with the host's own config (see that file's header comment — this is the established mechanism, not something to reinvent). This step extends that same wrapper with the two new env vars Step 3 added: `FERRUM_SECRETS_DIR` (from `ferrum.secretsDir`) and `FERRUM_SERVARR_APPS` (the actual enabled servarr apps on this host, not a hardcoded list — a host that hasn't enabled Prowlarr shouldn't have `ferrum-apply` waste a `ssh-to-age`+`sops` round trip generating a secret nothing uses, and a host that HAS enabled all three needs all three represented).
+
+Modify `modules/core/overlays.nix`'s `nixpkgs.overlays` list — add one `let`-bound value and two more `--set-default` lines to the existing `ferrum-apply` wrapper derivation:
+
+```nix
+  ferrum = config.ferrum;
+
+  # ...(unchanged: catalog, unfreePackageNames)...
+
+  # Only the three servarr apps ferrum-apply's secrets.rs module actually
+  # generates keys for (see crates/ferrum-apply/src/secrets.rs's own
+  # SERVARR_APPS list) -- qBittorrent/Plex/Jellyfin/SABnzbd have their own
+  # auth mechanisms and are deliberately excluded even if enabled.
+  enabledServarrApps = lib.filter
+    (id: ferrum.apps.${id}.enable or false)
+    [ "sonarr" "radarr" "prowlarr" ];
+```
+
+(Add `enabledServarrApps` as a new `let`-binding alongside the existing `ferrum`/`catalog`/`unfreePackageNames` bindings, before the `in` keyword.)
+
+Then add two more `--set-default` lines to the existing `makeWrapper` invocation:
+
+```nix
+          makeWrapper ${prev.ferrum-apply}/bin/ferrum-apply $out/bin/ferrum-apply \
+            --set-default FERRUM_STATE_DIR ${lib.escapeShellArg ferrum.storage.stateDir} \
+            --set-default FERRUM_SNAPSHOT_DIR ${lib.escapeShellArg ferrum.storage.snapshotDir} \
+            --set-default FERRUM_JOURNAL_DIR ${lib.escapeShellArg ferrum.storage.journalDir} \
+            --set-default FERRUM_MIN_FREE_GIB ${toString ferrum.storage.minFreeGiB} \
+            --set-default FERRUM_HEALTH_CHECK_TIMEOUT_SEC ${toString ferrum.apply.healthCheckTimeoutSec} \
+            --set-default FERRUM_SECRETS_DIR ${lib.escapeShellArg ferrum.secretsDir} \
+            --set-default FERRUM_SERVARR_APPS ${lib.escapeShellArg (lib.concatStringsSep "," enabledServarrApps)}
+```
+
+(Every existing line keeps its trailing `\`; only the final line's `\` moves to the new last line, and the two new lines are added — this is one wrapper invocation, not two.)
+
+- [ ] **Step 7: Run cargo tests**
 
 ```bash
 cd crates && cargo test -p ferrum-apply
 ```
 Expected: all tests pass, including the two new `secrets.rs` tests.
 
-- [ ] **Step 7: Verify structural checks pass on ferrum-dev**
+- [ ] **Step 8: Verify structural checks pass on ferrum-dev**
 
 ```bash
 nix build .#checks.x86_64-linux.catalog-consistency .#checks.x86_64-linux.schema-uniformity .#checks.x86_64-linux.eval-example-hosts --no-link
 cd crates && cargo test -p ferrum-apply && cargo clippy -p ferrum-apply -- -D warnings
 ```
 
-- [ ] **Step 8: Commit**
+- [ ] **Step 9: Commit**
 
 ```bash
-git add crates/ferrum-apply/src/secrets.rs crates/ferrum-apply/src/main.rs crates/ferrum-apply/src/apply.rs nix/pkgs/ferrum-apply/default.nix
+git add crates/ferrum-apply/src/secrets.rs crates/ferrum-apply/src/main.rs crates/ferrum-apply/src/apply.rs nix/pkgs/ferrum-apply/default.nix modules/core/overlays.nix
 git commit -m "Add ferrum-apply's secret-generation preflight step for servarr apps"
 ```
 
