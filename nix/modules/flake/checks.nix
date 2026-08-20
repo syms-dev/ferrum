@@ -87,6 +87,30 @@
           "echo $drvPaths > $out";
 
         smoke-vm = import ../../../tests/smoke.nix { inherit pkgs; };
+
+        cargo-test-ferrum-apply = pkgs.runCommand "ferrum-check-cargo-test-ferrum-apply"
+          {
+            nativeBuildInputs = [ pkgs.cargo pkgs.rustc ];
+          }
+          ''
+            cp -r ${../../../crates} crates
+            chmod -R u+w crates
+            cd crates
+            cargo test -p ferrum-apply --offline || cargo test -p ferrum-apply
+            touch $out
+          '';
+
+        clippy-ferrum-apply = pkgs.runCommand "ferrum-check-clippy-ferrum-apply"
+          {
+            nativeBuildInputs = [ pkgs.cargo pkgs.rustc pkgs.clippy ];
+          }
+          ''
+            cp -r ${../../../crates} crates
+            chmod -R u+w crates
+            cd crates
+            cargo clippy -p ferrum-apply -- -D warnings
+            touch $out
+          '';
       };
     };
 }
