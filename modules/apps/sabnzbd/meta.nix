@@ -25,7 +25,13 @@
   # eval error if each app set its own predicate).
   unfreePackages = [ "unrar" ];
 
-  authBypassPaths = [ ];
+  # /api must reach SABnzbd without a forward-auth redirect, same reasoning
+  # as Radarr/Sonarr/Prowlarr's identical bypass entry: SABnzbd's own
+  # `integrations.providesTo` below lists exactly those three apps as
+  # callers that push jobs into its API, so this app has the same real
+  # need for the bypass they do, not just a stylistic match (caught during
+  # Task 5's review -- the original brief left this empty).
+  authBypassPaths = [ "/api" ];
 
   healthCheck = {
     path = "/api?mode=version";
