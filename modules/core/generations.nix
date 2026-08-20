@@ -12,5 +12,7 @@
   systemd.targets.ferrum-apps = {
     description = "All ferrum-managed applications";
     wantedBy = [ "multi-user.target" ];
+    after = [ "ferrum-state-restore.service" ];
+    unitConfig.ConditionPathExists = "!/run/ferrum/state-restore-failed";
   };
 }

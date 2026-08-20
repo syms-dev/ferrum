@@ -6,7 +6,9 @@
   imports = [
     ./core/options.nix
     ./core/storage.nix
+    ./core/overlays.nix
     ./core/generations.nix
+    ./core/state-restore.nix
     ./apps/sonarr/service.nix
   ];
 }
