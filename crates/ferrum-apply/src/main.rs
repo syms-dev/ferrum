@@ -5,6 +5,7 @@ mod generations;
 mod journal;
 mod preflight;
 mod restore_state;
+mod rollback;
 
 #[derive(Parser)]
 #[command(name = "ferrum-apply")]
@@ -96,9 +97,18 @@ fn main() -> anyhow::Result<()> {
                 .unwrap_or_else(|_| "/etc/ferrum#nixosConfigurations.default.config.system.build.toplevel".to_string());
             handle_apply_result(apply::run(&flake_ref, &storage))
         }
-        Command::Rollback { to: _ } => {
-            eprintln!("rollback: not yet implemented");
-            1
+        Command::Rollback { to } => {
+            let journal_dir = std::env::var("FERRUM_JOURNAL_DIR")
+                .unwrap_or_else(|_| "/var/lib/ferrum/journal".to_string());
+            let intent_path = std::env::var("FERRUM_ROLLBACK_INTENT_PATH")
+                .unwrap_or_else(|_| "/var/lib/ferrum/rollback-intent.json".to_string());
+            match rollback::run(to, std::path::Path::new(&journal_dir), std::path::Path::new(&intent_path)) {
+                Ok(()) => 0,
+                Err(e) => {
+                    eprintln!("rollback failed: {e}");
+                    1
+                }
+            }
         }
         Command::RestoreState => {
             // Must not panic: an unresolvable device (e.g. a bind-mounted
