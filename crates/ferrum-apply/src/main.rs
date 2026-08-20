@@ -4,6 +4,7 @@ mod apply;
 mod generations;
 mod journal;
 mod preflight;
+mod restore_state;
 
 #[derive(Parser)]
 #[command(name = "ferrum-apply")]
@@ -100,8 +101,15 @@ fn main() -> anyhow::Result<()> {
             1
         }
         Command::RestoreState => {
-            eprintln!("restore-state: not yet implemented");
-            1
+            let root_device = std::env::var("FERRUM_ROOT_DEVICE")
+                .expect("FERRUM_ROOT_DEVICE must be set by the systemd unit");
+            let storage = restore_state::StorageConfig {
+                intent_path: "/var/lib/ferrum/rollback-intent.json".into(),
+                result_path: "/var/lib/ferrum/rollback-result.json".into(),
+                failure_marker_path: "/run/ferrum/state-restore-failed".into(),
+            };
+            restore_state::run(&root_device, &storage);
+            0 // always exits 0 -- see Global Constraints
         }
         Command::Gc => {
             eprintln!("gc: not yet implemented");
