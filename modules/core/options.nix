@@ -36,6 +36,11 @@ in
         type = types.str;
         default = "/var/lib/ferrum/snapshots";
       };
+      journalDir = mkOption {
+        type = types.str;
+        default = "/var/lib/ferrum/journal";
+        description = "Where ferrum-apply records one entry per generation, correlating it to its state snapshot. Lives on @root (not the snapshotted @state subvolume) -- see the plan's storage-layout rule that /var/lib/ferrum itself must survive a rollback.";
+      };
       mediaDir = mkOption {
         type = types.str;
         default = "/srv/media";

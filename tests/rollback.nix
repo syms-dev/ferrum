@@ -32,7 +32,10 @@
 #      whether its target is "older" than current, only that a state
 #      snapshot exists for it, so this still genuinely exercises
 #      rollback::run's real command sequence (nix-env --switch-generation,
-#      switch-to-configuration boot, reboot).
+#      switch-to-configuration boot, reboot). tests/apply-generation-switch.nix
+#      is the companion that closes this specific gap: a real switch
+#      between two genuinely different closures, proving the CLOSURE half
+#      of the atomic pair this file proves the STATE half of.
 { pkgs, ... }:
 pkgs.testers.runNixOSTest {
   name = "ferrum-rollback";

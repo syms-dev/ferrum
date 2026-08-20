@@ -85,12 +85,18 @@
         smoke-vm = import ../../../tests/smoke.nix { inherit pkgs; };
 
         # tests/rollback.nix is the plan's terminal proof: a real rollback
-        # reverts application STATE, not just the system closure.
-        # rollback-proves-necessity.nix is its companion, proving the
-        # failure mode the mechanism exists to prevent is real in the first
-        # place.
+        # reverts application STATE. rollback-proves-necessity.nix is its
+        # companion, proving the failure mode the mechanism exists to
+        # prevent is real in the first place. apply-generation-switch.nix
+        # (below) proves the other half of the pair: the CLOSURE reverts
+        # too, against a genuinely different generation.
         rollback = import ../../../tests/rollback.nix { inherit pkgs; };
         rollback-proves-necessity = import ../../../tests/rollback-proves-necessity.nix { inherit pkgs; };
+
+        # Closes the one gap tests/rollback.nix's own header discloses: a
+        # real generation switch between two genuinely different closures,
+        # not just application state, actually reverts on rollback.
+        apply-generation-switch = import ../../../tests/apply-generation-switch.nix { inherit pkgs; };
 
         # Proves systemd itself honors ConditionPathExists and holds
         # ferrum-managed apps down when the (durable, per Fix 1) failure
