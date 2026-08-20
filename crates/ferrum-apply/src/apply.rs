@@ -45,7 +45,7 @@ fn run_ok(cmd: &mut Command) -> anyhow::Result<()> {
 /// `/run/current-system` is the source of truth for what's running, but it's
 /// a plain symlink to a store path -- it doesn't encode a generation number
 /// itself, hence the scan.
-fn current_generation() -> anyhow::Result<(u32, PathBuf)> {
+pub(crate) fn current_generation() -> anyhow::Result<(u32, PathBuf)> {
     let running_target = std::fs::read_link("/run/current-system")
         .map_err(|e| anyhow::anyhow!("failed to read /run/current-system: {e}"))?;
 
@@ -116,6 +116,7 @@ pub struct StorageConfig {
     pub snapshot_dir: std::path::PathBuf,
     pub journal_dir: std::path::PathBuf,
     pub min_free_gib: u64,
+    pub failure_marker_path: std::path::PathBuf,
 }
 
 pub fn run(flake_ref: &str, storage: &StorageConfig) -> anyhow::Result<ApplyResult> {
@@ -140,8 +141,13 @@ pub fn run(flake_ref: &str, storage: &StorageConfig) -> anyhow::Result<ApplyResu
     }
 
     // 2. Preflight, before touching anything.
-    crate::preflight::run(&storage.state_dir, &storage.snapshot_dir, storage.min_free_gib)
-        .map_err(|e| anyhow::anyhow!("preflight failed, nothing changed: {e}"))?;
+    crate::preflight::run(
+        &storage.state_dir,
+        &storage.snapshot_dir,
+        storage.min_free_gib,
+        &storage.failure_marker_path,
+    )
+    .map_err(|e| anyhow::anyhow!("preflight failed, nothing changed: {e}"))?;
 
     // 3. Stop managed apps -- downtime starts here.
     run_ok(Command::new("systemctl").args(["stop", "ferrum-apps.target"]))?;
