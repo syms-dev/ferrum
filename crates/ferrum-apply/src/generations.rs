@@ -21,6 +21,9 @@ pub struct GenerationInfo {
 /// Parses `nix-env -p /nix/var/nix/profiles/system --list-generations`
 /// output. Validated against real output (Phase 1.0 probe 0.5):
 /// "   1   2026-08-19 23:37:29   \n   3   2026-08-20 00:02:36   (current)\n"
+// Not yet wired into any CLI subcommand -- kept for a future
+// `list-generations` consumer, same as the `date`/`current` fields above.
+#[allow(dead_code)]
 pub fn parse_nix_env_list(output: &str) -> Vec<(u32, String, bool)> {
     output
         .lines()
@@ -42,8 +45,10 @@ pub fn parse_nix_env_list(output: &str) -> Vec<(u32, String, bool)> {
 
 /// Extracts the unix-timestamp prefix from a snapshot name like
 /// "1770000000-gen42", for comparing which of several snapshots for the
-/// same generation number is the most recent.
-fn snapshot_ts(snapshot: &str) -> u64 {
+/// same generation number is the most recent. Shared with
+/// `rollback::prepare`, which picks the latest snapshot for a single target
+/// generation the same way `correlate` does for every generation.
+pub(crate) fn snapshot_ts(snapshot: &str) -> u64 {
     snapshot
         .split('-')
         .next()
@@ -51,6 +56,9 @@ fn snapshot_ts(snapshot: &str) -> u64 {
         .unwrap_or(0)
 }
 
+// Not yet wired into any CLI subcommand -- kept for a future
+// `list-generations` consumer, same as the `date`/`current` fields above.
+#[allow(dead_code)]
 pub fn correlate(
     generations: Vec<(u32, String, bool)>,
     journal_entries: Vec<JournalEntry>,
