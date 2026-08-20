@@ -24,6 +24,9 @@
     },
     "sabnzbd": {
       "enable": true
+    },
+    "qbittorrent": {
+      "enable": true
     }
   }
 }
