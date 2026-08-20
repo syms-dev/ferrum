@@ -1,10 +1,6 @@
 # The guardrail checks that keep the architecture honest, plus the trivial
 # smoke VM test that answers Phase 1.0 probe 0.1 (does a NixOS VM test even
 # run on a hosted GitHub runner?).
-#
-# NOTE: written without access to a local nix install (see the plan's dev
-# environment section) -- this has not been evaluated locally. The first
-# `nix flake check` in CI is the first real test of this file.
 { inputs, ... }:
 {
   perSystem = { system, pkgs, lib, self', ... }:
