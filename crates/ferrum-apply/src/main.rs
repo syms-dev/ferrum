@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 
 mod apply;
+mod generations;
 mod journal;
 mod preflight;
 
