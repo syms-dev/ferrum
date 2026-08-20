@@ -34,10 +34,23 @@
     consumes = [ ];
   };
 
+  # vpnWireguardConfig/vpnKillSwitch: see
+  # docs/superpowers/specs/2026-08-20-phase-1-3-catalog-apps-design.md's
+  # "qBittorrent VPN Kill Switch" section for the full design. NEVER read
+  # via Nix string interpolation into a systemd unit -- see service.nix.
   settingsSchema = {
     type = "object";
     additionalProperties = false;
-    properties = { };
+    properties = {
+      vpnWireguardConfig = {
+        type = "string";
+        default = "";
+      };
+      vpnKillSwitch = {
+        type = "boolean";
+        default = true;
+      };
+    };
   };
 
   docsUrl = "https://github.com/qbittorrent/qBittorrent/wiki";
