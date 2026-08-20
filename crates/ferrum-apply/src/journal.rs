@@ -23,6 +23,12 @@ pub fn write(journal_dir: &Path, entry: &JournalEntry) -> anyhow::Result<()> {
     Ok(())
 }
 
+// read/list have no caller yet within this task -- restore_state.rs and
+// rollback.rs (this plan's Tasks 6/7) and generations.rs (Task 5) are their
+// first real consumers. clippy's default (non-`--tests`) pass only sees
+// this crate's non-test call graph from main(), so without the allow it
+// flags both as dead code between now and whichever task lands first.
+#[allow(dead_code)]
 pub fn read(journal_dir: &Path, snapshot: &str) -> anyhow::Result<JournalEntry> {
     let path = journal_dir.join(format!("{snapshot}.json"));
     let content = std::fs::read_to_string(&path)
@@ -30,6 +36,7 @@ pub fn read(journal_dir: &Path, snapshot: &str) -> anyhow::Result<JournalEntry> 
     Ok(serde_json::from_str(&content)?)
 }
 
+#[allow(dead_code)]
 pub fn list(journal_dir: &Path) -> anyhow::Result<Vec<JournalEntry>> {
     if !journal_dir.exists() {
         return Ok(Vec::new());
