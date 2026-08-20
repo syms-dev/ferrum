@@ -7,7 +7,7 @@
 # `nix flake check` in CI is the first real test of this file.
 { inputs, ... }:
 {
-  perSystem = { system, pkgs, lib, ... }:
+  perSystem = { system, pkgs, lib, self', ... }:
     let
       ferrumLib = import ../../../modules/lib { nixpkgs = inputs.nixpkgs; };
       catalog = import ../../../modules/lib/catalog.nix { inherit lib; };
@@ -88,29 +88,31 @@
 
         smoke-vm = import ../../../tests/smoke.nix { inherit pkgs; };
 
-        cargo-test-ferrum-apply = pkgs.runCommand "ferrum-check-cargo-test-ferrum-apply"
-          {
-            nativeBuildInputs = [ pkgs.cargo pkgs.rustc ];
-          }
-          ''
-            cp -r ${../../../crates} crates
-            chmod -R u+w crates
-            cd crates
-            cargo test -p ferrum-apply --offline || cargo test -p ferrum-apply
-            touch $out
-          '';
+        # Not a separate runCommand: Nix's build sandbox has no network
+        # access, so a hand-rolled `cd crates && cargo test` derivation can
+        # never fetch crates.io and fails every time (verified: it does).
+        # `rustPlatform.buildRustPackage` avoids this by vendoring
+        # dependencies from Cargo.lock as a fixed-output derivation *before*
+        # the sandboxed build; its default cargoCheckHook already runs
+        # `cargo test` as part of building the package normally, so
+        # `packages.ferrum-apply` itself IS the cargo-test check -- aliasing
+        # it here just gives it a name under `checks`.
+        cargo-test-ferrum-apply = self'.packages.ferrum-apply;
 
-        clippy-ferrum-apply = pkgs.runCommand "ferrum-check-clippy-ferrum-apply"
-          {
-            nativeBuildInputs = [ pkgs.cargo pkgs.rustc pkgs.clippy ];
-          }
-          ''
-            cp -r ${../../../crates} crates
-            chmod -R u+w crates
-            cd crates
-            cargo clippy -p ferrum-apply -- -D warnings
-            touch $out
-          '';
+        # Clippy needs its own derivation (buildRustPackage's default check
+        # phase runs `cargo test`, not clippy), but reuses the same
+        # Cargo.lock-based vendoring so it builds offline too.
+        clippy-ferrum-apply = pkgs.rustPlatform.buildRustPackage {
+          pname = "ferrum-apply-clippy";
+          version = "0.1.0";
+          src = lib.cleanSource ../../../crates;
+          cargoLock.lockFile = ../../../crates/Cargo.lock;
+          buildAndTestSubdir = "ferrum-apply";
+          nativeBuildInputs = [ pkgs.clippy ];
+          buildPhase = "true";
+          checkPhase = "cargo clippy --offline -- -D warnings";
+          installPhase = "mkdir -p $out";
+        };
       };
     };
 }
