@@ -46,6 +46,14 @@ let
   unfreePackageNames = lib.unique (
     lib.concatMap (app: app.unfreePackages or [ ]) (lib.attrValues catalog)
   );
+
+  # Only the three servarr apps ferrum-apply's secrets.rs module actually
+  # generates keys for (see crates/ferrum-apply/src/secrets.rs's own
+  # SERVARR_APPS list) -- qBittorrent/Plex/Jellyfin/SABnzbd have their own
+  # auth mechanisms and are deliberately excluded even if enabled.
+  enabledServarrApps = lib.filter
+    (id: ferrum.apps.${id}.enable or false)
+    [ "sonarr" "radarr" "prowlarr" ];
 in
 {
   nixpkgs.config.allowUnfreePredicate = pkg:
@@ -72,7 +80,9 @@ in
             --set-default FERRUM_SNAPSHOT_DIR ${lib.escapeShellArg ferrum.storage.snapshotDir} \
             --set-default FERRUM_JOURNAL_DIR ${lib.escapeShellArg ferrum.storage.journalDir} \
             --set-default FERRUM_MIN_FREE_GIB ${toString ferrum.storage.minFreeGiB} \
-            --set-default FERRUM_HEALTH_CHECK_TIMEOUT_SEC ${toString ferrum.apply.healthCheckTimeoutSec}
+            --set-default FERRUM_HEALTH_CHECK_TIMEOUT_SEC ${toString ferrum.apply.healthCheckTimeoutSec} \
+            --set-default FERRUM_SECRETS_DIR ${lib.escapeShellArg ferrum.secretsDir} \
+            --set-default FERRUM_SERVARR_APPS ${lib.escapeShellArg (lib.concatStringsSep "," enabledServarrApps)}
         '' // {
         meta = (prev.ferrum-apply.meta or { }) // { mainProgram = "ferrum-apply"; };
       };

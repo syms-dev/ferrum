@@ -146,9 +146,20 @@ pub struct StorageConfig {
     pub min_free_gib: u64,
     pub failure_marker_path: std::path::PathBuf,
     pub health_check_timeout: Duration,
+    pub secrets_dir: PathBuf,
+    pub servarr_apps: Vec<String>,
 }
 
 pub fn run(flake_ref: &str, storage: &StorageConfig) -> anyhow::Result<ApplyResult> {
+    // 0. Ensure every enabled servarr app has its API-key secret, BEFORE
+    // build -- their environmentFiles reference the decrypted path
+    // statically, and sops.validateSopsFiles (on by default) checks the
+    // .sops file exists at Nix EVAL time, which happens inside the build
+    // step right after this.
+    let recipient = crate::secrets::host_age_recipient()?;
+    let servarr_refs: Vec<&str> = storage.servarr_apps.iter().map(String::as_str).collect();
+    crate::secrets::ensure_all(&storage.secrets_dir, &recipient, &servarr_refs)?;
+
     // 1. Build (apps still running -- the slow part).
     let build_output = Command::new("nix")
         .args(["build", "--no-link", "--print-out-paths", flake_ref])
