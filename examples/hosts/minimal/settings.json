@@ -15,6 +15,9 @@
     },
     "prowlarr": {
       "enable": true
+    },
+    "jellyfin": {
+      "enable": true
     }
   }
 }

@@ -12,5 +12,6 @@
     ./apps/sonarr/service.nix
     ./apps/radarr/service.nix
     ./apps/prowlarr/service.nix
+    ./apps/jellyfin/service.nix
   ];
 }
