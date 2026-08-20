@@ -6,6 +6,7 @@ mod journal;
 mod preflight;
 mod restore_state;
 mod rollback;
+mod secrets;
 
 #[derive(Parser)]
 #[command(name = "ferrum-apply")]
@@ -104,6 +105,15 @@ fn main() -> anyhow::Result<()> {
                         .and_then(|v| v.parse().ok())
                         .unwrap_or(120),
                 ),
+                secrets_dir: std::env::var("FERRUM_SECRETS_DIR")
+                    .unwrap_or_else(|_| "/etc/ferrum/secrets".to_string())
+                    .into(),
+                servarr_apps: std::env::var("FERRUM_SERVARR_APPS")
+                    .unwrap_or_else(|_| "sonarr,radarr,prowlarr".to_string())
+                    .split(',')
+                    .map(str::to_string)
+                    .filter(|s| !s.is_empty())
+                    .collect(),
             };
             let flake_ref = std::env::var("FERRUM_FLAKE_REF")
                 .unwrap_or_else(|_| "/etc/ferrum#nixosConfigurations.default.config.system.build.toplevel".to_string());
