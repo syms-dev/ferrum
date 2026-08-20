@@ -346,7 +346,7 @@ git commit -m "Add ferrum-testapp: the two-behavior fixture for the rollback tes
 
 **Interfaces:**
 - Consumes: nothing from other tasks.
-- Produces: a `Command` enum (`Preflight`, `Apply`, `Rollback { to: u32 }`, `RestoreState`, `Gc`) that Tasks 3–7 match on and implement. `main()` dispatches each variant to a function `run_<name>() -> anyhow::Result<i32>` (return value is the process exit code) that Tasks 3–7 define in their own modules; this task defines the dispatch and leaves each function as a real, compiling, minimal implementation printing `"not yet implemented"` and returning exit code `1` — that's the actual, current, correct behavior of an unbuilt subcommand, not a plan placeholder (every subsequent task replaces exactly one of these with its real behavior and its own test).
+- Produces: a `Command` enum (`Preflight`, `Apply`, `Rollback { to: u32 }`, `RestoreState`, `Gc`) that Tasks 3–7 match on and implement. `main()`'s `match cli.command` handles each variant inline (not via a `main.rs`-local `run_<name>()` wrapper — Tasks 3–7 each replace their own arm's body directly, calling into their own module's `run()` function, e.g. `preflight::run(...)`, exactly as those tasks' own Steps show); this task's arms are real, compiling, minimal implementations printing `"not yet implemented"` and returning exit code `1` — that's the actual, current, correct behavior of an unbuilt subcommand, not a plan placeholder (every subsequent task replaces exactly one arm's body with its real behavior and its own test).
 
 - [ ] **Step 1: Write the workspace root**
 
