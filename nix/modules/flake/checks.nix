@@ -1,13 +1,9 @@
 # The guardrail checks that keep the architecture honest, plus the trivial
 # smoke VM test that answers Phase 1.0 probe 0.1 (does a NixOS VM test even
 # run on a hosted GitHub runner?).
-#
-# NOTE: written without access to a local nix install (see the plan's dev
-# environment section) -- this has not been evaluated locally. The first
-# `nix flake check` in CI is the first real test of this file.
 { inputs, ... }:
 {
-  perSystem = { system, pkgs, lib, ... }:
+  perSystem = { system, pkgs, lib, self', ... }:
     let
       ferrumLib = import ../../../modules/lib { nixpkgs = inputs.nixpkgs; };
       catalog = import ../../../modules/lib/catalog.nix { inherit lib; };
@@ -87,6 +83,47 @@
           "echo $drvPaths > $out";
 
         smoke-vm = import ../../../tests/smoke.nix { inherit pkgs; };
+
+        # tests/rollback.nix is the plan's terminal proof: a real rollback
+        # reverts application STATE, not just the system closure.
+        # rollback-proves-necessity.nix is its companion, proving the
+        # failure mode the mechanism exists to prevent is real in the first
+        # place.
+        rollback = import ../../../tests/rollback.nix { inherit pkgs; };
+        rollback-proves-necessity = import ../../../tests/rollback-proves-necessity.nix { inherit pkgs; };
+
+        # Proves systemd itself honors ConditionPathExists and holds
+        # ferrum-managed apps down when the (durable, per Fix 1) failure
+        # marker is present -- the property the interlock actually depends
+        # on, which neither rollback.nix nor the restore_state.rs unit tests
+        # exercise directly.
+        state-restore-interlock = import ../../../tests/state-restore-interlock.nix { inherit pkgs; };
+
+        # Not a separate runCommand: Nix's build sandbox has no network
+        # access, so a hand-rolled `cd crates && cargo test` derivation can
+        # never fetch crates.io and fails every time (verified: it does).
+        # `rustPlatform.buildRustPackage` avoids this by vendoring
+        # dependencies from Cargo.lock as a fixed-output derivation *before*
+        # the sandboxed build; its default cargoCheckHook already runs
+        # `cargo test` as part of building the package normally, so
+        # `packages.ferrum-apply` itself IS the cargo-test check -- aliasing
+        # it here just gives it a name under `checks`.
+        cargo-test-ferrum-apply = self'.packages.ferrum-apply;
+
+        # Clippy needs its own derivation (buildRustPackage's default check
+        # phase runs `cargo test`, not clippy), but reuses the same
+        # Cargo.lock-based vendoring so it builds offline too.
+        clippy-ferrum-apply = pkgs.rustPlatform.buildRustPackage {
+          pname = "ferrum-apply-clippy";
+          version = "0.1.0";
+          src = lib.cleanSource ../../../crates;
+          cargoLock.lockFile = ../../../crates/Cargo.lock;
+          buildAndTestSubdir = "ferrum-apply";
+          nativeBuildInputs = [ pkgs.clippy ];
+          buildPhase = "true";
+          checkPhase = "cargo clippy --offline -- -D warnings";
+          installPhase = "mkdir -p $out";
+        };
       };
     };
 }

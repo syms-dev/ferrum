@@ -9,6 +9,17 @@
     fsType = "ext4";
   };
 
+  # modules/core/state-restore.nix reads this entry's `device` to know which
+  # block device to mount at subvolid=5 during a boot-time state restore --
+  # it needs to exist for evaluation even on this bare-bones example host.
+  # A real host's disko.nix (examples/hosts/homelab-btrfs/disko.nix) declares
+  # the same path as part of a real btrfs subvolume layout.
+  fileSystems."/var/lib/ferrum/state" = {
+    device = "/dev/disk/by-label/nixos";
+    fsType = "btrfs";
+    options = [ "subvol=@state" ];
+  };
+
   boot.loader.grub.enable = true;
   boot.loader.grub.device = "/dev/sda";
 }
