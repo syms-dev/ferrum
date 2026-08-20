@@ -1,12 +1,19 @@
-// Task 7 (rollback) is the first real consumer of this module. Every item
-// here is already exercised by this file's own tests, and Task 7 now wires it in.
+// Task 7 (rollback) is the first real consumer of this module.
 
 use crate::journal::JournalEntry;
 
 #[derive(Debug)]
 pub struct GenerationInfo {
     pub generation: u32,
+    // Populated for shape-consistency with correlate()'s output (used when
+    // listing all generations, e.g. a future ferrumd-facing API), but
+    // rollback::prepare() only needs `generation`/`snapshot` to validate a
+    // single target -- it constructs this with placeholder values for the
+    // other two, so they're genuinely unread until a real list-generations
+    // consumer exists.
+    #[allow(dead_code)]
     pub date: String,
+    #[allow(dead_code)]
     pub current: bool,
     pub snapshot: Option<JournalEntry>,
 }
