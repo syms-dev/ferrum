@@ -10,6 +10,13 @@ let
   claimToken = app.settings.claimToken or "";
 in
 lib.mkIf app.enable {
+  # nixpkgs' plexmediaserver package is licensed unfree; without this, the
+  # ENTIRE host config fails to evaluate the moment ferrum.apps.plex.enable
+  # is true, on any real host. Scoped to just this one package, not a
+  # blanket `nixpkgs.config.allowUnfree = true`.
+  nixpkgs.config.allowUnfreePredicate = pkg:
+    builtins.elem (lib.getName pkg) [ "plexmediaserver" ];
+
   services.plex = {
     enable = true;
     dataDir = app.stateDir;
