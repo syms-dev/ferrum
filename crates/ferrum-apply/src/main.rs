@@ -1,5 +1,7 @@
 use clap::{Parser, Subcommand};
 
+mod apply;
+mod journal;
 mod preflight;
 
 #[derive(Parser)]
@@ -51,8 +53,38 @@ fn main() -> anyhow::Result<()> {
             }
         }
         Command::Apply => {
-            eprintln!("apply: not yet implemented");
-            1
+            let storage = apply::StorageConfig {
+                state_dir: std::env::var("FERRUM_STATE_DIR")
+                    .unwrap_or_else(|_| "/var/lib/ferrum/state".to_string())
+                    .into(),
+                snapshot_dir: std::env::var("FERRUM_SNAPSHOT_DIR")
+                    .unwrap_or_else(|_| "/var/lib/ferrum/snapshots".to_string())
+                    .into(),
+                journal_dir: std::env::var("FERRUM_JOURNAL_DIR")
+                    .unwrap_or_else(|_| "/var/lib/ferrum/journal".to_string())
+                    .into(),
+                min_free_gib: std::env::var("FERRUM_MIN_FREE_GIB")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(10),
+            };
+            let flake_ref = std::env::var("FERRUM_FLAKE_REF")
+                .unwrap_or_else(|_| "/etc/ferrum#nixosConfigurations.default.config.system.build.toplevel".to_string());
+            match apply::run(&flake_ref, &storage) {
+                Ok(apply::ApplyResult::Succeeded) => 0,
+                Ok(apply::ApplyResult::Degraded(reason)) => {
+                    eprintln!("apply degraded: {reason}");
+                    0 // the switch itself succeeded; degraded is reported, not a process failure
+                }
+                Ok(apply::ApplyResult::Failed(reason)) => {
+                    eprintln!("apply failed: {reason}");
+                    1
+                }
+                Err(e) => {
+                    eprintln!("apply error: {e}");
+                    1
+                }
+            }
         }
         Command::Rollback { to: _ } => {
             eprintln!("rollback: not yet implemented");
