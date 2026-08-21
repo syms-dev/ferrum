@@ -12,29 +12,24 @@ let
   exposedApps = proxyLib.exposedApps ferrum;
   publicApps = proxyLib.publicApps ferrum;
   selfSignedCertDir = proxyLib.selfSignedCertDir;
-  # Authelia's own /api/verify hard-refuses a target URL whose scheme
-  # isn't https/wss (confirmed via a real request against a real Authelia
-  # instance: "Target URL ... has an insecure scheme 'http' ..."), so
-  # EVERY vhost stays forceSSL = true once auth is involved -- "public"
-  # vhosts get a real ACME cert, "lan" vhosts (and the auth vhost, when no
-  # app is public) get the self-signed one from
-  # modules/proxy/selfsigned-cert.nix instead. There is no plain-HTTP path
-  # once ferrum.auth.enable is true.
-  authScheme = "https";
 
-  mkVhost = id: app:
+  mkVhost = _: app:
     let
       vhostName = vhostNameFor app;
       isPublic = app.exposure == "public";
-      authRequestEnabled = ferrum.auth.enable && app.auth.policy != "bypass";
+      authRequestEnabled = proxyLib.authGated ferrum app;
     in
     {
       name = vhostName;
       value = {
         # "public" gets a real cert via modules/proxy/acme.nix's
         # security.acme.certs entry, keyed by this same vhost name. "lan"
-        # gets the shared self-signed cert instead -- see authScheme's
-        # comment above for why forceSSL can't be dropped for "lan".
+        # gets the shared self-signed cert instead. Authelia's own
+        # /api/verify hard-refuses a target URL whose scheme isn't
+        # https/wss (confirmed via a real request against a real Authelia
+        # instance: "Target URL ... has an insecure scheme 'http' ..."),
+        # so EVERY vhost stays forceSSL = true once auth is involved --
+        # there is no plain-HTTP path once ferrum.auth.enable is true.
         useACMEHost = lib.mkIf isPublic vhostName;
         forceSSL = true;
         sslCertificate = lib.mkIf (!isPublic) "${selfSignedCertDir}/cert.pem";
@@ -65,7 +60,7 @@ let
             proxy_set_header Remote-Groups $groups;
             proxy_set_header Remote-Name $name;
             proxy_set_header Remote-Email $email;
-            error_page 401 =302 ${authScheme}://auth.${ferrum.proxy.baseDomain}/?rd=$target_url;
+            error_page 401 =302 https://auth.${ferrum.proxy.baseDomain}/?rd=$target_url;
           '';
         };
       };

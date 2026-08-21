@@ -241,11 +241,20 @@ pub fn ensure_first_authelia_user(
     std::fs::create_dir_all(state_dir)?;
     std::fs::write(&users_db, content)?;
 
+    // Opened at mode 0o400 from the moment of creation (via OpenOptions),
+    // not write-then-chmod -- the old write()-then-chmod() sequence left a
+    // brief window where this one-time plaintext password sat at whatever
+    // mode the process umask produced, before being narrowed down.
     let setup_file = state_dir.join("authelia-setup-password");
-    std::fs::write(&setup_file, format!("{password}\n"))?;
-    let mut perms = std::fs::metadata(&setup_file)?.permissions();
-    std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o400);
-    std::fs::set_permissions(&setup_file, perms)?;
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o400)
+        .open(&setup_file)?;
+    f.write_all(format!("{password}\n").as_bytes())?;
     Ok(())
 }
 
