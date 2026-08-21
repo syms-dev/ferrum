@@ -25,6 +25,17 @@ lib.mkIf proxyEnabled {
   security.acme.acceptTerms = true;
   security.acme.defaults.email = ferrum.proxy.acme.email;
 
+  # The DNS-01 credential is operator-provided via `ferrum.secrets` -- same
+  # zero-privilege sops-encrypt mechanism as qBittorrent's VPN config. Must
+  # go through sops-nix's own decryption like every other secret in this
+  # codebase; environmentFile cannot point at the raw .sops ciphertext directly.
+  sops.secrets."${ferrum.proxy.acme.credentialSecret}" = {
+    sopsFile = /. + "${ferrum.secretsDir}/${ferrum.proxy.acme.credentialSecret}.sops";
+    format = "binary";
+    owner = "acme";
+    group = "acme";
+  };
+
   # lego reads CLOUDFLARE_DNS_API_TOKEN from this file via systemd's
   # EnvironmentFile= mechanism (confirmed by reading
   # nixos/modules/security/acme/default.nix: `environmentFile` is passed
@@ -37,7 +48,7 @@ lib.mkIf proxyEnabled {
   security.acme.certs = lib.mapAttrs'
     (id: app: lib.nameValuePair (vhostNameFor app) {
       dnsProvider = ferrum.proxy.acme.dnsProvider;
-      environmentFile = /. + "${ferrum.secretsDir}/${ferrum.proxy.acme.credentialSecret}.sops";
+      environmentFile = config.sops.secrets."${ferrum.proxy.acme.credentialSecret}".path;
       server = lib.mkIf ferrum.proxy.acme.staging
         "https://acme-staging-v02.api.letsencrypt.org/directory";
     })
