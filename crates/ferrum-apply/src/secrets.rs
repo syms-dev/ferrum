@@ -182,7 +182,7 @@ fn random_secret_value() -> anyhow::Result<String> {
 
 fn base64_encode(bytes: &[u8]) -> String {
     const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity((bytes.len() + 2) / 3 * 4);
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
         let b0 = chunk[0];
         let b1 = *chunk.get(1).unwrap_or(&0);
@@ -308,5 +308,24 @@ mod tests {
         let result = ensure_all(dir.path(), &nonexistent_pubkey, &["qbittorrent"]);
         assert!(result.is_ok(), "qbittorrent-only call should short-circuit before touching the host key: {result:?}");
         assert!(!dir.path().join("qbittorrent-apikey.sops").exists());
+    }
+
+    #[test]
+    fn base64_encode_matches_rfc_4648_test_vector() {
+        assert_eq!(base64_encode(b"Man"), "TWFu");
+    }
+
+    #[test]
+    fn ensure_authelia_secrets_is_idempotent_when_both_files_exist() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("authelia-jwt-secret.sops"), b"fake").unwrap();
+        std::fs::write(dir.path().join("authelia-storage-key.sops"), b"fake").unwrap();
+        // Both files already exist, so `missing` is empty and ensure_authelia_secrets
+        // must return Ok(()) without ever deriving a recipient or touching the host
+        // key -- a nonexistent pubkey path proves that: if it tried to read it,
+        // this would return an error instead of Ok(()).
+        let nonexistent_pubkey = dir.path().join("no-such-key.pub");
+        let result = ensure_authelia_secrets(dir.path(), &nonexistent_pubkey);
+        assert!(result.is_ok(), "should short-circuit when both secrets already exist: {result:?}");
     }
 }
