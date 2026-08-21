@@ -52,5 +52,13 @@ lib.mkIf proxyEnabled {
       server = lib.mkIf ferrum.proxy.acme.staging
         "https://acme-staging-v02.api.letsencrypt.org/directory";
     })
-    publicApps;
+    publicApps
+  // lib.optionalAttrs (ferrum.auth.enable && publicApps != { }) {
+    "auth.${ferrum.proxy.baseDomain}" = {
+      dnsProvider = ferrum.proxy.acme.dnsProvider;
+      environmentFile = config.sops.secrets."${ferrum.proxy.acme.credentialSecret}".path;
+      server = lib.mkIf ferrum.proxy.acme.staging
+        "https://acme-staging-v02.api.letsencrypt.org/directory";
+    };
+  };
 }

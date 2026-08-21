@@ -52,6 +52,35 @@ lib.mkIf authEnabled {
     };
   };
 
+  # One rule per app matching its vhost domain with policy = app.auth.policy
+  # (Authelia's own policy enum is literally bypass/one_factor/two_factor/deny
+  # -- the same names ferrum chose when this option was first scaffolded, no
+  # translation needed), plus a higher-priority bypass rule per entry in
+  # app.auth.bypassPaths. Higher priority = listed FIRST: Authelia evaluates
+  # access_control.rules in order and uses the first match, so bypass rules
+  # must precede the app's own general-policy rule.
+  services.authelia.instances.main.settings.access_control.rules =
+    let
+      proxyLib = import ./lib.nix { inherit lib; };
+      exposedAppsAuth = proxyLib.exposedApps ferrum;
+      vhostNameFor = proxyLib.vhostNameFor ferrum;
+
+      bypassRules = id: app: map
+        (path: {
+          domain = vhostNameFor app;
+          resources = [ "^${path}.*$" ];
+          policy = "bypass";
+        })
+        app.auth.bypassPaths;
+
+      appRule = id: app: {
+        domain = vhostNameFor app;
+        policy = app.auth.policy;
+      };
+    in
+    lib.concatLists (lib.mapAttrsToList bypassRules exposedAppsAuth)
+    ++ lib.mapAttrsToList appRule exposedAppsAuth;
+
   systemd.tmpfiles.rules = [
     "d '${stateDir}' 0750 authelia-main authelia-main - -"
   ];
