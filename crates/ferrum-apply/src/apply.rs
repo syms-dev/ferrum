@@ -161,8 +161,18 @@ pub fn run(flake_ref: &str, storage: &StorageConfig) -> anyhow::Result<ApplyResu
     crate::secrets::ensure_all(&storage.secrets_dir, &recipient, &servarr_refs)?;
 
     // 1. Build (apps still running -- the slow part).
+    //
+    // --impure is required, not optional: sops.secrets.<name>.sopsFile
+    // (constructed from ferrum.secretsDir, e.g. /etc/ferrum/secrets/...)
+    // is genuine Nix path-typed data referencing a location outside any
+    // flake's own hermetic source tree (the code constructing it lives in
+    // ferrum's own flake, fetched as an input to /etc/ferrum's flake --
+    // paths across that boundary are never accessible under Nix's default
+    // pure evaluation, confirmed for real on ferrum-dev: the identical
+    // eval fails with "access to absolute path ... is forbidden in pure
+    // evaluation mode" without --impure, and succeeds cleanly with it).
     let build_output = Command::new("nix")
-        .args(["build", "--no-link", "--print-out-paths", flake_ref])
+        .args(["build", "--impure", "--no-link", "--print-out-paths", flake_ref])
         .output()?;
     if !build_output.status.success() {
         return Ok(ApplyResult::Failed(format!(
