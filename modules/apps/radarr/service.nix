@@ -25,6 +25,37 @@ lib.mkIf app.enable {
     restartUnits = [ "radarr.service" ];
   };
 
+  sops.secrets."radarr-apikey-raw" = {
+    sopsFile = /. + "${ferrum.secretsDir}/radarr-apikey-raw.sops";
+    format = "binary";
+    owner = "radarr";
+  };
+
+  # A host that already had radarr-apikey.sops from before Phase 1.4c
+  # cannot get a matching raw secret generated retroactively --
+  # ensure_all has no way to decrypt the existing key (by design, it
+  # never holds the private age key), so a fresh, mismatched raw key
+  # would silently break Recyclarr/the reconciler's auth against this
+  # app rather than fail loudly. This assertion turns that into a clear,
+  # actionable message instead.
+  assertions = [
+    {
+      assertion = !(builtins.pathExists (/. + "${ferrum.secretsDir}/radarr-apikey.sops"))
+                  || builtins.pathExists (/. + "${ferrum.secretsDir}/radarr-apikey-raw.sops");
+      message = ''
+        ${ferrum.secretsDir}/radarr-apikey.sops exists but
+        ${ferrum.secretsDir}/radarr-apikey-raw.sops does not -- this host
+        generated its Radarr API key before Recyclarr/reconciler support
+        existed, which need a bare-value copy of the same key ferrum-apply
+        cannot retroactively create. Delete both radarr-apikey.sops and
+        radarr-apikey-raw.sops (if present) under ${ferrum.secretsDir} and
+        re-apply to generate a fresh matched pair -- see README.md's
+        Secrets section for the same recovery procedure already documented
+        for servarr keys.
+      '';
+    }
+  ];
+
   services.radarr = {
     enable = true;
     dataDir = app.stateDir;

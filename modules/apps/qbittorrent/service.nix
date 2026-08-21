@@ -29,6 +29,19 @@ lib.mkIf app.enable {
     user = "qbittorrent";
     group = "qbittorrent";
     webuiPort = app.port;
+    # qBittorrent requires WebUI authentication by default, even from
+    # localhost -- confirmed for real on ferrum-dev: an unconfigured
+    # instance prints a random PER-BOOT temporary password to its own log
+    # and returns 403 for any unauthenticated call. A random password that
+    # changes every restart is useless for the reconciler (Phase 1.4c) to
+    # authenticate with. This setting (confirmed via the real
+    # app/setPreferences WebAPI call, which wrote exactly this key into a
+    # real qBittorrent.conf) bypasses auth ONLY for requests from
+    # 127.0.0.1/the VPN-namespace veth's host side -- both already the
+    # trust boundary every other app in this catalog uses (bindaddress =
+    # 127.0.0.1), so this adds no new exposure. No credential to generate,
+    # store, or rotate.
+    serverConfig.Preferences.WebUI.LocalHostAuth = false;
   };
 
   users.users.qbittorrent.extraGroups =

@@ -30,6 +30,36 @@ lib.mkIf app.enable {
     restartUnits = [ "prowlarr.service" ];
   };
 
+  sops.secrets."prowlarr-apikey-raw" = {
+    sopsFile = /. + "${ferrum.secretsDir}/prowlarr-apikey-raw.sops";
+    format = "binary";
+  };
+
+  # A host that already had prowlarr-apikey.sops from before Phase 1.4c
+  # cannot get a matching raw secret generated retroactively --
+  # ensure_all has no way to decrypt the existing key (by design, it
+  # never holds the private age key), so a fresh, mismatched raw key
+  # would silently break Recyclarr/the reconciler's auth against this
+  # app rather than fail loudly. This assertion turns that into a clear,
+  # actionable message instead.
+  assertions = [
+    {
+      assertion = !(builtins.pathExists (/. + "${ferrum.secretsDir}/prowlarr-apikey.sops"))
+                  || builtins.pathExists (/. + "${ferrum.secretsDir}/prowlarr-apikey-raw.sops");
+      message = ''
+        ${ferrum.secretsDir}/prowlarr-apikey.sops exists but
+        ${ferrum.secretsDir}/prowlarr-apikey-raw.sops does not -- this host
+        generated its Prowlarr API key before Recyclarr/reconciler support
+        existed, which need a bare-value copy of the same key ferrum-apply
+        cannot retroactively create. Delete both prowlarr-apikey.sops and
+        prowlarr-apikey-raw.sops (if present) under ${ferrum.secretsDir} and
+        re-apply to generate a fresh matched pair -- see README.md's
+        Secrets section for the same recovery procedure already documented
+        for servarr keys.
+      '';
+    }
+  ];
+
   services.prowlarr = {
     enable = true;
     dataDir = app.stateDir;

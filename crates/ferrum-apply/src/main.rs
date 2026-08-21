@@ -125,6 +125,14 @@ fn main() -> anyhow::Result<()> {
                     .into(),
                 admin_email: std::env::var("FERRUM_ADMIN_EMAIL")
                     .unwrap_or_default(),
+                sabnzbd_state_dir: std::env::var("FERRUM_SABNZBD_STATE_DIR")
+                    .ok()
+                    .filter(|s| !s.is_empty())
+                    .map(std::path::PathBuf::from),
+                sabnzbd_port: std::env::var("FERRUM_SABNZBD_PORT")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(8080),
             };
             let flake_ref = std::env::var("FERRUM_FLAKE_REF")
                 .unwrap_or_else(|_| "/etc/ferrum#nixosConfigurations.default.config.system.build.toplevel".to_string());

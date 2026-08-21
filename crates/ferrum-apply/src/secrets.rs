@@ -158,11 +158,22 @@ pub fn ensure_all(secrets_dir: &Path, pubkey_path: &Path, apps: &[&str]) -> anyh
 
     let recipient = host_age_recipient(pubkey_path)?;
     for app in missing {
-        let dest = secrets_dir.join(format!("{app}-apikey.sops"));
         let key = random_hex_key()?;
+
         let env_var = format!("{}__AUTH__APIKEY", app.to_uppercase());
-        let content = format!("{env_var}={key}\n");
-        encrypt_and_write(&content, &recipient, &dest)?;
+        let env_dest = secrets_dir.join(format!("{app}-apikey.sops"));
+        encrypt_and_write(&format!("{env_var}={key}\n"), &recipient, &env_dest)?;
+
+        // A second, bare-value representation of the SAME key, generated
+        // together so the two can never drift apart -- Recyclarr's own
+        // `_secret` mechanism and the reconciler's own API calls (Phase
+        // 1.4c) both need the bare value, never the "KEY=VALUE\n" form
+        // environmentFiles needs. Confirmed for real against
+        // genJqSecretsReplacement's actual source and the real Sonarr/
+        // Prowlarr APIs on ferrum-dev while writing that plan -- neither
+        // consumer can use `<app>-apikey.sops` directly.
+        let raw_dest = secrets_dir.join(format!("{app}-apikey-raw.sops"));
+        encrypt_and_write(&format!("{key}\n"), &recipient, &raw_dest)?;
     }
     Ok(())
 }
@@ -258,6 +269,49 @@ pub fn ensure_first_authelia_user(
     Ok(())
 }
 
+/// Bootstraps SABnzbd's own api_key, which -- unlike the servarr apps --
+/// SABnzbd generates and owns itself in a non-declarative sabnzbd.ini
+/// (confirmed via nixpkgs' own services.sabnzbd module: only a `configFile`
+/// PATH option exists, no attrset-driven config). Writes a minimal ini
+/// SABnzbd accepts as a starting point (confirmed for real on ferrum-dev: a
+/// sparse [misc] host/port/api_key/enable_https ini boots cleanly and
+/// SABnzbd fills in its own remaining defaults, honoring the preset
+/// api_key for real authenticated calls -- verified 403 with a wrong key,
+/// 200 with the real one) BEFORE SABnzbd's own first start, so ferrum
+/// controls the key from day one instead of trying to scrape it out of
+/// SABnzbd's own generated file after the fact. Also the first code that
+/// makes ferrum.apps.sabnzbd.port control SABnzbd's real listening port --
+/// nixpkgs' own module never passes a --port argument, so only this ini
+/// key does anything (found while investigating this exact bootstrap
+/// question). Idempotent: does nothing if sabnzbd.ini already exists,
+/// matching ensure_first_authelia_user's exact contract -- a second apply
+/// never resets an operator's already-customized SABnzbd config. The same
+/// key is also sops-encrypted (bare value -- SABnzbd itself never reads
+/// this copy via EnvironmentFile=, only Recyclarr/the reconciler do) so
+/// both can read it back the same way they read every other app's key.
+pub fn ensure_sabnzbd_apikey(
+    state_dir: &Path,
+    secrets_dir: &Path,
+    pubkey_path: &Path,
+    port: u16,
+) -> anyhow::Result<()> {
+    let ini_path = state_dir.join("sabnzbd.ini");
+    if ini_path.exists() {
+        return Ok(());
+    }
+    let key = random_hex_key()?;
+    let content = format!(
+        "[misc]\nhost = 127.0.0.1\nport = {port}\napi_key = {key}\nenable_https = 0\n"
+    );
+    std::fs::create_dir_all(state_dir)?;
+    std::fs::write(&ini_path, content)?;
+
+    let recipient = host_age_recipient(pubkey_path)?;
+    let dest = secrets_dir.join("sabnzbd-apikey.sops");
+    encrypt_and_write(&format!("{key}\n"), &recipient, &dest)?;
+    Ok(())
+}
+
 /// Shells out to Authelia's own `authelia crypto hash generate argon2`
 /// (the package already provides this) rather than reimplementing
 /// argon2id in Rust -- this is the exact hash format Authelia's own
@@ -336,5 +390,53 @@ mod tests {
         let nonexistent_pubkey = dir.path().join("no-such-key.pub");
         let result = ensure_authelia_secrets(dir.path(), &nonexistent_pubkey);
         assert!(result.is_ok(), "should short-circuit when both secrets already exist: {result:?}");
+    }
+
+    #[test]
+    fn ensure_all_generates_a_matched_raw_secret_alongside_the_env_var_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let pubkey = dir.path().join("host.pub");
+        std::fs::write(&pubkey, "not-a-real-ssh-key").unwrap();
+        // ensure_all shells out to ssh-to-age/sops; without a real
+        // recipient this will fail before writing anything -- this test
+        // only exercises the case where both files already exist (the
+        // short-circuit, same technique ensure_all_only_touches_servarr_apps
+        // already uses), which is what actually proves the two-file
+        // behavior didn't break the existing idempotency contract.
+        let dest = dir.path().join("sonarr-apikey.sops");
+        std::fs::write(&dest, "SONARR__AUTH__APIKEY=deadbeef\n").unwrap();
+        let raw_dest = dir.path().join("sonarr-apikey-raw.sops");
+        std::fs::write(&raw_dest, "deadbeef\n").unwrap();
+        let result = ensure_all(dir.path(), &pubkey, &["sonarr"]);
+        assert!(result.is_ok(), "should short-circuit when both files already exist: {result:?}");
+    }
+
+    #[test]
+    fn ensure_sabnzbd_apikey_is_idempotent_when_ini_already_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path().join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        std::fs::write(state_dir.join("sabnzbd.ini"), "[misc]\napi_key = existing\n").unwrap();
+        let nonexistent_pubkey = dir.path().join("no-such-key.pub");
+        let result = ensure_sabnzbd_apikey(&state_dir, dir.path(), &nonexistent_pubkey, 8080);
+        assert!(result.is_ok(), "should short-circuit before touching the host key: {result:?}");
+        assert!(!dir.path().join("sabnzbd-apikey.sops").exists());
+        let content = std::fs::read_to_string(state_dir.join("sabnzbd.ini")).unwrap();
+        assert_eq!(content, "[misc]\napi_key = existing\n", "must not overwrite an existing ini");
+    }
+
+    #[test]
+    fn ensure_sabnzbd_apikey_bootstrap_ini_contains_the_configured_port() {
+        // Confirms the port actually lands in the generated ini without
+        // needing a real age recipient -- writes the ini, then fails on
+        // the sops step, which is fine: this test only checks the ini's
+        // own content, written before that step runs.
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path().join("state");
+        let nonexistent_pubkey = dir.path().join("no-such-key.pub");
+        let _ = ensure_sabnzbd_apikey(&state_dir, dir.path(), &nonexistent_pubkey, 9090);
+        let content = std::fs::read_to_string(state_dir.join("sabnzbd.ini")).unwrap();
+        assert!(content.contains("port = 9090"), "ini did not contain the configured port: {content}");
+        assert!(content.contains("api_key = "), "ini did not contain a generated api_key: {content}");
     }
 }

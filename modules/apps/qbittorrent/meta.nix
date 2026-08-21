@@ -22,15 +22,10 @@
   # review; fixed here before Task 6 is dispatched so it isn't repeated).
   authBypassPaths = [ "/api/v2" ];
 
-  # /api/v2/app/version requires an authenticated session (a valid SID
-  # cookie) -- unauthenticated it returns 403, not 200. That still proves
-  # the server is up and serving, which is all a health check needs (found
-  # during the final whole-branch review: this was the one health check in
-  # the whole phase that expected a 200 from an endpoint that never
-  # returns one unauthenticated).
+  # LocalHostAuth = false (service.nix) makes this endpoint genuinely return 200 unauthenticated from localhost -- confirmed for real on ferrum-dev.
   healthCheck = {
     path = "/api/v2/app/version";
-    expectStatus = 403;
+    expectStatus = 200;
     timeoutSec = 30;
   };
 
