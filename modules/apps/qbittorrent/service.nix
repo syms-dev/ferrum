@@ -81,6 +81,13 @@ lib.mkIf app.enable {
         exit 1
       fi
 
+      # wg0 is created in the root namespace, ahead of the `ip netns del
+      # qbt-vpn` cleanup above having anything to do with it -- if a prior
+      # run was killed between this line and the `ip link set ... netns`
+      # move below, wg0 would leak into the root namespace and this
+      # command would fail with "File exists" on the next start. Guarded
+      # the same way the netns cleanup above already is (found during the
+      # final whole-branch review's re-review).
       ip link del wg0 2>/dev/null || true
       ip link add wg0 type wireguard
       wg setconf wg0 <(wg-quick strip /run/qbt-vpn/wg0.conf)
@@ -90,6 +97,17 @@ lib.mkIf app.enable {
       ip netns exec qbt-vpn ip link set wg0 up
       ip netns exec qbt-vpn ip route add default dev wg0
 
+      # DNS: wg-quick would normally manage this itself via resolvconf;
+      # since it's not being used to bring the interface up (see above),
+      # the namespace's resolver is written by hand from any DNS= line in
+      # the config. /etc/netns/qbt-vpn/resolv.conf is what `ip netns exec`
+      # bind-mounts over /etc/resolv.conf for commands run through it --
+      # but qbittorrent.service itself joins the namespace via systemd's
+      # NetworkNamespacePath=, a plain setns() that does NOT get that
+      # bind-mount treatment, so qbittorrent.service's own BindReadOnlyPaths
+      # below points it at this same file directly. No DNS= line means no
+      # resolver is configured for the namespace, matching "the namespace
+      # only has what's explicitly given."
       mkdir -p /etc/netns/qbt-vpn
       wg_dns=$(awk -F'=' '/^[[:space:]]*DNS[[:space:]]*=/ { gsub(/[ \t]/, "", $2); print $2; exit }' /run/qbt-vpn/wg0.conf)
       : > /etc/netns/qbt-vpn/resolv.conf
@@ -100,6 +118,17 @@ lib.mkIf app.enable {
         done
       fi
 
+      # A management-only veth pair to the host is always created,
+      # regardless of the kill-switch setting -- without it, nothing in
+      # the host's default namespace (Radarr/Sonarr/Prowlarr pushing
+      # torrents into qBittorrent's API, a future reverse proxy, ferrum's
+      # own health checks) can reach the namespace-isolated WebUI at all,
+      # silently contradicting this app's own catalog metadata
+      # (integrations.providesTo, authBypassPaths, healthCheck). This does
+      # not weaken the kill switch: whether the veth ALSO becomes an
+      # internet fallback path is controlled entirely by whether a default
+      # route via it exists inside the namespace, which is exactly the
+      # branch below.
       ip link add veth-qbt-host type veth peer name veth-qbt-ns
       ip link set veth-qbt-ns netns qbt-vpn
       ip addr add 10.200.1.1/30 dev veth-qbt-host
@@ -108,6 +137,11 @@ lib.mkIf app.enable {
       ip netns exec qbt-vpn ip link set veth-qbt-ns up
 
       ${lib.optionalString (!killSwitch) ''
+        # Kill switch OFF: add a fallback DEFAULT route back to the host's
+        # normal network via the veth pair above, lower priority than the
+        # WireGuard route so the tunnel is always preferred when it's up.
+        # IP forwarding must be enabled or the MASQUERADE rule below never
+        # actually forwards packets (caught during Task 7's review).
         echo 1 > /proc/sys/net/ipv4/ip_forward
         ip netns exec qbt-vpn ip route add default via 10.200.1.1 dev veth-qbt-ns metric 200
         iptables -t nat -A POSTROUTING -s 10.200.1.0/30 -j MASQUERADE
@@ -134,6 +168,14 @@ lib.mkIf app.enable {
       CPUQuota = app.resources.cpuQuota;
     }) // lib.optionalAttrs vpnEnabled {
       NetworkNamespacePath = "/var/run/netns/qbt-vpn";
+      # qbittorrent.service joins the namespace via NetworkNamespacePath
+      # (setns), not `ip netns exec`, so it does not automatically pick up
+      # /etc/netns/qbt-vpn/resolv.conf the way commands run through `ip
+      # netns exec qbt-vpn ...` do. Bind-mounting it directly onto
+      # /etc/resolv.conf gives this unit the same resolver the namespace
+      # was actually configured with (found during the final whole-branch
+      # review -- NetworkNamespacePath= shares only the network namespace,
+      # not iproute2's own /etc overlay mechanism).
       BindReadOnlyPaths = [ "/etc/netns/qbt-vpn/resolv.conf:/etc/resolv.conf" ];
     };
   };
