@@ -61,34 +61,65 @@ fn main() -> anyhow::Result<()> {
     let config: ReconcileConfig = serde_json::from_str(&raw)
         .map_err(|e| anyhow::anyhow!("failed to parse {config_path}: {e}"))?;
 
+    // Every registration is idempotent by name (find_existing_id), so a
+    // failed pair here is safe to skip and retry on the unit's own next
+    // Restart=on-failure attempt rather than aborting every OTHER pair --
+    // confirmed for real that a single cold-start-timing failure would
+    // otherwise silently skip every unrelated registration too (found
+    // during the controller's own real end-to-end test).
+    let mut had_error = false;
     for pair in &config.pairs {
-        let consumer = config
-            .apps
-            .get(&pair.consumer)
-            .ok_or_else(|| anyhow::anyhow!("unknown consumer app '{}'", pair.consumer))?;
-        let provider = config
-            .apps
-            .get(&pair.provider)
-            .ok_or_else(|| anyhow::anyhow!("unknown provider app '{}'", pair.provider))?;
-        let consumer_key = read_api_key(&consumer.api_key_secret_path)?.ok_or_else(|| {
-            anyhow::anyhow!(
-                "no API key configured for consumer app '{}' -- required to call its own API",
-                pair.consumer
-            )
-        })?;
-
-        match pair.kind.as_str() {
-            "downloadClient" => {
-                register_download_client(&pair.consumer, consumer, &consumer_key, &pair.provider, provider)?
+        match reconcile_pair(&config, pair) {
+            Ok(()) => println!(
+                "ferrum-reconcile: {} <- {} ({}) OK",
+                pair.consumer, pair.provider, pair.kind
+            ),
+            Err(e) => {
+                eprintln!(
+                    "ferrum-reconcile: {} <- {} ({}) FAILED: {e}",
+                    pair.consumer, pair.provider, pair.kind
+                );
+                had_error = true;
             }
-            "application" => {
-                register_application(consumer, &consumer_key, &pair.provider, provider)?
-            }
-            other => anyhow::bail!("unknown pair kind '{other}' for {}->{}", pair.consumer, pair.provider),
         }
-        println!("ferrum-reconcile: {} <- {} ({}) OK", pair.consumer, pair.provider, pair.kind);
+    }
+    if had_error {
+        anyhow::bail!("one or more pairs failed to reconcile -- see errors above");
     }
     Ok(())
+}
+
+fn reconcile_pair(config: &ReconcileConfig, pair: &Pair) -> anyhow::Result<()> {
+    let consumer = config
+        .apps
+        .get(&pair.consumer)
+        .ok_or_else(|| anyhow::anyhow!("unknown consumer app '{}'", pair.consumer))?;
+    let provider = config
+        .apps
+        .get(&pair.provider)
+        .ok_or_else(|| anyhow::anyhow!("unknown provider app '{}'", pair.provider))?;
+    let consumer_key = read_api_key(&consumer.api_key_secret_path)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "no API key configured for consumer app '{}' -- required to call its own API",
+            pair.consumer
+        )
+    })?;
+
+    match pair.kind.as_str() {
+        "downloadClient" => register_download_client(
+            &pair.consumer,
+            consumer,
+            &consumer_key,
+            &pair.provider,
+            provider,
+        ),
+        "application" => register_application(consumer, &consumer_key, &pair.provider, provider),
+        other => anyhow::bail!(
+            "unknown pair kind '{other}' for {}->{}",
+            pair.consumer,
+            pair.provider
+        ),
+    }
 }
 
 /// Looks up an existing entry by `name` at `GET {base}{path}` -- both
@@ -162,6 +193,29 @@ fn provider_implementation(
     }
 }
 
+/// SABnzbd requires a category to already exist before any downloadclient
+/// registration can reference it -- confirmed for real: a registration
+/// attempt otherwise returns a real 400 "Category does not exist", unlike
+/// qBittorrent, which accepts an arbitrary category string with no
+/// pre-creation needed. Idempotent by construction: SABnzbd's own
+/// mode=set_config either creates the category or updates it in place if
+/// it already exists -- confirmed for real, calling this twice against
+/// the same name produces the same category unchanged.
+fn ensure_sabnzbd_category(
+    provider: &AppConnInfo,
+    provider_key: &str,
+    category: &str,
+) -> anyhow::Result<()> {
+    let url = format!(
+        "{}/api?mode=set_config&section=categories&name={category}&dir={category}&apikey={provider_key}&output=json",
+        base_url(provider)
+    );
+    ureq::get(&url)
+        .call()
+        .map_err(|e| anyhow::anyhow!("failed to ensure SABnzbd category '{category}': {e}"))?;
+    Ok(())
+}
+
 fn register_download_client(
     consumer_id: &str,
     consumer: &AppConnInfo,
@@ -178,6 +232,14 @@ fn register_download_client(
     // Only Sabnzbd needs its own key read here (qBittorrent needs none) --
     // read_api_key handles both, called with the PROVIDER's own secret path.
     let provider_key = read_api_key(&provider.api_key_secret_path)?;
+
+    if provider_id == "sabnzbd" {
+        let key = provider_key.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("SABnzbd provider has no API key configured -- cannot ensure its category")
+        })?;
+        ensure_sabnzbd_category(provider, key, consumer_id)?;
+    }
+
     let (implementation, config_contract, protocol, extra_fields) =
         provider_implementation(provider_id, &provider_key)?;
     let category_field = category_field_name(consumer_id)?;
@@ -194,7 +256,7 @@ fn register_download_client(
         }
     }
 
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "enable": true,
         "protocol": protocol,
         "priority": 1,
@@ -203,6 +265,20 @@ fn register_download_client(
         "configContract": config_contract,
         "fields": fields,
     });
+
+    // Prowlarr's own downloadclient schema has a top-level `categories`
+    // list (indexer-category-to-client-category mappings), absent from
+    // Sonarr/Radarr's schema -- confirmed for real: omitting it makes
+    // Prowlarr's own DownloadClientBase.ValidateCategories throw a real
+    // NullReferenceException casting a null Categories collection, on
+    // EVERY downloadclient registration attempt, not just an edge case.
+    // An empty list is exactly what Prowlarr's own schema shows as this
+    // field's default for a blank client -- this isn't a workaround, it's
+    // supplying the field's real default value Prowlarr's own JSON
+    // deserialization doesn't apply on a missing key.
+    if consumer_id == "prowlarr" {
+        body["categories"] = serde_json::json!([]);
+    }
 
     ureq::post(&format!("{base}{path}"))
         .set("X-Api-Key", consumer_key)

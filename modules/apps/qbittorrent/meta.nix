@@ -22,7 +22,15 @@
   # review; fixed here before Task 6 is dispatched so it isn't repeated).
   authBypassPaths = [ "/api/v2" ];
 
-  # LocalHostAuth = false (service.nix) makes this endpoint genuinely return 200 unauthenticated from localhost -- confirmed for real on ferrum-dev.
+  # LocalHostAuth = false (service.nix) makes this endpoint genuinely
+  # return 200 unauthenticated from localhost -- confirmed for real on
+  # ferrum-dev. NOTE: on a VPN-kill-switch-enabled host, a caller reaching
+  # this app across the veth pair (a non-loopback address) needs the
+  # AuthSubnetWhitelist service.nix also sets in that case for the same
+  # 200 to hold -- this static catalog value can't express that
+  # per-host-config distinction; nothing currently consumes this field
+  # from that code path, so left as the non-VPN-host-accurate default
+  # (found during the final whole-branch review).
   healthCheck = {
     path = "/api/v2/app/version";
     expectStatus = 200;

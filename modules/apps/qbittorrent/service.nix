@@ -37,11 +37,29 @@ lib.mkIf app.enable {
     # authenticate with. This setting (confirmed via the real
     # app/setPreferences WebAPI call, which wrote exactly this key into a
     # real qBittorrent.conf) bypasses auth ONLY for requests from
-    # 127.0.0.1/the VPN-namespace veth's host side -- both already the
-    # trust boundary every other app in this catalog uses (bindaddress =
-    # 127.0.0.1), so this adds no new exposure. No credential to generate,
+    # 127.0.0.1 -- already the trust boundary every other app in this
+    # catalog uses (bindaddress = 127.0.0.1). No credential to generate,
     # store, or rotate.
-    serverConfig.Preferences.WebUI.LocalHostAuth = false;
+    serverConfig.Preferences.WebUI = {
+      LocalHostAuth = false;
+    } // lib.optionalAttrs vpnEnabled {
+      # qBittorrent's own LocalHostAuth bypass is gated on the connecting
+      # client being loopback (127.0.0.1) -- confirmed for real: hitting a
+      # LocalHostAuth=false instance from a real non-loopback address still
+      # returns 403. When the VPN kill switch is active, Sonarr/Radarr/
+      # Prowlarr reach qBittorrent across the veth pair (this file's own
+      # qbt-vpn-netns-setup script: 10.200.1.1 <-> 10.200.1.2) -- a
+      # non-loopback peer, so LocalHostAuth alone does not bypass auth
+      # there (found during the final whole-branch review, confirmed for
+      # real: a real non-loopback request against LocalHostAuth=false
+      # still returned 403). AuthSubnetWhitelist covers exactly that /30 --
+      # confirmed for real to resolve it. Real ini keys are
+      # WebUI\AuthSubnetWhitelistEnabled / WebUI\AuthSubnetWhitelist,
+      # matching the WebAPI's own bypass_auth_subnet_whitelist_enabled /
+      # bypass_auth_subnet_whitelist preferences.
+      AuthSubnetWhitelistEnabled = true;
+      AuthSubnetWhitelist = "10.200.1.0/30";
+    };
   };
 
   users.users.qbittorrent.extraGroups =
