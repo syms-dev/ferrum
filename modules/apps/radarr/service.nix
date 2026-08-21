@@ -18,6 +18,10 @@ lib.mkIf app.enable {
     sopsFile = /. + "${ferrum.secretsDir}/radarr-apikey.sops";
     format = "binary";
     owner = "radarr";
+    # See modules/apps/sonarr/service.nix's comment on this exact line --
+    # without restartUnits, rotating this key would leave radarr.service
+    # running with the old one until something else restarts it.
+    restartUnits = [ "radarr.service" ];
   };
 
   services.radarr = {

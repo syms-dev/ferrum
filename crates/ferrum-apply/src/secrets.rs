@@ -7,14 +7,27 @@ use std::process::Command;
 /// through this mechanism (see the design spec's Secrets section).
 const SERVARR_APPS: &[&str] = &["sonarr", "radarr", "prowlarr"];
 
+/// Default SSH host public key path, used only when the wrapper's
+/// FERRUM_HOST_KEY_PUB (derived from this host's real
+/// config.sops.age.sshKeyPaths -- see modules/core/overlays.nix) isn't set,
+/// e.g. under `cargo run` outside a built ferrum-apply wrapper.
+pub const DEFAULT_HOST_KEY_PUB: &str = "/etc/ssh/ssh_host_ed25519_key.pub";
+
 /// Derives the box's PUBLIC age recipient from its own SSH host key, via
 /// ssh-to-age. Needs no privilege and touches no private key material --
 /// this is the same derivation sops-nix's own decrypt side uses by default
-/// (sops.age.sshKeyPaths), just run in the encrypt direction.
-pub fn host_age_recipient() -> anyhow::Result<String> {
-    let pubkey_path = "/etc/ssh/ssh_host_ed25519_key.pub";
+/// (sops.age.sshKeyPaths), just run in the encrypt direction. `pubkey_path`
+/// should be the real path sops-nix's own config resolved to (passed by the
+/// caller from FERRUM_HOST_KEY_PUB) -- hardcoding the default here instead
+/// would silently desync from a host that overrides
+/// services.openssh.hostKeys, encrypting to a recipient sops-nix never
+/// decrypts with.
+pub fn host_age_recipient(pubkey_path: &Path) -> anyhow::Result<String> {
     let pubkey = std::fs::read_to_string(pubkey_path).map_err(|e| {
-        anyhow::anyhow!("failed to read SSH host public key at {pubkey_path}: {e}")
+        anyhow::anyhow!(
+            "failed to read SSH host public key at {}: {e}",
+            pubkey_path.display()
+        )
     })?;
 
     let output = Command::new("ssh-to-age")
@@ -104,9 +117,18 @@ fn encrypt_and_write(plaintext: &str, recipient: &str, dest: &Path) -> anyhow::R
     }
     // Write via a temp file + rename so a crash mid-write never leaves a
     // half-written .sops file for the next apply (or a curious operator)
-    // to find.
+    // to find. sync_all() before the rename matters as much as the rename
+    // itself: without it, a power loss can land the rename durably while
+    // the temp file's own content is still only in the page cache, leaving
+    // a present-but-truncated .sops file that `dest.exists()` then treats
+    // as valid forever (ensure_all never reads a secret back to check it).
     let tmp = dest.with_extension("sops.tmp");
-    std::fs::write(&tmp, &output.stdout)?;
+    let file = std::fs::File::create(&tmp)?;
+    {
+        use std::io::Write;
+        (&file).write_all(&output.stdout)?;
+    }
+    file.sync_all()?;
     std::fs::rename(&tmp, dest)?;
     Ok(())
 }
@@ -116,19 +138,31 @@ fn encrypt_and_write(plaintext: &str, recipient: &str, dest: &Path) -> anyhow::R
 /// any that don't have one yet. Idempotent: an app whose .sops file already
 /// exists is left completely alone (its key is never regenerated or read
 /// back -- this process has no way to decrypt it anyway).
-pub fn ensure_all(secrets_dir: &Path, recipient: &str, apps: &[&str]) -> anyhow::Result<()> {
-    for app in apps {
-        if !SERVARR_APPS.contains(app) {
-            continue;
-        }
+///
+/// `pubkey_path` is only actually read (via ssh-to-age, which needs no
+/// privilege) when at least one app is genuinely missing its .sops file --
+/// a host with nothing to generate (every app's key already exists, or no
+/// servarr apps enabled) never touches the SSH host key at all, so a
+/// missing/unreadable host key can't break `ferrum-apply apply` on a host
+/// that doesn't need this mechanism.
+pub fn ensure_all(secrets_dir: &Path, pubkey_path: &Path, apps: &[&str]) -> anyhow::Result<()> {
+    let missing: Vec<&str> = apps
+        .iter()
+        .copied()
+        .filter(|app| SERVARR_APPS.contains(app))
+        .filter(|app| !secrets_dir.join(format!("{app}-apikey.sops")).exists())
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+
+    let recipient = host_age_recipient(pubkey_path)?;
+    for app in missing {
         let dest = secrets_dir.join(format!("{app}-apikey.sops"));
-        if dest.exists() {
-            continue;
-        }
         let key = random_hex_key()?;
         let env_var = format!("{}__AUTH__APIKEY", app.to_uppercase());
         let content = format!("{env_var}={key}\n");
-        encrypt_and_write(&content, recipient, &dest)?;
+        encrypt_and_write(&content, &recipient, &dest)?;
     }
     Ok(())
 }
@@ -154,14 +188,15 @@ mod tests {
     #[test]
     fn ensure_all_only_touches_servarr_apps() {
         let dir = tempfile::tempdir().unwrap();
-        // qbittorrent is not in SERVARR_APPS -- ensure_all must be a no-op
-        // for it even though it's in the requested `apps` list. Uses a
-        // fake recipient and expects sops to fail (no real sops binary
-        // guaranteed in a plain `cargo test` sandbox) -- the assertion
-        // that matters is that NO file was created for qbittorrent,
-        // regardless of whether sonarr's encrypt call succeeded or failed
-        // in this environment.
-        let _ = ensure_all(dir.path(), "age1nonexistentrecipient", &["qbittorrent"]);
+        // qbittorrent is not in SERVARR_APPS, so it's filtered out of
+        // `missing` before ensure_all ever derives a recipient or shells
+        // out to ssh-to-age/sops -- passing a pubkey path that doesn't
+        // exist proves that: if ensure_all tried to read it, this would
+        // return an error instead of Ok(()), and no real ssh-to-age/sops
+        // binary is guaranteed in a plain `cargo test` sandbox anyway.
+        let nonexistent_pubkey = dir.path().join("no-such-key.pub");
+        let result = ensure_all(dir.path(), &nonexistent_pubkey, &["qbittorrent"]);
+        assert!(result.is_ok(), "qbittorrent-only call should short-circuit before touching the host key: {result:?}");
         assert!(!dir.path().join("qbittorrent-apikey.sops").exists());
     }
 }

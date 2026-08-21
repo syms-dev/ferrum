@@ -32,6 +32,17 @@ lib.mkIf app.enable {
     sopsFile = /. + "${ferrum.secretsDir}/sonarr-apikey.sops";
     format = "binary";
     owner = "sonarr";
+    # sops-nix's decrypted-secret PATH (config.sops.secrets."sonarr-apikey".path,
+    # used by environmentFiles below) is invariant under a content change --
+    # regenerating this key (e.g. deleting the .sops file and re-applying)
+    # decrypts new content to the same path, which switch-to-configuration
+    # has no way to notice on its own. Without restartUnits, sonarr.service
+    # would keep running with the OLD key loaded in memory until something
+    # else restarts it. restartUnits is a real sops-nix option (works the
+    # same way as systemd.services.<name>.restartTriggers, scoped
+    # per-secret) -- same mechanism qBittorrent's VPN secret uses, see
+    # modules/apps/qbittorrent/service.nix.
+    restartUnits = [ "sonarr.service" ];
   };
 
   services.sonarr = {

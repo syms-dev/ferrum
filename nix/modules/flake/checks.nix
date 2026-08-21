@@ -84,6 +84,30 @@
           offenders = map (o: lib.concatStringsSep "." o.loc) offenders;
         };
 
+      # Regression guard for the bug documented in the plan's Global
+      # Constraints (see docs/superpowers/plans/2026-08-20-phase-1-4a-
+      # secrets-foundation.md): sops-nix's own assertion accepts sopsFile
+      # if EITHER `builtins.isPath` is true OR it's a string already
+      # prefixed with the Nix store dir -- and this host's own
+      # `ferrum.secretsDir` override happens to evaluate to a `/nix/store`
+      # string (a path literal converted via `toString`), which takes the
+      # SECOND branch. That means a future edit reverting any
+      # `sopsFile = /. + "${x}/y"` back to plain string interpolation
+      # (`sopsFile = "${x}/y"`) would pass on THIS host and still break
+      # every real deployed box, whose secretsDir is a plain
+      # non-store path -- reading `.sops.secrets.*.sopsFile`'s own value
+      # forces no realization (unlike system.build.toplevel below), so this
+      # stays genuinely cheap.
+      sopsFilesArePaths =
+        let
+          secrets = lib.attrValues exampleHosts.minimal.config.sops.secrets;
+          offenders = builtins.filter (s: !builtins.isPath s.sopsFile) secrets;
+        in
+        {
+          ok = offenders == [ ];
+          offenders = map (s: s.sopsFile) offenders;
+        };
+
       mkAssertionCheck = name: result:
         pkgs.runCommand "ferrum-check-${name}" { } (
           if result.ok then
@@ -96,6 +120,7 @@
       checks = {
         catalog-consistency = mkAssertionCheck "catalog-consistency" catalogConsistency;
         schema-uniformity = mkAssertionCheck "schema-uniformity" schemaUniformity;
+        sopsfile-are-paths = mkAssertionCheck "sopsfile-are-paths" sopsFilesArePaths;
 
         # Forces .drvPath for each example host so an option-type mistake
         # fails fast, without a full build -- true for the catalog apps
@@ -105,12 +130,23 @@
         # the real default sops.validateSopsFiles = true): sops-nix's own
         # system.activationScripts.setupSecrets needs sops-install-secrets
         # (a real Haskell program) actually realized to build its text,
-        # not just referenced by hash -- confirmed for real on ferrum-dev,
-        # this alone triggers a ~1293-store-path, ~8.7GB build (the whole
-        # example host's real app closures come along transitively).
-        # Budget real disk/time for this check accordingly -- it is no
-        # longer the "seconds, pure eval" check its name implies, and that
-        # is an accepted cost of using sops-nix at all, not a bug here.
+        # not just referenced by hash. Confirmed for real, repeatedly, on
+        # ferrum-dev (a 79GB VM): this now costs well beyond the original
+        # ~1293-store-path/~8.7GB measurement -- three consecutive attempts
+        # each hit ENOSPC after freeing 70+GB via `nix-store --gc`
+        # immediately beforehand, meaning peak usage is somewhere north of
+        # that freed amount. Standard GitHub-hosted runners do not
+        # reliably have that much free disk, so this check is
+        # DELIBERATELY NOT wired into any CI job (see .github/workflows/
+        # ci.yml's "cheap checks" step, which used to include it and no
+        # longer does) -- run it by hand, on ferrum-dev or an equivalent
+        # real machine with disk to spare, when touching anything under
+        # modules/apps/ or modules/core/secrets.nix. This is an accepted,
+        # deliberate scope decision, not a silently-dropped check: the
+        # regression it existed to catch for THIS branch's own bug
+        # (sopsFile's isPath requirement) is covered instead by the
+        # genuinely cheap sopsfile-are-paths check above, which needs no
+        # realization at all.
         eval-example-hosts = pkgs.runCommand "ferrum-check-eval-example-hosts"
           {
             drvPaths = builtins.toJSON

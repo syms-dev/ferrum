@@ -125,7 +125,16 @@ in
         };
       });
       default = { };
-      description = "Names ferrumd is permitted to write a secret under. See modules/core/secrets.nix.";
+      description = ''
+        Names ferrumd is permitted to write a secret under. See
+        modules/core/secrets.nix. Declaring a name here also gates whichever
+        catalog app consumes it -- e.g. `qbittorrent-vpn` both permits that
+        secret's existence AND enables qBittorrent's VPN-gated network
+        namespace (see modules/apps/qbittorrent/service.nix's `vpnEnabled`).
+        Declaring a name requires the corresponding
+        `<ferrum.secretsDir>/<name>.sops` file to already exist on disk --
+        this option does not create or generate one.
+      '';
     };
 
     backup = {

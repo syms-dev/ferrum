@@ -114,6 +114,9 @@ fn main() -> anyhow::Result<()> {
                     .map(str::to_string)
                     .filter(|s| !s.is_empty())
                     .collect(),
+                host_key_pub: std::env::var("FERRUM_HOST_KEY_PUB")
+                    .unwrap_or_else(|_| secrets::DEFAULT_HOST_KEY_PUB.to_string())
+                    .into(),
             };
             let flake_ref = std::env::var("FERRUM_FLAKE_REF")
                 .unwrap_or_else(|_| "/etc/ferrum#nixosConfigurations.default.config.system.build.toplevel".to_string());

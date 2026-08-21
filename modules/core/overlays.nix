@@ -54,6 +54,28 @@ let
   enabledServarrApps = lib.filter
     (id: ferrum.apps.${id}.enable or false)
     [ "sonarr" "radarr" "prowlarr" ];
+
+  # ferrum-apply's encrypt side (crates/ferrum-apply/src/secrets.rs) derives
+  # its age recipient from a hardcoded default public-key path unless told
+  # otherwise. sops-nix's own decrypt side reads config.sops.age.sshKeyPaths
+  # (which defaults to config.services.openssh.hostKeys's ed25519 entries,
+  # see modules/core/secrets.nix) -- the default coincides with the Rust
+  # side's hardcoded path today, but an operator overriding
+  # services.openssh.hostKeys in custom/ (a different path, a different key
+  # type, a key on another volume) would silently desync the two sides:
+  # ferrum-apply would encrypt to a recipient sops-nix never decrypts with,
+  # and activation would fail with a decryption error nowhere near this
+  # cause. Passing the REAL configured path through, the same way
+  # FERRUM_SECRETS_DIR/FERRUM_SERVARR_APPS already prevent this class of
+  # drift, closes it. sops.age.sshKeyPaths holds PRIVATE key paths; the
+  # public key sits alongside it at the same path plus ".pub" (standard
+  # OpenSSH convention, and the only relationship ssh-to-age itself relies
+  # on). Guarded with `or null`/mkIf so a host with sops.age.sshKeyPaths
+  # somehow empty just falls back to the Rust side's own hardcoded default
+  # instead of failing this eval.
+  hostKeyPubPath =
+    let paths = config.sops.age.sshKeyPaths or [ ];
+    in lib.optionalString (paths != [ ]) "${lib.head paths}.pub";
 in
 {
   nixpkgs.config.allowUnfreePredicate = pkg:
@@ -82,7 +104,9 @@ in
             --set-default FERRUM_MIN_FREE_GIB ${toString ferrum.storage.minFreeGiB} \
             --set-default FERRUM_HEALTH_CHECK_TIMEOUT_SEC ${toString ferrum.apply.healthCheckTimeoutSec} \
             --set-default FERRUM_SECRETS_DIR ${lib.escapeShellArg ferrum.secretsDir} \
-            --set-default FERRUM_SERVARR_APPS ${lib.escapeShellArg (lib.concatStringsSep "," enabledServarrApps)}
+            --set-default FERRUM_SERVARR_APPS ${lib.escapeShellArg (lib.concatStringsSep "," enabledServarrApps)} \
+            ${lib.optionalString (hostKeyPubPath != "")
+              "--set-default FERRUM_HOST_KEY_PUB ${lib.escapeShellArg hostKeyPubPath}"}
         '' // {
         meta = (prev.ferrum-apply.meta or { }) // { mainProgram = "ferrum-apply"; };
       };
