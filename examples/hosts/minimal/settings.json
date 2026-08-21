@@ -1,6 +1,7 @@
 {
   "schemaVersion": 1,
   "proxy": {
+    "enable": true,
     "baseDomain": "example.invalid",
     "acme": {
       "email": "admin@example.invalid"
@@ -8,7 +9,8 @@
   },
   "apps": {
     "sonarr": {
-      "enable": true
+      "enable": true,
+      "exposure": "lan"
     },
     "radarr": {
       "enable": true
