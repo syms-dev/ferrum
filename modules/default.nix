@@ -10,6 +10,7 @@
     ./core/generations.nix
     ./core/state-restore.nix
     ./core/secrets.nix
+    ./core/recyclarr.nix
     ./proxy/acme.nix
     ./proxy/nginx.nix
     ./proxy/selfsigned-cert.nix

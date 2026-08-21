@@ -117,6 +117,10 @@ in
       };
     };
 
+    recyclarr = {
+      enable = mkEnableOption "opinionated TRaSH-Guide quality-profile sync for Sonarr/Radarr via Recyclarr";
+    };
+
     secrets = mkOption {
       type = types.attrsOf (types.submodule {
         options.description = mkOption {
