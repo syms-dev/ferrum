@@ -152,6 +152,8 @@ pub struct StorageConfig {
     pub auth_enabled: bool,
     pub authelia_state_dir: PathBuf,
     pub admin_email: String,
+    pub sabnzbd_state_dir: Option<PathBuf>,
+    pub sabnzbd_port: u16,
 }
 
 pub fn run(flake_ref: &str, storage: &StorageConfig) -> anyhow::Result<ApplyResult> {
@@ -165,6 +167,14 @@ pub fn run(flake_ref: &str, storage: &StorageConfig) -> anyhow::Result<ApplyResu
     if storage.auth_enabled {
         crate::secrets::ensure_authelia_secrets(&storage.secrets_dir, &storage.host_key_pub)?;
         crate::secrets::ensure_first_authelia_user(&storage.authelia_state_dir, &storage.admin_email)?;
+    }
+    if let Some(sabnzbd_state_dir) = &storage.sabnzbd_state_dir {
+        crate::secrets::ensure_sabnzbd_apikey(
+            sabnzbd_state_dir,
+            &storage.secrets_dir,
+            &storage.host_key_pub,
+            storage.sabnzbd_port,
+        )?;
     }
 
     // 1. Build (apps still running -- the slow part).

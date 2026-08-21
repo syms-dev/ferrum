@@ -123,7 +123,9 @@ in
               "--set-default FERRUM_HOST_KEY_PUB ${lib.escapeShellArg hostKeyPubPath}"} \
             --set-default FERRUM_AUTH_ENABLED ${if ferrum.auth.enable then "1" else "0"} \
             --set-default FERRUM_AUTHELIA_STATE_DIR "/var/lib/authelia-main" \
-            --set-default FERRUM_ADMIN_EMAIL ${lib.escapeShellArg ferrum.auth.adminEmail}
+            --set-default FERRUM_ADMIN_EMAIL ${lib.escapeShellArg ferrum.auth.adminEmail} \
+            --set-default FERRUM_SABNZBD_STATE_DIR ${lib.escapeShellArg (if ferrum.apps.sabnzbd.enable or false then ferrum.apps.sabnzbd.stateDir else "")} \
+            --set-default FERRUM_SABNZBD_PORT ${toString (ferrum.apps.sabnzbd.port or 8080)}
         '' // {
         meta = (prev.ferrum-apply.meta or { }) // { mainProgram = "ferrum-apply"; };
       };

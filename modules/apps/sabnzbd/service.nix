@@ -13,6 +13,12 @@ let
   app = ferrum.apps.sabnzbd or { enable = false; };
 in
 lib.mkIf app.enable {
+  sops.secrets."sabnzbd-apikey" = {
+    sopsFile = /. + "${ferrum.secretsDir}/sabnzbd-apikey.sops";
+    format = "binary";
+    owner = "sabnzbd";
+  };
+
   services.sabnzbd = {
     enable = true;
     user = "sabnzbd";

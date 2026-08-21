@@ -46,6 +46,37 @@ lib.mkIf app.enable {
     restartUnits = [ "sonarr.service" ];
   };
 
+  sops.secrets."sonarr-apikey-raw" = {
+    sopsFile = /. + "${ferrum.secretsDir}/sonarr-apikey-raw.sops";
+    format = "binary";
+    owner = "sonarr";
+  };
+
+  # A host that already had sonarr-apikey.sops from before Phase 1.4c
+  # cannot get a matching raw secret generated retroactively --
+  # ensure_all has no way to decrypt the existing key (by design, it
+  # never holds the private age key), so a fresh, mismatched raw key
+  # would silently break Recyclarr/the reconciler's auth against this
+  # app rather than fail loudly. This assertion turns that into a clear,
+  # actionable message instead.
+  assertions = [
+    {
+      assertion = !(builtins.pathExists (/. + "${ferrum.secretsDir}/sonarr-apikey.sops"))
+                  || builtins.pathExists (/. + "${ferrum.secretsDir}/sonarr-apikey-raw.sops");
+      message = ''
+        ${ferrum.secretsDir}/sonarr-apikey.sops exists but
+        ${ferrum.secretsDir}/sonarr-apikey-raw.sops does not -- this host
+        generated its Sonarr API key before Recyclarr/reconciler support
+        existed, which need a bare-value copy of the same key ferrum-apply
+        cannot retroactively create. Delete both sonarr-apikey.sops and
+        sonarr-apikey-raw.sops (if present) under ${ferrum.secretsDir} and
+        re-apply to generate a fresh matched pair -- see README.md's
+        Secrets section for the same recovery procedure already documented
+        for servarr keys.
+      '';
+    }
+  ];
+
   services.sonarr = {
     enable = true;
     dataDir = app.stateDir;
