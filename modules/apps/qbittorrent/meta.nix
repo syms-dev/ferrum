@@ -40,18 +40,15 @@
     consumes = [ ];
   };
 
-  # vpnWireguardConfig/vpnKillSwitch: see
-  # docs/superpowers/specs/2026-08-20-phase-1-3-catalog-apps-design.md's
-  # "qBittorrent VPN Kill Switch" section for the full design. NEVER read
-  # via Nix string interpolation into a systemd unit -- see service.nix.
+  # vpnKillSwitch: see docs/superpowers/specs/2026-08-20-phase-1-3-catalog-apps-
+  # design.md's "qBittorrent VPN Kill Switch" section. The WireGuard config
+  # itself moved to a real sops secret (ferrum.secrets."qbittorrent-vpn") in
+  # Phase 1.4a -- see modules/apps/qbittorrent/service.nix. Nothing in
+  # app.settings ever holds the config text anymore.
   settingsSchema = {
     type = "object";
     additionalProperties = false;
     properties = {
-      vpnWireguardConfig = {
-        type = "string";
-        default = "";
-      };
       vpnKillSwitch = {
         type = "boolean";
         default = true;
