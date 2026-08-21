@@ -59,6 +59,17 @@ lib.mkIf app.enable {
       } // lib.optionalAttrs (app.settings ? urlBase && app.settings.urlBase != "") {
         urlbase = app.settings.urlBase;
       };
+      # Disables Sonarr's own login page entirely -- Authelia's
+      # forward-auth (modules/proxy/nginx.nix's auth_request wiring)
+      # is the only auth layer once ferrum.auth.enable is true, per
+      # this plan's confirmed answer to "does the app keep native
+      # login as defense-in-depth" (it doesn't -- one identity, one
+      # login, matching the SSO model cleanly). Only applied when
+      # ferrum.auth.enable is actually true, so an operator running
+      # without Authelia still gets Sonarr's own login as a fallback.
+      auth = lib.mkIf ferrum.auth.enable {
+        method = "External";
+      };
       log.analyticsenabled = false;
       update.mechanism = "external";
     };
