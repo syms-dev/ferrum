@@ -11,6 +11,17 @@ let
   stateDir = "/var/lib/authelia-main";
 in
 lib.mkIf authEnabled {
+  assertions = [
+    {
+      assertion = ferrum.proxy.enable;
+      message = "ferrum.auth.enable is true but ferrum.proxy.enable is false -- Authelia has no reverse proxy in front of it to forward-auth for.";
+    }
+    {
+      assertion = ferrum.auth.adminEmail != "";
+      message = "ferrum.auth.enable is true but ferrum.auth.adminEmail is empty -- the generated first user needs a real email address.";
+    }
+  ];
+
   sops.secrets."authelia-jwt-secret" = {
     sopsFile = /. + "${ferrum.secretsDir}/authelia-jwt-secret.sops";
     format = "binary";
@@ -65,7 +76,7 @@ lib.mkIf authEnabled {
       exposedAppsAuth = proxyLib.exposedApps ferrum;
       vhostNameFor = proxyLib.vhostNameFor ferrum;
 
-      bypassRules = id: app: map
+      bypassRules = _: app: map
         (path: {
           domain = vhostNameFor app;
           resources = [ "^${path}.*$" ];
@@ -73,7 +84,7 @@ lib.mkIf authEnabled {
         })
         app.auth.bypassPaths;
 
-      appRule = id: app: {
+      appRule = _: app: {
         domain = vhostNameFor app;
         policy = app.auth.policy;
       };
@@ -83,5 +94,17 @@ lib.mkIf authEnabled {
 
   systemd.tmpfiles.rules = [
     "d '${stateDir}' 0750 authelia-main authelia-main - -"
+    # 'Z' fixes ownership/mode on an EXISTING path without requiring it to
+    # exist when the rule is first evaluated -- needed because
+    # users_database.yml is created by ferrum-apply's Step 0 (secrets.rs's
+    # ensure_first_authelia_user), root-owned by whatever process ran
+    # ferrum-apply, before the authelia-main user necessarily exists on a
+    # first-ever apply. NixOS activation re-processes tmpfiles.d rules on
+    # every switch-to-configuration, so this corrects ownership on every
+    # subsequent apply too, including a later password change Authelia
+    # itself writes back (found during the final whole-branch review --
+    # without this, the file stays root-owned 0644 forever and Authelia's
+    # own process can never rewrite it).
+    "Z '${stateDir}/users_database.yml' 0640 authelia-main authelia-main - -"
   ];
 }

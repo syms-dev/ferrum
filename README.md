@@ -60,6 +60,38 @@ qBittorrent's VPN kill-switch config is operator-provided, since it's your own W
 
 If this host's SSH host key is ever regenerated, every existing `.sops` file under `ferrum.secretsDir` becomes permanently undecryptable — back up `/etc/ssh/ssh_host_ed25519_key` the same way you'd back up any other credential this box depends on. Auto-generated servarr keys recover on their own (delete the stale `.sops` file and re-apply; a fresh key is generated); a lost `qbittorrent-vpn.sops` must be re-encrypted from your original WireGuard config via the steps above.
 
+## Reverse proxy, TLS, and single sign-on
+
+Enabling `ferrum.proxy.enable` puts nginx in front of every non-`local`-exposure app, with TLS on every vhost: a real ACME certificate (via Cloudflare DNS-01) for `public` apps, and a self-signed one for `lan` apps and the Authelia portal itself. Enabling `ferrum.auth.enable` additionally puts [Authelia](https://www.authelia.com/) in front of every non-`local`-exposure app whose `auth.policy` isn't `"bypass"`, as the box's single sign-on layer — each app's own native login is disabled in favor of it.
+
+### ACME / Cloudflare DNS-01 credential
+
+Issuing a real certificate for a `public` app needs a Cloudflare API token, operator-provided the same way qBittorrent's VPN config is:
+
+1. Create a **scoped** Cloudflare API token (Zone:Read + DNS:Edit on the zone that owns `ferrum.proxy.baseDomain`) — never the legacy Global API key.
+2. Get this host's age recipient:
+   ```bash
+   ssh-to-age -i /etc/ssh/ssh_host_ed25519_key.pub
+   ```
+3. Encrypt the token to that recipient, as a raw binary blob:
+   ```bash
+   echo -n "CLOUDFLARE_DNS_API_TOKEN=<your token>" | sops --encrypt --age <recipient from step 2> \
+     --input-type binary --output-type binary \
+     /dev/stdin > /etc/ferrum/secrets/acme-dns.sops
+   ```
+4. Add `"acme-dns"` to `ferrum.secrets` in `settings.json` (or whatever name `ferrum.proxy.acme.credentialSecret` is set to).
+5. Re-apply.
+
+### First Authelia login
+
+`ferrum-apply` generates a random password for Authelia's first user (`admin`) the first time `ferrum.auth.enable` turns on, and writes it once, in plaintext, to `/var/lib/authelia-main/authelia-setup-password` (mode `0400`, root-only). Read it over SSH:
+
+```bash
+ssh <host> sudo cat /var/lib/authelia-main/authelia-setup-password
+```
+
+Log in at `https://auth.<ferrum.proxy.baseDomain>/`, then change the password from Authelia's own UI — the setup file is never regenerated or deleted automatically once `users_database.yml` exists, so treat it as sensitive until you remove it by hand.
+
 ## Development
 
 There is no local nix install in this environment yet, so nothing here has been evaluated locally — `nix flake check` in CI is the first real test of any of it. See the design doc's "Dev loop" section for the intended setup (an aarch64 dev VM plus a real x86_64 test target provisioned via `nixos-anywhere`).

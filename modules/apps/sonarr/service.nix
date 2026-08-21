@@ -12,6 +12,7 @@
 let
   ferrum = config.ferrum;
   app = ferrum.apps.sonarr or { enable = false; };
+  proxyLib = import ../../proxy/lib.nix { inherit lib; };
 in
 lib.mkIf app.enable {
   sops.secrets."sonarr-apikey" = {
@@ -67,7 +68,7 @@ lib.mkIf app.enable {
       # login, matching the SSO model cleanly). Only applied when
       # ferrum.auth.enable is actually true, so an operator running
       # without Authelia still gets Sonarr's own login as a fallback.
-      auth = lib.mkIf ferrum.auth.enable {
+      auth = lib.mkIf (proxyLib.authGated ferrum app) {
         method = "External";
       };
       log.analyticsenabled = false;
