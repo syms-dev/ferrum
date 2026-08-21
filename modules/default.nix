@@ -10,6 +10,8 @@
     ./core/generations.nix
     ./core/state-restore.nix
     ./core/secrets.nix
+    ./proxy/acme.nix
+    ./proxy/nginx.nix
     ./apps/sonarr/service.nix
     ./apps/radarr/service.nix
     ./apps/prowlarr/service.nix
