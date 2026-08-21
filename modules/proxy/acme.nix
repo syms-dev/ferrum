@@ -29,7 +29,7 @@ lib.mkIf proxyEnabled {
   # zero-privilege sops-encrypt mechanism as qBittorrent's VPN config. Must
   # go through sops-nix's own decryption like every other secret in this
   # codebase; environmentFile cannot point at the raw .sops ciphertext directly.
-  sops.secrets."${ferrum.proxy.acme.credentialSecret}" = {
+  sops.secrets."${ferrum.proxy.acme.credentialSecret}" = lib.mkIf (publicApps != { }) {
     sopsFile = /. + "${ferrum.secretsDir}/${ferrum.proxy.acme.credentialSecret}.sops";
     format = "binary";
     owner = "acme";
