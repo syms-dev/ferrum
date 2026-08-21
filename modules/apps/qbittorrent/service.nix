@@ -12,6 +12,17 @@ let
   killSwitch = app.settings.vpnKillSwitch or true;
 in
 lib.mkIf app.enable {
+  assertions = lib.optional vpnEnabled {
+    assertion = builtins.pathExists (/. + "${ferrum.secretsDir}/qbittorrent-vpn.sops");
+    message = ''
+      ferrum.secrets declares "qbittorrent-vpn" but
+      ${ferrum.secretsDir}/qbittorrent-vpn.sops does not exist yet. Encrypt
+      your WireGuard config to this host's own age recipient first -- see
+      README.md's "qBittorrent VPN kill switch" section for the full
+      procedure -- then re-apply.
+    '';
+  };
+
   services.qbittorrent = {
     enable = true;
     profileDir = app.stateDir;
@@ -72,9 +83,14 @@ lib.mkIf app.enable {
       # move it into qbt-vpn -- a WireGuard interface's encrypted UDP
       # socket stays bound to whichever namespace it was created in, even
       # after the interface itself is moved elsewhere. Creating it
-      # directly inside qbt-vpn leaves the encrypted tunnel traffic with no
-      # route out (found for real during Phase 1.3's final whole-branch
-      # review, confirmed via an actual WireGuard handshake test).
+      # directly inside qbt-vpn (the original approach, via `ip netns exec
+      # qbt-vpn wg-quick up ...`) leaves the encrypted tunnel traffic with
+      # no route out, since qbt-vpn has no other interface to carry it --
+      # confirmed via a real `ip route get <peer> mark <fwmark>` test on
+      # ferrum-dev returning "Network is unreachable" under that approach
+      # (found during the final whole-branch review). Because this
+      # bypasses wg-quick's own Address/DNS handling, both are parsed from
+      # the runtime-read config below instead.
       wg_address=$(awk -F'=' '/^[[:space:]]*Address[[:space:]]*=/ { gsub(/[ \t]/, "", $2); print $2; exit }' /run/qbt-vpn/wg0.conf)
       if [ -z "$wg_address" ]; then
         echo "qbt-vpn-netns-setup: no Address= line in the WireGuard config" >&2

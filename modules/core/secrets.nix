@@ -16,7 +16,24 @@
 # auto-generated per-app API keys, or a later ferrumd change for
 # operator-provided secrets (see the design spec). This module is decrypt
 # plumbing only.
-{ lib, ... }:
+#
+# services.openssh.enable also defaults services.openssh.openFirewall to
+# true, opening TCP/22 -- an intended, not incidental, consequence: the
+# design spec's first-user setup-token bootstrap is delivered "readable
+# only over SSH", so a ferrum host is meant to be SSH-reachable out of the
+# box. An operator who wants SSH closed can override
+# services.openssh.openFirewall = false in custom/ without affecting the
+# age-identity mechanism above, which only needs the host key to exist,
+# not the port to be open.
+{ config, lib, ... }:
 {
   services.openssh.enable = lib.mkDefault true;
+
+  assertions = [
+    {
+      assertion = lib.hasPrefix "/" config.ferrum.secretsDir
+        && !lib.hasSuffix "/" config.ferrum.secretsDir;
+      message = "ferrum.secretsDir must be an absolute path with no trailing slash (got: ${config.ferrum.secretsDir}) -- every sops.secrets.<name>.sopsFile in this tree is built by concatenating it with a filename via `/. + \"\${ferrum.secretsDir}/...\"`, and a relative or trailing-slash value produces a confusing eval error far from this option.";
+    }
+  ];
 }

@@ -23,9 +23,21 @@ jobs:
       # so a separate `nix flake check --no-build` pass would only repeat
       # that evaluation (NixOS module evaluation is not free) for no extra
       # coverage -- the first CI run measured this costing several minutes.
+      #
+      # eval-example-hosts is deliberately NOT in this list, even though it
+      # once was: once the example host declares any sops.secrets (Phase
+      # 1.4a onward), forcing its .drvPath requires realizing
+      # sops-install-secrets and the host's full app closures, confirmed on
+      # real infrastructure to cost well beyond what a standard
+      # GitHub-hosted runner's disk reliably holds (see the comment on
+      # `eval-example-hosts` in nix/modules/flake/checks.nix for the real
+      # numbers). sopsfile-are-paths below is the cheap, CI-safe regression
+      # guard for the specific bug that check exists to catch in this
+      # phase; eval-example-hosts itself is still defined and runnable by
+      # hand for anyone touching modules/apps/ or modules/core/secrets.nix.
       - name: cheap checks
         run: |
           nix build --print-build-logs \
             .#checks.x86_64-linux.catalog-consistency \
             .#checks.x86_64-linux.schema-uniformity \
-            .#checks.x86_64-linux.eval-example-hosts
+            .#checks.x86_64-linux.sopsfile-are-paths

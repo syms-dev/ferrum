@@ -35,6 +35,29 @@ examples/hosts/      example settings.json + host config used by the guard check
 docs/design/         the approved design spec
 ```
 
+## Secrets
+
+Every secret on a ferrum host is a [sops](https://github.com/getsops/sops)-encrypted file under `ferrum.secretsDir` (default `/etc/ferrum/secrets`), decrypted at boot into a runtime-only path by [sops-nix](https://github.com/Mic92/sops-nix). The box's age decryption identity is derived from its own SSH host key — nothing to provision or lose track of separately.
+
+**Sonarr, Radarr and Prowlarr's API keys are fully automatic.** `ferrum-apply` generates and encrypts a random key for each enabled app on first apply; there is nothing an operator needs to do.
+
+**qBittorrent's VPN kill-switch config is operator-provided**, since it's your own WireGuard peer's config, not something ferrum can generate. To enable it:
+
+1. Get this host's age recipient (its SSH host key's public half, converted):
+   ```bash
+   ssh-to-age -i /etc/ssh/ssh_host_ed25519_key.pub
+   ```
+2. Encrypt your WireGuard config to that recipient, as a raw binary blob (not YAML/JSON — `sops` would otherwise try to parse the `.conf` file's structure):
+   ```bash
+   sops --encrypt --age <recipient from step 1> \
+     --input-type binary --output-type binary \
+     /dev/stdin < your-wg0.conf > /etc/ferrum/secrets/qbittorrent-vpn.sops
+   ```
+3. Add `"qbittorrent-vpn"` to `ferrum.secrets` in `settings.json` — this is what actually enables qBittorrent's VPN-gated network namespace; the file's mere presence on disk is not enough on its own.
+4. Re-apply. qBittorrent's traffic now routes exclusively through the tunnel; see `modules/apps/qbittorrent/service.nix` for the kill-switch mechanism itself.
+
+If this host's SSH host key is ever regenerated, every existing `.sops` file under `ferrum.secretsDir` becomes permanently undecryptable — back up `/etc/ssh/ssh_host_ed25519_key` the same way you'd back up any other credential this box depends on. Auto-generated servarr keys recover on their own (delete the stale `.sops` file and re-apply; a fresh key is generated); a lost `qbittorrent-vpn.sops` must be re-encrypted from your original WireGuard config via the steps above.
+
 ## Development
 
 There is no local nix install in this environment yet, so nothing here has been evaluated locally — `nix flake check` in CI is the first real test of any of it. See the design doc's "Dev loop" section for the intended setup (an aarch64 dev VM plus a real x86_64 test target provisioned via `nixos-anywhere`).

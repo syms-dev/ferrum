@@ -148,6 +148,7 @@ pub struct StorageConfig {
     pub health_check_timeout: Duration,
     pub secrets_dir: PathBuf,
     pub servarr_apps: Vec<String>,
+    pub host_key_pub: PathBuf,
 }
 
 pub fn run(flake_ref: &str, storage: &StorageConfig) -> anyhow::Result<ApplyResult> {
@@ -155,10 +156,12 @@ pub fn run(flake_ref: &str, storage: &StorageConfig) -> anyhow::Result<ApplyResu
     // build -- their environmentFiles reference the decrypted path
     // statically, and sops.validateSopsFiles (on by default) checks the
     // .sops file exists at Nix EVAL time, which happens inside the build
-    // step right after this.
-    let recipient = crate::secrets::host_age_recipient()?;
+    // step right after this. ensure_all only reads storage.host_key_pub
+    // (and shells out to ssh-to-age/sops) when something is actually
+    // missing, so a host with every key already generated -- or with no
+    // servarr apps enabled at all -- never depends on the host key here.
     let servarr_refs: Vec<&str> = storage.servarr_apps.iter().map(String::as_str).collect();
-    crate::secrets::ensure_all(&storage.secrets_dir, &recipient, &servarr_refs)?;
+    crate::secrets::ensure_all(&storage.secrets_dir, &storage.host_key_pub, &servarr_refs)?;
 
     // 1. Build (apps still running -- the slow part).
     //

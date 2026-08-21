@@ -23,6 +23,10 @@ lib.mkIf app.enable {
     # while keeping ferrum.secretsDir configurable.
     sopsFile = /. + "${ferrum.secretsDir}/prowlarr-apikey.sops";
     format = "binary";
+    # See modules/apps/sonarr/service.nix's comment on this exact line --
+    # without restartUnits, rotating this key would leave prowlarr.service
+    # running with the old one until something else restarts it.
+    restartUnits = [ "prowlarr.service" ];
   };
 
   services.prowlarr = {
