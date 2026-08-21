@@ -1,9 +1,8 @@
 # Catalog metadata for qBittorrent. defaultPort (8090) deliberately differs
 # from qBittorrent's own upstream default (8080), which collides with
 # SABnzbd's default port when both are enabled on the same host.
-# vpnWireguardConfig/vpnKillSwitch are added and consumed starting in
-# Task 7 (this task's meta.nix does not yet declare them -- Task 7 adds
-# them to this same file's settingsSchema).
+# vpnKillSwitch is consumed by settingsSchema below; the VPN config itself
+# lives in ferrum.secrets."qbittorrent-vpn", a real sops secret, not here.
 {
   id = "qbittorrent";
   displayName = "qBittorrent";
