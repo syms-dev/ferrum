@@ -171,6 +171,14 @@ pub fn run(flake_ref: &str, storage: &StorageConfig) -> anyhow::Result<ApplyResu
     // pure evaluation, confirmed for real on ferrum-dev: the identical
     // eval fails with "access to absolute path ... is forbidden in pure
     // evaluation mode" without --impure, and succeeds cleanly with it).
+    //
+    // Note this disables the purity sandbox for the WHOLE build, not just
+    // this one path -- any other impure builtin (currentTime, getEnv, an
+    // arbitrary absolute-path read introduced elsewhere in the module
+    // tree) would now silently succeed here instead of failing fast.
+    // checks.eval-example-hosts (the CI-facing check) never runs with
+    // --impure, so it stays a real guard against accidental impurity
+    // everywhere except this one specific, already-audited case.
     let build_output = Command::new("nix")
         .args(["build", "--impure", "--no-link", "--print-out-paths", flake_ref])
         .output()?;
