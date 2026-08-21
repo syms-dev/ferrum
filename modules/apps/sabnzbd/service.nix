@@ -13,6 +13,26 @@ let
   app = ferrum.apps.sabnzbd or { enable = false; };
 in
 lib.mkIf app.enable {
+  assertions = [
+    {
+      assertion = !(builtins.pathExists (/. + "${app.stateDir}/sabnzbd.ini"))
+                  || builtins.pathExists (/. + "${ferrum.secretsDir}/sabnzbd-apikey.sops");
+      message = ''
+        ${app.stateDir}/sabnzbd.ini exists but
+        ${ferrum.secretsDir}/sabnzbd-apikey.sops does not -- this host's
+        SABnzbd was bootstrapped before Recyclarr/reconciler support
+        existed (or its state was rolled back to a snapshot predating this
+        secret), and ferrum-apply cannot retroactively recover the
+        already-generated key from the existing sabnzbd.ini without
+        decrypt access it deliberately never holds. Delete both
+        ${app.stateDir}/sabnzbd.ini and
+        ${ferrum.secretsDir}/sabnzbd-apikey.sops and re-apply to generate
+        a fresh matched pair -- see README.md's Secrets section for the
+        same recovery procedure already documented for servarr keys.
+      '';
+    }
+  ];
+
   sops.secrets."sabnzbd-apikey" = {
     sopsFile = /. + "${ferrum.secretsDir}/sabnzbd-apikey.sops";
     format = "binary";
@@ -28,6 +48,19 @@ lib.mkIf app.enable {
 
   systemd.tmpfiles.rules = [
     "d ${app.stateDir} 0750 sabnzbd sabnzbd - -"
+    # ferrum-apply's own ensure_sabnzbd_apikey (crates/ferrum-apply/src/
+    # secrets.rs) writes this file directly, running as root, BEFORE the
+    # sabnzbd system user necessarily exists (first-ever apply, before
+    # activation has ever run) -- so it can't chown to "sabnzbd" itself.
+    # 'Z' fixes ownership/mode on the existing path without requiring it
+    # to exist when the rule is first evaluated, and NixOS activation
+    # re-processes tmpfiles.d rules on every switch-to-configuration,
+    # matching the exact same pattern modules/proxy/authelia.nix already
+    # uses for users_database.yml. Without this, the file stays root-owned
+    # 0644 forever and SABnzbd's own process (which needs to persist
+    # settings changes back into this same file) can never write it
+    # (found during the final whole-branch review).
+    "Z '${app.stateDir}/sabnzbd.ini' 0640 sabnzbd sabnzbd - -"
   ];
 
   users.users.sabnzbd.extraGroups =

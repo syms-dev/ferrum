@@ -45,12 +45,16 @@ let
   symmetryErrors = lib.flatten (lib.mapAttrsToList
     (id: meta:
       (map
-        (p: if !(lib.elem id (catalog.${p}.integrations.consumes or [ ])) then
+        (p: if !(catalog ? ${p}) then
+          "modules/apps/${id}/meta.nix declares integrations.providesTo \"${p}\", but no catalog app named \"${p}\" exists"
+        else if !(lib.elem id (catalog.${p}.integrations.consumes or [ ])) then
           "modules/apps/${id}/meta.nix declares integrations.providesTo \"${p}\", but ${p}'s own meta.nix integrations.consumes does not list \"${id}\""
         else null)
         (meta.integrations.providesTo or [ ]))
       ++ (map
-        (c: if !(lib.elem id (catalog.${c}.integrations.providesTo or [ ])) then
+        (c: if !(catalog ? ${c}) then
+          "modules/apps/${id}/meta.nix declares integrations.consumes \"${c}\", but no catalog app named \"${c}\" exists"
+        else if !(lib.elem id (catalog.${c}.integrations.providesTo or [ ])) then
           "modules/apps/${id}/meta.nix declares integrations.consumes \"${c}\", but ${c}'s own meta.nix integrations.providesTo does not list \"${id}\""
         else null)
         (meta.integrations.consumes or [ ])))
@@ -85,10 +89,41 @@ in
     description = "Register download clients and indexer applications across the catalog";
     after = [ "ferrum-apps.target" ];
     wantedBy = [ "ferrum-apps.target" ];
+    # PartOf so `systemctl stop ferrum-apps.target` (what ferrum-apply does
+    # before every snapshot) actually stops this unit too, matching every
+    # other app service's own wantedBy/partOf pairing in this catalog --
+    # otherwise it never re-runs after a switch. Confirmed for real: PartOf
+    # alone correctly propagates the stop from the target.
+    partOf = [ "ferrum-apps.target" ];
     unitConfig.ConditionPathExists = "!/var/lib/ferrum/state-restore-failed";
     environment.FERRUM_RECONCILE_CONFIG = "${reconcileConfigFile}";
     serviceConfig = {
       Type = "oneshot";
+      # A successful Type=oneshot with no RemainAfterExit reports
+      # `is-active` -> inactive (exit 3), which crates/ferrum-apply/src/
+      # apply.rs's all_managed_units_active() -- which requires EVERY unit
+      # ferrum-apps.target pulls in via wantedBy to report active --
+      # treats as a failure. Confirmed for real: a genuinely successful
+      # oneshot without this reports inactive; with it, active (found
+      # during the final whole-branch review -- every apply on a host with
+      # any reconciler pair would report Degraded after a 2-minute stall,
+      # even when the reconciler succeeded).
+      RemainAfterExit = true;
+      # Sonarr/Radarr/Prowlarr are Type=simple (systemd default, no
+      # readiness notification) and can take tens of seconds to actually
+      # start listening (see apply.rs's own wait_for_healthy comment) --
+      # `After=ferrum-apps.target` alone does NOT wait for that, since the
+      # target (and its Type=simple members) report `active` as soon as
+      # their process forks, not when ready. Confirmed for real: a
+      # Type=simple unit under a target reports active essentially
+      # immediately after `systemctl start <target>` returns, well before
+      # any real work is done. Restart=on-failure lets a cold-start race
+      # self-heal on the next attempt -- combined with main.rs's own
+      # per-pair error isolation (this fix wave's Rust change) and every
+      # registration already being idempotent by name, a retry after the
+      # apps are actually up just fills in whatever failed the first time.
+      Restart = "on-failure";
+      RestartSec = 10;
       ExecStart = "${pkgs.ferrum-reconcile}/bin/ferrum-reconcile";
       # Runs as root: sops-nix's own default secret ownership is root:root,
       # and this oneshot's whole job is reading a handful of already-
