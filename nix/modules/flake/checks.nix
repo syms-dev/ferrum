@@ -204,6 +204,20 @@
           checkPhase = "cargo clippy --offline -- -D warnings";
           installPhase = "mkdir -p $out";
         };
+
+        cargo-test-ferrum-reconcile = self'.packages.ferrum-reconcile;
+
+        clippy-ferrum-reconcile = pkgs.rustPlatform.buildRustPackage {
+          pname = "ferrum-reconcile-clippy";
+          version = "0.1.0";
+          src = lib.cleanSource ../../../crates;
+          cargoLock.lockFile = ../../../crates/Cargo.lock;
+          buildAndTestSubdir = "ferrum-reconcile";
+          nativeBuildInputs = [ pkgs.clippy ];
+          buildPhase = "true";
+          checkPhase = "cargo clippy --offline -- -D warnings";
+          installPhase = "mkdir -p $out";
+        };
       };
     };
 }
