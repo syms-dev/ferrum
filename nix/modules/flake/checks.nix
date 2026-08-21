@@ -97,8 +97,20 @@
         catalog-consistency = mkAssertionCheck "catalog-consistency" catalogConsistency;
         schema-uniformity = mkAssertionCheck "schema-uniformity" schemaUniformity;
 
-        # Pure eval, not a real build: forces .drvPath for each example host
-        # so an option-type mistake fails in seconds, not after a full build.
+        # Forces .drvPath for each example host so an option-type mistake
+        # fails fast, without a full build -- true for the catalog apps
+        # themselves. NOT true once any sops.secrets exist on a host
+        # (which the example host's placeholder secrets under
+        # examples/hosts/minimal/secrets/ now do, on purpose, to exercise
+        # the real default sops.validateSopsFiles = true): sops-nix's own
+        # system.activationScripts.setupSecrets needs sops-install-secrets
+        # (a real Haskell program) actually realized to build its text,
+        # not just referenced by hash -- confirmed for real on ferrum-dev,
+        # this alone triggers a ~1293-store-path, ~8.7GB build (the whole
+        # example host's real app closures come along transitively).
+        # Budget real disk/time for this check accordingly -- it is no
+        # longer the "seconds, pure eval" check its name implies, and that
+        # is an accepted cost of using sops-nix at all, not a bug here.
         eval-example-hosts = pkgs.runCommand "ferrum-check-eval-example-hosts"
           {
             drvPaths = builtins.toJSON
