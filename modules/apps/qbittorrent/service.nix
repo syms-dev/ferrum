@@ -1,3 +1,9 @@
+# qBittorrent, wired through the uniform ferrum.apps.qbittorrent submodule
+# onto nixpkgs' services.qbittorrent, with an optional VPN-gated network
+# namespace. See docs/superpowers/specs/2026-08-20-phase-1-3-catalog-apps-
+# design.md's "qBittorrent VPN Kill Switch" section for the full design and
+# why network-namespace isolation was chosen over qBittorrent's own
+# interface-binding setting (known historical leak classes).
 { config, lib, pkgs, ... }:
 let
   ferrum = config.ferrum;
@@ -20,6 +26,18 @@ lib.mkIf app.enable {
   sops.secrets."qbittorrent-vpn" = lib.mkIf vpnEnabled {
     sopsFile = /. + "${ferrum.secretsDir}/qbittorrent-vpn.sops";
     format = "binary";
+    # Restores the restart-on-secret-change property the old
+    # app.settings-based mechanism had for free via restartTriggers on a
+    # content hash -- sops-nix's own decrypted-secret path is invariant
+    # under a config change (same reason the old Nix-interpolation
+    # approach was rejected: the whole POINT is that changing the secret's
+    # content doesn't change any Nix-visible value), so without this,
+    # switch-to-configuration would have nothing to detect and an operator
+    # rotating their WireGuard key would keep running the stale tunnel
+    # until a manual restart. restartUnits is sops-nix's own real option
+    # for exactly this (confirmed by reading its source) -- works the same
+    # way as systemd.services.<name>.restartTriggers, scoped per-secret.
+    restartUnits = [ "qbt-vpn-netns-setup.service" ];
   };
 
   # The WireGuard config is a real sops secret now (ferrum.secrets."qbittorrent-vpn"),
