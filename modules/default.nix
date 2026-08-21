@@ -11,6 +11,7 @@
     ./core/state-restore.nix
     ./core/secrets.nix
     ./core/recyclarr.nix
+    ./core/reconciler.nix
     ./proxy/acme.nix
     ./proxy/nginx.nix
     ./proxy/selfsigned-cert.nix
