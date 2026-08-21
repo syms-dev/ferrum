@@ -19,14 +19,26 @@
           modules = [
             ../../../examples/hosts/minimal/configuration.nix
             # This host is eval-only (see configuration.nix's own "NOT
-            # BOOTABLE" comment) and never has real secrets on disk.
-            # sops.validateSopsFiles defaults to true and requires every
-            # referenced .sops file to physically exist at eval time
-            # (confirmed by reading sops-nix's own source: it computes
-            # builtins.hashFile on each one) -- a real deployed box has
-            # these because ferrum-apply generates them before every
-            # build, but nothing does that for this check.
-            { sops.validateSopsFiles = false; }
+            # BOOTABLE" comment) and has no real deployed box's
+            # /etc/ferrum/secrets to read from. sops.validateSopsFiles
+            # defaults to true and requires each sops.secrets.<name>.sopsFile
+            # to be a genuine Nix path value pointing at a file that
+            # physically exists at eval time (confirmed by reading
+            # sops-nix's own source) -- disabling that check alone (an
+            # earlier version of this override did just that) is NOT
+            # sufficient, since Nix's own path-value semantics
+            # independently require the referenced file to exist the
+            # moment the value is touched, regardless of validateSopsFiles.
+            # The real fix: point ferrum.secretsDir at real (throwaway,
+            # non-production) placeholder secrets committed alongside this
+            # example host, via a path LITERAL relative to this file's own
+            # location -- that makes it part of ferrum's own flake source,
+            # auto-imported into the store at parse time, genuinely
+            # readable under pure evaluation (confirmed for real on
+            # ferrum-dev: this exact override, with placeholders present,
+            # makes checks.eval-example-hosts pass with the real default
+            # validateSopsFiles = true, no override needed at all).
+            { ferrum.secretsDir = toString ../../../examples/hosts/minimal/secrets; }
           ];
           revision = "ci";
         };
