@@ -666,13 +666,13 @@ let
   mkVhost = id: app:
 ```
 
-And extend `modules/proxy/acme.nix`'s `security.acme.certs` set (from Task 1's Step 2) with Authelia's own entry, so a real certificate actually gets issued for it whenever it's needed — this is a real, required addition to that file, not just nginx-side wiring:
+And extend `modules/proxy/acme.nix`'s `security.acme.certs` set with Authelia's own entry, so a real certificate actually gets issued for it whenever it's needed. **Note this supersedes the ORIGINAL `security.acme.certs` assignment Task 1 shipped — Task 1's own fix rounds (see the ledger) changed `environmentFile` from a broken raw-ciphertext reference to `config.sops.secrets."${ferrum.proxy.acme.credentialSecret}".path`, and also added a `sops.secrets."${ferrum.proxy.acme.credentialSecret}"` block gated on `publicApps != { }` earlier in the same file. This replacement below uses that already-fixed, already-decrypting reference — do NOT reintroduce the raw `/. + "${ferrum.secretsDir}/...sops"` form, and do NOT add a second `sops.secrets` declaration; the existing one (gated on `publicApps != { }`) already covers this, since `ferrum.auth.enable && publicApps != { }` (this entry's own condition) can only be true when `publicApps != { }` is also true.** Replace the ENTIRE existing `security.acme.certs = ...` assignment in `acme.nix` with:
 
 ```nix
   security.acme.certs = lib.mapAttrs'
     (id: app: lib.nameValuePair (vhostNameFor app) {
       dnsProvider = ferrum.proxy.acme.dnsProvider;
-      environmentFile = /. + "${ferrum.secretsDir}/${ferrum.proxy.acme.credentialSecret}.sops";
+      environmentFile = config.sops.secrets."${ferrum.proxy.acme.credentialSecret}".path;
       server = lib.mkIf ferrum.proxy.acme.staging
         "https://acme-staging-v02.api.letsencrypt.org/directory";
     })
@@ -680,7 +680,7 @@ And extend `modules/proxy/acme.nix`'s `security.acme.certs` set (from Task 1's S
   // lib.optionalAttrs (ferrum.auth.enable && publicApps != { }) {
     "auth.${ferrum.proxy.baseDomain}" = {
       dnsProvider = ferrum.proxy.acme.dnsProvider;
-      environmentFile = /. + "${ferrum.secretsDir}/${ferrum.proxy.acme.credentialSecret}.sops";
+      environmentFile = config.sops.secrets."${ferrum.proxy.acme.credentialSecret}".path;
       server = lib.mkIf ferrum.proxy.acme.staging
         "https://acme-staging-v02.api.letsencrypt.org/directory";
     };
