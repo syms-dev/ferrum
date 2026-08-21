@@ -120,7 +120,10 @@ in
             --set-default FERRUM_SECRETS_DIR ${lib.escapeShellArg ferrum.secretsDir} \
             --set-default FERRUM_SERVARR_APPS ${lib.escapeShellArg (lib.concatStringsSep "," enabledServarrApps)} \
             ${lib.optionalString (hostKeyPubPath != "")
-              "--set-default FERRUM_HOST_KEY_PUB ${lib.escapeShellArg hostKeyPubPath}"}
+              "--set-default FERRUM_HOST_KEY_PUB ${lib.escapeShellArg hostKeyPubPath}"} \
+            --set-default FERRUM_AUTH_ENABLED ${if ferrum.auth.enable then "1" else "0"} \
+            --set-default FERRUM_AUTHELIA_STATE_DIR "/var/lib/authelia-main" \
+            --set-default FERRUM_ADMIN_EMAIL ${lib.escapeShellArg ferrum.auth.adminEmail}
         '' // {
         meta = (prev.ferrum-apply.meta or { }) // { mainProgram = "ferrum-apply"; };
       };

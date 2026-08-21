@@ -117,6 +117,14 @@ fn main() -> anyhow::Result<()> {
                 host_key_pub: std::env::var("FERRUM_HOST_KEY_PUB")
                     .unwrap_or_else(|_| secrets::DEFAULT_HOST_KEY_PUB.to_string())
                     .into(),
+                auth_enabled: std::env::var("FERRUM_AUTH_ENABLED")
+                    .map(|v| v == "1")
+                    .unwrap_or(false),
+                authelia_state_dir: std::env::var("FERRUM_AUTHELIA_STATE_DIR")
+                    .unwrap_or_else(|_| "/var/lib/authelia-main".to_string())
+                    .into(),
+                admin_email: std::env::var("FERRUM_ADMIN_EMAIL")
+                    .unwrap_or_default(),
             };
             let flake_ref = std::env::var("FERRUM_FLAKE_REF")
                 .unwrap_or_else(|_| "/etc/ferrum#nixosConfigurations.default.config.system.build.toplevel".to_string());
