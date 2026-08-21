@@ -12,6 +12,7 @@
     ./core/secrets.nix
     ./proxy/acme.nix
     ./proxy/nginx.nix
+    ./proxy/selfsigned-cert.nix
     ./proxy/authelia.nix
     ./apps/sonarr/service.nix
     ./apps/radarr/service.nix

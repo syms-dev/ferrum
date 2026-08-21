@@ -16,4 +16,10 @@
   publicApps = ferrum: lib.filterAttrs
     (_: app: app.enable && app.exposure == "public")
     ferrum.apps;
+
+  # Where modules/proxy/selfsigned-cert.nix persists the self-signed
+  # certificate "lan"-exposure vhosts (and the auth vhost, when no app is
+  # public) use -- shared with nginx.nix so both files agree on the path
+  # without duplicating the string literal.
+  selfSignedCertDir = "/var/lib/ferrum-proxy/selfsigned";
 }
