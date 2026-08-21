@@ -70,12 +70,26 @@ let
   # drift, closes it. sops.age.sshKeyPaths holds PRIVATE key paths; the
   # public key sits alongside it at the same path plus ".pub" (standard
   # OpenSSH convention, and the only relationship ssh-to-age itself relies
-  # on). Guarded with `or null`/mkIf so a host with sops.age.sshKeyPaths
-  # somehow empty just falls back to the Rust side's own hardcoded default
-  # instead of failing this eval.
+  # on). Guarded with `or [ ]`/lib.optionalString so a host with
+  # sops.age.sshKeyPaths somehow empty just falls back to the Rust side's
+  # own hardcoded default instead of failing this eval.
+  #
+  # builtins.toString (not plain string interpolation) on the list element:
+  # sops.age.sshKeyPaths is typed `types.listOf types.path`, and
+  # interpolating a genuine Nix PATH value (as opposed to a string that
+  # merely looks like one) copies it into the Nix store and yields that
+  # store path instead of the literal text -- which here would mean
+  # copying the PRIVATE host key into the world-readable store and
+  # producing a nonsensical ".pub" path. Today's real default (via
+  # config.services.openssh.hostKeys) happens to pass a plain string
+  # through unchanged, so this has no observable effect yet, but
+  # builtins.toString makes the expression correct regardless of which
+  # representation a future value takes -- the same class of Nix
+  # path-vs-string footgun this branch already spent multiple rounds
+  # chasing for `sopsFile` (see modules/apps/sonarr/service.nix's comment).
   hostKeyPubPath =
     let paths = config.sops.age.sshKeyPaths or [ ];
-    in lib.optionalString (paths != [ ]) "${lib.head paths}.pub";
+    in lib.optionalString (paths != [ ]) "${builtins.toString (lib.head paths)}.pub";
 in
 {
   nixpkgs.config.allowUnfreePredicate = pkg:

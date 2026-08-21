@@ -41,7 +41,9 @@ Every secret on a ferrum host is a [sops](https://github.com/getsops/sops)-encry
 
 **Sonarr, Radarr and Prowlarr's API keys are fully automatic.** `ferrum-apply` generates and encrypts a random key for each enabled app on first apply; there is nothing an operator needs to do.
 
-**qBittorrent's VPN kill-switch config is operator-provided**, since it's your own WireGuard peer's config, not something ferrum can generate. To enable it:
+### qBittorrent VPN kill switch
+
+qBittorrent's VPN kill-switch config is operator-provided, since it's your own WireGuard peer's config, not something ferrum can generate. To enable it:
 
 1. Get this host's age recipient (its SSH host key's public half, converted):
    ```bash
