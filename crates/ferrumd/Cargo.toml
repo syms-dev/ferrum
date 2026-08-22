@@ -1,0 +1,24 @@
+[package]
+name = "ferrumd"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "ferrumd"
+path = "src/main.rs"
+
+[dependencies]
+axum = "0.7"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+rusqlite = { version = "0.31", features = ["bundled"] }
+argon2 = "0.5"
+password-hash = "0.5"
+rand_core = { version = "0.6", features = ["getrandom", "std"] }
+tower-cookies = "0.10"
+ferrum-secrets = { path = "../ferrum-secrets" }
+
+[dev-dependencies]
+tempfile = "3"
