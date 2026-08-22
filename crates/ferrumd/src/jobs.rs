@@ -48,6 +48,64 @@ fn requests_dir() -> std::path::PathBuf {
         .into()
 }
 
+/// Recovers a job's UUID from the systemd unit name carried by a real
+/// `JobRemoved` signal, or `None` if this is not one of our units.
+///
+/// The UUID is re-parsed rather than trusted as a string: the return value
+/// becomes a FILENAME under `requests_dir()` in `remove_request_file`
+/// below, so anything that is not literally a UUID (a `..` component, a
+/// slash, an empty instance name) must not get that far. systemd is a
+/// trustworthy source here, but "the value I am about to use as a path
+/// component is a UUID" is cheap to actually check and expensive to be
+/// wrong about. A UUID also contains no character systemd's own instance
+/// escaping would have mangled, so no unescaping step is needed.
+pub fn job_uuid_from_unit(unit: &str) -> Option<String> {
+    let instance = unit
+        .strip_prefix("ferrum-apply@")?
+        .strip_suffix(".service")?;
+    Uuid::parse_str(instance).ok()?;
+    Some(instance.to_string())
+}
+
+/// Deletes a finished job's request file. Best-effort by design: a failure
+/// here is logged and otherwise ignored, because the file is spent input to
+/// a run that has already ended and there is nothing useful the daemon
+/// could do about it -- crashing (or refusing later jobs) over a stale
+/// tmpfs file would be a worse outcome than the stale file itself.
+///
+/// Why bother at all: the request file is the thing a
+/// `ferrum-apply@<uuid>.service` start actually consumes, so a request file
+/// that outlives its job is a replayable privileged trigger sitting on
+/// disk. The PRIMARY defence against that replay is the polkit
+/// `subject.user == "ferrum"` check in modules/core/daemon.nix -- nothing
+/// but ferrumd's own account can issue the start in the first place. This
+/// is defence in depth underneath it: it shrinks the window in which a
+/// replay would find anything to replay, rather than closing the hole on
+/// its own.
+pub fn remove_request_file(uuid: &str) {
+    remove_request_file_in(&requests_dir(), uuid)
+}
+
+/// The body of `remove_request_file`, with the directory passed in so the
+/// tests below exercise the real deletion against a real temp directory
+/// without mutating process-wide environment state that the other tests in
+/// this module read concurrently.
+fn remove_request_file_in(dir: &std::path::Path, uuid: &str) {
+    let path = dir.join(format!("{uuid}.json"));
+    match std::fs::remove_file(&path) {
+        Ok(()) => {}
+        // Already gone is the expected outcome on a re-delivered signal, not
+        // a problem worth a log line.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => eprintln!(
+            "ferrumd: could not remove the spent request file {}: {e} -- \
+             harmless to this job, but it will linger until the next reboot \
+             clears /run",
+            path.display()
+        ),
+    }
+}
+
 /// The exact JSON `ferrum-apply run-request` parses back out of the request
 /// file. Kept as an explicit match rather than a `Serialize` derive so the
 /// wire format ferrumd writes across the privilege boundary is spelled out
@@ -229,6 +287,49 @@ mod tests {
         ));
         assert!(!is_terminal_line("not json at all"));
         assert!(!is_terminal_line(""));
+    }
+
+    #[test]
+    fn a_real_job_removed_unit_name_yields_its_uuid() {
+        assert_eq!(
+            job_uuid_from_unit("ferrum-apply@6e2f7795-58c7-4654-82b6-f655b065ea47.service")
+                .as_deref(),
+            Some("6e2f7795-58c7-4654-82b6-f655b065ea47")
+        );
+    }
+
+    #[test]
+    fn unrelated_units_and_non_uuid_instances_are_not_treated_as_jobs() {
+        // Every JobRemoved on the box arrives at this listener, not just
+        // ours -- an unrelated unit must never name a file to delete.
+        assert_eq!(job_uuid_from_unit("sshd.service"), None);
+        assert_eq!(job_uuid_from_unit("ferrum-apply.service"), None);
+        // The path-traversal shapes specifically: these must be rejected by
+        // the UUID parse, not joined onto requests_dir().
+        assert_eq!(job_uuid_from_unit("ferrum-apply@...service"), None);
+        assert_eq!(
+            job_uuid_from_unit("ferrum-apply@../../etc/passwd.service"),
+            None
+        );
+        assert_eq!(job_uuid_from_unit("ferrum-apply@.service"), None);
+        // Right prefix, right instance, wrong suffix.
+        assert_eq!(
+            job_uuid_from_unit("ferrum-apply@6e2f7795-58c7-4654-82b6-f655b065ea47.timer"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_spent_request_file_is_really_deleted_and_a_missing_one_is_not_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let uuid = "6e2f7795-58c7-4654-82b6-f655b065ea47";
+        let path = dir.path().join(format!("{uuid}.json"));
+        std::fs::write(&path, r#"{"kind":"preflight"}"#).unwrap();
+        assert!(path.exists());
+        remove_request_file_in(dir.path(), uuid);
+        assert!(!path.exists(), "the spent request file must really be gone");
+        // Idempotent: a re-delivered JobRemoved must not panic or fail.
+        remove_request_file_in(dir.path(), uuid);
     }
 
     #[test]

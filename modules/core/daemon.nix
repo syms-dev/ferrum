@@ -26,10 +26,26 @@ lib.mkIf ferrum.daemon.enable {
   # hyphens) -- ferrumd (Task 6) generates the UUID per job request; it is
   # NEVER parsed as data by this rule or by ferrum-apply itself, only
   # compared against this fixed pattern.
+  #
+  # `subject.user == "ferrum"` IS LOAD-BEARING AND MUST NOT BE REMOVED.
+  # Without it (the shape this rule shipped in until the branch-wide final
+  # review caught it) the rule returns YES for EVERY local subject, which
+  # means any unprivileged local account -- not just the daemon's own --
+  # could start a real, root ferrum-apply run against any request file it
+  # could name. That directly contradicts this phase's whole security
+  # thesis ("compromising ferrumd only ever yields the power expressed by
+  # the settings schema"), because it hands the same privileged trigger to
+  # processes that never compromised ferrumd at all. `subject.user` is
+  # polkit's own documented JS property (polkit(8), "Subject" object): the
+  # UNIX user name of the process making the call, resolved by polkit from
+  # the D-Bus caller's credentials, so it cannot be spoofed by the caller.
+  # tests/privilege-boundary.nix proves BOTH halves for real: the `ferrum`
+  # user is allowed, an ordinary `testferrum` user is denied.
   security.polkit.enable = true;
   security.polkit.extraConfig = ''
     polkit.addRule(function(action, subject) {
       if (action.id == "org.freedesktop.systemd1.manage-units" &&
+          subject.user == "ferrum" &&
           action.lookup("unit") &&
           /^ferrum-apply@[0-9a-f-]{36}\.service$/.test(action.lookup("unit")) &&
           action.lookup("verb") == "start") {
@@ -107,7 +123,17 @@ lib.mkIf ferrum.daemon.enable {
     # and confirming ferrumd genuinely refuses to start.
     unitConfig.AssertPathExists = [ "/etc/ferrum/settings.json" "/etc/ferrum/secrets" ];
     environment = {
-      FERRUMD_STATE_DIR = "/var/lib/ferrum";
+      # NOT /var/lib/ferrum itself. That parent directory also holds
+      # root-trusted control files from earlier phases --
+      # `state-restore-failed` (the fail-closed marker every app unit and
+      # modules/core/generations.nix gate on via ConditionPathExists) and
+      # `rollback-intent.json` (read as root at boot by
+      # modules/core/state-restore.nix) -- and directory-level write access
+      # is delete/create/rename access to all of them regardless of the
+      # individual files' own modes. Pointing ferrumd's state dir at a
+      # dedicated subdirectory is what lets the parent stay root-owned; see
+      # modules/core/storage.nix for the other half.
+      FERRUMD_STATE_DIR = "/var/lib/ferrum/daemon";
       FERRUMD_LISTEN_ADDRESS = ferrum.daemon.listenAddress;
       FERRUMD_PORT = toString ferrum.daemon.port;
       FERRUM_SETTINGS_PATH = "/etc/ferrum/settings.json";
@@ -123,19 +149,73 @@ lib.mkIf ferrum.daemon.enable {
       Group = "ferrum";
       ExecStart = "${pkgs.ferrumd}/bin/ferrumd";
       ProtectSystem = "strict";
-      ReadWritePaths = [ "/var/lib/ferrum" "/etc/ferrum/settings.json" "/etc/ferrum/secrets" "/run/ferrum" ];
+      # Exactly the four paths ferrumd genuinely writes, and no parent of
+      # any of them. /var/lib/ferrum itself is deliberately absent: see the
+      # FERRUMD_STATE_DIR comment above and modules/core/storage.nix -- the
+      # parent holds root-trusted control files (state-restore-failed,
+      # rollback-intent.json, journal/) that a compromised ferrumd must not
+      # be able to create, delete or replace.
+      ReadWritePaths = [
+        "/var/lib/ferrum/daemon"
+        "/var/lib/ferrum/jobs"
+        "/etc/ferrum/settings.json"
+        "/etc/ferrum/secrets"
+        "/run/ferrum"
+      ];
       CapabilityBoundingSet = "";
       NoNewPrivileges = true;
+      # Containment hardening. None of this is what STOPS ferrumd doing
+      # something privileged -- the polkit rule above and the closed
+      # request enum in crates/ferrumd/src/jobs.rs are -- it is what limits
+      # the blast radius if either is ever bypassed. Each directive below
+      # was chosen against what ferrumd genuinely needs at runtime, and all
+      # of it is exercised for real by tests/daemon-end-to-end.nix (SQLite
+      # under /var/lib/ferrum/daemon, D-Bus over AF_UNIX, the HTTP listener
+      # over AF_INET, and the sops/ssh-to-age subprocesses the secrets API
+      # forks).
+      PrivateTmp = true;
+      ProtectHome = true;
+      # AF_UNIX for the system D-Bus socket (src/dbus.rs), AF_INET/AF_INET6
+      # for ferrumd's own TCP listener. Deliberately no AF_NETLINK and no
+      # AF_PACKET: ferrumd has no business enumerating interfaces or
+      # opening raw sockets.
+      RestrictAddressFamilies = [ "AF_UNIX" "AF_INET" "AF_INET6" ];
+      # systemd's own curated allow-list for ordinary long-running system
+      # services. `~@privileged` and `~@resources` on top is the standard
+      # belt-and-braces spelling: @system-service already excludes most of
+      # both, and subtracting them explicitly means a future systemd
+      # widening the preset doesn't silently widen this unit.
+      SystemCallFilter = [ "@system-service" "~@privileged" "~@resources" ];
+      SystemCallErrorNumber = "EPERM";
+      # A daemon that never needs a second personality; blocks a whole
+      # class of exploit that flips to a 32-bit ABI to dodge the filter
+      # above.
+      SystemCallArchitectures = "native";
+      LockPersonality = true;
+      RestrictSUIDSGID = true;
+      RestrictRealtime = true;
+      ProtectKernelTunables = true;
+      ProtectKernelModules = true;
+      ProtectControlGroups = true;
+      ProtectClock = true;
       Restart = "on-failure";
     };
   };
 
   systemd.tmpfiles.rules = [
     "d /run/ferrum/requests 0750 ferrum ferrum - -"
+    # ferrumd's OWN state: its SQLite database (ferrumd.db) and the
+    # first-boot bootstrap password file. A dedicated subdirectory, not
+    # /var/lib/ferrum itself -- the parent stays root-owned so a
+    # compromised ferrumd cannot delete the state-restore-failed marker or
+    # forge rollback-intent.json. modules/core/storage.nix creates that
+    # parent as `root:ferrum 0750`, which gives this user traverse access
+    # to reach here and nothing more (no write bit on the parent means no
+    # create, delete or rename of the root-trusted files beside it).
+    "d /var/lib/ferrum/daemon 0750 ferrum ferrum - -"
     # Written by ferrum-apply (as root, via the template unit above) and
     # read by ferrumd (as the ferrum user) to serve the SSE progress
-    # stream. /var/lib/ferrum itself is created by modules/core/storage.nix,
-    # which owns it by the ferrum user for exactly this reason.
+    # stream.
     "d /var/lib/ferrum/jobs 0750 ferrum ferrum - -"
   ];
 
