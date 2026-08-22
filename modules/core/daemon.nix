@@ -1,10 +1,12 @@
-# The ferrum system user and the privilege boundary that lets it trigger
-# real ferrum-apply runs without ever becoming root itself. ferrumd's own
-# systemd unit is NOT defined here -- that needs the ferrumd binary to
-# exist first (Phase 1.5a Task 6). This file is deliberately testable and
-# usable standalone: an operator (or a test) can already trigger a real
-# apply via a real D-Bus call before ferrumd itself exists, which is
-# exactly what tests/privilege-boundary.nix does.
+# The ferrum system user, the privilege boundary that lets it trigger real
+# ferrum-apply runs without ever becoming root itself, and (since Phase
+# 1.5a Task 6) ferrumd's own systemd unit.
+#
+# The two halves stay independently exercisable on purpose: an operator (or
+# a test) can trigger a real apply via a real D-Bus call with no ferrumd
+# involved at all, which is exactly what tests/privilege-boundary.nix does,
+# while tests/daemon-end-to-end.nix drives the whole stack through the real
+# HTTP API.
 { config, lib, pkgs, ... }:
 let
   ferrum = config.ferrum;
@@ -38,6 +40,18 @@ lib.mkIf ferrum.daemon.enable {
 
   systemd.services."ferrum-apply@" = {
     description = "ferrum-apply, dispatched from a ferrumd-written request file";
+    # %i again -- systemd's own instance-name substitution, so FERRUM_JOB_ID
+    # is always exactly the UUID ferrumd's D-Bus StartUnit call used, with no
+    # second channel to keep in sync. crates/ferrum-apply/src/progress.rs
+    # writes $FERRUM_JOBS_DIR/$FERRUM_JOB_ID.jsonl only when FERRUM_JOB_ID is
+    # set, which is precisely "this run was dispatched by ferrumd" -- a bare
+    # `ferrum-apply apply` over SSH still writes no progress file at all.
+    # Without this block, ferrumd's SSE handler would tail a file that never
+    # appears.
+    environment = {
+      FERRUM_JOB_ID = "%i";
+      FERRUM_JOBS_DIR = "/var/lib/ferrum/jobs";
+    };
     serviceConfig = {
       Type = "oneshot";
       # %i is systemd's own instance-name substitution -- the UUID from
@@ -51,8 +65,68 @@ lib.mkIf ferrum.daemon.enable {
     };
   };
 
+  # The unprivileged web daemon itself. Everything privileged it can reach
+  # is the polkit rule above plus the ferrum-apply@ template unit -- this
+  # process has no capabilities at all (CapabilityBoundingSet = "") and
+  # cannot gain any (NoNewPrivileges = true).
+  systemd.services.ferrumd = {
+    description = "ferrumd -- the unprivileged ferrum web daemon";
+    after = [ "network.target" ];
+    wantedBy = [ "multi-user.target" ];
+    # sops and ssh-to-age are runtime dependencies of the SECRETS API, not
+    # of the daemon's core: crates/ferrumd/src/secrets_api.rs shells out to
+    # both (via ferrum-secrets) to derive this host's own age recipient and
+    # encrypt an operator-provided value. nix/pkgs/ferrumd wraps them onto
+    # PATH already; naming them here too means the unit still works if
+    # someone points ExecStart at an unwrapped build.
+    path = [ pkgs.sops pkgs.ssh-to-age ];
+    environment = {
+      FERRUMD_STATE_DIR = "/var/lib/ferrum";
+      FERRUMD_LISTEN_ADDRESS = ferrum.daemon.listenAddress;
+      FERRUMD_PORT = toString ferrum.daemon.port;
+      FERRUM_SETTINGS_PATH = "/etc/ferrum/settings.json";
+      FERRUM_SECRETS_DIR = ferrum.secretsDir;
+      FERRUM_HOST_KEY_PUB = "/etc/ssh/ssh_host_ed25519_key.pub";
+      FERRUM_JOBS_DIR = "/var/lib/ferrum/jobs";
+      FERRUM_REQUESTS_DIR = "/run/ferrum/requests";
+      FERRUM_SETTINGS_SCHEMA = "${pkgs.ferrum-settings-schema}/share/ferrum/settings-schema.json";
+    };
+    serviceConfig = {
+      Type = "simple";
+      User = "ferrum";
+      Group = "ferrum";
+      ExecStart = "${pkgs.ferrumd}/bin/ferrumd";
+      ProtectSystem = "strict";
+      ReadWritePaths = [ "/var/lib/ferrum" "/etc/ferrum/settings.json" "/etc/ferrum/secrets" "/run/ferrum" ];
+      CapabilityBoundingSet = "";
+      NoNewPrivileges = true;
+      Restart = "on-failure";
+      # Real runtime check (systemd's own AssertPathExists=, confirmed via
+      # `man systemd.unit` on ferrum-dev) that these two pre-provisioned
+      # paths exist on THIS machine before ferrumd starts -- replaces an
+      # earlier, wrong Nix-eval-time `assertions = [...]` block in this
+      # file that this plan's own pre-flight review caught and removed (see
+      # the note at the bottom): a plain NixOS assertion using
+      # builtins.pathExists checks the machine doing the Nix evaluation,
+      # not the machine the unit actually starts on, which would have made
+      # every VM test that enables ferrum.daemon fail to even evaluate on a
+      # fresh CI runner. AssertPathExists= is checked at real activation
+      # time on the real target machine instead -- it fails the unit loudly
+      # (logged, visible via `systemctl status`) if nixos-anywhere's
+      # initial setup never provisioned these paths, matching the original
+      # intended safety property without depending on where evaluation
+      # happens to run.
+      AssertPathExists = [ "/etc/ferrum/settings.json" "/etc/ferrum/secrets" ];
+    };
+  };
+
   systemd.tmpfiles.rules = [
     "d /run/ferrum/requests 0750 ferrum ferrum - -"
+    # Written by ferrum-apply (as root, via the template unit above) and
+    # read by ferrumd (as the ferrum user) to serve the SSE progress
+    # stream. /var/lib/ferrum itself is created by modules/core/storage.nix,
+    # which owns it by the ferrum user for exactly this reason.
+    "d /var/lib/ferrum/jobs 0750 ferrum ferrum - -"
   ];
 
   # /etc/ferrum's own carved-out permission model (settings.json and

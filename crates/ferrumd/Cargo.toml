@@ -20,6 +20,15 @@ rand_core = { version = "0.6", features = ["getrandom", "std"] }
 tower-cookies = "0.10"
 ferrum-secrets = { path = "../ferrum-secrets" }
 jsonschema = "0.18"
+# The privilege boundary's client half (src/dbus.rs). default-features =
+# false + the tokio feature keeps zbus off its own async-io/async-executor
+# stack, so it shares ferrumd's existing tokio runtime instead of spinning
+# up a second one.
+zbus = { version = "4", default-features = false, features = ["tokio"] }
+uuid = { version = "1", features = ["v4"] }
+async-stream = "0.3"
+# Only for StreamExt on zbus's JobRemoved signal stream in main.rs.
+futures = "0.3"
 
 [dev-dependencies]
 tempfile = "3"

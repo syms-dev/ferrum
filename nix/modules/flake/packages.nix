@@ -22,6 +22,7 @@
         ferrum-testapp = pkgs.callPackage ../../../nix/pkgs/testapp { };
         ferrum-apply = pkgs.callPackage ../../../nix/pkgs/ferrum-apply { };
         ferrum-reconcile = pkgs.callPackage ../../../nix/pkgs/ferrum-reconcile { };
+        ferrumd = pkgs.callPackage ../../../nix/pkgs/ferrumd { };
         ferrum-settings-schema = pkgs.writeTextFile {
           name = "ferrum-settings-schema.json";
           destination = "/share/ferrum/settings-schema.json";
