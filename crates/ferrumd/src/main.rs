@@ -1,5 +1,6 @@
 mod auth;
 mod db;
+mod settings;
 
 use axum::{
     extract::State,
@@ -54,6 +55,19 @@ async fn logout_handler(State(state): State<Arc<AppState>>, cookies: Cookies) ->
     StatusCode::OK
 }
 
+async fn require_session(
+    State(state): State<Arc<AppState>>,
+    cookies: tower_cookies::Cookies,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Result<axum::response::Response, StatusCode> {
+    let token = cookies.get("ferrumd_session").ok_or(StatusCode::UNAUTHORIZED)?;
+    match auth::validate_session(&state.db, token.value()) {
+        Ok(Some(_csrf)) => Ok(next.run(request).await),
+        _ => Err(StatusCode::UNAUTHORIZED),
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let state_dir = std::env::var("FERRUMD_STATE_DIR").unwrap_or_else(|_| "/var/lib/ferrum".to_string());
@@ -62,9 +76,15 @@ async fn main() -> anyhow::Result<()> {
     auth::ensure_first_user(&db, state_dir)?;
 
     let state = Arc::new(AppState { db });
+
+    let protected = Router::new()
+        .route("/api/settings", axum::routing::get(settings::get_settings).put(settings::put_settings))
+        .route_layer(axum::middleware::from_fn_with_state(state.clone(), require_session));
+
     let app = Router::new()
         .route("/api/login", post(login_handler))
         .route("/api/logout", post(logout_handler))
+        .merge(protected)
         .layer(CookieManagerLayer::new())
         .with_state(state);
 

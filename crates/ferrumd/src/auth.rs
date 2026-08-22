@@ -130,13 +130,8 @@ pub fn login(db: &Db, username: &str, password: &str) -> anyhow::Result<Option<L
 /// validate the CSRF header on mutating requests against the SAME lookup,
 /// rather than two separate queries that could disagree.
 ///
-/// Not yet called from `main.rs`: this crate has no protected routes of
-/// its own until Tasks 4/5/6 add them and build a `require_session`
-/// middleware on top of it. `ferrumd` is a bin-only crate (no lib target),
-/// so clippy's dead-code lint can't see that future consumption -- allowed
-/// here rather than removed, since removing it would just mean re-adding
-/// the same function later.
-#[allow(dead_code)]
+/// Called from `main.rs`'s `require_session` middleware (Task 4), which
+/// gates `/api/settings` behind a valid session cookie.
 pub fn validate_session(db: &Db, token: &str) -> anyhow::Result<Option<String>> {
     db.conn()
         .query_row(

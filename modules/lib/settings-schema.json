@@ -1,0 +1,98 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "schemaVersion": { "type": "integer" },
+    "storage": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "stateDir": { "type": "string" },
+        "snapshotDir": { "type": "string" },
+        "journalDir": { "type": "string" },
+        "mediaDir": { "type": "string" },
+        "mediaGroup": { "type": "string" },
+        "minFreeGiB": { "type": "integer" },
+        "keepGenerations": { "type": "integer" }
+      }
+    },
+    "secretsDir": { "type": "string" },
+    "proxy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enable": { "type": "boolean" },
+        "baseDomain": { "type": "string" },
+        "acme": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "email": { "type": "string" },
+            "dnsProvider": { "type": "string", "enum": ["cloudflare"] },
+            "credentialSecret": { "type": "string" },
+            "staging": { "type": "boolean" }
+          }
+        },
+        "trustedNetworks": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "auth": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enable": { "type": "boolean" },
+        "adminEmail": { "type": "string" }
+      }
+    },
+    "recyclarr": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enable": { "type": "boolean" }
+      }
+    },
+    "secrets": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "description": { "type": "string" }
+        }
+      }
+    },
+    "backup": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enable": { "type": "boolean" },
+        "repo": { "type": "string" },
+        "schedule": { "type": "string" },
+        "passwordSecret": { "type": "string" }
+      }
+    },
+    "apply": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "autoRollbackOnFailure": { "type": "boolean" },
+        "healthCheckTimeoutSec": { "type": "integer" }
+      }
+    },
+    "daemon": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enable": { "type": "boolean" },
+        "port": { "type": "integer" },
+        "listenAddress": { "type": "string" },
+        "subdomain": { "type": "string" }
+      }
+    },
+    "apps": {
+      "type": "object",
+      "description": "Per-app settings, keyed by catalog app name. Deep per-app validation is deferred -- Phase 1.5a's own scope is the daemon backend; a future task tightens this against the real catalog-driven submodule shape."
+    }
+  }
+}
