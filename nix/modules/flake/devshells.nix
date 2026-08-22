@@ -13,6 +13,9 @@
         rustc
         clippy
         rustfmt
+        rage
+        ssh-to-age
+        sops
       ];
     };
   };
