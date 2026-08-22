@@ -319,6 +319,72 @@ pkgs.testers.runNixOSTest {
     machine.fail("test -e /etc/ferrum/secrets/not-declared.sops")
     print("PASS: the secrets API really is settings-gated, not an open file-write primitive")
 
+    print("=== real password rotation over the real API ===")
+    # The whole point of the endpoint: an operator turns the generated
+    # bootstrap password (which is sitting in a file on disk, and which
+    # every one of these tests just read) into one of their own. Every
+    # assertion below is made through the REAL login endpoint, not by
+    # inspecting the database.
+    def login_code(pw):
+        return machine.succeed(
+            f"curl -s -o /dev/null -w '%{{http_code}}' -c /dev/null "
+            f"-X POST http://127.0.0.1:7788/api/login "
+            f"-H 'Content-Type: application/json' "
+            f"-d '{{\"username\":\"admin\",\"password\":\"{pw}\"}}'"
+        ).strip()
+
+    def change_password(current, new, extra_headers=csrf_header):
+        return machine.succeed(
+            f"curl -s -o /dev/null -w '%{{http_code}}' -b /tmp/cookies.txt {extra_headers} "
+            f"-X POST http://127.0.0.1:7788/api/password "
+            f"-H 'Content-Type: application/json' "
+            f"-d '{{\"current_password\":\"{current}\",\"new_password\":\"{new}\"}}'"
+        ).strip()
+
+    new_password = "a-real-rotated-password"
+
+    # Same session cookie, no CSRF header: a password change is exactly the
+    # kind of mutating request the gate exists for.
+    no_csrf_rotate = change_password(password, new_password, extra_headers="")
+    assert no_csrf_rotate == "403", f"expected 403 without a CSRF header, got {no_csrf_rotate}"
+
+    # A wrong current password is a real 401 -- distinct from a 500, and it
+    # must change nothing at all.
+    wrong_current = change_password("definitely-not-the-password", new_password)
+    assert wrong_current == "401", f"expected 401 for a wrong current password, got {wrong_current}"
+    assert login_code(password) == "200", (
+        "a refused rotation must leave the real current password working"
+    )
+    assert login_code(new_password) == "401", (
+        "the password a REFUSED rotation proposed must never have been set"
+    )
+
+    # An empty new password is refused as malformed, not accepted.
+    empty_new = change_password(password, "")
+    assert empty_new == "400", f"expected 400 for an empty new password, got {empty_new}"
+    assert login_code(password) == "200"
+
+    # The real rotation.
+    rotated = change_password(password, new_password)
+    assert rotated == "200", f"the real rotation must be accepted, got {rotated}"
+    assert login_code(new_password) == "200", (
+        "a real login with the NEW password must really succeed"
+    )
+    assert login_code(password) == "401", (
+        "the OLD password must really stop working -- otherwise the rotation "
+        "added a credential instead of replacing one"
+    )
+    # The existing session is deliberately untouched by a rotation, so the
+    # rest of this test keeps working with the cookie it already has.
+    machine.succeed(
+        "curl -s -f -b /tmp/cookies.txt http://127.0.0.1:7788/api/settings > /dev/null"
+    )
+    # Rotate back, so anything later in this file that uses the bootstrap
+    # password still works.
+    assert change_password(new_password, password) == "200"
+    assert login_code(password) == "200"
+    print("PASS: a real password rotation really replaced the real credential, and a wrong current password really changed nothing")
+
     print("=== real job trigger: preflight, through the real privilege boundary ===")
     job_response = machine.succeed(
         f"curl -s -f -b /tmp/cookies.txt -X POST http://127.0.0.1:7788/api/jobs "
@@ -583,6 +649,90 @@ pkgs.testers.runNixOSTest {
             f"the shared parent must not be writable by ferrumd: {rw}"
         )
     print("PASS: systemd really applied the hardening, and the daemon really worked under all of it")
+
+    print("=== ferrumd's own startup writability check really refuses a mis-owned settings.json ===")
+    # The real gap this closes: `AssertPathExists=` answers only "does this
+    # path exist". A host provisioned BEFORE this phase has
+    # /etc/ferrum/settings.json as root:root 0644 -- the assertion passes,
+    # ferrumd starts, login works, GET /api/settings works, and the
+    # operator's first real PUT dies with a bare "Permission denied" with
+    # nothing anywhere explaining why. There is no systemd directive for
+    # "this specific file must be writable by this specific user"
+    # (AssertPathIsReadWrite= only checks the mount is not read-only), so
+    # the check lives inside ferrumd itself, before the listener binds.
+    machine.succeed("systemctl stop ferrumd.service")
+    machine.succeed("chown root:root /etc/ferrum/settings.json")
+    machine.succeed("chmod 0644 /etc/ferrum/settings.json")
+    # Exactly the shape a pre-phase host has -- confirm the fixture really
+    # is that shape before asserting anything about it.
+    mis_owned = machine.succeed("stat -c '%U %G %a' /etc/ferrum/settings.json").strip()
+    assert mis_owned == "root root 644", f"fixture is not the pre-phase shape: {mis_owned}"
+
+    # Type=simple, so `systemctl start` returns as soon as the process is
+    # FORKED -- a non-zero exit from systemctl is not what proves anything
+    # here. What proves it: the daemon really dies, really never binds its
+    # port, and really says why on every attempt. Restart=on-failure turns
+    # that into a crash loop that hits systemd's start limit within a
+    # second or so.
+    machine.execute("systemctl start ferrumd.service")
+    machine.wait_until_succeeds(
+        "journalctl -u ferrumd.service -n 100 --no-pager | grep -q 'refusing to start'",
+        timeout=60,
+    )
+    refusal = machine.succeed("journalctl -u ferrumd.service -n 40 --no-pager")
+    print(f"real journal output from the refusing daemon:\n{refusal}")
+
+    # The message has to be genuinely actionable, not merely present: it must
+    # name the exact file and give the exact command that fixes it.
+    assert "/etc/ferrum/settings.json is not writable" in refusal, refusal
+    assert "Permission denied" in refusal, refusal
+    assert "chown root:ferrum /etc/ferrum/settings.json" in refusal, refusal
+    assert "chmod 0664 /etc/ferrum/settings.json" in refusal, refusal
+    # It also reports what is really on disk right now, so an operator does
+    # not have to go and look.
+    assert "uid=0 gid=0 mode=0644" in refusal, refusal
+
+    # It really did not start serving: no port, no API.
+    machine.fail("curl -s --max-time 5 http://127.0.0.1:7788/api/settings")
+    machine.wait_until_succeeds(
+        "systemctl show ferrumd.service -p ActiveState --value | grep -qE 'failed|inactive'",
+        timeout=90,
+    )
+    print("PASS: ferrumd really refused to start, with a real, actionable message, rather than failing later on the first write")
+
+    # And the fix in the message really is the fix.
+    machine.succeed("chown root:ferrum /etc/ferrum/settings.json")
+    machine.succeed("chmod 0664 /etc/ferrum/settings.json")
+    machine.succeed("systemctl reset-failed ferrumd.service")
+    machine.succeed("systemctl start ferrumd.service")
+    machine.wait_for_open_port(7788)
+    print("PASS: running exactly the command the error message prints really makes ferrumd start")
+
+    print("=== ...and the same check really covers the secrets directory ===")
+    # Checked by really creating and removing a probe file, not by reading
+    # mode bits: what POST /api/secrets/<name> needs is the ability to
+    # CREATE a file here, which mode bits alone can be wrong about.
+    machine.succeed("systemctl stop ferrumd.service")
+    machine.succeed("chown root:root /etc/ferrum/secrets")
+    machine.succeed("chmod 0755 /etc/ferrum/secrets")
+    machine.execute("systemctl start ferrumd.service")
+    machine.wait_until_succeeds(
+        "journalctl -u ferrumd.service -n 100 --no-pager | grep -q 'secrets directory'",
+        timeout=60,
+    )
+    secrets_refusal = machine.succeed("journalctl -u ferrumd.service -n 40 --no-pager")
+    print(f"real journal output for the mis-owned secrets directory:\n{secrets_refusal}")
+    assert "/etc/ferrum/secrets is not writable" in secrets_refusal, secrets_refusal
+    assert "chown ferrum:ferrum /etc/ferrum/secrets" in secrets_refusal, secrets_refusal
+    assert "chmod 0750 /etc/ferrum/secrets" in secrets_refusal, secrets_refusal
+    machine.fail("curl -s --max-time 5 http://127.0.0.1:7788/api/settings")
+
+    machine.succeed("chown ferrum:ferrum /etc/ferrum/secrets")
+    machine.succeed("chmod 0750 /etc/ferrum/secrets")
+    machine.succeed("systemctl reset-failed ferrumd.service")
+    machine.succeed("systemctl start ferrumd.service")
+    machine.wait_for_open_port(7788)
+    print("PASS: the secrets directory is really covered by the same real check")
 
     # Deliberately LAST: this one deletes a path ferrumd needs and leaves
     # the unit failed, so nothing after it could rely on a working daemon.

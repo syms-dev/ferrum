@@ -68,6 +68,29 @@ lib.mkIf ferrum.daemon.enable {
       FERRUM_JOB_ID = "%i";
       FERRUM_JOBS_DIR = "/var/lib/ferrum/jobs";
     };
+    # REAL BUG, FOUND BY REALLY RUNNING A REAL APPLY THROUGH THIS UNIT
+    # (tests/daemon-apply-end-to-end.nix, added alongside this line).
+    #
+    # `ferrum-apply apply` shells out to `nix build` and then `nix-env -p
+    # /nix/var/nix/profiles/system --set` (crates/ferrum-apply/src/apply.rs
+    # steps 1 and 5), resolving both through PATH. A NixOS systemd unit does
+    # NOT inherit a login shell's PATH: `systemd.services.<name>.path`
+    # defaults to just coreutils/findutils/gnugrep/gnused/systemd, so `nix`
+    # and `nix-env` were simply absent here. Every real `{"kind":"apply"}`
+    # job dispatched by ferrumd therefore died on its very first real step
+    # with a bare, causeless `apply error: No such file or directory (os
+    # error 2)` -- confirmed for real, in a real VM, as the first failure
+    # this new test produced.
+    #
+    # It was invisible until now because the only path anything ever
+    # exercised a real apply through was `ferrum-apply apply` typed by hand
+    # over SSH, where the operator's own login shell puts nix on PATH. The
+    # daemon's path never had one. `systemctl` comes from the default set
+    # above, and `btrfs` is already wrapped into the ferrum-apply binary
+    # itself by nix/pkgs/ferrum-apply's own postFixup -- nix is the one
+    # genuine gap, and config.nix.package is this host's own real nix rather
+    # than a second, possibly-different one from pkgs.
+    path = [ config.nix.package ];
     serviceConfig = {
       Type = "oneshot";
       # %i is systemd's own instance-name substitution -- the UUID from
