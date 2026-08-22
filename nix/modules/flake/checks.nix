@@ -179,6 +179,12 @@
         # exercise directly.
         state-restore-interlock = import ../../../tests/state-restore-interlock.nix { inherit pkgs; };
 
+        # Proves the real privilege boundary Task 2 built: an unprivileged
+        # user really can trigger a real ferrum-apply run via D-Bus +
+        # polkit (not just that the polkit rule text parses), and really
+        # is denied starting an unrelated unit.
+        privilege-boundary = import ../../../tests/privilege-boundary.nix { inherit pkgs; sopsNix = inputs.sops-nix; };
+
         # Not a separate runCommand: Nix's build sandbox has no network
         # access, so a hand-rolled `cd crates && cargo test` derivation can
         # never fetch crates.io and fails every time (verified: it does).

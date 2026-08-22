@@ -10,6 +10,7 @@
     ./core/generations.nix
     ./core/state-restore.nix
     ./core/secrets.nix
+    ./core/daemon.nix
     ./core/recyclarr.nix
     ./core/reconciler.nix
     ./proxy/acme.nix
