@@ -250,6 +250,16 @@
         # crosses the real polkit/D-Bus privilege boundary and produces a
         # real JSONL progress log.
         daemon-end-to-end = import ../../../tests/daemon-end-to-end.nix { inherit pkgs; sopsNix = inputs.sops-nix; };
+
+        # The one thing daemon-end-to-end.nix deliberately never did: a real
+        # `{"kind":"apply"}` submitted over the real HTTP API, which really
+        # crosses the real polkit/D-Bus boundary and really switches the
+        # running system to a genuinely different NixOS closure. Kept as its
+        # own check rather than bolted onto daemon-end-to-end: it needs a
+        # second whole closure and a bootloader-backed VM (see the test's
+        # header), which would slow down and complicate a file whose own
+        # subject is the daemon's read-only surface.
+        daemon-apply-end-to-end = import ../../../tests/daemon-apply-end-to-end.nix { inherit pkgs; sopsNix = inputs.sops-nix; };
       };
     };
 }
