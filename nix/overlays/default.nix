@@ -9,4 +9,9 @@ final: prev: {
   ferrum-apply = final.callPackage ../pkgs/ferrum-apply { };
   ferrum-reconcile = final.callPackage ../pkgs/ferrum-reconcile { };
   ferrum-testapp = final.callPackage ../pkgs/testapp { };
+  ferrum-settings-schema = final.writeTextFile {
+    name = "ferrum-settings-schema.json";
+    destination = "/share/ferrum/settings-schema.json";
+    text = builtins.readFile ../../modules/lib/settings-schema.json;
+  };
 }

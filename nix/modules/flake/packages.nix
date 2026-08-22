@@ -22,6 +22,11 @@
         ferrum-testapp = pkgs.callPackage ../../../nix/pkgs/testapp { };
         ferrum-apply = pkgs.callPackage ../../../nix/pkgs/ferrum-apply { };
         ferrum-reconcile = pkgs.callPackage ../../../nix/pkgs/ferrum-reconcile { };
+        ferrum-settings-schema = pkgs.writeTextFile {
+          name = "ferrum-settings-schema.json";
+          destination = "/share/ferrum/settings-schema.json";
+          text = builtins.readFile ../../../modules/lib/settings-schema.json;
+        };
       };
     };
 }
