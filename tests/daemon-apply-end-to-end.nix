@@ -93,13 +93,13 @@ let
     boot.loader.efi.canTouchEfiVariables = true;
 
     # `nix build` is the real first step of a real apply, and it is part of
-    # the new CLI, which nix still gates behind these experimental features.
-    # Enabled here explicitly rather than assumed: nothing in modules/ turns
-    # them on today (see this test's companion note in the follow-up report
-    # -- a real deployed ferrum host needs them for `ferrum-apply apply` to
-    # get past its first step at all, which is a real, separate gap this
-    # test happens to surface rather than one it invents).
-    nix.settings.experimental-features = [ "nix-command" "flakes" ];
+    # the new CLI, which nix still gates behind the "nix-command" and
+    # "flakes" experimental features. NOT set here: modules/core/nix-settings.nix
+    # (imported via `../modules` above) now enables both unconditionally for
+    # every ferrum host, so this test deliberately leans on that module
+    # default rather than overriding it -- if that module regressed, this
+    # test's own real `nix build` step would fail for real, which is the
+    # whole point of leaving it unset here.
 
     ferrum.daemon = {
       enable = true;
