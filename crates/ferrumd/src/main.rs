@@ -1,6 +1,7 @@
 mod auth;
 mod db;
 mod settings;
+mod secrets_api;
 
 use axum::{
     extract::State,
@@ -79,6 +80,7 @@ async fn main() -> anyhow::Result<()> {
 
     let protected = Router::new()
         .route("/api/settings", axum::routing::get(settings::get_settings).put(settings::put_settings))
+        .route("/api/secrets/:name", axum::routing::post(secrets_api::write_secret))
         .route_layer(axum::middleware::from_fn_with_state(state.clone(), require_session));
 
     let app = Router::new()
