@@ -18,7 +18,11 @@ use tower_cookies::{Cookie, CookieManagerLayer, Cookies};
 
 pub struct AppState {
     pub db: db::Db,
-    /// ferrumd's own single-job interlock -- see jobs::create_job. Cleared
+    /// ferrumd's own single-job interlock -- see jobs::create_job. Seeded
+    /// at startup from systemd's real view of whether a
+    /// `ferrum-apply@*.service` is currently running (see
+    /// dbus::ferrum_apply_job_is_running), so a ferrumd restarted mid-apply
+    /// by its own generation switch does not admit a second job. Cleared
     /// both by ferrum-apply finishing (via systemd's JobRemoved signal,
     /// below) and, on the failure paths, by create_job itself.
     pub job_running: Mutex<bool>,
@@ -100,7 +104,41 @@ async fn main() -> anyhow::Result<()> {
     let db = db::Db::open(&state_dir.join("ferrumd.db"))?;
     auth::ensure_first_user(&db, state_dir)?;
 
-    let state = Arc::new(AppState { db, job_running: Mutex::new(false) });
+    // The interlock is in-process state, so it would otherwise start every
+    // process lifetime believing nothing is running. That is wrong in one
+    // real, reachable case: an `apply` job can switch to a generation
+    // carrying a new ferrumd, which restarts ferrumd WHILE that same apply
+    // is still executing -- and the restarted daemon would then happily
+    // admit a second, concurrent job. Ask systemd (the only durable source
+    // of truth about what is actually running) before serving anything.
+    //
+    // On a query failure this seeds `false` rather than `true`: a failed
+    // query is not evidence that a job is running, and seeding `true` would
+    // leave the daemon refusing every job forever with no way to clear the
+    // flag (nothing would ever start, so no JobRemoved would ever arrive).
+    // The failure is logged loudly instead.
+    let job_running = match dbus::ferrum_apply_job_is_running().await {
+        Ok(running) => {
+            if running {
+                eprintln!(
+                    "ferrumd: a ferrum-apply job is still running -- starting with the \
+                     single-job interlock already held; new jobs will be refused until it \
+                     finishes"
+                );
+            }
+            running
+        }
+        Err(e) => {
+            eprintln!(
+                "ferrumd: could not ask systemd whether a ferrum-apply job is running: {e} -- \
+                 assuming none is. If ferrumd was just restarted by an in-flight apply, a \
+                 second concurrent job could be admitted."
+            );
+            false
+        }
+    };
+
+    let state = Arc::new(AppState { db, job_running: Mutex::new(job_running) });
 
     // Independently confirms job completion via systemd's own JobRemoved
     // D-Bus signal, so `job_running` is cleared even if ferrum-apply
