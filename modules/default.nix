@@ -5,6 +5,7 @@
 {
   imports = [
     ./core/options.nix
+    ./core/nix-settings.nix
     ./core/storage.nix
     ./core/overlays.nix
     ./core/generations.nix
