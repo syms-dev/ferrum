@@ -13,6 +13,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
 rustix = { version = "0.38", features = ["fs"] }
+ferrum-secrets = { path = "../ferrum-secrets" }
 
 [dev-dependencies]
 tempfile = "3"

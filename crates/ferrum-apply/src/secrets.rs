@@ -1,137 +1,12 @@
 use std::path::Path;
-use std::process::Command;
+
+use ferrum_secrets::{encrypt_and_write, host_age_recipient, random_hex_key, random_secret_value};
 
 /// Servarr apps that get an auto-generated API key. qBittorrent has its own
 /// WebUI username/password, Plex uses Plex.tv account auth, Jellyfin and
 /// SABnzbd have their own first-run setup flows -- none of those four go
 /// through this mechanism (see the design spec's Secrets section).
 const SERVARR_APPS: &[&str] = &["sonarr", "radarr", "prowlarr"];
-
-/// Default SSH host public key path, used only when the wrapper's
-/// FERRUM_HOST_KEY_PUB (derived from this host's real
-/// config.sops.age.sshKeyPaths -- see modules/core/overlays.nix) isn't set,
-/// e.g. under `cargo run` outside a built ferrum-apply wrapper.
-pub const DEFAULT_HOST_KEY_PUB: &str = "/etc/ssh/ssh_host_ed25519_key.pub";
-
-/// Derives the box's PUBLIC age recipient from its own SSH host key, via
-/// ssh-to-age. Needs no privilege and touches no private key material --
-/// this is the same derivation sops-nix's own decrypt side uses by default
-/// (sops.age.sshKeyPaths), just run in the encrypt direction. `pubkey_path`
-/// should be the real path sops-nix's own config resolved to (passed by the
-/// caller from FERRUM_HOST_KEY_PUB) -- hardcoding the default here instead
-/// would silently desync from a host that overrides
-/// services.openssh.hostKeys, encrypting to a recipient sops-nix never
-/// decrypts with.
-pub fn host_age_recipient(pubkey_path: &Path) -> anyhow::Result<String> {
-    let pubkey = std::fs::read_to_string(pubkey_path).map_err(|e| {
-        anyhow::anyhow!(
-            "failed to read SSH host public key at {}: {e}",
-            pubkey_path.display()
-        )
-    })?;
-
-    let output = Command::new("ssh-to-age")
-        .arg("-i")
-        .arg("-")
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .spawn()
-        .and_then(|mut child| {
-            use std::io::Write;
-            child
-                .stdin
-                .take()
-                .expect("stdin was piped")
-                .write_all(pubkey.as_bytes())?;
-            child.wait_with_output()
-        })
-        .map_err(|e| anyhow::anyhow!("failed to run ssh-to-age: {e}"))?;
-
-    if !output.status.success() {
-        anyhow::bail!(
-            "ssh-to-age failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-    Ok(String::from_utf8(output.stdout)?.trim().to_string())
-}
-
-/// A cryptographically random 32-character hex string -- matches the
-/// community convention for Sonarr/Radarr/Prowlarr API keys (no format is
-/// enforced by the nixpkgs module itself, but this is what the apps
-/// generate on their own first run, so ferrum's generated ones look
-/// identical).
-fn random_hex_key() -> anyhow::Result<String> {
-    let bytes: [u8; 16] = rand_bytes()?;
-    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
-}
-
-fn rand_bytes() -> anyhow::Result<[u8; 16]> {
-    let mut buf = [0u8; 16];
-    let mut f = std::fs::File::open("/dev/urandom")
-        .map_err(|e| anyhow::anyhow!("failed to open /dev/urandom: {e}"))?;
-    std::io::Read::read_exact(&mut f, &mut buf)
-        .map_err(|e| anyhow::anyhow!("failed to read from /dev/urandom: {e}"))?;
-    Ok(buf)
-}
-
-/// Encrypts `plaintext` with sops, using only the recipient's PUBLIC age
-/// key, and writes it to `dest`. No private key is ever touched by this
-/// process -- confirmed real behaviour of `sops --encrypt --age <recipient>`
-/// (nix run nixpkgs#sops -- --help on ferrum-dev).
-fn encrypt_and_write(plaintext: &str, recipient: &str, dest: &Path) -> anyhow::Result<()> {
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let output = Command::new("sops")
-        .args([
-            "--encrypt",
-            "--age",
-            recipient,
-            "--input-type",
-            "binary",
-            "--output-type",
-            "binary",
-            "/dev/stdin",
-        ])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .spawn()
-        .and_then(|mut child| {
-            use std::io::Write;
-            child
-                .stdin
-                .take()
-                .expect("stdin was piped")
-                .write_all(plaintext.as_bytes())?;
-            child.wait_with_output()
-        })
-        .map_err(|e| anyhow::anyhow!("failed to run sops --encrypt: {e}"))?;
-
-    if !output.status.success() {
-        anyhow::bail!(
-            "sops --encrypt failed for {}: {}",
-            dest.display(),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-    // Write via a temp file + rename so a crash mid-write never leaves a
-    // half-written .sops file for the next apply (or a curious operator)
-    // to find. sync_all() before the rename matters as much as the rename
-    // itself: without it, a power loss can land the rename durably while
-    // the temp file's own content is still only in the page cache, leaving
-    // a present-but-truncated .sops file that `dest.exists()` then treats
-    // as valid forever (ensure_all never reads a secret back to check it).
-    let tmp = dest.with_extension("sops.tmp");
-    let file = std::fs::File::create(&tmp)?;
-    {
-        use std::io::Write;
-        (&file).write_all(&output.stdout)?;
-    }
-    file.sync_all()?;
-    std::fs::rename(&tmp, dest)?;
-    Ok(())
-}
 
 /// Ensures every enabled servarr app in `apps` has a `<app>-apikey.sops`
 /// file under `secrets_dir`, generating and encrypting a new random key for
@@ -176,34 +51,6 @@ pub fn ensure_all(secrets_dir: &Path, pubkey_path: &Path, apps: &[&str]) -> anyh
         encrypt_and_write(&format!("{key}\n"), &recipient, &raw_dest)?;
     }
     Ok(())
-}
-
-/// Cryptographically random bytes, base64-encoded -- Authelia's own docs
-/// recommend a value "more than twenty characters"; 32 random bytes
-/// (43 base64 characters) comfortably clears that with real entropy,
-/// matching the same /dev/urandom source random_hex_key already uses.
-fn random_secret_value() -> anyhow::Result<String> {
-    let mut buf = [0u8; 32];
-    let mut f = std::fs::File::open("/dev/urandom")
-        .map_err(|e| anyhow::anyhow!("failed to open /dev/urandom: {e}"))?;
-    std::io::Read::read_exact(&mut f, &mut buf)
-        .map_err(|e| anyhow::anyhow!("failed to read from /dev/urandom: {e}"))?;
-    Ok(base64_encode(&buf))
-}
-
-fn base64_encode(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let b0 = chunk[0];
-        let b1 = *chunk.get(1).unwrap_or(&0);
-        let b2 = *chunk.get(2).unwrap_or(&0);
-        out.push(ALPHABET[(b0 >> 2) as usize] as char);
-        out.push(ALPHABET[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize] as char);
-        out.push(if chunk.len() > 1 { ALPHABET[(((b1 & 0x0f) << 2) | (b2 >> 6)) as usize] as char } else { '=' });
-        out.push(if chunk.len() > 2 { ALPHABET[(b2 & 0x3f) as usize] as char } else { '=' });
-    }
-    out
 }
 
 /// Ensures Authelia's two required secrets (jwtSecretFile,
@@ -345,20 +192,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn random_hex_key_is_32_lowercase_hex_chars() {
-        let key = random_hex_key().unwrap();
-        assert_eq!(key.len(), 32);
-        assert!(key.chars().all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()));
-    }
-
-    #[test]
-    fn random_hex_key_is_not_constant() {
-        let a = random_hex_key().unwrap();
-        let b = random_hex_key().unwrap();
-        assert_ne!(a, b, "two calls produced the same key -- /dev/urandom read is broken");
-    }
-
-    #[test]
     fn ensure_all_only_touches_servarr_apps() {
         let dir = tempfile::tempdir().unwrap();
         // qbittorrent is not in SERVARR_APPS, so it's filtered out of
@@ -371,11 +204,6 @@ mod tests {
         let result = ensure_all(dir.path(), &nonexistent_pubkey, &["qbittorrent"]);
         assert!(result.is_ok(), "qbittorrent-only call should short-circuit before touching the host key: {result:?}");
         assert!(!dir.path().join("qbittorrent-apikey.sops").exists());
-    }
-
-    #[test]
-    fn base64_encode_matches_rfc_4648_test_vector() {
-        assert_eq!(base64_encode(b"Man"), "TWFu");
     }
 
     #[test]

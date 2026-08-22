@@ -115,7 +115,7 @@ fn main() -> anyhow::Result<()> {
                     .filter(|s| !s.is_empty())
                     .collect(),
                 host_key_pub: std::env::var("FERRUM_HOST_KEY_PUB")
-                    .unwrap_or_else(|_| secrets::DEFAULT_HOST_KEY_PUB.to_string())
+                    .unwrap_or_else(|_| ferrum_secrets::DEFAULT_HOST_KEY_PUB.to_string())
                     .into(),
                 auth_enabled: std::env::var("FERRUM_AUTH_ENABLED")
                     .map(|v| v == "1")
