@@ -80,6 +80,32 @@ lib.mkIf ferrum.daemon.enable {
     # PATH already; naming them here too means the unit still works if
     # someone points ExecStart at an unwrapped build.
     path = [ pkgs.sops pkgs.ssh-to-age ];
+    # Real runtime check (systemd's own AssertPathExists=) that these two
+    # pre-provisioned paths exist on THIS machine before ferrumd starts --
+    # replaces an earlier, wrong Nix-eval-time `assertions = [...]` block in
+    # this file that this plan's own pre-flight review caught and removed
+    # (see the note at the bottom): a plain NixOS assertion using
+    # builtins.pathExists checks the machine doing the Nix evaluation, not
+    # the machine the unit actually starts on, which would have made every
+    # VM test that enables ferrum.daemon fail to even evaluate on a fresh CI
+    # runner. AssertPathExists= is checked at real activation time on the
+    # real target machine instead -- it fails the unit loudly (logged,
+    # visible via `systemctl status`) if nixos-anywhere's initial setup
+    # never provisioned these paths, matching the original intended safety
+    # property without depending on where evaluation happens to run.
+    #
+    # IT MUST LIVE IN unitConfig, NOT serviceConfig. AssertPathExists= is a
+    # [Unit]-section directive (systemd.unit(5)), and NixOS emits
+    # serviceConfig verbatim into [Service] -- where systemd logs "Unknown
+    # key name 'AssertPathExists' in section 'Service', ignoring" and starts
+    # the unit anyway, silently disabling the whole check. This was the
+    # original form of this block and it did nothing at all; the repo's own
+    # established idiom for Condition*/Assert* directives is unitConfig (see
+    # modules/apps/sonarr/service.nix, modules/core/generations.nix,
+    # modules/proxy/selfsigned-cert.nix). tests/daemon-end-to-end.nix now
+    # proves the assertion really fires by removing one of these two paths
+    # and confirming ferrumd genuinely refuses to start.
+    unitConfig.AssertPathExists = [ "/etc/ferrum/settings.json" "/etc/ferrum/secrets" ];
     environment = {
       FERRUMD_STATE_DIR = "/var/lib/ferrum";
       FERRUMD_LISTEN_ADDRESS = ferrum.daemon.listenAddress;
@@ -101,22 +127,6 @@ lib.mkIf ferrum.daemon.enable {
       CapabilityBoundingSet = "";
       NoNewPrivileges = true;
       Restart = "on-failure";
-      # Real runtime check (systemd's own AssertPathExists=, confirmed via
-      # `man systemd.unit` on ferrum-dev) that these two pre-provisioned
-      # paths exist on THIS machine before ferrumd starts -- replaces an
-      # earlier, wrong Nix-eval-time `assertions = [...]` block in this
-      # file that this plan's own pre-flight review caught and removed (see
-      # the note at the bottom): a plain NixOS assertion using
-      # builtins.pathExists checks the machine doing the Nix evaluation,
-      # not the machine the unit actually starts on, which would have made
-      # every VM test that enables ferrum.daemon fail to even evaluate on a
-      # fresh CI runner. AssertPathExists= is checked at real activation
-      # time on the real target machine instead -- it fails the unit loudly
-      # (logged, visible via `systemctl status`) if nixos-anywhere's
-      # initial setup never provisioned these paths, matching the original
-      # intended safety property without depending on where evaluation
-      # happens to run.
-      AssertPathExists = [ "/etc/ferrum/settings.json" "/etc/ferrum/secrets" ];
     };
   };
 
@@ -149,9 +159,9 @@ lib.mkIf ferrum.daemon.enable {
   # even boots, on every run, unconditionally. The correct mechanism for
   # "does this real path exist on the machine actually starting this
   # unit" is systemd's own AssertPathExists= (a real, standard, documented
-  # systemd.exec directive -- confirmed via `man systemd.unit` on
-  # ferrum-dev), which is evaluated at REAL activation time on the REAL
-  # target machine, not at Nix-eval time -- see Task 6 Step 6, where it is
-  # attached to the ferrumd unit itself (the actual thing that needs these
-  # paths, rather than the whole daemon.nix module).
+  # systemd.unit(5) [Unit]-section directive -- NOT a [Service] one, which
+  # is why it is set via `unitConfig` above), which is evaluated at REAL
+  # activation time on the REAL target machine, not at Nix-eval time -- see
+  # the ferrumd unit above, where it is attached to the actual thing that
+  # needs these paths rather than to the whole daemon.nix module.
 }

@@ -312,6 +312,62 @@ pkgs.testers.runNixOSTest {
     else:
         print("NOTE: the second job had already completed; interlock not exercised on this run")
 
+    print("=== the interlock is really seeded from systemd across a ferrumd restart ===")
+    # The real race this closes: an `apply` job can switch to a generation
+    # carrying a new ferrumd, restarting ferrumd WHILE its own job is still
+    # running. A fresh Mutex<bool> would say "nothing running" and admit a
+    # second, concurrent job. There is no long-running job kind to hold open
+    # (a preflight finishes in ~50ms), so one real instance of the real
+    # template unit is given a real /run drop-in that makes it block. It is
+    # a genuine `ferrum-apply@<uuid>.service` in a genuine `activating`
+    # state -- exactly what systemd reports for a real in-flight apply, and
+    # exactly what ferrumd's startup query has to notice. (A transient
+    # `systemd-run --unit=` under this name is refused outright by systemd:
+    # "already loaded or has a fragment file", because the template really
+    # is installed here.)
+    stuck = "ferrum-apply@00000000-0000-4000-8000-000000000000.service"
+    dropin = f"/run/systemd/system/{stuck}.d"
+    machine.succeed(f"mkdir -p '{dropin}'")
+    machine.succeed(f"echo '[Service]' > '{dropin}/override.conf'")
+    machine.succeed(f"echo 'ExecStart=' >> '{dropin}/override.conf'")
+    machine.succeed(
+        f"echo 'ExecStart=/run/current-system/sw/bin/sleep 300' >> '{dropin}/override.conf'"
+    )
+    machine.succeed("systemctl daemon-reload")
+    # --no-block: a Type=oneshot start otherwise waits for the 300s sleep.
+    machine.succeed(f"systemctl start --no-block {stuck}")
+    machine.wait_until_succeeds(
+        f"systemctl show {stuck} -p ActiveState --value | grep -qE 'activating|active'"
+    )
+    machine.succeed("systemctl restart ferrumd.service")
+    machine.wait_for_open_port(7788)
+    seeded = machine.succeed(
+        "curl -s -o /dev/null -w '%{http_code}' -b /tmp/cookies.txt "
+        "-X POST http://127.0.0.1:7788/api/jobs "
+        "-H 'Content-Type: application/json' -d '{\"kind\":\"preflight\"}'"
+    ).strip()
+    assert seeded == "409", (
+        "a ferrumd restarted while a real ferrum-apply unit is active must "
+        f"refuse a new job, got {seeded}"
+    )
+    print("PASS: a restarted ferrumd really refused a job while one was really still running")
+
+    machine.succeed(f"systemctl stop {stuck}")
+    machine.succeed(f"systemctl reset-failed {stuck} || true")
+    machine.succeed(f"rm -rf '{dropin}' && systemctl daemon-reload")
+    machine.succeed("systemctl restart ferrumd.service")
+    machine.wait_for_open_port(7788)
+    cleared = machine.succeed(
+        "curl -s -o /dev/null -w '%{http_code}' -b /tmp/cookies.txt "
+        "-X POST http://127.0.0.1:7788/api/jobs "
+        "-H 'Content-Type: application/json' -d '{\"kind\":\"preflight\"}'"
+    ).strip()
+    assert cleared == "200", (
+        "with nothing running, the startup query must seed the interlock OPEN "
+        f"-- a daemon that refuses everything is no use either; got {cleared}"
+    )
+    print("PASS: with nothing running, the same query really seeds the interlock open")
+
     print("=== ferrumd really is unprivileged ===")
     ferrumd_user = machine.succeed(
         "systemctl show ferrumd.service -p User --value"
@@ -323,5 +379,56 @@ pkgs.testers.runNixOSTest {
         "'sshd.service' replace\""
     )
     print("PASS: the daemon's user really cannot start an arbitrary unit")
+
+    # Deliberately LAST: this one deletes a path ferrumd needs and leaves
+    # the unit failed, so nothing after it could rely on a working daemon.
+    print("=== AssertPathExists really gates ferrumd's startup ===")
+    # First, structurally: it must be in the unit file's [Unit] section.
+    # In [Service] systemd logs "Unknown key name 'AssertPathExists' in
+    # section 'Service', ignoring" and starts the unit anyway -- which is
+    # exactly the silent no-op this check exists to prevent regressing to.
+    unit_text = machine.succeed("systemctl cat ferrumd.service")
+    unit_section = unit_text.split("[Service]")[0]
+    assert "AssertPathExists=/etc/ferrum/settings.json" in unit_section, (
+        f"AssertPathExists must be a [Unit] directive, got:\n{unit_text}"
+    )
+    assert "AssertPathExists=/etc/ferrum/secrets" in unit_section, unit_text
+    # systemd's own parser, asked directly. Scoped to this one directive on
+    # purpose: `verify` also pulls in dependency units, whose unrelated
+    # warnings are none of this test's business.
+    verify = machine.succeed("systemd-analyze verify ferrumd.service 2>&1 || true")
+    print(f"systemd-analyze verify ferrumd.service:\n{verify}")
+    assert "Unknown key name 'AssertPathExists'" not in verify, (
+        f"systemd itself must recognise this directive where it is placed: {verify}"
+    )
+    print("PASS: systemd really parses AssertPathExists on this unit")
+
+    # Then, behaviourally: with one of the two asserted paths genuinely
+    # missing, the unit must genuinely refuse to start.
+    machine.succeed("systemctl stop ferrumd.service")
+    machine.succeed("mv /etc/ferrum/settings.json /etc/ferrum/settings.json.moved")
+    # An assert failure fails the START JOB and leaves the unit inactive --
+    # it does NOT put the unit in `failed` (so `Result` stays `success`,
+    # which is why that property is not what gets checked here). What
+    # matters is that the start really did not happen.
+    status, out = machine.execute("systemctl start ferrumd.service 2>&1")
+    print(f"systemctl start with a required path missing: status={status} output={out.strip()}")
+    assert status != 0, "ferrumd must refuse to start when an asserted path is missing"
+    assert "ssertion" in out, (
+        f"the refusal must really come from the assertion, not something else: {out}"
+    )
+    machine.fail("systemctl is-active ferrumd.service")
+    active_state = machine.succeed(
+        "systemctl show ferrumd.service -p ActiveState --value"
+    ).strip()
+    assert active_state == "inactive", f"ferrumd must not be running, got {active_state}"
+    machine.fail("curl -s --max-time 5 http://127.0.0.1:7788/api/settings")
+    print("PASS: the real assertion really refused to start ferrumd with a required path missing")
+
+    machine.succeed("mv /etc/ferrum/settings.json.moved /etc/ferrum/settings.json")
+    machine.succeed("systemctl reset-failed ferrumd.service")
+    machine.succeed("systemctl start ferrumd.service")
+    machine.wait_for_open_port(7788)
+    print("PASS: and starts again for real once the path is back")
   '';
 }

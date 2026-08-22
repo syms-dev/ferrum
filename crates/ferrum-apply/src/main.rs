@@ -204,9 +204,78 @@ fn run_restore_state() -> i32 {
     };
     let mut progress = progress::Progress::open();
     progress.event("restore-state", "performing any pending state restore");
+    // Whether there was anything to do at all, captured BEFORE the run:
+    // restore_state::run removes the intent file on confirmed success, so
+    // asking afterwards can't distinguish "ordinary boot, nothing pending"
+    // from "a real restore that completed".
+    let had_intent = storage.intent_path.exists();
     restore_state::run(&root_device, &storage);
-    progress.complete("succeeded", "restore-state finished (it always exits 0 by design)");
+    let (result, detail) = restore_state_outcome(&storage, had_intent);
+    progress.complete(result, &detail);
     0 // always exits 0 -- see Global Constraints
+}
+
+/// The real outcome of a `restore-state` run, read back from the real
+/// signal `restore_state::run` uses.
+///
+/// `restore_state::run` returns `()` on purpose -- a failed restore must
+/// never fail the boot -- so it reports failure by leaving
+/// `failure_marker_path` in place (that same marker is what
+/// `ferrum-apps.target`'s ConditionPathExists uses to hold managed apps
+/// down) and by writing `{"ok": false, ...}` to `result_path`. The marker
+/// is therefore the authoritative signal, and this reads it rather than
+/// assuming success: `RestoreState` is a real operator-triggerable job kind
+/// over `POST /api/jobs`, and an SSE stream that always says "succeeded"
+/// would tell an operator the box is fine while it is actually sitting with
+/// apps held down by a failed restore.
+///
+/// A marker left over from an EARLIER boot's failure is deliberately still
+/// reported as a failure here: apps really are being held down right now,
+/// which is the thing the operator needs to know, and this run genuinely
+/// did not clear it.
+///
+/// Fails closed on an unreadable marker (permission denied, an I/O error):
+/// "I cannot tell" is reported as a failure, never as success.
+fn restore_state_outcome(
+    storage: &restore_state::StorageConfig,
+    had_intent: bool,
+) -> (&'static str, String) {
+    let marker = &storage.failure_marker_path;
+    match std::fs::read_to_string(marker) {
+        Ok(reason) => {
+            let reason = reason.trim();
+            let reason = if reason.is_empty() { "no reason recorded" } else { reason };
+            (
+                "failed",
+                format!(
+                    "state restore failed: {reason} -- the failure marker at {} is holding \
+                     managed apps down until it is cleared",
+                    marker.display()
+                ),
+            )
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if had_intent {
+                (
+                    "succeeded",
+                    "pending state restore completed; the failure marker was cleared".to_string(),
+                )
+            } else {
+                (
+                    "succeeded",
+                    "no state restore was pending; nothing to do".to_string(),
+                )
+            }
+        }
+        Err(e) => (
+            "failed",
+            format!(
+                "could not read the state-restore failure marker at {}: {e} -- reporting \
+                 failure rather than assuming the restore was fine",
+                marker.display()
+            ),
+        ),
+    }
 }
 
 fn main() -> anyhow::Result<()> {
@@ -283,6 +352,107 @@ mod tests {
             Command::RunRequest { path } => assert_eq!(path, std::path::PathBuf::from("/tmp/req.json")),
             other => panic!("expected RunRequest, got {other:?}"),
         }
+    }
+
+    fn storage_in(dir: &std::path::Path) -> restore_state::StorageConfig {
+        restore_state::StorageConfig {
+            intent_path: dir.join("var/rollback-intent.json"),
+            result_path: dir.join("var/rollback-result.json"),
+            failure_marker_path: dir.join("run/ferrum/state-restore-failed"),
+        }
+    }
+
+    /// The real regression: a failed restore used to be reported to the
+    /// operator's SSE stream as "succeeded". This drives the REAL
+    /// restore_state::run failure path (a malformed intent, which really
+    /// writes the real failure marker) and asserts the progress outcome
+    /// derived from it is genuinely a failure.
+    #[test]
+    fn a_real_failed_restore_is_reported_as_failed_not_succeeded() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = storage_in(dir.path());
+        std::fs::create_dir_all(storage.intent_path.parent().unwrap()).unwrap();
+        std::fs::write(&storage.intent_path, "not json").unwrap();
+
+        let had_intent = storage.intent_path.exists();
+        restore_state::run("", &storage);
+
+        assert!(storage.failure_marker_path.exists());
+        let (result, detail) = restore_state_outcome(&storage, had_intent);
+        assert_eq!(result, "failed");
+        assert!(
+            detail.contains("malformed rollback intent"),
+            "the real failure reason must reach the operator, got: {detail}"
+        );
+    }
+
+    /// A valid intent that cannot be acted on (empty root device) is the
+    /// other real failure path -- also reported as a failure, with the real
+    /// reason rather than a generic one.
+    #[test]
+    fn an_unactionable_intent_is_reported_as_failed_with_the_real_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = storage_in(dir.path());
+        std::fs::create_dir_all(storage.intent_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &storage.intent_path,
+            r#"{"target_generation": 1, "snapshot": "s", "requested_at": "2026-08-20T00:00:00Z"}"#,
+        )
+        .unwrap();
+
+        let had_intent = storage.intent_path.exists();
+        restore_state::run("", &storage);
+
+        let (result, detail) = restore_state_outcome(&storage, had_intent);
+        assert_eq!(result, "failed");
+        assert!(
+            detail.contains("FERRUM_ROOT_DEVICE"),
+            "expected the real underlying reason, got: {detail}"
+        );
+    }
+
+    /// An ordinary boot with nothing pending: no marker is ever written, so
+    /// this really is a success -- and says so honestly rather than
+    /// claiming a restore happened.
+    #[test]
+    fn an_ordinary_boot_with_no_pending_restore_reports_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = storage_in(dir.path());
+
+        let had_intent = storage.intent_path.exists();
+        restore_state::run("", &storage);
+
+        let (result, detail) = restore_state_outcome(&storage, had_intent);
+        assert_eq!(result, "succeeded");
+        assert!(detail.contains("no state restore was pending"), "got: {detail}");
+    }
+
+    /// A marker left behind by an EARLIER boot's failure still means apps
+    /// are held down right now, so this run must not report success.
+    #[test]
+    fn a_stale_failure_marker_still_reports_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = storage_in(dir.path());
+        std::fs::create_dir_all(storage.failure_marker_path.parent().unwrap()).unwrap();
+        std::fs::write(&storage.failure_marker_path, "an earlier boot's failure").unwrap();
+
+        let (result, detail) = restore_state_outcome(&storage, false);
+        assert_eq!(result, "failed");
+        assert!(detail.contains("an earlier boot's failure"), "got: {detail}");
+    }
+
+    /// A marker with no readable reason must still be a failure, not a
+    /// success with a confusing empty detail.
+    #[test]
+    fn an_empty_failure_marker_is_still_a_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = storage_in(dir.path());
+        std::fs::create_dir_all(storage.failure_marker_path.parent().unwrap()).unwrap();
+        std::fs::write(&storage.failure_marker_path, "").unwrap();
+
+        let (result, detail) = restore_state_outcome(&storage, true);
+        assert_eq!(result, "failed");
+        assert!(detail.contains("no reason recorded"), "got: {detail}");
     }
 
     #[test]
