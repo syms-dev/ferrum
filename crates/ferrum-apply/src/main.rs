@@ -4,6 +4,7 @@ mod apply;
 mod generations;
 mod journal;
 mod preflight;
+mod progress;
 mod request;
 mod restore_state;
 mod rollback;
@@ -62,7 +63,33 @@ fn handle_apply_result(result: anyhow::Result<apply::ApplyResult>) -> i32 {
     }
 }
 
+/// Every request kind dispatched via `run-request` must terminate its own
+/// JSONL progress file with exactly one `complete` line -- ferrumd's SSE
+/// handler tails that file and only closes the stream when it sees one.
+/// `apply` and `rollback` write theirs inside `apply::run`/`rollback::run`
+/// (which have real intermediate steps worth streaming); the remaining
+/// kinds are single-shot, so they're instrumented here at the wrapper
+/// level instead. Every one of these wrappers is ALSO the bare-CLI entry
+/// point, where `Progress::open()` finds no FERRUM_JOB_ID and is a total
+/// no-op -- so this changes nothing about running ferrum-apply by hand
+/// over SSH.
 fn run_preflight() -> i32 {
+    let mut progress = progress::Progress::open();
+    progress.event("preflight", "checking free space and snapshot subvolumes");
+    match run_preflight_inner() {
+        Ok(()) => {
+            progress.complete("succeeded", "preflight passed");
+            0
+        }
+        Err(e) => {
+            eprintln!("preflight failed: {e}");
+            progress.complete("failed", &e.to_string());
+            1
+        }
+    }
+}
+
+fn run_preflight_inner() -> anyhow::Result<()> {
     let state_dir = std::env::var("FERRUM_STATE_DIR")
         .unwrap_or_else(|_| "/var/lib/ferrum/state".to_string());
     let snapshot_dir = std::env::var("FERRUM_SNAPSHOT_DIR")
@@ -73,18 +100,12 @@ fn run_preflight() -> i32 {
         .unwrap_or(10);
     let failure_marker_path = std::env::var("FERRUM_FAILURE_MARKER_PATH")
         .unwrap_or_else(|_| "/var/lib/ferrum/state-restore-failed".to_string());
-    match preflight::run(
+    preflight::run(
         std::path::Path::new(&state_dir),
         std::path::Path::new(&snapshot_dir),
         min_free_gib,
         std::path::Path::new(&failure_marker_path),
-    ) {
-        Ok(()) => 0,
-        Err(e) => {
-            eprintln!("preflight failed: {e}");
-            1
-        }
-    }
+    )
 }
 
 fn run_apply() -> i32 {
@@ -181,7 +202,10 @@ fn run_restore_state() -> i32 {
         result_path: "/var/lib/ferrum/rollback-result.json".into(),
         failure_marker_path: failure_marker_path.into(),
     };
+    let mut progress = progress::Progress::open();
+    progress.event("restore-state", "performing any pending state restore");
     restore_state::run(&root_device, &storage);
+    progress.complete("succeeded", "restore-state finished (it always exits 0 by design)");
     0 // always exits 0 -- see Global Constraints
 }
 
@@ -203,10 +227,15 @@ fn main() -> anyhow::Result<()> {
             Ok(request::Request::RestoreState) => run_restore_state(),
             Ok(request::Request::Gc) => {
                 eprintln!("gc: not yet implemented via run-request");
+                // Still writes a terminal progress line: a job ferrumd
+                // dispatched must always end its own stream, even when the
+                // answer is "this kind isn't implemented yet".
+                progress::Progress::open().complete("failed", "gc is not yet implemented");
                 1
             }
             Err(e) => {
                 eprintln!("run-request: {e}");
+                progress::Progress::open().complete("failed", &e.to_string());
                 1
             }
         },

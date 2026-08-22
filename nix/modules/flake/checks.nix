@@ -224,6 +224,28 @@
           checkPhase = "cargo clippy --offline -- -D warnings";
           installPhase = "mkdir -p $out";
         };
+
+        cargo-test-ferrumd = self'.packages.ferrumd;
+
+        clippy-ferrumd = pkgs.rustPlatform.buildRustPackage {
+          pname = "ferrumd-clippy";
+          version = "0.1.0";
+          src = lib.cleanSource ../../../crates;
+          cargoLock.lockFile = ../../../crates/Cargo.lock;
+          buildAndTestSubdir = "ferrumd";
+          nativeBuildInputs = [ pkgs.clippy ];
+          buildPhase = "true";
+          checkPhase = "cargo clippy --offline -- -D warnings";
+          installPhase = "mkdir -p $out";
+        };
+
+        # The proof this whole phase's core deliverable works: a real
+        # operator login with the real generated bootstrap password, a real
+        # settings write, a real secret round-tripped through real sops
+        # encryption, and a real job triggered over the real HTTP API that
+        # crosses the real polkit/D-Bus privilege boundary and produces a
+        # real JSONL progress log.
+        daemon-end-to-end = import ../../../tests/daemon-end-to-end.nix { inherit pkgs; sopsNix = inputs.sops-nix; };
       };
     };
 }

@@ -66,14 +66,49 @@ pub fn prepare(
     Ok(intent)
 }
 
+/// Purely additive instrumentation wrapper around `run_inner`, mirroring
+/// `apply::run`: writes the terminal `complete` progress line on both the
+/// success and error paths, so a job's progress file always ends in one.
+/// Note the success path only ever reaches `complete` if `reboot` returns
+/// without the machine going down first -- a rollback that reboots
+/// promptly ends its progress stream by the unit (and machine) going away,
+/// which is exactly what an operator watching it should see.
 pub fn run(
     target_generation: u32,
     journal_dir: &Path,
     intent_path: &Path,
     snapshot_dir: &Path,
 ) -> anyhow::Result<()> {
-    prepare(target_generation, journal_dir, intent_path, snapshot_dir)?;
+    let mut progress = crate::progress::Progress::open();
+    let outcome = run_inner(
+        target_generation,
+        journal_dir,
+        intent_path,
+        snapshot_dir,
+        &mut progress,
+    );
+    match &outcome {
+        Ok(()) => progress.complete("succeeded", &format!("rebooting into generation {target_generation}")),
+        Err(e) => progress.complete("failed", &e.to_string()),
+    }
+    outcome
+}
 
+fn run_inner(
+    target_generation: u32,
+    journal_dir: &Path,
+    intent_path: &Path,
+    snapshot_dir: &Path,
+    progress: &mut crate::progress::Progress,
+) -> anyhow::Result<()> {
+    progress.event(
+        "validate",
+        &format!("checking generation {target_generation} has a usable state snapshot"),
+    );
+    prepare(target_generation, journal_dir, intent_path, snapshot_dir)?;
+    progress.event("write-intent", "rollback intent written");
+
+    progress.event("switch-generation", "pointing the system profile at the target generation");
     let status = Command::new("nix-env")
         .args([
             "-p",
@@ -98,6 +133,7 @@ pub fn run(
         anyhow::bail!("switch-to-configuration boot failed");
     }
 
+    progress.event("reboot", "scheduling the reboot into the target generation");
     Command::new("reboot").status()?;
     Ok(())
 }

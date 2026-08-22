@@ -1,7 +1,9 @@
 mod auth;
 mod db;
-mod settings;
+mod dbus;
+mod jobs;
 mod secrets_api;
+mod settings;
 
 use axum::{
     extract::State,
@@ -11,11 +13,15 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tower_cookies::{Cookie, CookieManagerLayer, Cookies};
 
 pub struct AppState {
     pub db: db::Db,
+    /// ferrumd's own single-job interlock -- see jobs::create_job. Cleared
+    /// both by ferrum-apply finishing (via systemd's JobRemoved signal,
+    /// below) and, on the failure paths, by create_job itself.
+    pub job_running: Mutex<bool>,
 }
 
 #[derive(Deserialize)]
@@ -69,6 +75,24 @@ async fn require_session(
     }
 }
 
+/// Clears `job_running` when the real ferrum-apply unit's systemd job
+/// finishes, whatever its result -- including the case ferrum-apply
+/// crashed before writing a "complete" line to its own progress file.
+async fn watch_job_completions(state: Arc<AppState>) -> anyhow::Result<()> {
+    let connection = zbus::Connection::system().await?;
+    let proxy = dbus::SystemdManagerProxy::new(&connection).await?;
+    proxy.subscribe().await?;
+    let mut stream = proxy.receive_job_removed().await?;
+    use futures::StreamExt;
+    while let Some(signal) = stream.next().await {
+        let Ok(args) = signal.args() else { continue };
+        if args.unit().starts_with("ferrum-apply@") {
+            *state.job_running.lock().unwrap() = false;
+        }
+    }
+    anyhow::bail!("the systemd JobRemoved signal stream ended unexpectedly")
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let state_dir = std::env::var("FERRUMD_STATE_DIR").unwrap_or_else(|_| "/var/lib/ferrum".to_string());
@@ -76,11 +100,40 @@ async fn main() -> anyhow::Result<()> {
     let db = db::Db::open(&state_dir.join("ferrumd.db"))?;
     auth::ensure_first_user(&db, state_dir)?;
 
-    let state = Arc::new(AppState { db });
+    let state = Arc::new(AppState { db, job_running: Mutex::new(false) });
+
+    // Independently confirms job completion via systemd's own JobRemoved
+    // D-Bus signal, so `job_running` is cleared even if ferrum-apply
+    // crashed before ever writing a "complete" line to its own progress
+    // file -- see this plan's spec Known Risk #2 for why a job can
+    // otherwise be left "running" forever.
+    //
+    // Filtered on the unit name, unlike the plan's original sketch:
+    // JobRemoved fires for EVERY systemd job on the box (a timer firing, a
+    // logrotate run, an operator restarting sshd), so an unfiltered
+    // listener would clear the interlock the moment any unrelated unit
+    // finished -- defeating the serialization jobs::create_job exists to
+    // provide.
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            if let Err(e) = watch_job_completions(state).await {
+                // Deliberately loud rather than silent: if this listener
+                // never comes up, the single-job interlock can only ever
+                // be cleared on create_job's own failure paths, so the
+                // daemon would refuse every job after the first. That is a
+                // real, operator-visible degradation and belongs in the
+                // journal, not swallowed by an `if let Ok` chain.
+                eprintln!("ferrumd: job-completion listener stopped: {e}");
+            }
+        });
+    }
 
     let protected = Router::new()
         .route("/api/settings", axum::routing::get(settings::get_settings).put(settings::put_settings))
         .route("/api/secrets/:name", axum::routing::post(secrets_api::write_secret))
+        .route("/api/jobs", axum::routing::post(jobs::create_job))
+        .route("/api/jobs/:id/stream", axum::routing::get(jobs::stream_job))
         .route_layer(axum::middleware::from_fn_with_state(state.clone(), require_session));
 
     let app = Router::new()

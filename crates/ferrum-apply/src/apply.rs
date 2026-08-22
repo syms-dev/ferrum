@@ -156,12 +156,51 @@ pub struct StorageConfig {
     pub sabnzbd_port: u16,
 }
 
+/// Names the `ApplyResult` variant without its payload, for the terminal
+/// progress line. Deliberately not `Debug`: the payload can be a whole
+/// nix-build stderr dump, and the `complete` line carries the detail
+/// separately.
+fn result_name(result: &ApplyResult) -> &'static str {
+    match result {
+        ApplyResult::Succeeded => "succeeded",
+        ApplyResult::Degraded(_) => "degraded",
+        ApplyResult::Failed(_) => "failed",
+    }
+}
+
+fn result_detail(result: &ApplyResult) -> String {
+    match result {
+        ApplyResult::Succeeded => String::new(),
+        ApplyResult::Degraded(reason) | ApplyResult::Failed(reason) => reason.clone(),
+    }
+}
+
+/// Purely additive instrumentation wrapper: runs the real `run_inner`
+/// below and writes the terminal `complete` progress line for it,
+/// including on the error path (an early `?` inside `run_inner` would
+/// otherwise leave a job's progress file with no terminal line at all, and
+/// ferrumd's SSE handler would tail it forever).
 pub fn run(flake_ref: &str, storage: &StorageConfig) -> anyhow::Result<ApplyResult> {
+    let mut progress = crate::progress::Progress::open();
+    let outcome = run_inner(flake_ref, storage, &mut progress);
+    match &outcome {
+        Ok(result) => progress.complete(result_name(result), &result_detail(result)),
+        Err(e) => progress.complete("error", &e.to_string()),
+    }
+    outcome
+}
+
+fn run_inner(
+    flake_ref: &str,
+    storage: &StorageConfig,
+    progress: &mut crate::progress::Progress,
+) -> anyhow::Result<ApplyResult> {
     // 0. Ensure every enabled servarr app has its API-key secret, and (if
     // auth is enabled) Authelia's own required secrets and first user,
     // BEFORE build -- same reasoning as the servarr keys: sops.validateSopsFiles
     // checks file existence at Nix EVAL time, inside the build step right
     // after this.
+    progress.event("secrets", "ensuring generated secrets exist");
     let servarr_refs: Vec<&str> = storage.servarr_apps.iter().map(String::as_str).collect();
     crate::secrets::ensure_all(&storage.secrets_dir, &storage.host_key_pub, &servarr_refs)?;
     if storage.auth_enabled {
@@ -196,6 +235,7 @@ pub fn run(flake_ref: &str, storage: &StorageConfig) -> anyhow::Result<ApplyResu
     // checks.eval-example-hosts (the CI-facing check) never runs with
     // --impure, so it stays a real guard against accidental impurity
     // everywhere except this one specific, already-audited case.
+    progress.event("build", "building the new system closure");
     let build_output = Command::new("nix")
         .args(["build", "--impure", "--no-link", "--print-out-paths", flake_ref])
         .output()?;
@@ -212,10 +252,12 @@ pub fn run(flake_ref: &str, storage: &StorageConfig) -> anyhow::Result<ApplyResu
         // Nothing to switch. But a *prior* apply may have left the system
         // degraded (e.g. an app crashed after activation) -- report real
         // health instead of a bare, potentially-false "succeeded".
+        progress.event("health-check", "already on the target closure; checking health only");
         return Ok(classify(0, wait_for_healthy(storage.health_check_timeout)?));
     }
 
     // 2. Preflight, before touching anything.
+    progress.event("preflight", "checking free space and snapshot subvolumes");
     crate::preflight::run(
         &storage.state_dir,
         &storage.snapshot_dir,
@@ -225,6 +267,7 @@ pub fn run(flake_ref: &str, storage: &StorageConfig) -> anyhow::Result<ApplyResu
     .map_err(|e| anyhow::anyhow!("preflight failed, nothing changed: {e}"))?;
 
     // 3. Stop managed apps -- downtime starts here.
+    progress.event("stop-apps", "stopping ferrum-apps.target (downtime starts)");
     run_ok(Command::new("systemctl").args(["stop", "ferrum-apps.target"]))?;
 
     // Everything between the stop above and the restart below MUST leave
@@ -234,8 +277,9 @@ pub fn run(flake_ref: &str, storage: &StorageConfig) -> anyhow::Result<ApplyResu
     // ferrum-apps.target stopped forever. So the fallible sequence is
     // isolated in a closure whose error we inspect AFTER the unconditional
     // restart below, not before.
-    let inner = || -> anyhow::Result<i32> {
+    let mut inner = || -> anyhow::Result<i32> {
         // 4. Snapshot @state.
+        progress.event("snapshot", "snapshotting @state");
         let ts = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
         let snapshot_name = journal::snapshot_name(ts, current);
         let snapshot_path = storage.snapshot_dir.join(&snapshot_name);
@@ -256,6 +300,7 @@ pub fn run(flake_ref: &str, storage: &StorageConfig) -> anyhow::Result<ApplyResu
         journal::write(&storage.journal_dir, &entry)?;
 
         // 5. Set the profile to the new generation.
+        progress.event("set-profile", "pointing the system profile at the new closure");
         run_ok(
             Command::new("nix-env")
                 .args(["-p", "/nix/var/nix/profiles/system", "--set"])
@@ -263,6 +308,7 @@ pub fn run(flake_ref: &str, storage: &StorageConfig) -> anyhow::Result<ApplyResu
         )?;
 
         // 6. Activate.
+        progress.event("switch", "running switch-to-configuration switch");
         let switch_status = Command::new(format!("{toplevel}/bin/switch-to-configuration"))
             .arg("switch")
             .status()?;
@@ -278,12 +324,14 @@ pub fn run(flake_ref: &str, storage: &StorageConfig) -> anyhow::Result<ApplyResu
     // propagate its error until after this line. If systemctl itself can't
     // be reached, that's a distinct, real problem worth surfacing loudly via
     // `?` rather than swallowing.
+    progress.event("start-apps", "restarting ferrum-apps.target");
     run_ok(Command::new("systemctl").args(["start", "ferrum-apps.target"]))?;
 
     let switch_exit_code = inner_result.map_err(|e| {
         anyhow::anyhow!("apply failed mid-sequence (apps have been restarted): {e}")
     })?;
 
+    progress.event("health-check", "waiting for every managed unit to become active");
     let healthy = wait_for_healthy(storage.health_check_timeout)?;
     Ok(classify(switch_exit_code, healthy))
 }
