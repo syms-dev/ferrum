@@ -506,32 +506,29 @@ lib.mkIf ferrum.daemon.enable {
 
   # /etc/ferrum's own carved-out permission model (settings.json and
   # secrets/ writable by ferrumd, everything else root-only) is provisioned
-  # once by nixos-anywhere's own initial setup, not by this module at
-  # runtime -- this only ASSERTS the expected shape exists before ferrumd
-  # is allowed to start, mirroring modules/core/storage.nix's own
-  # assertion style, so a host provisioned before this phase existed fails
-  # loud with an actionable message instead of ferrumd silently failing to
-  # write settings.json the first time an operator tries.
-  assertions = [
-    {
-      assertion = builtins.pathExists /etc/ferrum/settings.json;
-      message = ''
-        ferrum.daemon.enable is true but /etc/ferrum/settings.json does not
-        exist. This file must be provisioned once, at creation, owned
-        root:ferrum mode 0664, as part of this host's initial
-        nixos-anywhere setup -- ferrumd itself never creates it.
-      '';
-    }
-    {
-      assertion = builtins.pathExists /etc/ferrum/secrets;
-      message = ''
-        ferrum.daemon.enable is true but /etc/ferrum/secrets does not
-        exist. This directory must be provisioned once, at creation, owned
-        ferrum:ferrum mode 0750, as part of this host's initial
-        nixos-anywhere setup.
-      '';
-    }
-  ];
+  # once by nixos-anywhere's own initial setup, not by this module.
+  #
+  # NOTE ON A REAL DESIGN CORRECTION MADE WHILE WRITING THIS PLAN: an
+  # earlier draft of this module asserted these paths exist via a plain
+  # NixOS `assertions = [ { assertion = builtins.pathExists ...; } ];`
+  # block. That is wrong and was caught by this plan's own pre-flight
+  # review, confirmed for real on ferrum-dev: `builtins.pathExists` on an
+  # absolute path is evaluated against the MACHINE RUNNING THE NIX
+  # EVALUATION, not the machine the resulting config will boot on. For a
+  # real deployed host rebuilding itself locally (the normal
+  # `nixos-rebuild switch` case ferrum-apply drives), evaluator and target
+  # happen to be the same machine, so it would appear to "work" -- but for
+  # THIS PLAN'S OWN VM TESTS (this task's Step 5, and Task 6's Step 8),
+  # evaluation runs on the CI runner / ferrum-dev, which never has
+  # /etc/ferrum/settings.json, so the assertion would fail before the VM
+  # even boots, on every run, unconditionally. The correct mechanism for
+  # "does this real path exist on the machine actually starting this
+  # unit" is systemd's own AssertPathExists= (a real, standard, documented
+  # systemd.exec directive -- confirmed via `man systemd.unit` on
+  # ferrum-dev), which is evaluated at REAL activation time on the REAL
+  # target machine, not at Nix-eval time -- see Task 6 Step 6, where it is
+  # attached to the ferrumd unit itself (the actual thing that needs these
+  # paths, rather than the whole daemon.nix module).
 }
 ```
 
@@ -552,12 +549,12 @@ pkgs.testers.runNixOSTest {
     options.ferrum = lib.mkOption { type = lib.types.raw; default = { }; };
     config = {
       ferrum.daemon.enable = true;
-      # Satisfy the two assertions Step 3 added, since this test doesn't
-      # go through real nixos-anywhere provisioning.
-      systemd.tmpfiles.rules = [
-        "f /etc/ferrum/settings.json 0664 root ferrum - {}"
-        "d /etc/ferrum/secrets 0750 ferrum ferrum - -"
-      ];
+      # No /etc/ferrum stub files needed here: the ferrum-apply@ template
+      # unit and polkit rule under test don't reference /etc/ferrum at all
+      # -- that dependency belongs only to the ferrumd unit itself (added
+      # in Task 6, which checks it via the real, activation-time
+      # AssertPathExists=, not an eval-time assertion; see Task 6 Step 8's
+      # own test for where those stub files are actually needed).
       users.users.testferrum = {
         isNormalUser = true;
       };
@@ -607,7 +604,7 @@ Wire it into `nix/modules/flake/checks.nix` alongside the other VM tests: `privi
 
 1. `cargo test -p ferrum-apply` — new `request.rs` tests plus the new `parses_run_request_subcommand` test all pass; existing tests unaffected.
 2. `cargo clippy -p ferrum-apply --all-targets -- -D warnings` — clean.
-3. Real `nix eval` of a host with `ferrum.daemon.enable = true` (and the two assertion-satisfying stub files/dirs) — confirms the module evaluates cleanly, the polkit rule text is syntactically valid JS (polkit rules are evaluated, not just stored as a string), and the template unit resolves `${pkgs.ferrum-apply}` correctly.
+3. Real `nix eval` of a host with `ferrum.daemon.enable = true` — confirms the module evaluates cleanly with no filesystem dependency at eval time (the earlier eval-time assertion design was removed in this same task after being caught by this plan's own pre-flight review — see the note left in `modules/core/daemon.nix`), the polkit rule text is syntactically valid JS (polkit rules are evaluated, not just stored as a string), and the template unit resolves `${pkgs.ferrum-apply}` correctly.
 4. `nix build .#checks.x86_64-linux.privilege-boundary --print-build-logs` — the real VM test from Step 5 passes both assertions.
 
 - [ ] **Step 7: Commit**
@@ -1737,9 +1734,25 @@ Add `futures = "0.3"` to `Cargo.toml`.
 
 Add `mod jobs; mod dbus;` to `main.rs`'s module declarations.
 
-- [ ] **Step 6: Complete `modules/core/daemon.nix` — add ferrumd's own systemd unit**
+- [ ] **Step 6: Complete `modules/core/daemon.nix` — wire job env vars into the `ferrum-apply@` unit, and add ferrumd's own systemd unit**
 
-Append to the existing `modules/core/daemon.nix` (from Task 2), inside the same `lib.mkIf ferrum.daemon.enable { ... }` block:
+**A real gap caught in this plan's own pre-flight review, before dispatch:** Task 2's `systemd.services."ferrum-apply@"` unit (the actual process that runs when a job is triggered) has no `environment` block at all — but Step 1 of this task made `ferrum-apply`'s own `apply::run`/`rollback::run` read `FERRUM_JOB_ID` and `FERRUM_JOBS_DIR` to decide whether and where to write JSONL progress (`crates/ferrum-apply/src/progress.rs`'s `Progress::open()`). Without `FERRUM_JOB_ID` set on this specific unit, `Progress::open()` sees no job id, silently writes no progress file at all, and `jobs::stream_job`'s SSE handler (Step 3) waits forever for a `/var/lib/ferrum/jobs/<uuid>.jsonl` that never gets created — breaking the Job API's entire progress-streaming feature, and specifically making Step 8's `daemon-end-to-end.nix` test hang on its own `wait_until_succeeds("grep -q complete ...")` call. Fix it by extending the EXISTING `ferrum-apply@` unit from Task 2 with an `environment` block, using systemd's own `%i` instance-name substitution (the same mechanism the unit's `ExecStart` already relies on for the request-file path) so `FERRUM_JOB_ID` is always exactly the UUID this job's own D-Bus `StartUnit` call used:
+
+```nix
+  systemd.services."ferrum-apply@" = {
+    description = "ferrum-apply, dispatched from a ferrumd-written request file";
+    environment = {
+      FERRUM_JOB_ID = "%i";
+      FERRUM_JOBS_DIR = "/var/lib/ferrum/jobs";
+    };
+    serviceConfig = {
+      Type = "oneshot";
+      ExecStart = "${pkgs.ferrum-apply}/bin/ferrum-apply run-request /run/ferrum/requests/%i.json";
+    };
+  };
+```
+
+This replaces Task 2's original `systemd.services."ferrum-apply@"` block in full (the `description`/`ExecStart`/comments stay exactly as Task 2 wrote them — only the new `environment` attribute is added). Then append the new `ferrumd` unit itself, inside the same `lib.mkIf ferrum.daemon.enable { ... }` block:
 
 ```nix
   systemd.services.ferrumd = {
@@ -1767,6 +1780,22 @@ Append to the existing `modules/core/daemon.nix` (from Task 2), inside the same 
       CapabilityBoundingSet = "";
       NoNewPrivileges = true;
       Restart = "on-failure";
+      # Real runtime check (systemd's own AssertPathExists=, confirmed via
+      # `man systemd.unit` on ferrum-dev) that these two pre-provisioned
+      # paths exist on THIS machine before ferrumd starts -- replaces an
+      # earlier, wrong Nix-eval-time `assertions = [...]` block in Task 2's
+      # daemon.nix that this plan's own pre-flight review caught and
+      # removed (see the note left in that file): a plain NixOS assertion
+      # using builtins.pathExists checks the machine doing the Nix
+      # evaluation, not the machine the unit actually starts on, which
+      # would have made every VM test that enables ferrum.daemon fail to
+      # even evaluate on a fresh CI runner. AssertPathExists= is checked at
+      # real activation time on the real target machine instead -- it
+      # fails the unit loudly (logged, visible via `systemctl status`) if
+      # nixos-anywhere's initial setup never provisioned these paths,
+      # matching the original intended safety property without depending
+      # on where evaluation happens to run.
+      AssertPathExists = [ "/etc/ferrum/settings.json" "/etc/ferrum/secrets" ];
     };
   };
 ```
