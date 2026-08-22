@@ -180,6 +180,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "ferrum-secrets",
  "rustix 0.38.44",
  "serde",
  "serde_json",
@@ -195,6 +196,14 @@ dependencies = [
  "serde_json",
  "tempfile",
  "ureq",
+]
+
+[[package]]
+name = "ferrum-secrets"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "tempfile",
 ]
 
 [[package]]
