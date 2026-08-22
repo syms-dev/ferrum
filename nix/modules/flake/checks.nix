@@ -179,10 +179,14 @@
         # exercise directly.
         state-restore-interlock = import ../../../tests/state-restore-interlock.nix { inherit pkgs; };
 
-        # Proves the real privilege boundary Task 2 built: an unprivileged
-        # user really can trigger a real ferrum-apply run via D-Bus +
-        # polkit (not just that the polkit rule text parses), and really
-        # is denied starting an unrelated unit.
+        # Proves the real privilege boundary Task 2 built, in BOTH
+        # directions (not just that the polkit rule text parses): the real
+        # `ferrum` service account really can trigger a real ferrum-apply
+        # run via D-Bus + polkit, an ordinary unprivileged account really
+        # is DENIED the identical call, and neither may start an unrelated
+        # unit. The two-directional form is deliberate -- this test used to
+        # assert only that "an unprivileged user can trigger a run", which
+        # passed because the rule had no subject check at all.
         privilege-boundary = import ../../../tests/privilege-boundary.nix { inherit pkgs; sopsNix = inputs.sops-nix; };
 
         # Not a separate runCommand: Nix's build sandbox has no network

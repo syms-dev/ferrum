@@ -679,6 +679,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "tower",
  "tower-cookies",
  "uuid",
  "zbus",

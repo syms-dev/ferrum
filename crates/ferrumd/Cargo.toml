@@ -32,3 +32,10 @@ futures = "0.3"
 
 [dev-dependencies]
 tempfile = "3"
+# Only for `ServiceExt::oneshot` in main.rs's CSRF tests, which drive real
+# requests through the real axum router + require_session middleware rather
+# than calling the predicates in isolation. 0.5 is the line axum 0.7.9
+# itself already resolves to (checked against the real Cargo.lock: a "0.4"
+# pin here really did add a SECOND tower to the tree), so this pulls in no
+# new dependency at all.
+tower = { version = "0.5", features = ["util"] }

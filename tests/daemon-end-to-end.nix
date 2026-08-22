@@ -17,6 +17,23 @@
 #   6. ferrumd's single-job interlock really clears afterwards, via systemd's
 #      own JobRemoved signal, so a real second job is really admitted.
 #
+# Added by the branch-wide final review of Phase 1.5a, all in the same
+# "prove it on a real booted machine" spirit:
+#
+#   7. The real CSRF gate really refuses a real, session-authenticated
+#      mutating request that carries no (or a wrong) X-CSRF-Token header,
+#      with a real 403 and no write landing on disk -- and every mutating
+#      call in this file really carries the real token the real login
+#      handed out.
+#   8. /var/lib/ferrum really stays root-owned: the real ferrum user really
+#      cannot create or delete `state-restore-failed` or
+#      `rollback-intent.json` beside its own state, while really being able
+#      to write its own /var/lib/ferrum/daemon subdirectory.
+#   9. The spent request file really is deleted once the job's real
+#      JobRemoved signal arrives, and systemd really applied every
+#      hardening directive on the unit -- with the whole rest of this test
+#      having really run underneath them.
+#
 # DELIBERATE DEVIATIONS from the task brief's literal test code, each of
 # which was necessary to make the test actually run rather than hang or
 # fail to evaluate:
@@ -174,8 +191,50 @@ pkgs.testers.runNixOSTest {
     machine.wait_for_unit("ferrumd.service")
     machine.wait_for_open_port(7788)
 
+    print("=== /var/lib/ferrum's own permission model ===")
+    # The parent directory is SHARED between root-trusted control files
+    # (state-restore-failed, rollback-intent.json, journal/) and ferrumd's
+    # own state, so root must keep it: directory write permission is
+    # create/delete/rename permission on every name inside, whatever the
+    # individual files' modes say. ferrumd gets a subdirectory instead.
+    parent = machine.succeed("stat -c '%U %G %a' /var/lib/ferrum").strip()
+    print(f"/var/lib/ferrum: {parent}")
+    assert parent == "root ferrum 750", (
+        f"/var/lib/ferrum must be root-owned with only group traverse, got: {parent}"
+    )
+    for sub in ("daemon", "jobs"):
+        owned = machine.succeed(f"stat -c '%U %G %a' /var/lib/ferrum/{sub}").strip()
+        print(f"/var/lib/ferrum/{sub}: {owned}")
+        assert owned == "ferrum ferrum 750", f"/var/lib/ferrum/{sub} unexpected: {owned}"
+
+    # Behaviourally, as the real daemon user: it can write its own
+    # subdirectory and genuinely cannot create or delete anything in the
+    # shared parent. The two named files are the real interlocks -- deleting
+    # state-restore-failed would defeat the fail-closed gate on every app
+    # unit, and forging rollback-intent.json would steer a real state
+    # rollback.
+    #
+    # `rm -f`, not bare `rm`, throughout: coreutils' rm PROMPTS ("remove
+    # write-protected regular empty file ...?") when the target is not
+    # writable by the calling user, and the test driver's shell gives it a
+    # stdin that never answers -- a bare `rm` here hangs the whole VM test
+    # forever instead of failing. `-f` suppresses only the prompt, not the
+    # unlink error: a denied unlink still exits non-zero, which is exactly
+    # what machine.fail must observe. (Found by actually running this.)
+    machine.succeed("su -s /bin/sh ferrum -c 'touch /var/lib/ferrum/daemon/.writable'")
+    machine.succeed("su -s /bin/sh ferrum -c 'rm -f /var/lib/ferrum/daemon/.writable'")
+    machine.fail("su -s /bin/sh ferrum -c 'touch /var/lib/ferrum/rollback-intent.json'")
+    machine.fail("su -s /bin/sh ferrum -c 'touch /var/lib/ferrum/state-restore-failed'")
+    machine.succeed("touch /var/lib/ferrum/state-restore-failed")
+    machine.fail("su -s /bin/sh ferrum -c 'rm -f /var/lib/ferrum/state-restore-failed'")
+    # Still there -- the denial above really denied, rather than `-f`
+    # quietly swallowing a successful delete.
+    machine.succeed("test -e /var/lib/ferrum/state-restore-failed")
+    machine.succeed("rm -f /var/lib/ferrum/state-restore-failed")
+    print("PASS: ferrumd really cannot create or delete root-trusted files beside its own state")
+
     print("=== real login with the real bootstrap password ===")
-    password = machine.succeed("cat /var/lib/ferrum/ferrumd-setup-password").strip()
+    password = machine.succeed("cat /var/lib/ferrum/daemon/ferrumd-setup-password").strip()
     login_response = machine.succeed(
         f"curl -s -c /tmp/cookies.txt -X POST http://127.0.0.1:7788/api/login "
         f"-H 'Content-Type: application/json' "
@@ -183,7 +242,36 @@ pkgs.testers.runNixOSTest {
     )
     print(f"login response: {login_response}")
     assert "csrf_token" in login_response
+    import json
+    csrf = json.loads(login_response)["csrf_token"]
+    # Every mutating call below carries this. The daemon now requires it:
+    # `SameSite=Strict` on the session cookie is a browser-enforced control,
+    # and the server needs one of its own.
+    csrf_header = f"-H 'X-CSRF-Token: {csrf}'"
     print("PASS: real login against the real generated bootstrap password")
+
+    print("=== a mutating call WITHOUT the CSRF header must be refused ===")
+    # Same valid session cookie, same valid body -- the ONLY difference from
+    # the write two steps down is the missing header. 403, not 401: the
+    # caller is authenticated, the request is not.
+    no_csrf = machine.succeed(
+        "curl -s -o /dev/null -w '%{http_code}' -b /tmp/cookies.txt "
+        "-X PUT http://127.0.0.1:7788/api/settings "
+        "-H 'Content-Type: application/json' "
+        "-d '{\"schemaVersion\":1,\"secrets\":{\"test-secret\":{}}}'"
+    ).strip()
+    assert no_csrf == "403", f"expected 403 for a session-authenticated request with no CSRF header, got {no_csrf}"
+    wrong_csrf = machine.succeed(
+        "curl -s -o /dev/null -w '%{http_code}' -b /tmp/cookies.txt "
+        "-X PUT http://127.0.0.1:7788/api/settings "
+        "-H 'Content-Type: application/json' -H 'X-CSRF-Token: not-the-real-token' "
+        "-d '{\"schemaVersion\":1,\"secrets\":{\"test-secret\":{}}}'"
+    ).strip()
+    assert wrong_csrf == "403", f"expected 403 for a wrong CSRF token, got {wrong_csrf}"
+    # And the refusal really refused: nothing was written.
+    machine.succeed("grep -q test-secret /etc/ferrum/settings.json")
+    machine.fail("grep -q ops@example.com /etc/ferrum/settings.json")
+    print("PASS: the real CSRF gate really refuses a cookie-only mutating request")
 
     print("=== an unauthenticated job POST must be rejected ===")
     unauth = machine.succeed(
@@ -195,9 +283,9 @@ pkgs.testers.runNixOSTest {
 
     print("=== real settings write ===")
     machine.succeed(
-        "curl -s -f -b /tmp/cookies.txt -X PUT http://127.0.0.1:7788/api/settings "
-        "-H 'Content-Type: application/json' "
-        "-d '{\"schemaVersion\":1,\"secrets\":{\"test-secret\":{}},\"auth\":{\"adminEmail\":\"ops@example.com\"}}'"
+        f"curl -s -f -b /tmp/cookies.txt -X PUT http://127.0.0.1:7788/api/settings "
+        f"-H 'Content-Type: application/json' {csrf_header} "
+        f"-d '{{\"schemaVersion\":1,\"secrets\":{{\"test-secret\":{{}}}},\"auth\":{{\"adminEmail\":\"ops@example.com\"}}}}'"
     )
     settings_content = machine.succeed("cat /etc/ferrum/settings.json")
     print(f"settings.json on disk: {settings_content}")
@@ -207,8 +295,8 @@ pkgs.testers.runNixOSTest {
 
     print("=== real secret write, confirmed by real decryption ===")
     machine.succeed(
-        "curl -s -f -b /tmp/cookies.txt -X POST http://127.0.0.1:7788/api/secrets/test-secret "
-        "-d 'a-real-secret-value'"
+        f"curl -s -f -b /tmp/cookies.txt -X POST http://127.0.0.1:7788/api/secrets/test-secret "
+        f"{csrf_header} -d 'a-real-secret-value'"
     )
     # sops has no idea this box's age identity lives inside its OpenSSH
     # host key -- convert it the same way sops-nix's own decrypt side does.
@@ -224,8 +312,8 @@ pkgs.testers.runNixOSTest {
 
     print("=== an undeclared secret name must be refused ===")
     undeclared = machine.succeed(
-        "curl -s -o /dev/null -w '%{http_code}' -b /tmp/cookies.txt "
-        "-X POST http://127.0.0.1:7788/api/secrets/not-declared -d 'nope'"
+        f"curl -s -o /dev/null -w '%{{http_code}}' -b /tmp/cookies.txt {csrf_header} "
+        f"-X POST http://127.0.0.1:7788/api/secrets/not-declared -d 'nope'"
     ).strip()
     assert undeclared == "400", f"expected 400 for a name settings.json never declared, got {undeclared}"
     machine.fail("test -e /etc/ferrum/secrets/not-declared.sops")
@@ -233,11 +321,10 @@ pkgs.testers.runNixOSTest {
 
     print("=== real job trigger: preflight, through the real privilege boundary ===")
     job_response = machine.succeed(
-        "curl -s -f -b /tmp/cookies.txt -X POST http://127.0.0.1:7788/api/jobs "
-        "-H 'Content-Type: application/json' -d '{\"kind\":\"preflight\"}'"
+        f"curl -s -f -b /tmp/cookies.txt -X POST http://127.0.0.1:7788/api/jobs "
+        f"-H 'Content-Type: application/json' {csrf_header} -d '{{\"kind\":\"preflight\"}}'"
     )
     print(f"job response: {job_response}")
-    import json
     job_id = json.loads(job_response)["id"]
 
     machine.wait_until_succeeds(
@@ -256,8 +343,20 @@ pkgs.testers.runNixOSTest {
         f"systemctl show ferrum-apply@{job_id}.service -p Result --value"
     ).strip()
     assert unit_result == "success", f"the real privileged unit must have succeeded, got: {unit_result}"
-    machine.succeed(f"test -e /run/ferrum/requests/{job_id}.json")
     print("PASS: a real job, triggered over the real HTTP API, ran through the real privilege boundary and produced a real progress log")
+
+    print("=== the spent request file is really cleaned up ===")
+    # It used to be left behind forever. A request file that outlives its
+    # job is a replayable privileged trigger sitting in a tmpfs directory:
+    # anything that can name the UUID (it is visible in `systemctl
+    # list-units`) and reach the D-Bus StartUnit call could re-run it. The
+    # polkit subject check is what actually stops that call; this is the
+    # defence-in-depth half, shrinking the window in which there is
+    # anything to replay. Retried rather than checked once: the deletion
+    # happens when ferrumd processes systemd's JobRemoved signal, which is
+    # asynchronous with respect to the progress file's last line.
+    machine.wait_until_succeeds(f"test ! -e /run/ferrum/requests/{job_id}.json", timeout=60)
+    print("PASS: ferrumd really deleted the spent request file after the job finished")
 
     print("=== the real SSE progress stream really serves that log back ===")
     # Replays from the start and closes itself on the terminal "complete"
@@ -286,9 +385,9 @@ pkgs.testers.runNixOSTest {
     # assuming the signal has already been processed the instant the
     # progress file's last line landed.
     machine.wait_until_succeeds(
-        "curl -s -o /dev/null -w '%{http_code}' -b /tmp/cookies.txt "
-        "-X POST http://127.0.0.1:7788/api/jobs "
-        "-H 'Content-Type: application/json' -d '{\"kind\":\"preflight\"}' | grep -q 200",
+        f"curl -s -o /dev/null -w '%{{http_code}}' -b /tmp/cookies.txt "
+        f"-X POST http://127.0.0.1:7788/api/jobs {csrf_header} "
+        f"-H 'Content-Type: application/json' -d '{{\"kind\":\"preflight\"}}' | grep -q 200",
         timeout=60,
     )
     print("PASS: job_running correctly cleared after completion, allowing a real second job")
@@ -301,9 +400,9 @@ pkgs.testers.runNixOSTest {
     # this runs we would see a 200 instead, so this is checked immediately,
     # with no waiting in between.
     third = machine.succeed(
-        "curl -s -o /dev/null -w '%{http_code}' -b /tmp/cookies.txt "
-        "-X POST http://127.0.0.1:7788/api/jobs "
-        "-H 'Content-Type: application/json' -d '{\"kind\":\"preflight\"}'"
+        f"curl -s -o /dev/null -w '%{{http_code}}' -b /tmp/cookies.txt "
+        f"-X POST http://127.0.0.1:7788/api/jobs {csrf_header} "
+        f"-H 'Content-Type: application/json' -d '{{\"kind\":\"preflight\"}}'"
     ).strip()
     print(f"third job HTTP code: {third}")
     assert third in ("409", "200"), f"unexpected code from the third job: {third}"
@@ -342,9 +441,9 @@ pkgs.testers.runNixOSTest {
     machine.succeed("systemctl restart ferrumd.service")
     machine.wait_for_open_port(7788)
     seeded = machine.succeed(
-        "curl -s -o /dev/null -w '%{http_code}' -b /tmp/cookies.txt "
-        "-X POST http://127.0.0.1:7788/api/jobs "
-        "-H 'Content-Type: application/json' -d '{\"kind\":\"preflight\"}'"
+        f"curl -s -o /dev/null -w '%{{http_code}}' -b /tmp/cookies.txt "
+        f"-X POST http://127.0.0.1:7788/api/jobs {csrf_header} "
+        f"-H 'Content-Type: application/json' -d '{{\"kind\":\"preflight\"}}'"
     ).strip()
     assert seeded == "409", (
         "a ferrumd restarted while a real ferrum-apply unit is active must "
@@ -358,9 +457,9 @@ pkgs.testers.runNixOSTest {
     machine.succeed("systemctl restart ferrumd.service")
     machine.wait_for_open_port(7788)
     cleared = machine.succeed(
-        "curl -s -o /dev/null -w '%{http_code}' -b /tmp/cookies.txt "
-        "-X POST http://127.0.0.1:7788/api/jobs "
-        "-H 'Content-Type: application/json' -d '{\"kind\":\"preflight\"}'"
+        f"curl -s -o /dev/null -w '%{{http_code}}' -b /tmp/cookies.txt "
+        f"-X POST http://127.0.0.1:7788/api/jobs {csrf_header} "
+        f"-H 'Content-Type: application/json' -d '{{\"kind\":\"preflight\"}}'"
     ).strip()
     assert cleared == "200", (
         "with nothing running, the startup query must seed the interlock OPEN "
@@ -379,6 +478,111 @@ pkgs.testers.runNixOSTest {
         "'sshd.service' replace\""
     )
     print("PASS: the daemon's user really cannot start an arbitrary unit")
+
+    print("=== ...and really is confined by the unit's hardening directives ===")
+    # Read back from systemd's OWN parsed view of the running unit, not from
+    # the Nix source: a directive systemd did not accept (wrong section,
+    # wrong spelling) would show its default here. Everything above in this
+    # test already ran under these restrictions -- SQLite writes, the D-Bus
+    # StartUnit, the TCP listener, and the sops/ssh-to-age subprocesses the
+    # secrets API forks -- so this is the structural half of a property the
+    # rest of the file has already proven behaviourally.
+    for prop, expected in [
+        ("PrivateTmp", "yes"),
+        ("ProtectHome", "yes"),
+        ("NoNewPrivileges", "yes"),
+        ("LockPersonality", "yes"),
+        ("RestrictSUIDSGID", "yes"),
+        ("RestrictRealtime", "yes"),
+        ("ProtectKernelTunables", "yes"),
+        ("ProtectKernelModules", "yes"),
+        ("ProtectControlGroups", "yes"),
+        ("ProtectClock", "yes"),
+        ("ProtectSystem", "strict"),
+    ]:
+        actual = machine.succeed(
+            f"systemctl show ferrumd.service -p {prop} --value"
+        ).strip()
+        assert actual == expected, f"ferrumd.service {prop}: expected {expected}, got {actual}"
+
+    families = machine.succeed(
+        "systemctl show ferrumd.service -p RestrictAddressFamilies --value"
+    ).strip()
+    print(f"RestrictAddressFamilies: {families}")
+    for needed in ("AF_UNIX", "AF_INET", "AF_INET6"):
+        assert needed in families, f"{needed} is genuinely required by ferrumd: {families}"
+    # A filter that allowed everything would satisfy the line above too.
+    assert "AF_NETLINK" not in families, f"the filter must really be a filter: {families}"
+    assert "AF_PACKET" not in families, f"the filter must really be a filter: {families}"
+
+    # Two different questions, deliberately asked separately.
+    #
+    # (a) Is the directive WRITTEN the way this repo intends? Only the unit
+    #     fragment can answer that: `systemctl show -p SystemCallFilter`
+    #     does NOT echo "@system-service" back -- it RESOLVES the preset and
+    #     returns the full expanded allow-list of individual syscall names.
+    #     (Found by actually running this: an earlier version of this check
+    #     asserted the preset name appeared in the property value and failed
+    #     against a perfectly correct unit.)
+    fragment = machine.succeed("systemctl cat ferrumd.service")
+    assert "SystemCallFilter=@system-service" in fragment, (
+        f"expected the standard preset in the unit fragment:\n{fragment}"
+    )
+    # Checked as two separate substrings because NixOS renders a
+    # list-valued serviceConfig attribute as one `Key=value` line per
+    # element -- this matches both that rendering and a single combined
+    # `SystemCallFilter=~@privileged @resources` line.
+    assert "SystemCallFilter=~@privileged" in fragment, (
+        f"the privileged group must be subtracted:\n{fragment}"
+    )
+    assert "@resources" in fragment, (
+        f"the resource-control group must be subtracted:\n{fragment}"
+    )
+
+    # (b) Did systemd really APPLY it, and is the result really a filter
+    #     rather than an allow-everything? Asked of systemd's own expanded
+    #     view. Word-split into a set rather than substring-matched --
+    #     "mount" is a substring of the perfectly ordinary `listmount` and
+    #     `statmount`, so `in` on the raw string would silently pass.
+    allowed = set(
+        machine.succeed("systemctl show ferrumd.service -p SystemCallFilter --value").split()
+    )
+    print(f"SystemCallFilter resolves to {len(allowed)} syscalls")
+    assert allowed, "an empty SystemCallFilter is no filter at all"
+    for needed in ("read", "write", "openat", "socket", "connect", "futex", "mmap"):
+        assert needed in allowed, (
+            f"{needed} is genuinely required by ferrumd and must not be filtered away"
+        )
+    # The whole point of @system-service minus @privileged/@resources: an
+    # ordinary daemon has no business doing any of these.
+    for forbidden in (
+        "mount", "umount2", "pivot_root", "chroot", "reboot", "kexec_load",
+        "init_module", "finit_module", "delete_module", "swapon", "swapoff",
+        "bpf", "ptrace", "settimeofday", "setdomainname", "sethostname",
+    ):
+        assert forbidden not in allowed, (
+            f"{forbidden} must not be reachable from ferrumd: the filter is too wide"
+        )
+
+    arches = machine.succeed(
+        "systemctl show ferrumd.service -p SystemCallArchitectures --value"
+    ).strip()
+    assert arches == "native", f"expected native-only, got: {arches}"
+
+    caps = machine.succeed(
+        "systemctl show ferrumd.service -p CapabilityBoundingSet --value"
+    ).strip()
+    assert caps == "", f"ferrumd must hold no capabilities at all, got: {caps}"
+
+    # The narrowed write surface: the shared parent must NOT be in it.
+    rw = machine.succeed("systemctl show ferrumd.service -p ReadWritePaths --value").strip()
+    print(f"ReadWritePaths: {rw}")
+    assert "/var/lib/ferrum/daemon" in rw and "/var/lib/ferrum/jobs" in rw, rw
+    for entry in rw.strip().split():
+        assert entry != "/var/lib/ferrum", (
+            f"the shared parent must not be writable by ferrumd: {rw}"
+        )
+    print("PASS: systemd really applied the hardening, and the daemon really worked under all of it")
 
     # Deliberately LAST: this one deletes a path ferrumd needs and leaves
     # the unit failed, so nothing after it could rely on a working daemon.
