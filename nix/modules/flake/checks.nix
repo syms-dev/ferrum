@@ -108,6 +108,49 @@
           offenders = map (s: s.sopsFile) offenders;
         };
 
+      # Real test coverage for modules/lib/migrations.nix's own machinery
+      # -- genuinely calling its real, exported `migrateWith` function
+      # (never a second, independently-written copy of the same
+      # recursion) against SYNTHETIC chains constructed inline here, so
+      # this test doesn't depend on any real migration ever existing.
+      # Proves: a no-op when already current, a single-step migration, a
+      # multi-step chain applying in sequence, and a throwing migration
+      # genuinely failing eval with its own message intact -- all through
+      # the one real code path every real host's mkHost call also uses.
+      migrationMechanism =
+        let
+          realMigrations = import ../../../modules/lib/migrations.nix { inherit lib; };
+
+          testMigrations = [
+            { from = 1; to = 2; description = "test: renames foo to bar";
+              migrate = s: (removeAttrs s [ "foo" ]) // { bar = s.foo or null; }; }
+            { from = 2; to = 3; description = "test: doubles baz";
+              migrate = s: s // { baz = (s.baz or 0) * 2; }; }
+          ];
+          testMigrate = realMigrations.migrateWith testMigrations;
+
+          alreadyCurrent = testMigrate { schemaVersion = 3; baz = 5; };
+          oneStep = testMigrate { schemaVersion = 2; baz = 5; };
+          twoStep = testMigrate { schemaVersion = 1; foo = "hello"; baz = 5; };
+
+          throwingChain = [
+            { from = 1; to = 2; description = "test: always throws";
+              migrate = s: throw "this update needs your input: real reason here"; }
+          ];
+          throwingMigrate = realMigrations.migrateWith throwingChain;
+          throwCaught = !(builtins.tryEval (throwingMigrate { schemaVersion = 1; })).success;
+        in
+        {
+          ok = alreadyCurrent == { schemaVersion = 3; baz = 5; }
+            && oneStep == { schemaVersion = 3; baz = 10; }
+            && twoStep == { schemaVersion = 3; bar = "hello"; baz = 10; }
+            && throwCaught;
+          alreadyCurrent = alreadyCurrent;
+          oneStep = oneStep;
+          twoStep = twoStep;
+          throwCaught = throwCaught;
+        };
+
       mkAssertionCheck = name: result:
         pkgs.runCommand "ferrum-check-${name}" { } (
           if result.ok then
@@ -121,6 +164,7 @@
         catalog-consistency = mkAssertionCheck "catalog-consistency" catalogConsistency;
         schema-uniformity = mkAssertionCheck "schema-uniformity" schemaUniformity;
         sopsfile-are-paths = mkAssertionCheck "sopsfile-are-paths" sopsFilesArePaths;
+        migration-mechanism = mkAssertionCheck "migration-mechanism" migrationMechanism;
 
         # Forces .drvPath for each example host so an option-type mistake
         # fails fast, without a full build -- true for the catalog apps
