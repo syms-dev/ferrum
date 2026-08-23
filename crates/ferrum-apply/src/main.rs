@@ -39,6 +39,10 @@ enum Command {
     RunRequest {
         path: std::path::PathBuf,
     },
+    /// Show what a settings.json schema migration would do, without
+    /// writing anything. Read-only: evaluates the real flake via `nix
+    /// eval`, never runs `nix build` or touches settings.json on disk.
+    PreviewMigration,
 }
 
 /// Maps an `apply::run` outcome to a process exit code, printing context to
@@ -278,6 +282,76 @@ fn restore_state_outcome(
     }
 }
 
+/// Shells out to `nix eval --json` against the real flake to compute
+/// what a schema migration would produce, WITHOUT writing anything --
+/// this is a preview, matching this plan's own Global Constraint that
+/// the preview step must be provably read-only. Reuses the same
+/// FERRUM_FLAKE_REF convention `run_apply()` already established, but
+/// evaluates `config.ferrum` (cheap: a plain attrset) rather than
+/// `config.system.build.toplevel` (expensive: forces a full build).
+fn run_preview_migration() -> i32 {
+    let settings_path = std::env::var("FERRUM_SETTINGS_PATH")
+        .unwrap_or_else(|_| "/etc/ferrum/settings.json".to_string());
+    let flake_dir = std::env::var("FERRUM_FLAKE_DIR")
+        .unwrap_or_else(|_| "/etc/ferrum".to_string());
+
+    let current_settings = match std::fs::read_to_string(&settings_path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("preview-migration: failed to read {settings_path}: {e}");
+            return 1;
+        }
+    };
+    let current_version: i64 = match serde_json::from_str::<serde_json::Value>(&current_settings) {
+        Ok(v) => v.get("schemaVersion").and_then(|x| x.as_i64()).unwrap_or(1),
+        Err(e) => {
+            eprintln!("preview-migration: {settings_path} is not valid JSON: {e}");
+            return 1;
+        }
+    };
+
+    let eval_attr = format!(
+        "{flake_dir}#nixosConfigurations.default.config.ferrum.schemaVersion"
+    );
+    let output = std::process::Command::new("nix")
+        .args(["eval", "--json", &eval_attr])
+        .output();
+    let output = match output {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("preview-migration: failed to run nix eval: {e}");
+            return 1;
+        }
+    };
+    if !output.status.success() {
+        // A throw()-ing migration surfaces here as a real, non-zero nix
+        // eval failure -- print the real stderr text (the throw's own
+        // message) rather than a generic failure, per this plan's Global
+        // Constraint that a blocked migration must be specific and
+        // actionable, not swallowed.
+        eprintln!(
+            "preview-migration: this update needs attention:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return 1;
+    }
+    let target_version: i64 = match String::from_utf8_lossy(&output.stdout).trim().parse() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("preview-migration: unexpected nix eval output: {e}");
+            return 1;
+        }
+    };
+
+    let summary = serde_json::json!({
+        "current_version": current_version,
+        "target_version": target_version,
+        "would_migrate": target_version != current_version,
+    });
+    println!("{summary}");
+    0
+}
+
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let exit_code = match cli.command {
@@ -289,6 +363,7 @@ fn main() -> anyhow::Result<()> {
             eprintln!("gc: not yet implemented");
             1
         }
+        Command::PreviewMigration => run_preview_migration(),
         Command::RunRequest { path } => match request::read_request(&path) {
             Ok(request::Request::Preflight) => run_preflight(),
             Ok(request::Request::Apply) => run_apply(),
@@ -343,6 +418,12 @@ mod tests {
         ] {
             Cli::try_parse_from(args).expect("all five subcommands must parse");
         }
+    }
+
+    #[test]
+    fn parses_preview_migration_subcommand() {
+        let cli = Cli::parse_from(["ferrum-apply", "preview-migration"]);
+        assert!(matches!(cli.command, Command::PreviewMigration));
     }
 
     #[test]
