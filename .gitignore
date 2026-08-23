@@ -17,6 +17,7 @@ Thumbs.db
 # Local agent/tooling config -- not part of the ferrum project
 .claude/
 .serena/
+.superpowers/
 CLAUDE.md
 
 # Secrets should never land unencrypted
