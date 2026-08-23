@@ -21,7 +21,7 @@ in
   options.ferrum = {
     schemaVersion = mkOption {
       type = types.int;
-      default = 1;
+      default = (import ../lib/migrations.nix { inherit lib; }).currentVersion;
       readOnly = true;
       description = "Version of the ferrum settings.json schema this module tree expects.";
     };

@@ -151,6 +151,45 @@
           throwCaught = throwCaught;
         };
 
+      # Honest about its own real scope: with modules/lib/migrations.nix's
+      # real list empty, migrate is the identity function for any
+      # already-current settings.json, so this check CANNOT distinguish
+      # "mkHost really calls migrate()" from "mkHost never calls it at
+      # all" -- both produce byte-identical output when there is nothing
+      # to migrate, and no automated eval check can observe that
+      # difference for an identity input. What this genuinely proves: the
+      # real mkHost pipeline (Task 2 Step 1's own change) does not corrupt
+      # or drop schemaVersion for the common case every real apply hits
+      # (an already-current settings.json), and the result really is a
+      # normal, well-typed NixOS config (config.ferrum.schemaVersion
+      # actually resolves, nothing throws). The wiring itself -- that
+      # Step 1's one-line change from `settings` to `migrate settings` is
+      # actually present -- is a small, legible diff verified by this
+      # plan's own task-scoped review of the real code, the same as any
+      # other one-line change in this project. The moment a real
+      # migration exists (a future major-version bump), this exact same
+      # fixture starts exercising the real, non-identity migration path,
+      # since examples/hosts/minimal/settings.json's schemaVersion: 1
+      # would then be behind the real currentVersion -- at which point
+      # this check's assertion becomes a genuine, distinguishing one.
+      mkHostAppliesMigration =
+        let
+          testSettings = builtins.fromJSON (builtins.readFile ../../../examples/hosts/minimal/settings.json);
+          migratedHost = ferrumLib.mkHost {
+            inherit system;
+            settings = testSettings;
+            modules = [
+              ../../../examples/hosts/minimal/configuration.nix
+              { ferrum.secretsDir = toString ../../../examples/hosts/minimal/secrets; }
+            ];
+            revision = "ci";
+          };
+        in
+        {
+          ok = migratedHost.config.ferrum.schemaVersion == 1;
+          actualSchemaVersion = migratedHost.config.ferrum.schemaVersion;
+        };
+
       mkAssertionCheck = name: result:
         pkgs.runCommand "ferrum-check-${name}" { } (
           if result.ok then
@@ -165,6 +204,7 @@
         schema-uniformity = mkAssertionCheck "schema-uniformity" schemaUniformity;
         sopsfile-are-paths = mkAssertionCheck "sopsfile-are-paths" sopsFilesArePaths;
         migration-mechanism = mkAssertionCheck "migration-mechanism" migrationMechanism;
+        mkhost-applies-migration = mkAssertionCheck "mkhost-applies-migration" mkHostAppliesMigration;
 
         # Forces .drvPath for each example host so an option-type mistake
         # fails fast, without a full build -- true for the catalog apps

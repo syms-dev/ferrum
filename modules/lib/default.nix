@@ -11,6 +11,7 @@
 let
   inherit (nixpkgs) lib;
   ferrumModule = import ../default.nix;
+  inherit (import ./migrations.nix { inherit lib; }) migrate;
 in
 {
   # mkHost turns a settings attrset (typically `builtins.fromJSON
@@ -30,7 +31,7 @@ in
       modules = [
         sopsNix.nixosModules.sops
         ferrumModule
-        { config.ferrum = settings; }
+        { config.ferrum = removeAttrs (migrate settings) [ "schemaVersion" ]; }
         { system.stateVersion = lib.mkDefault stateVersion; }
       ] ++ modules;
     };
