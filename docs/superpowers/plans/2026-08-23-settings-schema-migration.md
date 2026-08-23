@@ -74,21 +74,30 @@ let
     in
     actualFroms == expectedFroms && actualTos == expectedTos;
 
-  migrateOnce = settings:
+  # Parameterized on the migration list rather than closing over
+  # `migrations` directly, so Task 1's own test (Step 2 below) can
+  # exercise this SAME real chaining algorithm against a synthetic list
+  # -- never a second, independently-written copy of the same recursion
+  # that could drift from this one and silently stop testing anything
+  # real.
+  migrateWith = migrationList: settings:
     let
       version = settings.schemaVersion or 1;
-      step = lib.findFirst (m: m.from == version) null migrations;
+      step = lib.findFirst (m: m.from == version) null migrationList;
     in
     if step == null
     then settings
-    else migrateOnce (step.migrate settings // { schemaVersion = step.to; });
+    else migrateWith migrationList (step.migrate settings // { schemaVersion = step.to; });
 in
 if !chainIsValid then
   throw "modules/lib/migrations.nix: migration chain is not a valid unbroken sequence from 1 to ${toString currentVersion} -- check each entry's from/to fields"
 else
 {
   inherit migrations currentVersion;
-  migrate = migrateOnce;
+  migrate = migrateWith migrations;
+  # Exposed specifically so tests can drive the real algorithm against a
+  # synthetic chain -- not meant to be called outside a test context.
+  inherit migrateWith;
 }
 ```
 
@@ -97,29 +106,26 @@ else
 Read the existing file's `schemaUniformity`/`sopsFilesArePaths`/`mkAssertionCheck` pattern first (already in the file, `let` block around line 62-117) — this step follows that exact shape, not a new mechanism. Add inside the same `let` block, after `sopsFilesArePaths`:
 
 ```nix
-      # Real test coverage for modules/lib/migrations.nix's own machinery,
-      # using a SYNTHETIC two-step chain (not the real, currently-empty
-      # migrations list) constructed inline here so this test doesn't
-      # depend on any real migration ever existing. Proves: a no-op when
-      # already current, a single-step migration, a multi-step chain
-      # applying in sequence, and a throwing migration genuinely failing
-      # eval with its own message intact.
+      # Real test coverage for modules/lib/migrations.nix's own machinery
+      # -- genuinely calling its real, exported `migrateWith` function
+      # (never a second, independently-written copy of the same
+      # recursion) against SYNTHETIC chains constructed inline here, so
+      # this test doesn't depend on any real migration ever existing.
+      # Proves: a no-op when already current, a single-step migration, a
+      # multi-step chain applying in sequence, and a throwing migration
+      # genuinely failing eval with its own message intact -- all through
+      # the one real code path every real host's mkHost call also uses.
       migrationMechanism =
         let
+          realMigrations = import ../../../modules/lib/migrations.nix { inherit lib; };
+
           testMigrations = [
             { from = 1; to = 2; description = "test: renames foo to bar";
               migrate = s: (removeAttrs s [ "foo" ]) // { bar = s.foo or null; }; }
             { from = 2; to = 3; description = "test: doubles baz";
               migrate = s: s // { baz = (s.baz or 0) * 2; }; }
           ];
-          testMigrate = settings:
-            let
-              version = settings.schemaVersion or 1;
-              step = lib.findFirst (m: m.from == version) null testMigrations;
-            in
-            if step == null
-            then settings
-            else testMigrate (step.migrate settings // { schemaVersion = step.to; });
+          testMigrate = realMigrations.migrateWith testMigrations;
 
           alreadyCurrent = testMigrate { schemaVersion = 3; baz = 5; };
           oneStep = testMigrate { schemaVersion = 2; baz = 5; };
@@ -129,16 +135,8 @@ Read the existing file's `schemaUniformity`/`sopsFilesArePaths`/`mkAssertionChec
             { from = 1; to = 2; description = "test: always throws";
               migrate = s: throw "this update needs your input: real reason here"; }
           ];
-          throwCaught =
-            let
-              result = builtins.tryEval (
-                let
-                  step = builtins.elemAt throwingChain 0;
-                in
-                step.migrate { schemaVersion = 1; }
-              );
-            in
-            !result.success;
+          throwingMigrate = realMigrations.migrateWith throwingChain;
+          throwCaught = !(builtins.tryEval (throwingMigrate { schemaVersion = 1; })).success;
         in
         {
           ok = alreadyCurrent == { schemaVersion = 3; baz = 5; }
