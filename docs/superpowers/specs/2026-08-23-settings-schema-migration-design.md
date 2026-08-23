@@ -76,16 +76,17 @@ per version step.
 directly from the migration list itself — `builtins.length migrations +
 1` (schema version starts at 1; each listed step advances it by exactly
 one) — never a separately-maintained literal. `options.nix`'s declared
-default becomes `import ../lib/migrations.nix { }; # .currentVersion`
+default becomes `(import ../lib/migrations.nix { inherit lib; }).currentVersion`
 rather than a hardcoded number, so there is exactly one place this value
 is defined, not two that could drift apart.
 
 **Why here, not in Rust or in `ferrumd`:** `ferrum.lib.mkHost` already
-parses `settings.json` into a plain attrset before constructing the
-NixOS module config — every host build already passes through this exact
-point. Running the migration chain there, immediately after parsing and
-before `options.nix` ever sees the result, reuses infrastructure that
-already exists rather than adding a new one. It also gets a real safety
+receives `settings.json` as an already-parsed attrset (its caller does
+the `fromJSON`/`readFile`) before constructing the NixOS module config —
+every host build already passes through this exact point, right after
+that parsing happens and before `options.nix` ever sees the result.
+Running the migration chain there reuses infrastructure that already
+exists rather than adding a new one. It also gets a real safety
 property for free: if a migration produces a shape `options.nix` doesn't
 accept, the flake simply fails to evaluate — the same class of failure
 every other type error in this module tree already produces, not a new
@@ -138,6 +139,13 @@ Updates screen — visually identical to how an app version bump already
 renders ("Sonarr 4.0.1 → 4.0.3"), just labeled "Settings" instead of an
 app name. No new UI concept is introduced.
 
+As actually shipped, the `ferrum-apply preview-migration` CLI command
+(built in this plan's Task 3) does not yet surface `description` text in
+its own JSON output (only `current_version`/`target_version`/
+`would_migrate`) — wiring descriptions into a real UI-facing endpoint is
+deferred to whichever future task actually builds the `ferrumd` Updates
+API, since no real caller exists yet.
+
 ## When a migration can't be automatic
 
 Some migrations genuinely can't produce a safe default — a field was
@@ -174,10 +182,12 @@ prefers "refuse to evaluate" over "silently do something possibly wrong"
 - A companion test asserting a `settings.json` already at
   `currentSchemaVersion` passes through `mkHost` completely unchanged
   (the no-op case is not accidentally mutating anything).
-- A real test proving a `throw`-ing migration genuinely fails eval with
-  the expected message text — confirming the loud-failure path actually
-  behaves the way this spec claims, not just that the Nix syntax is
-  valid.
+- A real test proving a `throw`-ing migration genuinely fails eval —
+  confirming the loud-failure path actually triggers, not just that the
+  Nix syntax is valid. This automated check can only prove failure
+  occurs, not the exact content of the thrown message; message-text
+  accuracy is a code-review discipline point (see Known Risk 2), the
+  same as every other `throw()` message in this project.
 - A real, `ferrum-apply`-level test (VM or eval, whichever proves it
   most directly) confirming the preview step's `nix eval --json` call
   returns the migrated JSON without ever writing to the real
@@ -201,3 +211,20 @@ prefers "refuse to evaluate" over "silently do something possibly wrong"
    time.** For a large catalog this could become a real, felt delay in
    the Updates screen. Not a blocker for the initial design, worth
    measuring once real migrations exist.
+4. **The write-back step described under "Where migrations run" is not
+   yet implemented.** This spec calls for `ferrum-apply` to write the
+   migrated JSON back to settings.json (with the bumped schemaVersion)
+   after a successful apply, so the migration chain doesn't re-run every
+   time. No task in the implementing plan built this -- it was scoped
+   out implicitly, not deliberately deferred with a tracked follow-up.
+   It is harmless today (the migration list is still empty), but it
+   does not yet compose with what already exists: `ferrumd`'s settings
+   endpoint (`crates/ferrumd/src/settings.rs`) writes whatever JSON a
+   client PUTs verbatim, with no schemaVersion bump logic, and
+   `modules/lib/settings-schema.json` is version-blind (schemaVersion is
+   an optional integer, and every object level uses
+   `additionalProperties: false` describing only the CURRENT shape) --
+   so once a real migration exists, an on-disk settings.json would stay
+   at its old schema shape forever unless something writes the migrated
+   result back. This must be built before any real migration ships, not
+   discovered by a future author re-reading this file.

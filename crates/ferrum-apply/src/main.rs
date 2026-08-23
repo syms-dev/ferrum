@@ -285,15 +285,21 @@ fn restore_state_outcome(
 /// Shells out to `nix eval --json` against the real flake to compute
 /// what a schema migration would produce, WITHOUT writing anything --
 /// this is a preview, matching this plan's own Global Constraint that
-/// the preview step must be provably read-only. Reuses the same
-/// FERRUM_FLAKE_REF convention `run_apply()` already established, but
-/// evaluates `config.ferrum` (cheap: a plain attrset) rather than
-/// `config.system.build.toplevel` (expensive: forces a full build).
+/// the preview step must be provably read-only. Derives the flake
+/// directory from the same FERRUM_FLAKE_REF env var `run_apply()`
+/// already reads (splitting off the `#attr` suffix), so a deployment
+/// or test that points FERRUM_FLAKE_REF at a non-default flake gets
+/// the same flake here -- never a second, independently-configured
+/// path that could drift from it. Evaluates `config.ferrum.schemaVersion`
+/// (cheap: a plain int) rather than `config.system.build.toplevel`
+/// (expensive: forces a full build).
 fn run_preview_migration() -> i32 {
     let settings_path = std::env::var("FERRUM_SETTINGS_PATH")
         .unwrap_or_else(|_| "/etc/ferrum/settings.json".to_string());
-    let flake_dir = std::env::var("FERRUM_FLAKE_DIR")
-        .unwrap_or_else(|_| "/etc/ferrum".to_string());
+    let flake_ref = std::env::var("FERRUM_FLAKE_REF").unwrap_or_else(|_| {
+        "/etc/ferrum#nixosConfigurations.default.config.system.build.toplevel".to_string()
+    });
+    let flake_dir = flake_ref.split('#').next().unwrap_or(&flake_ref);
 
     let current_settings = match std::fs::read_to_string(&settings_path) {
         Ok(s) => s,
@@ -343,10 +349,15 @@ fn run_preview_migration() -> i32 {
         }
     };
 
+    if target_version < current_version {
+        eprintln!(
+            "preview-migration: warning: on-disk settings.json (schemaVersion {current_version}) is newer than this ferrum's module tree (schemaVersion {target_version}) -- no migration will run"
+        );
+    }
     let summary = serde_json::json!({
         "current_version": current_version,
         "target_version": target_version,
-        "would_migrate": target_version != current_version,
+        "would_migrate": target_version > current_version,
     });
     println!("{summary}");
     0

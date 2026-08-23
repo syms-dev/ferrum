@@ -11,6 +11,10 @@
       };
       catalog = import ../../../modules/lib/catalog.nix { inherit lib; };
       appsDir = ../../../modules/apps;
+      # Shared by migrationMechanism and mkHostAppliesMigration below, so
+      # both real check bodies reference the one real currentVersion
+      # rather than each importing (or worse, hardcoding) their own.
+      realMigrations = import ../../../modules/lib/migrations.nix { inherit lib; };
 
       exampleHosts = {
         minimal = ferrumLib.mkHost {
@@ -115,12 +119,16 @@
       # this test doesn't depend on any real migration ever existing.
       # Proves: a no-op when already current, a single-step migration, a
       # multi-step chain applying in sequence, and a throwing migration
-      # genuinely failing eval with its own message intact -- all through
-      # the one real code path every real host's mkHost call also uses.
+      # genuinely failing eval (via a real Nix `throw`, whose message text
+      # reaches the operator through `ferrum-apply preview-migration`'s own
+      # stderr passthrough -- this eval-level check can only prove failure
+      # occurs, not the message's exact content; message accuracy is a
+      # code-review discipline point, the same as this project already
+      # treats other throw() messages, e.g. `checks.schema-uniformity`) --
+      # all through the one real code path every real host's mkHost call
+      # also uses.
       migrationMechanism =
         let
-          realMigrations = import ../../../modules/lib/migrations.nix { inherit lib; };
-
           testMigrations = [
             { from = 1; to = 2; description = "test: renames foo to bar";
               migrate = s: (removeAttrs s [ "foo" ]) // { bar = s.foo or null; }; }
@@ -158,20 +166,25 @@
       # all" -- both produce byte-identical output when there is nothing
       # to migrate, and no automated eval check can observe that
       # difference for an identity input. What this genuinely proves: the
-      # real mkHost pipeline (Task 2 Step 1's own change) does not corrupt
-      # or drop schemaVersion for the common case every real apply hits
-      # (an already-current settings.json), and the result really is a
+      # real mkHost pipeline (mkHost's own removeAttrs-based fix) does not
+      # corrupt or drop schemaVersion for the common case every real apply
+      # hits (an already-current settings.json), and the result really is a
       # normal, well-typed NixOS config (config.ferrum.schemaVersion
       # actually resolves, nothing throws). The wiring itself -- that
-      # Step 1's one-line change from `settings` to `migrate settings` is
-      # actually present -- is a small, legible diff verified by this
-      # plan's own task-scoped review of the real code, the same as any
-      # other one-line change in this project. The moment a real
-      # migration exists (a future major-version bump), this exact same
-      # fixture starts exercising the real, non-identity migration path,
-      # since examples/hosts/minimal/settings.json's schemaVersion: 1
-      # would then be behind the real currentVersion -- at which point
-      # this check's assertion becomes a genuine, distinguishing one.
+      # mkHost's one-line change from `settings` to `migrate settings` is
+      # actually present -- is a small, legible diff verified by ordinary
+      # code review of the real diff, the same as any other one-line change
+      # in this project.
+      #
+      # This assertion is tautologically true by construction, permanently --
+      # not just "true today" -- because mkHost's removeAttrs strips any
+      # input schemaVersion before merging, so config.ferrum.schemaVersion
+      # can ONLY ever resolve to the readOnly option's own default (which IS
+      # migrations.currentVersion). What this check actually guards against:
+      # a future refactor that reintroduces the readOnly-collision bug Task 2
+      # found and fixed (e.g. someone "simplifying" mkHost back to
+      # `config.ferrum = migrate settings;`) would break this immediately,
+      # with the same real error NixOS's module system throws today.
       mkHostAppliesMigration =
         let
           testSettings = builtins.fromJSON (builtins.readFile ../../../examples/hosts/minimal/settings.json);
@@ -186,7 +199,7 @@
           };
         in
         {
-          ok = migratedHost.config.ferrum.schemaVersion == 1;
+          ok = migratedHost.config.ferrum.schemaVersion == realMigrations.currentVersion;
           actualSchemaVersion = migratedHost.config.ferrum.schemaVersion;
         };
 

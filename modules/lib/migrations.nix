@@ -38,11 +38,11 @@ let
     actualFroms == expectedFroms && actualTos == expectedTos;
 
   # Parameterized on the migration list rather than closing over
-  # `migrations` directly, so Task 1's own test (Step 2 below) can
-  # exercise this SAME real chaining algorithm against a synthetic list
-  # -- never a second, independently-written copy of the same recursion
-  # that could drift from this one and silently stop testing anything
-  # real.
+  # `migrations` directly, so a test elsewhere (nix/modules/flake/checks.nix's
+  # migrationMechanism check) can exercise this SAME real chaining algorithm
+  # against a synthetic list -- never a second, independently-written copy
+  # of the same recursion that could drift from this one and silently stop
+  # testing anything real.
   migrateWith = migrationList: settings:
     let
       version = settings.schemaVersion or 1;
