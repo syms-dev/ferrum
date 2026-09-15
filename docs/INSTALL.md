@@ -29,8 +29,15 @@ You need all of these before you begin. Each one is something that is
 painful or impossible to obtain after the OS is gone:
 
 - [ ] **Out-of-band access** — IPMI, a KVM, or physical access with a monitor
-      and keyboard. If the install fails partway the machine may not boot, and
-      SSH will not be there to help you.
+      **and** keyboard. If the install fails partway the machine may not boot,
+      and SSH will not be there to help you.
+
+      A keyboard without a monitor is not out-of-band access. You cannot read
+      a GRUB error, see which device failed to mount, or tell whether the
+      machine got past POST — you would be typing blind into a box that
+      cannot answer. Any HDMI television counts as a monitor. If you truly
+      cannot attach a display, treat Step 5b's VM test as mandatory rather
+      than recommended.
 - [ ] **A backup of anything on the OS disk you care about.** Application
       configuration, databases, `docker-compose` files, `.env` files, cron
       jobs, anything under `/opt` or `/home`. ferrum's catalog is seven apps;
@@ -180,6 +187,38 @@ itself: **if the pure build fails, something other than secrets is wrong.**
 
 It must succeed before you continue. A failure here is free; the same failure
 after Step 6 has begun is a machine with no operating system.
+
+## Step 5b — boot the configuration in a VM first
+
+`nixos-anywhere` can build the system and boot the disk layout in a VM
+without touching the target at all:
+
+```bash
+nix run github:nix-community/nixos-anywhere -- --flake .#<hostname> --vm-test
+```
+
+This is the single highest-value step in this document, and it is the one
+that settles the question a dry run cannot: **does this disk layout actually
+produce a machine that boots?** Partitioning, bootloader installation, the
+subvolume layout and the mount ordering are all exercised for real. It is
+also the only place a BIOS-versus-UEFI mistake shows up *before* it has cost
+you an operating system.
+
+**Run it on the target itself.** The VM test needs KVM and must match the
+target's architecture, so a laptop of a different architecture cannot run it
+— but the machine you are about to install onto is, by definition, the right
+architecture, and it is about to be wiped anyway. Installing Nix on it for
+this one check costs nothing:
+
+```bash
+# on the target, which is about to be replaced regardless
+curl --proto '=https' --tlsv1.2 -sSf -L https://install.determinate.systems/nix | sh -s -- install
+```
+
+Do this especially if you do not have a monitor on the target. It does not
+replace console access — a VM cannot reproduce the real firmware's boot
+order, a USB disk that enumerates slowly, or a kexec that hangs — but it
+converts the largest single unknown from a gamble into a tested fact.
 
 ## Step 6 — install
 
