@@ -32,6 +32,14 @@ in
         sopsNix.nixosModules.sops
         ferrumModule
         { config.ferrum = removeAttrs (migrate settings) [ "schemaVersion" ]; }
+        # The migrated settings document, threaded to modules/core/bootstrap.nix
+        # so a freshly-installed host can seed /etc/ferrum/settings.json from
+        # the exact document it was built from. Passed WITH schemaVersion,
+        # unlike config.ferrum above: the file on disk is what ferrumd
+        # validates against settings-schema.json, and that schema expects the
+        # version field to be present. See bootstrap.nix's header for why this
+        # is a module argument rather than a ferrum.* option.
+        { _module.args.ferrumSettingsSeed = migrate settings; }
         { system.stateVersion = lib.mkDefault stateVersion; }
       ] ++ modules;
     };
