@@ -12,13 +12,37 @@ jobs:
   # tests/smoke.nix and the plan's "Known risks" section.
   smoke:
     strategy:
+      # LOAD-BEARING. Without it, GitHub's matrix default (fail-fast: true)
+      # cancels every other leg the instant one fails -- and the aarch64 leg
+      # below fails in ~30 seconds on a missing /dev/kvm. The net effect,
+      # confirmed against every scheduled run from 2026-08-20 to 2026-09-15:
+      # the x86_64 leg was CANCELLED before it built a single VM, so this
+      # entire suite -- which the design doc calls "the entire quality
+      # story" -- never actually executed on any commit. The workflow was
+      # red for 24 consecutive nights and the signal meant nothing.
+      fail-fast: false
       matrix:
         include:
           - runner: ubuntu-latest
             system: x86_64-linux
+          # GitHub's ARM hosted runners do NOT provide /dev/kvm (unlike the
+          # x86_64 ones), so this leg cannot run a VM test at all today.
+          # It stays in the matrix, marked non-blocking, as a live probe:
+          # the day GitHub ships KVM on ARM runners this starts passing and
+          # we get the aarch64 coverage back for free. Until then its
+          # failure must never be mistaken for a code failure -- which is
+          # exactly what happened for a month.
+          #
+          # This is design known-risk 2 ("KVM on GitHub-hosted runners...
+          # has changed before") arriving for real. The doc's own fallback
+          # is a self-hosted runner on the test box; that is the fix if
+          # aarch64 VM coverage becomes load-bearing rather than nice to
+          # have.
           - runner: ubuntu-24.04-arm
             system: aarch64-linux
+            optional: true
     runs-on: ${{ matrix.runner }}
+    continue-on-error: ${{ matrix.optional || false }}
     steps:
       - uses: actions/checkout@v4
 
@@ -33,3 +57,41 @@ jobs:
 
       - name: Build and run the smoke VM test
         run: nix build .#checks.${{ matrix.system }}.smoke-vm --print-build-logs
+
+  # The suite that actually tests the product. smoke-vm above only proves a
+  # VM test can run at all (Phase 1.0 probe 0.1) -- it asserts nothing about
+  # ferrum. Until 2026-09-15 this job did not exist, so the rollback proof,
+  # the privilege boundary and both daemon end-to-end tests were defined as
+  # flake checks and never once executed by CI on any commit.
+  #
+  # x86_64 only, deliberately: the aarch64 hosted runners have no /dev/kvm
+  # (see the matrix comment above), so there is nowhere to run these today.
+  vm-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: DeterminateSystems/nix-installer-action@main
+
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+
+      - name: /dev/kvm is available and accessible
+        run: |
+          ls -l /dev/kvm
+          test -r /dev/kvm && test -w /dev/kvm
+
+      # Built as one `nix build` invocation so Nix schedules them itself and
+      # the job fails if ANY of them fails. Listed explicitly rather than via
+      # `nix flake check` because that would also pull in the eval checks
+      # ci.yml already covers, and (per ci.yml's own comment) force
+      # eval-example-hosts, which does not fit on a hosted runner's disk.
+      - name: Build and run the real VM test suite
+        run: |
+          nix build --print-build-logs \
+            .#checks.x86_64-linux.rollback \
+            .#checks.x86_64-linux.rollback-proves-necessity \
+            .#checks.x86_64-linux.apply-generation-switch \
+            .#checks.x86_64-linux.state-restore-interlock \
+            .#checks.x86_64-linux.privilege-boundary \
+            .#checks.x86_64-linux.daemon-end-to-end \
+            .#checks.x86_64-linux.daemon-apply-end-to-end

@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 
 mod apply;
+mod gc;
 mod generations;
 mod journal;
 mod preflight;
@@ -363,6 +364,62 @@ fn run_preview_migration() -> i32 {
     0
 }
 
+/// A real GC pass: prunes state snapshots beyond `ferrum.storage.keepGenerations`.
+///
+/// Was a stub returning exit 1 until 2026-09-15, while
+/// `ferrum.storage.keepGenerations` sat in options.nix and
+/// settings-schema.json with no consumer anywhere -- so an operator could
+/// set a retention policy that nothing enforced, and snapshots accumulated
+/// for the life of the host. See gc.rs's own header for why that matters
+/// more than it sounds.
+fn run_gc() -> i32 {
+    let mut progress = progress::Progress::open();
+    match run_gc_inner(&mut progress) {
+        Ok(pruned) => {
+            let detail = format!("pruned {pruned} snapshot(s)");
+            println!("gc: {detail}");
+            progress.complete("succeeded", &detail);
+            0
+        }
+        Err(e) => {
+            eprintln!("gc failed: {e}");
+            progress.complete("failed", &e.to_string());
+            1
+        }
+    }
+}
+
+fn run_gc_inner(progress: &mut progress::Progress) -> anyhow::Result<usize> {
+    let snapshot_dir = std::env::var("FERRUM_SNAPSHOT_DIR")
+        .unwrap_or_else(|_| "/var/lib/ferrum/snapshots".to_string());
+    let journal_dir = std::env::var("FERRUM_JOURNAL_DIR")
+        .unwrap_or_else(|_| "/var/lib/ferrum/journal".to_string());
+    // Matches ferrum.storage.keepGenerations' own default in
+    // modules/core/options.nix. The module wires the real value through
+    // modules/core/overlays.nix, so this fallback only applies to a
+    // ferrum-apply invoked outside a ferrum host.
+    let keep_generations: usize = std::env::var("FERRUM_KEEP_GENERATIONS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10);
+
+    // Read from the live system, not from the journal: the running
+    // generation is what rule 2 in gc::plan protects, and it is only
+    // knowable from /run/current-system. A failure here must abort the
+    // whole run rather than defaulting to "no generation is current" --
+    // that would drop the protection and let the running generation's own
+    // snapshot be pruned.
+    let (current, _) = apply::current_generation()?;
+
+    gc::run(
+        std::path::Path::new(&snapshot_dir),
+        std::path::Path::new(&journal_dir),
+        keep_generations,
+        current,
+        progress,
+    )
+}
+
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let exit_code = match cli.command {
@@ -370,24 +427,14 @@ fn main() -> anyhow::Result<()> {
         Command::Apply => run_apply(),
         Command::Rollback { to } => run_rollback(to),
         Command::RestoreState => run_restore_state(),
-        Command::Gc => {
-            eprintln!("gc: not yet implemented");
-            1
-        }
+        Command::Gc => run_gc(),
         Command::PreviewMigration => run_preview_migration(),
         Command::RunRequest { path } => match request::read_request(&path) {
             Ok(request::Request::Preflight) => run_preflight(),
             Ok(request::Request::Apply) => run_apply(),
             Ok(request::Request::Rollback { to }) => run_rollback(to),
             Ok(request::Request::RestoreState) => run_restore_state(),
-            Ok(request::Request::Gc) => {
-                eprintln!("gc: not yet implemented via run-request");
-                // Still writes a terminal progress line: a job ferrumd
-                // dispatched must always end its own stream, even when the
-                // answer is "this kind isn't implemented yet".
-                progress::Progress::open().complete("failed", "gc is not yet implemented");
-                1
-            }
+            Ok(request::Request::Gc) => run_gc(),
             Err(e) => {
                 eprintln!("run-request: {e}");
                 progress::Progress::open().complete("failed", &e.to_string());
