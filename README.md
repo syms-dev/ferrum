@@ -2,7 +2,13 @@
 
 A NixOS-based, rollback-safe alternative to [Saltbox](https://github.com/saltyorg/Saltbox) for self-hosted media and automation servers.
 
-**Status: early scaffolding.** The design is written; the rollback engine described below is not built yet. Nothing here should be pointed at a real server.
+**Status: pre-alpha — working engine, no install path, never run on real hardware.**
+
+Built and tested: the rollback engine, the seven-app catalog, the reverse proxy with TLS and SSO, sops secrets, the cross-app reconciler, and `ferrumd` (the unprivileged daemon with its polkit privilege boundary). 118 Rust unit tests and eight NixOS VM tests cover them.
+
+Not built: the web UI (`ui/` does not exist yet) and the install path. `ferrum-apply gc` is a stub, so **application-state snapshots are never pruned and will fill a disk over time**.
+
+Nothing here has ever been installed on a real machine end to end — [`examples/hosts/homelab-btrfs`](examples/hosts/homelab-btrfs) is a reference disk layout that has not been provisioned. **Do not point this at a server holding data you care about.**
 
 ## Why
 
@@ -28,8 +34,9 @@ modules/             the NixOS module tree — the product
   lib/               ferrum.lib.mkHost, the app catalog, the uniform app submodule
   core/              cross-cutting ferrum.* options, storage, generations
   apps/<name>/       one directory per catalog app: meta.nix + service.nix
-crates/              Rust workspace (ferrumd, ferrum-apply, ferrum-reconcile) — not yet started
-ui/                  the web UI — not yet started
+crates/              Rust workspace: ferrum-apply (the rollback engine), ferrumd (the
+                     daemon), ferrum-reconcile (cross-app registration), ferrum-secrets
+ui/                  the web UI — not started (Phase 1.5b)
 tests/               NixOS VM tests
 examples/hosts/      example settings.json + host config used by the guard checks
 docs/design/         the approved design spec
@@ -94,7 +101,18 @@ Log in at `https://auth.<ferrum.proxy.baseDomain>/`, then change the password fr
 
 ## Development
 
-There is no local nix install in this environment yet, so nothing here has been evaluated locally — `nix flake check` in CI is the first real test of any of it. See the design doc's "Dev loop" section for the intended setup (an aarch64 dev VM plus a real x86_64 test target provisioned via `nixos-anywhere`).
+See the design doc's "Dev loop" section for the intended setup (an aarch64 dev VM plus a real x86_64 test target provisioned via `nixos-anywhere`).
+
+The Rust workspace can be built and tested without a Nix install, which is useful on a machine that has neither Nix nor a Rust toolchain:
+
+```bash
+docker run --rm -v "$PWD:/src:ro" -w /work rust:1-bookworm bash -c '
+  apt-get update -qq && apt-get install -y -qq btrfs-progs &&
+  cp -r /src/crates /work/crates && cd /work/crates &&
+  cargo test --workspace --locked'
+```
+
+`btrfs-progs` is required: `preflight::check_is_subvolume` shells out to `btrfs`, and without it one test fails on the spawn error rather than the assertion it means to make. The Nix build supplies it via `nativeCheckInputs`.
 
 ```bash
 nix flake check

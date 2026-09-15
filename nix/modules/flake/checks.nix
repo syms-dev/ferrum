@@ -253,6 +253,35 @@
           }
           "echo $drvPaths > $out";
 
+        # ferrum-secrets is a LIBRARY crate with no package of its own, and
+        # every package that depends on it sets buildAndTestSubdir to its own
+        # crate -- so `cargo test` never reaches ferrum-secrets' own five
+        # tests, even though its code compiles into both ferrum-apply and
+        # ferrumd. Without this check the shared encrypt-and-write path that
+        # BOTH the privileged applier and the unprivileged daemon rely on is
+        # the one part of the workspace CI does not test.
+        #
+        # Deliberately a real buildRustPackage over the whole workspace
+        # rather than a bare `cargo test` in a runCommand: that is what puts
+        # the pinned toolchain and the vendored Cargo.lock closure in play,
+        # matching how every other Rust artifact here is built. The runtime
+        # tools are the union of what the workspace's tests shell out to --
+        # btrfs (preflight::check_is_subvolume), sops/ssh-to-age (secrets),
+        # authelia (argon2id hashing). Confirmed real, by really running the
+        # suite in a container on 2026-09-15: without btrfs on PATH,
+        # is_subvolume_check_fails_on_a_plain_directory fails on the spawn
+        # error rather than the assertion it means to make.
+        workspace-tests = pkgs.rustPlatform.buildRustPackage {
+          pname = "ferrum-workspace-tests";
+          version = "0.1.0";
+          src = lib.cleanSource ../../../crates;
+          cargoLock.lockFile = ../../../crates/Cargo.lock;
+          nativeCheckInputs = [ pkgs.btrfs-progs pkgs.sops pkgs.ssh-to-age pkgs.authelia ];
+          # The point of this derivation is the checkPhase; nothing consumes
+          # its binaries, so skip the install entirely.
+          installPhase = "touch $out";
+        };
+
         smoke-vm = import ../../../tests/smoke.nix { inherit pkgs; };
 
         # tests/rollback.nix is the plan's terminal proof: a real rollback

@@ -57,6 +57,22 @@ in
       keepGenerations = mkOption {
         type = types.int;
         default = 10;
+        description = ''
+          How many application-state snapshots `ferrum-apply gc` keeps.
+          Every apply takes one snapshot, so this is roughly "how many
+          applies back can I roll to".
+
+          The snapshot belonging to the currently-running generation is
+          ALWAYS kept, even when it falls outside this window -- on a host
+          that has been rebooted into an older generation it can easily be
+          older than `keepGenerations` newer ones, and pruning it would
+          remove the way back. See crates/ferrum-apply/src/gc.rs.
+
+          Snapshots are not free: btrfs pins the extents they reference, so
+          a SQLite-heavy app rewritten in place keeps historical extents
+          alive for as long as any snapshot references them. Raising this a
+          lot on a host with busy *arr databases costs real disk.
+        '';
       };
     };
 

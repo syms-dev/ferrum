@@ -41,3 +41,36 @@ jobs:
             .#checks.x86_64-linux.catalog-consistency \
             .#checks.x86_64-linux.schema-uniformity \
             .#checks.x86_64-linux.sopsfile-are-paths
+
+  # The Rust workspace: ~5,200 lines across four crates and 118 unit tests
+  # which, until 2026-09-15, CI never ran even once. The eval checks above
+  # do not build the Rust packages, and the VM tests (vm-tests.yml) had
+  # never completed, so nothing in CI had ever compiled this code.
+  #
+  # Building the four packages is what runs the tests: each is a
+  # rustPlatform.buildRustPackage whose checkPhase runs `cargo test`, with
+  # the real runtime tools (btrfs-progs, sops, ssh-to-age, authelia) supplied
+  # via nativeCheckInputs. That matters -- preflight::check_is_subvolume
+  # shells out to `btrfs`, and without it on PATH that test fails for an
+  # environment reason rather than a real one.
+  #
+  # Going through Nix rather than a separate rustup toolchain also means CI
+  # tests the exact compiler and dependency closure the real host builds
+  # with, instead of a second toolchain that could drift from it.
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: DeterminateSystems/nix-installer-action@main
+
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+
+      - name: build and test the Rust workspace
+        run: |
+          nix build --print-build-logs \
+            .#ferrum-apply \
+            .#ferrumd \
+            .#ferrum-reconcile \
+            .#ferrum-testapp \
+            .#checks.x86_64-linux.workspace-tests
