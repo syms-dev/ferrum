@@ -43,7 +43,11 @@
 # declared under options.ferrum is walked by checks.schema-uniformity and
 # forms part of the settings surface the security thesis reasons about. This
 # value is build-time plumbing, not a setting.
-{ config, lib, pkgs, ferrumSettingsSeed ? null, ... }:
+#
+# Its null default is declared in modules/default.nix via mkDefault, NOT as a
+# `? null` in this signature -- see that file for why the signature form
+# silently does not work.
+{ config, lib, pkgs, ferrumSettingsSeed, ... }:
 let
   ferrum = config.ferrum;
 
