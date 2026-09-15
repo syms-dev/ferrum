@@ -1,0 +1,34 @@
+{
+  "schemaVersion": 1,
+  "proxy": {
+    "enable": true,
+    "baseDomain": "example.invalid",
+    "acme": {
+      "email": "admin@example.invalid"
+    }
+  },
+  "apps": {
+    "sonarr": {
+      "enable": true,
+      "exposure": "lan"
+    },
+    "radarr": {
+      "enable": true
+    },
+    "prowlarr": {
+      "enable": true
+    },
+    "jellyfin": {
+      "enable": true
+    },
+    "plex": {
+      "enable": true
+    },
+    "sabnzbd": {
+      "enable": true
+    },
+    "qbittorrent": {
+      "enable": true
+    }
+  }
+}
