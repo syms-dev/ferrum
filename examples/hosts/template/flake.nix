@@ -67,6 +67,15 @@
               settings.PermitRootLogin = "prohibit-password";
             };
 
+            # UEFI. On a legacy-BIOS target this is wrong and produces an
+            # unbootable machine -- see disko.nix's ESP comment for how to
+            # check, and use instead:
+            #
+            #   boot.loader.grub = {
+            #     enable = true;
+            #     devices = [ "/dev/disk/by-id/<the OS disk>" ];
+            #     efiSupport = false;
+            #   };
             boot.loader.systemd-boot.enable = true;
             boot.loader.efi.canTouchEfiVariables = true;
 

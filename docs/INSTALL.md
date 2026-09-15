@@ -66,6 +66,24 @@ difference between "the OS disk" and "the disk holding your library" can come
 down to one reboot's worth of luck. Prefer the `by-id` entry carrying the model
 and serial; skip the `-part<N>` and `wwn-` aliases.
 
+**Also record the boot mode.** Run on the target:
+
+```bash
+[ -d /sys/firmware/efi ] && echo UEFI || echo BIOS
+```
+
+This decides the partition table and the bootloader, and getting it wrong is
+the worst failure available here: the install completes successfully and the
+machine then does not boot, with the previous OS already gone. The template
+ships a UEFI layout (a vfat ESP plus systemd-boot); a BIOS target needs an
+`EF02` BIOS boot partition and GRUB instead. Both files say so at the point
+of change.
+
+The partition table is a second, independent tell: a UEFI system cannot boot
+without a FAT32 ESP, so `lsblk -o NAME,FSTYPE` showing no `vfat` partition
+anywhere means the machine is booting BIOS regardless of what its firmware
+supports.
+
 If the data disks are pooled (mergerfs, LVM, RAID, ZFS), record the pool's
 layout too. **ferrum has no mergerfs or rclone support** — the design doc puts
 that tier explicitly out of scope for Phase 1 — so any pool must be
