@@ -35,6 +35,21 @@
     content = {
       type = "gpt";
       partitions = {
+        # UEFI ONLY. If the target boots in legacy BIOS mode, this layout
+        # installs cleanly and then does not boot -- with the previous OS
+        # already destroyed. Replace this ESP with a BIOS boot partition:
+        #
+        #   boot = { priority = 1; name = "bios-boot"; size = "1M"; type = "EF02"; };
+        #
+        # and swap systemd-boot for GRUB in flake.nix. CHECK FIRST, on the
+        # target, and do not infer it from the machine's age:
+        #
+        #   [ -d /sys/firmware/efi ] && echo UEFI || echo BIOS
+        #
+        # The partition table is the other tell: a UEFI system cannot boot
+        # without a FAT32 ESP, so `lsblk -o NAME,FSTYPE` showing no vfat
+        # partition anywhere means the machine is booting BIOS, whatever its
+        # firmware is capable of.
         ESP = {
           priority = 1;
           name = "ESP";
