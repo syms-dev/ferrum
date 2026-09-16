@@ -24,6 +24,13 @@
         ferrum-apply = pkgs.callPackage ../../../nix/pkgs/ferrum-apply { };
         ferrum-reconcile = pkgs.callPackage ../../../nix/pkgs/ferrum-reconcile { };
         ferrumd = pkgs.callPackage ../../../nix/pkgs/ferrumd { };
+        # Also present in nix/overlays/default.nix -- modules/core/daemon.nix
+        # reads pkgs.ferrum-ui, and a package defined ONLY here builds fine
+        # and then fails at host eval with "attribute missing". That has now
+        # happened three times in this repo; see the package's own comment.
+        ferrum-ui = pkgs.callPackage ../../../nix/pkgs/ferrum-ui {
+          uiSrc = ../../../ui;
+        };
         ferrum-settings-schema = pkgs.writeTextFile {
           name = "ferrum-settings-schema.json";
           destination = "/share/ferrum/settings-schema.json";

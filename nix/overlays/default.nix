@@ -14,6 +14,14 @@ final: prev: {
   # real host, long after the package itself builds fine.
   ferrumd = final.callPackage ../pkgs/ferrumd { };
   ferrum-testapp = final.callPackage ../pkgs/testapp { };
+  # modules/core/daemon.nix reads pkgs.ferrum-ui for FERRUM_UI_DIR. The task
+  # plan lists only nix/modules/flake/packages.nix for this package, which
+  # would have reproduced the exact gap the ferrumd comment above describes
+  # and that ferrum-catalog hit in Phase 1.5b Task 2 -- builds fine, fails on
+  # every real host eval. Added here deliberately, not incidentally.
+  ferrum-ui = final.callPackage ../pkgs/ferrum-ui {
+    uiSrc = ../../ui;
+  };
   ferrum-settings-schema = final.writeTextFile {
     name = "ferrum-settings-schema.json";
     destination = "/share/ferrum/settings-schema.json";
