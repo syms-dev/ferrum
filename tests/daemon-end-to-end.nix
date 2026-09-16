@@ -197,10 +197,32 @@ pkgs.testers.runNixOSTest {
     # own state, so root must keep it: directory write permission is
     # create/delete/rename permission on every name inside, whatever the
     # individual files' modes say. ferrumd gets a subdirectory instead.
+    #
+    # Asserted as the PROPERTY rather than a literal mode. This used to pin
+    # "root ferrum 750" exactly, and that literal was stricter than the
+    # reasoning above it: every catalog app's stateDir lives at
+    # ferrum.storage.stateDir/<app> under this directory and is owned by that
+    # app's own user, so an app must be able to TRAVERSE here to reach it. At
+    # 750 none could, and plexmediaserver failed its prestart mkdir on the
+    # first real hardware run of any catalog app. What actually protects the
+    # interlocks is the absence of the WRITE bit, which 751 keeps absent.
     parent = machine.succeed("stat -c '%U %G %a' /var/lib/ferrum").strip()
     print(f"/var/lib/ferrum: {parent}")
-    assert parent == "root ferrum 750", (
-        f"/var/lib/ferrum must be root-owned with only group traverse, got: {parent}"
+    powner, pgroup, pmode = parent.split()
+    assert (powner, pgroup) == ("root", "ferrum"), (
+        f"/var/lib/ferrum must be root-owned, group ferrum, got: {parent}"
+    )
+    pg, po = int(pmode[1]), int(pmode[2])
+    assert not (pg & 2) and not (po & 2), (
+        f"group/other must NOT be able to create or delete beside the "
+        f"root-trusted interlocks, got mode {pmode}"
+    )
+    assert not (po & 4), (
+        f"other must NOT be able to list this directory, got mode {pmode}"
+    )
+    assert po & 1, (
+        f"other MUST be able to traverse, or no catalog app can reach its "
+        f"own stateDir underneath, got mode {pmode}"
     )
     for sub in ("daemon", "jobs"):
         owned = machine.succeed(f"stat -c '%U %G %a' /var/lib/ferrum/{sub}").strip()
@@ -232,6 +254,20 @@ pkgs.testers.runNixOSTest {
     machine.succeed("test -e /var/lib/ferrum/state-restore-failed")
     machine.succeed("rm -f /var/lib/ferrum/state-restore-failed")
     print("PASS: ferrumd really cannot create or delete root-trusted files beside its own state")
+
+    # The traverse bit, proved behaviourally rather than inferred from the
+    # mode digits above, and as a user in NEITHER root nor the ferrum group --
+    # which is exactly what every catalog app's own user is. `nobody` stands
+    # in for one so this holds whether or not any app is enabled here.
+    #
+    # Traversal must work (an app has to reach stateDir/<app>) while listing
+    # and writing must not: one app must not be able to enumerate the others,
+    # and nothing outside root may touch the interlocks beside them.
+    for shared in ("/var/lib/ferrum", "/var/lib/ferrum/state"):
+        machine.succeed(f"su -s /bin/sh nobody -c 'test -x {shared}'")
+        machine.fail(f"su -s /bin/sh nobody -c 'ls {shared}'")
+        machine.fail(f"su -s /bin/sh nobody -c 'touch {shared}/.nope'")
+    print("PASS: an app-like unprivileged user can traverse to its stateDir but cannot list or write")
 
     print("=== real login with the real bootstrap password ===")
     password = machine.succeed("cat /var/lib/ferrum/daemon/ferrumd-setup-password").strip()
