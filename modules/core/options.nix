@@ -26,6 +26,20 @@ in
       description = "Version of the ferrum settings.json schema this module tree expects.";
     };
 
+    # Surfaced to the operator through GET /api/catalog's `ferrumVersion`, so
+    # it answers "which ferrum is this host running". Deliberately NOT derived
+    # from inputs.self here: a NixOS module has no access to the flake's own
+    # outputs (see modules/core/overlays.nix's comment on the same wall), and
+    # threading specialArgs through would change the host-flake contract that
+    # examples/hosts/template and docs/INSTALL.md document. A host flake that
+    # wants the real revision sets this from its own `self.shortRev`; one that
+    # does not gets "dev", which is honest rather than wrong.
+    version = mkOption {
+      type = types.str;
+      default = "dev";
+      description = "Human-readable ferrum revision reported by the catalog API.";
+    };
+
     storage = {
       stateDir = mkOption {
         type = types.str;

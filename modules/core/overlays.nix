@@ -115,6 +115,34 @@ in
   nixpkgs.overlays = [
     (import ../../nix/overlays)
     (final: prev: {
+      # modules/core/daemon.nix's FERRUM_CATALOG consumes pkgs.ferrum-catalog.
+      # It lived only in nix/modules/flake/packages.nix, which builds the
+      # package but does NOT populate pkgs.* inside this module tree -- so
+      # `nix flake check` passed while every real host eval failed with
+      # "attribute 'ferrum-catalog' missing". That is the third instance of
+      # the gap nix/overlays/default.nix's own ferrumd comment warns about.
+      #
+      # Defined in THIS config-wiring overlay rather than the base one
+      # because it needs config.ferrum.version, and the base overlay is a
+      # plain `final: prev:` with no access to the configuration tree.
+      ferrum-catalog = prev.writeTextFile {
+        name = "ferrum-catalog.json";
+        destination = "/share/ferrum/catalog.json";
+        # schemaVersion is the literal 1, mirroring the flake package byte for
+        # byte rather than reading ferrum.schemaVersion. Both resolve to 1
+        # today (modules/lib/migrations.nix has an empty migration list), but
+        # the option is computed as `length migrations + 1` while the flake
+        # package hardcodes it -- so reading the option here would make the two
+        # producers disagree the first time a migration is added. Consistently
+        # stale is better than newly divergent; that the flake package
+        # hardcodes it at all is a separate pre-existing bug.
+        text = builtins.toJSON {
+          schemaVersion = 1;
+          ferrumVersion = ferrum.version;
+          apps = catalog;
+        };
+      };
+
       # `--set-default` (not `--set`): a caller's own explicit environment=
       # still wins, matching how ferrum-state-restore.service sets
       # FERRUM_ROOT_DEVICE itself today. Only a host that changes these
