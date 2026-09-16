@@ -23,7 +23,7 @@
 # BEFORE the base overlay, so the base's plain `ferrum-apply =
 # final.callPackage ...` silently clobbered the wrapper). A single list
 # literal has no such ambiguity -- Nix list order is exactly written order.
-{ config, lib, pkgs, ... }:
+{ config, lib, pkgs, revision, ... }:
 let
   ferrum = config.ferrum;
 
@@ -123,8 +123,16 @@ in
       # the gap nix/overlays/default.nix's own ferrumd comment warns about.
       #
       # Defined in THIS config-wiring overlay rather than the base one
-      # because it needs config.ferrum.version, and the base overlay is a
-      # plain `final: prev:` with no access to the configuration tree.
+      # because it needs the `revision` specialArg, and the base overlay is a
+      # plain `final: prev:` with no access to the module arguments.
+      #
+      # `revision` is mkHost's own parameter (modules/lib/default.nix:25),
+      # threaded through specialArgs and, until now, consumed by NOTHING --
+      # it was wired up waiting for exactly this consumer. Real host flakes
+      # already pass their own `self.shortRev` (examples/hosts/template's
+      # flake.nix:41 and saltbox's do), and checks.nix passes "ci", so using
+      # it here makes ferrumVersion true on every existing host with no
+      # host-flake change at all. Its default is "unknown".
       ferrum-catalog = prev.writeTextFile {
         name = "ferrum-catalog.json";
         destination = "/share/ferrum/catalog.json";
@@ -138,7 +146,7 @@ in
         # hardcodes it at all is a separate pre-existing bug.
         text = builtins.toJSON {
           schemaVersion = 1;
-          ferrumVersion = ferrum.version;
+          ferrumVersion = revision;
           apps = catalog;
         };
       };
