@@ -35,9 +35,16 @@ export function setUnauthenticatedHandler(fn) {
   onUnauthenticated = fn;
 }
 
-async function request(method, path, { body, raw = false } = {}) {
+/// `csrf: false` marks a mutating call the daemon does NOT gate on a CSRF
+/// token, because it is not behind `require_session`. There are exactly two:
+/// login and logout, both registered on the outer router in main.rs rather
+/// than inside the `protected` group. Getting this wrong is not theoretical
+/// -- the first browser load of this UI failed with "no CSRF token yet"
+/// because login went down the guarded path and demanded the very token you
+/// log in to obtain.
+async function request(method, path, { body, raw = false, csrf = true } = {}) {
   const headers = {};
-  const mutating = !["GET", "HEAD", "OPTIONS", "TRACE"].includes(method);
+  const mutating = csrf && !["GET", "HEAD", "OPTIONS", "TRACE"].includes(method);
 
   if (mutating) {
     // The daemon rejects a mutating request whose header does not match the
@@ -92,18 +99,28 @@ async function request(method, path, { body, raw = false } = {}) {
 // --- session -------------------------------------------------------------
 
 export async function login(username, password) {
+  // csrf: false -- see `request`. /api/login is outside the protected router,
+  // so the daemon never checks a CSRF header here, and requiring one would
+  // make logging in impossible on a fresh page load.
   const result = await request("POST", "/api/login", {
     body: { username, password },
+    csrf: false,
   });
   csrfToken = result.csrf_token;
   return result;
 }
 
 export async function logout() {
-  // Deliberately not routed through `request`: logging out is the one
-  // mutating call that must still work when the token is already stale, and
-  // the daemon does not gate /api/logout behind require_session.
-  await fetch("/api/logout", { method: "POST", credentials: "same-origin" });
+  // csrf: false for the same reason as login, plus one of its own: logging
+  // out must still work when the token is already stale, which is exactly
+  // when someone reaches for it.
+  try {
+    await request("POST", "/api/logout", { csrf: false });
+  } catch {
+    // A failed logout still clears local state -- leaving the UI believing
+    // it is logged in would be worse than a server-side session lingering
+    // until it expires.
+  }
   csrfToken = null;
 }
 
