@@ -22,6 +22,20 @@
   # evaluate. mkHost's own plain assignment outranks this mkDefault.
   _module.args.ferrumSettingsSeed = lib.mkDefault null;
 
+  # The ferrum revision this host was built from, consumed by
+  # ./core/overlays.nix for ferrum-catalog's `ferrumVersion`. Same rule as
+  # ferrumSettingsSeed above, and for the same reason: a `revision ?
+  # "unknown"` default in overlays.nix's own signature is NOT consulted by
+  # the module system, which looks up config._module.args.revision and
+  # errors "attribute 'revision' missing" if it is absent.
+  #
+  # Confirmed for real: without this line every VM test failed to evaluate,
+  # because pkgs.testers.runNixOSTest does `imports = [ ../modules ]`
+  # directly and never goes through mkHost (see tests/privilege-boundary.nix's
+  # own note). mkHost passes revision via specialArgs, which outranks this
+  # mkDefault, so a real host still reports its true shortRev.
+  _module.args.revision = lib.mkDefault "unknown";
+
   imports = [
     ./core/options.nix
     ./core/nix-settings.nix
