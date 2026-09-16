@@ -90,6 +90,23 @@ let
   hostKeyPubPath =
     let paths = config.sops.age.sshKeyPaths or [ ];
     in lib.optionalString (paths != [ ]) "${builtins.toString (lib.head paths)}.pub";
+  # ferrum-apply's own compiled-in fallback is
+  # "/etc/ferrum#nixosConfigurations.default...", which quietly assumes every
+  # host flake names its configuration `default`. Real host flakes name it
+  # after the machine -- examples/hosts/template and docs/INSTALL.md both say
+  # to -- so on the first real ferrum host a bare `ferrum-apply apply` failed
+  # outright. Deriving it from this host's own hostName makes it always
+  # correct, and the operator never has to learn the variable exists.
+  #
+  # NOTE FOR ANYONE EDITING THE makeWrapper BLOCK BELOW: it is one shell
+  # command held together by trailing backslashes, so a `#` comment must
+  # never be placed between two of its lines. The backslash joins the
+  # comment into the command, everything after `#` is discarded, and every
+  # following `--set-default` becomes a standalone command -- which fails
+  # the build with the genuinely baffling "--set-default: command not
+  # found". That really happened here; hence this binding.
+  defaultFlakeRef =
+    "/etc/ferrum#nixosConfigurations.${config.networking.hostName}.config.system.build.toplevel";
 in
 {
   nixpkgs.config.allowUnfreePredicate = pkg:
@@ -116,16 +133,7 @@ in
             --set-default FERRUM_SNAPSHOT_DIR ${lib.escapeShellArg ferrum.storage.snapshotDir} \
             --set-default FERRUM_JOURNAL_DIR ${lib.escapeShellArg ferrum.storage.journalDir} \
             --set-default FERRUM_MIN_FREE_GIB ${toString ferrum.storage.minFreeGiB} \
-            # FOUND ON THE FIRST REAL HOST: ferrum-apply's own fallback is
-            # "/etc/ferrum#nixosConfigurations.default...", which assumes
-            # every host flake names its configuration `default`. A real
-            # host names it after the machine, so a bare `ferrum-apply
-            # apply` failed with "could not find a flake.nix file" and, had
-            # the file been there, would then have failed on a missing
-            # `default` attribute. Deriving it from the host's OWN hostname
-            # means the operator never has to know this variable exists.
-            --set-default FERRUM_FLAKE_REF ${lib.escapeShellArg
-              "/etc/ferrum#nixosConfigurations.${config.networking.hostName}.config.system.build.toplevel"} \
+            --set-default FERRUM_FLAKE_REF ${lib.escapeShellArg defaultFlakeRef} \
             --set-default FERRUM_KEEP_GENERATIONS ${toString ferrum.storage.keepGenerations} \
             --set-default FERRUM_HEALTH_CHECK_TIMEOUT_SEC ${toString ferrum.apply.healthCheckTimeoutSec} \
             --set-default FERRUM_SECRETS_DIR ${lib.escapeShellArg ferrum.secretsDir} \
