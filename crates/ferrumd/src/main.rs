@@ -1,4 +1,5 @@
 mod auth;
+mod catalog;
 mod db;
 mod dbus;
 mod jobs;
@@ -214,6 +215,7 @@ async fn require_session(
 /// approximation of it.
 fn build_router(state: Arc<AppState>) -> Router {
     let protected = Router::new()
+        .route("/api/catalog", axum::routing::get(catalog::get_catalog))
         .route("/api/settings", axum::routing::get(settings::get_settings).put(settings::put_settings))
         .route("/api/secrets/:name", axum::routing::post(secrets_api::write_secret))
         .route("/api/jobs", axum::routing::post(jobs::create_job))
