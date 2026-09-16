@@ -78,6 +78,16 @@ async fn logout_handler(State(state): State<Arc<AppState>>, cookies: Cookies) ->
 #[derive(Clone, Copy, Debug)]
 struct SessionUserId(i64);
 
+/// The CSRF token of the session `require_session` just authenticated.
+///
+/// A second extension rather than a widened `SessionUserId`, so that type
+/// keeps meaning exactly one thing and `POST /api/password`'s extractor is
+/// untouched. `GET /api/session` reads the token from HERE, never from
+/// anything on the wire -- the same rule require_session states for the
+/// user id, and for the same reason.
+#[derive(Clone)]
+struct SessionCsrfToken(String);
+
 #[derive(Deserialize)]
 struct ChangePasswordRequest {
     current_password: String,
@@ -206,6 +216,9 @@ async fn require_session(
     // account being acted on is always the one this middleware just
     // authenticated.
     request.extensions_mut().insert(SessionUserId(session.user_id));
+    request
+        .extensions_mut()
+        .insert(SessionCsrfToken(session.csrf_token.clone()));
 
     Ok(next.run(request).await)
 }
@@ -214,12 +227,68 @@ async fn require_session(
 /// at the bottom of this file exercise the REAL middleware stack (cookie
 /// layer, `require_session`, the actual routes) rather than a re-declared
 /// approximation of it.
+/// `GET /api/session` -- who am I, and what CSRF token do my mutating
+/// requests need?
+///
+/// The UI gets both at login, but a page reload loses them while the session
+/// cookie survives (it is HttpOnly, so JavaScript can never read it back).
+/// Without this endpoint a refreshed tab is authenticated yet unable to make
+/// a single mutating request, and would have to force a pointless re-login.
+///
+/// Handing out the CSRF token is safe here because two independent things
+/// stop another origin from reading it, and this endpoint depends on BOTH:
+///   1. the session cookie is `SameSite=Strict` (see `login_handler`), so a
+///      cross-site request never carries it and gets a 401; and
+///   2. ferrumd installs no CORS layer at all, so the browser's same-origin
+///      policy stops a cross-origin page reading the response body.
+///
+/// Control 2 is the one that will still be load-bearing later, and it is
+/// worth being precise about why. `SameSite` is scoped to the registrable
+/// SITE, not the origin. ferrumd is loopback-only today (nginx builds vhosts
+/// solely from `exposedApps`, and `ferrum.daemon.subdomain` is declared but
+/// unused), but once a daemon vhost exists under `ferrum.proxy.baseDomain`, a
+/// sibling catalog-app subdomain is same-site -- a compromised app WOULD have
+/// the browser attach `ferrumd_session` to a request here. What stops it
+/// reading the answer is purely the absence of CORS.
+///
+/// So the invariant to protect is specific: never serve this route with
+/// `Access-Control-Allow-Credentials: true` alongside a reflected or wildcard
+/// origin. That combination, and only that, turns this endpoint into a CSRF
+/// bypass for every app hosted under the same base domain.
+async fn session_handler(
+    State(state): State<Arc<AppState>>,
+    axum::Extension(SessionUserId(user_id)): axum::Extension<SessionUserId>,
+    axum::Extension(SessionCsrfToken(csrf_token)): axum::Extension<SessionCsrfToken>,
+) -> impl IntoResponse {
+    match auth::username_for(&state.db, user_id) {
+        Ok(Some(username)) => {
+            Json(serde_json::json!({ "username": username, "csrf_token": csrf_token }))
+                .into_response()
+        }
+        // The session authenticated against a user row that is gone. That is
+        // a database inconsistency, not a failed login, so it is a 500 rather
+        // than a 401: telling the operator to log in again would not fix it,
+        // and a blank username in the UI would hide it entirely.
+        Ok(None) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "session references a user that no longer exists",
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("could not read the session's user: {e}"),
+        )
+            .into_response(),
+    }
+}
+
 fn build_router(state: Arc<AppState>) -> Router {
     let protected = Router::new()
         .route("/api/catalog", axum::routing::get(catalog::get_catalog))
         .route("/api/generations", axum::routing::get(generations::get_generations))
         .route("/api/settings", axum::routing::get(settings::get_settings).put(settings::put_settings))
         .route("/api/secrets/:name", axum::routing::post(secrets_api::write_secret))
+        .route("/api/session", axum::routing::get(session_handler))
         .route("/api/jobs", axum::routing::post(jobs::create_job))
         .route("/api/jobs", axum::routing::get(jobs::list_jobs))
         .route("/api/jobs/:id", axum::routing::get(jobs::get_job))
@@ -531,6 +600,89 @@ mod tests {
             builder = builder.header(CSRF_HEADER, csrf);
         }
         builder.body(Body::empty()).unwrap()
+    }
+
+    /// `GET /api/session` with no cookie at all must be a 401 -- it is
+    /// inside the protected router, so `require_session` rejects it before
+    /// the handler is reached.
+    #[tokio::test]
+    async fn the_session_endpoint_refuses_an_unauthenticated_caller() {
+        let (_dir, state, _session, _csrf) = logged_in();
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/api/session")
+            .body(Body::empty())
+            .unwrap();
+        let response = build_router(state).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// The real username, and a CSRF token that a real mutating request
+    /// through the REAL router actually accepts.
+    ///
+    /// That second half is the whole point of the endpoint and is asserted
+    /// by using the token, not by checking it is a non-empty string: a
+    /// handler that returned any plausible-looking value would pass the
+    /// weaker check and leave a refreshed UI unable to make a single
+    /// mutating request.
+    #[tokio::test]
+    async fn the_session_endpoint_returns_a_csrf_token_that_really_works() {
+        let (_dir, state, session, csrf) = logged_in();
+
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/api/session")
+            .header("Cookie", format!("ferrumd_session={session}"))
+            .body(Body::empty())
+            .unwrap();
+        let response = build_router(state.clone()).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["username"], "admin", "the real username from the real database");
+
+        let returned = body["csrf_token"].as_str().unwrap().to_string();
+        assert_eq!(returned, csrf, "it must be THIS session's own token");
+
+        // Now actually spend it on a real mutating request through the real
+        // router. A wrong-but-plausible token would be a 403 here.
+        let mutating = Request::builder()
+            .method(Method::POST)
+            .uri("/api/password")
+            .header("Cookie", format!("ferrumd_session={session}"))
+            .header(CSRF_HEADER, &returned)
+            .header("Content-Type", "application/json")
+            .body(Body::from(r#"{"current_password":"wrong","new_password":"x"}"#))
+            .unwrap();
+        let response = build_router(state).oneshot(mutating).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "401 means the CSRF gate PASSED and the handler ran (and rejected the \
+             deliberately wrong current password); a 403 would mean the token was refused"
+        );
+    }
+
+    /// One session must never be handed another session's CSRF token.
+    #[tokio::test]
+    async fn the_session_endpoint_returns_this_sessions_token_not_another() {
+        let (_dir, state, _session, csrf) = logged_in();
+        let password = std::fs::read_to_string(_dir.path().join("ferrumd-setup-password")).unwrap();
+        let other = auth::login(&state.db, "admin", password.trim()).unwrap().unwrap();
+        assert_ne!(other.csrf_token, csrf, "two real logins, two real tokens");
+
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/api/session")
+            .header("Cookie", format!("ferrumd_session={}", other.session_token))
+            .body(Body::empty())
+            .unwrap();
+        let response = build_router(state).oneshot(request).await.unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["csrf_token"], other.csrf_token);
+        assert_ne!(body["csrf_token"], csrf);
     }
 
     #[tokio::test]

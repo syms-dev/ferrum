@@ -157,6 +157,32 @@ pub fn validate_session(db: &Db, token: &str) -> anyhow::Result<Option<SessionIn
         .or_else(|e| if matches!(e, rusqlite::Error::QueryReturnedNoRows) { Ok(None) } else { Err(e.into()) })
 }
 
+/// Resolves an authenticated user id to that user's username.
+///
+/// Takes the id `require_session` just authenticated, never anything off the
+/// wire -- the same rule `change_password` follows, for the same reason.
+///
+/// `Ok(None)` means the session referenced a user row that no longer exists.
+/// That is a database inconsistency rather than a normal outcome (a session
+/// should not outlive its user), so it is reported distinctly instead of
+/// being flattened into an empty username the UI would render as a blank.
+pub fn username_for(db: &Db, user_id: i64) -> anyhow::Result<Option<String>> {
+    db.conn()
+        .query_row(
+            "SELECT username FROM users WHERE id = ?1",
+            rusqlite::params![user_id],
+            |row| row.get(0),
+        )
+        .map(Some)
+        .or_else(|e| {
+            if matches!(e, rusqlite::Error::QueryReturnedNoRows) {
+                Ok(None)
+            } else {
+                Err(e.into())
+            }
+        })
+}
+
 /// Rotates one user's own password, after really verifying the current one.
 ///
 /// Returns `Ok(false)` -- deliberately NOT an error -- when
