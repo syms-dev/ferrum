@@ -267,6 +267,56 @@ The demo that sells the project arrives at the end of 1.2: enable testapp v1, wr
 5. **What "rollback" means to a user versus what it does.** Media files, download queues, ACME certs and Authelia users do *not* revert. The confirmation dialog must list concretely what will and will not roll back. Getting this wrong is how a technically correct product earns a reputation for losing data.
 6. **Scope creep in the reconciler.** Declarative *arr configuration is bottomless. Phase 1 holds to app-to-app registration and defers quality profiles to Recyclarr.
 
+## What the first real install taught us about testing
+
+*Added 2026-09-15, after the first ferrum host was installed on real hardware.*
+
+The install found **ten defects**. The VM suite was fully green throughout, and
+**six of the ten were invisible to it**. That is not a gap in any individual
+test; it is a gap in what the suite is shaped to ask.
+
+Every VM test builds a host from a Nix expression and drives it through
+systemd units or explicit store paths. A real operator installs a machine from
+nothing and then types commands at a shell. The defects living in the gap
+between those two things were:
+
+- **`/etc/ferrum` was never provisioned by any module.** `daemon.nix` asserted
+  it existed; nothing created it. Invisible because a VM test's host is built,
+  never installed.
+- **`ferrum-apply` was in no `systemPackages`.** The binary existed only as a
+  store path inside a unit's `ExecStart`, so `ferrum-apply apply` was "command
+  not found" on a real box. Invisible because tests invoke it by store path or
+  through systemd — never as a bare command.
+- **`FERRUM_FLAKE_REF` defaulted to `nixosConfigurations.default`**, which no
+  real host flake uses. Invisible because tests set it explicitly.
+- **The first install cannot have apps enabled** — sops requires each
+  `sopsFile` to exist at eval time, but secrets are generated on the host
+  afterwards. Invisible because test hosts have placeholder secrets committed.
+- **The template assumed UEFI.** Invisible because VM tests do not exercise a
+  bootloader on real firmware.
+- **A `#` comment inside a `makeWrapper` shell continuation** broke the build
+  with `--set-default: command not found`. Invisible to `nix eval`, which sees
+  a perfectly valid string: the error only exists once a shell reads it.
+
+The shared shape: *a test that never acts like a human never finds what a human
+hits.* Three concrete conclusions for later phases:
+
+1. **Eval is not build, and build is not run.** Each catches a strictly
+   different class. `nix eval` passing says nothing about whether a generated
+   shell script is syntactically whole.
+2. **At least one test must use the operator's own interface** — a bare command
+   on `PATH`, against defaults, with nothing pre-set in the environment.
+3. **Install-from-nothing is its own test target.** Every VM test starts from a
+   built host, so nothing before that point was covered until a real machine
+   was built. `nixos-anywhere --vm-test` is the cheap way to cover most of it.
+
+What did *not* fail is worth recording too: the rollback engine. Ten defects,
+all of them in the install path and the operator surface, none in the
+mechanism the project exists for. When a build failed mid-apply on real
+hardware, the host was left completely untouched — generation unchanged,
+application state unchanged, no snapshot written, every service still running
+— because `apply` builds before it stops anything. The design held.
+
 ## Open items
 
 - Apache-2.0 versus MIT — the owner chose "MIT or Apache-2.0"; Apache-2.0 is assumed here for its patent grant. Confirm before the first public commit.
