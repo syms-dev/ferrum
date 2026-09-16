@@ -2,6 +2,7 @@ mod auth;
 mod catalog;
 mod db;
 mod dbus;
+mod generations;
 mod jobs;
 mod secrets_api;
 mod settings;
@@ -216,6 +217,7 @@ async fn require_session(
 fn build_router(state: Arc<AppState>) -> Router {
     let protected = Router::new()
         .route("/api/catalog", axum::routing::get(catalog::get_catalog))
+        .route("/api/generations", axum::routing::get(generations::get_generations))
         .route("/api/settings", axum::routing::get(settings::get_settings).put(settings::put_settings))
         .route("/api/secrets/:name", axum::routing::post(secrets_api::write_secret))
         .route("/api/jobs", axum::routing::post(jobs::create_job))
@@ -772,6 +774,30 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(auth::login(&state.db, "admin", old.trim()).unwrap().is_some());
+    }
+
+    /// AC25 -- the READ route is behind the session gate too.
+    ///
+    /// `the_real_mutating_routes_are_really_behind_the_csrf_gate` above
+    /// enumerates mutating routes only, so a read route declared outside the
+    /// `protected` group -- beside `/api/login` rather than behind
+    /// `require_session` -- would be invisible to it and to every other test
+    /// here. This drives the REAL router with no session cookie at all, so
+    /// moving `/api/generations` out of `protected` fails here.
+    #[tokio::test]
+    async fn an_unauthenticated_generations_read_is_refused() {
+        let (_dir, state, _session, _csrf) = logged_in();
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/api/generations")
+            .body(Body::empty())
+            .unwrap();
+        let response = build_router(state).oneshot(request).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "GET /api/generations must not be reachable without a session"
+        );
     }
 
     #[tokio::test]

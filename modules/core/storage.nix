@@ -58,6 +58,7 @@ in
       "d ${cfg.mediaDir} 0775 root ${cfg.mediaGroup} - -"
       "d ${cfg.mediaDir}/downloads 0775 root ${cfg.mediaGroup} - -"
       "d ${cfg.mediaDir}/library 0775 root ${cfg.mediaGroup} - -"
+      "d ${cfg.journalDir} 0750 root ${ferrumdGroup} - -"
     ];
 
     assertions = [
@@ -72,6 +73,33 @@ in
       {
         assertion = !(lib.hasInfix cfg.stateDir cfg.snapshotDir);
         message = "ferrum.storage.snapshotDir must not nest inside ferrum.storage.stateDir.";
+      }
+      {
+        assertion =
+          cfg.journalDir != "/var/lib/ferrum"
+          && !(lib.any (dir: lib.hasInfix dir cfg.journalDir) [
+            cfg.stateDir
+            cfg.snapshotDir
+            cfg.mediaDir
+          ]);
+        message = ''
+          ferrum.storage.journalDir must not be /var/lib/ferrum itself, and
+          must be neither equal to nor nested inside stateDir, snapshotDir or
+          mediaDir. It is operator-settable and otherwise unconstrained, and
+          this module declares a systemd.tmpfiles rule for whatever it is set
+          to -- and as the note above says, two rules for one path with
+          different arguments is a real conflict, not a merge. NixOS
+          re-processes tmpfiles rules on every switch-to-configuration, not
+          only at boot (see modules/proxy/authelia.nix:102-104), so a
+          colliding value is not a one-time boot failure: it is re-applied in
+          the middle of every apply, forever. journalDir = mediaDir would flip
+          the media tree from 0775 root:${cfg.mediaGroup} to 0750
+          root:${ferrumdGroup} and break every app; journalDir = stateDir
+          would regroup the state subvolume root; journalDir =
+          /var/lib/ferrum collides with the rule declared above. The default
+          /var/lib/ferrum/journal lives under /var/lib/ferrum without being
+          equal to it and nests inside none of the three, so it stays legal.
+        '';
       }
       {
         assertion = cfg.minFreeGiB > 0;

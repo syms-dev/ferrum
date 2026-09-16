@@ -203,6 +203,73 @@
           actualSchemaVersion = migratedHost.config.ferrum.schemaVersion;
         };
 
+      # Proof that modules/core/storage.nix's journalDir assertion is really
+      # wired into an evaluated host config, not merely written down -- and
+      # that the DEFAULT journalDir survives it. That second half is the part
+      # worth a check: the assertion rejects anything nesting inside stateDir
+      # (/var/lib/ferrum/state), and the default /var/lib/ferrum/journal sits
+      # one directory away from it, so an over-broad rewrite of the condition
+      # would brick every host rather than only the misconfigured ones.
+      #
+      # A false NixOS assertion becomes a hard error only when
+      # system.build.toplevel is forced, which is far too expensive to do here
+      # (eval-example-hosts below documents that cost). This inspects the same
+      # config.assertions list top-level reads, one step before NixOS turns a
+      # false entry into a throw. builtins.tryEval -- the throwCaught idiom
+      # from migrationMechanism above -- keeps a genuine evaluation error on a
+      # colliding value counting as "rejected" instead of taking the whole
+      # flake down with it.
+      journalDirCollision =
+        let
+          hostWith = journalDir: ferrumLib.mkHost {
+            inherit system;
+            settings = builtins.fromJSON (builtins.readFile ../../../examples/hosts/minimal/settings.json);
+            modules = [
+              ../../../examples/hosts/minimal/configuration.nix
+              { ferrum.secretsDir = toString ../../../examples/hosts/minimal/secrets; }
+            ] ++ lib.optional (journalDir != null) { ferrum.storage.journalDir = journalDir; };
+            revision = "ci";
+          };
+          # Scoped to the journalDir assertion's own message on purpose, and
+          # not negotiable: the example host carries OTHER failing assertions
+          # unrelated to this one (its committed placeholder secrets under
+          # examples/hosts/minimal/secrets/ have no *-apikey-raw.sops
+          # counterparts, which modules/ asserts on). Confirmed for real by
+          # running this check unscoped first. An unscoped version is not
+          # merely noisy, it is worthless in BOTH directions: it reports the
+          # legal default as rejected, and it reports every colliding value as
+          # rejected for a reason that has nothing to do with journalDir --
+          # so it would pass identically with this assertion deleted.
+          # null means "leave journalDir at its declared default".
+          failuresFor = journalDir:
+            let
+              probe = builtins.tryEval (
+                builtins.filter (m: lib.hasInfix "ferrum.storage.journalDir" m)
+                  (map (a: a.message)
+                    (builtins.filter (a: !a.assertion) (hostWith journalDir).config.assertions))
+              );
+            in
+            if probe.success then probe.value else [ "evaluation threw" ];
+
+          storage = (hostWith null).config.ferrum.storage;
+          colliding = [
+            "/var/lib/ferrum"
+            storage.stateDir
+            storage.snapshotDir
+            storage.mediaDir
+            "${storage.stateDir}/journal"
+            "${storage.mediaDir}/journal"
+          ];
+
+          defaultFailures = failuresFor null;
+          notRejected = builtins.filter (dir: failuresFor dir == [ ]) colliding;
+        in
+        {
+          ok = defaultFailures == [ ] && notRejected == [ ];
+          defaultJournalDir = storage.journalDir;
+          inherit defaultFailures notRejected;
+        };
+
       mkAssertionCheck = name: result:
         pkgs.runCommand "ferrum-check-${name}" { } (
           if result.ok then
@@ -217,6 +284,7 @@
         schema-uniformity = mkAssertionCheck "schema-uniformity" schemaUniformity;
         sopsfile-are-paths = mkAssertionCheck "sopsfile-are-paths" sopsFilesArePaths;
         migration-mechanism = mkAssertionCheck "migration-mechanism" migrationMechanism;
+        journaldir-collision = mkAssertionCheck "journaldir-collision" journalDirCollision;
         mkhost-applies-migration = mkAssertionCheck "mkhost-applies-migration" mkHostAppliesMigration;
 
         # Forces .drvPath for each example host so an option-type mistake
