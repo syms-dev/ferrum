@@ -221,6 +221,8 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/settings", axum::routing::get(settings::get_settings).put(settings::put_settings))
         .route("/api/secrets/:name", axum::routing::post(secrets_api::write_secret))
         .route("/api/jobs", axum::routing::post(jobs::create_job))
+        .route("/api/jobs", axum::routing::get(jobs::list_jobs))
+        .route("/api/jobs/:id", axum::routing::get(jobs::get_job))
         .route("/api/jobs/:id/stream", axum::routing::get(jobs::stream_job))
         .route("/api/password", post(change_password_handler))
         .route_layer(axum::middleware::from_fn_with_state(state.clone(), require_session));
