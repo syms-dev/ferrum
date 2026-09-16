@@ -246,9 +246,13 @@ setting."
 - Many apps change version in the same apply (the common case, since nixpkgs moves them together):
   the existing single-generation/single-snapshot model already treats "many things changed at once"
   uniformly; no per-app tracking inside one generation is required or introduced.
-- The candidate pin advanced but resolves to **no change** for this host's enabled apps (none of
-  them happened to move in that nixpkgs revision): the apply still proceeds and succeeds as an
-  ordinary, if uneventful, generation — not treated as an error or a no-op that's silently skipped.
+- The candidate pin advanced but resolves to **no change** in the built closure: `apply::run`
+  returns early after a health check when the built toplevel equals the running one
+  (`crates/ferrum-apply/src/apply.rs:250-257`) — **no preflight, no snapshot, no journal entry, no
+  new generation**. An earlier draft of this spec asserted the opposite; satisfying that would have
+  required forking `apply::run`, which R4's first criterion forbids. The operator is therefore told
+  "no change — nothing to apply", and the UI copy must say exactly that rather than implying a
+  generation was created.
 
 ---
 
@@ -284,11 +288,24 @@ so that an update is never a one-way door.
       currently-running generation is always reported `rollbackable: false`").
 
 **Edge Cases**:
-- The pre-update generation's snapshot could in principle be pruned before an operator notices the
-  update is bad — today nothing prunes automatically (`ferrum-apply gc` is stated as
-  "not yet implemented," `crates/ferrum-apply/src/main.rs:373-376`), so this is a known future
-  interaction with GC rather than a present risk; flagged so it is not rediscovered as a surprise
-  once GC ships (see Open Question 4).
+- **The pre-update generation's snapshot CAN be pruned before an operator notices the update is
+  bad, and this is a PRESENT risk, not a future one.** An earlier draft of this spec said the
+  opposite, citing a stale README line; `ferrum-apply gc` is fully implemented
+  (`crates/ferrum-apply/src/gc.rs` — `plan()` at :58, `delete_one()` at :105, `run()` at :136, nine
+  unit tests; wired via `run_gc`/`run_gc_inner` at `crates/ferrum-apply/src/main.rs:397-443`, and
+  `main.rs:389-396`'s own comment records that it stopped being a stub on 2026-09-15). Retention is
+  `FERRUM_KEEP_GENERATIONS`, default **10**, and `gc::plan` protects only the **currently-running**
+  generation's snapshot (`gc.rs:71-78`). So an operator who updates and then applies ten more times
+  can lose the pre-update snapshot, after which `is_rollbackable` reports that generation as
+  unrollbackable with "its snapshot was pruned"
+  (`crates/ferrum-state/src/generations.rs:73-81`). The one mitigating fact — no systemd timer runs
+  gc, so it is operator-triggered (confirmed: `keepGenerations` appears only in
+  `modules/core/options.nix` and `modules/core/overlays.nix`, with no timer unit anywhere) — is the
+  reason this is survivable today, and it is not something to rely on.
+- **Therefore a requirement this phase needs and does not yet have:** an update-produced
+  generation's pre-image snapshot must be protected from `gc` until the operator confirms the
+  update is good. Without it, "an update is never a one-way door" is true only for about ten
+  applies.
 - A generation genuinely has no snapshot (applied by a bare `nixos-rebuild switch` bypassing
   `ferrum-apply`): already handled — the daemon's own `reason` string is shown and no control is
   offered; unchanged by this phase.
@@ -388,6 +405,137 @@ that I don't assume a per-app control exists and go looking for one that isn't t
   *removes* an app from tracking the shared pin rather than letting it move independently ahead of
   it.
 
+### R8: A Generation Records the Pin It Was Built From
+
+**Description**: Every generation records the resolved flake pin that produced it, and the system
+refuses to silently rebuild from a pin the running generation was not built from.
+
+**User Story**: As an operator who rolled back a bad update, I want the rollback to stay rolled
+back, so that changing an unrelated setting a week later does not quietly reinstall the update I
+rejected.
+
+**Why this requirement exists** (found in adversarial review, verified against the code): **rollback
+does not revert the pin.** `crates/ferrum-apply/src/rollback.rs` contains no reference to
+`flake.nix`, `flake.lock` or `FERRUM_FLAKE_REF` at all — it writes the intent file, runs
+`nix-env --switch-generation` (:112-119), `switch-to-configuration boot` (:128), and reboots
+(:137). Meanwhile every apply rebuilds from `FERRUM_FLAKE_REF`, defaulting to the live on-disk
+`/etc/ferrum` flake (`crates/ferrum-apply/src/main.rs:191-192`). So:
+
+> update → the app regresses → roll back → the machine is healthy → days later the operator toggles
+> an unrelated setting and clicks Apply → `apply::run` rebuilds from the **still-advanced pin** →
+> the rejected update returns, with no preview, no confirmation, and a generation that reads as an
+> ordinary settings change.
+
+This needs no attacker and no unusual sequence. It is also currently **undetectable**:
+`JournalEntry` is `{snapshot, generation, toplevel, taken_at, quiesced}`
+(`crates/ferrum-state/src/journal.rs:4-14`) — no field records which pin produced a generation, so
+R4's claim that no new journal field is required is **retracted**.
+
+**Acceptance Criteria**:
+- [ ] `JournalEntry` gains a field recording the resolved pin (the `nodes.ferrum.locked.rev` and
+      `narHash` from `/etc/ferrum/flake.lock`) that the generation was built from. Adding a field
+      to that struct is a settings-schema-adjacent change; entries written before this field exists
+      must deserialise with it absent rather than failing, the same tolerance
+      `jobs::summarize` applies to job files predating the `started` line.
+- [ ] Rolling back to a generation whose recorded pin differs from the on-disk pin **either**
+      reverts the on-disk pin to the recorded one, **or** refuses to complete silently — it must
+      not leave the two disagreeing without saying so.
+- [ ] Any apply whose on-disk pin differs from the running generation's recorded pin is **gated**:
+      the operator is told, in the Apply view, that this rebuild will also move the system to a
+      different ferrum revision, and which one. An ordinary settings change must never carry an
+      update in on its back unannounced.
+- [ ] The rollback confirmation dialog (`ui/app.js`'s `confirmRollback`) states plainly what the
+      rollback does and does not do about the pin, in the same prose register as the rest of that
+      dialog.
+- [ ] Discovery reports "your on-disk pin differs from the pin the running generation was built
+      from" as a first-class state, not an error — it is also what an operator sees after a
+      `git checkout` in `/etc/ferrum` reverts a machine-written `flake.lock` (see R2's edge cases).
+
+**Edge Cases**:
+- A generation predating this field: reported as "pin unknown" and never used to justify gating an
+  apply, since the absence is an artifact of age rather than a disagreement.
+- The operator deliberately wants the new pin after rolling back the closure: the gate must be
+  passable, not a wall — it exists to make the decision visible, not to prevent it.
+
+---
+
+## Review outcomes — architect decision and the open register
+
+This section records what the planning review changed. The requirements above are revised; this
+explains why, so a reader does not have to reconstruct it.
+
+### Open Question 1 — RESOLVED by the Technical Architect: track a curated release ref
+
+A host's `ferrum.url` names a ferrum-published release branch/tag; `ferrum-apply` advances the pin
+with `nix flake lock --update-input ferrum`, mutating **only `flake.lock`**.
+`/etc/ferrum/flake.nix` stays byte-identical forever.
+
+The reasoning that decided it is not the one this spec originally framed. The
+compromised-ferrumd invariant holds identically either way — what matters is that the mutated file
+is root-owned, not *which* root-owned file it is. What actually decided it was tooling fit:
+`nix flake lock --update-input` is a first-class Nix command whose entire job is this operation,
+whereas rewriting a `ferrum.url` string inside a human-authored `.nix` file means new,
+root-privileged, bespoke source-text mutation with no Nix-native atomicity. Secondarily, ferrum's
+own `flake.nix:5` already tracks a ref with a pinned rev underneath it for nixpkgs, so this applies
+an existing pattern rather than inventing one.
+
+**The cost, accepted explicitly:** every host that requests an update trusts that ferrum's release
+ref only ever receives tested commits. A compromised maintainer account fans out to every host on
+its next check. Mitigations: Preview shows the exact candidate rev before any commit; `flake.lock`
+records the resolved rev and narHash afterwards, so the audit trail an exact-commit pin gives is
+preserved; and nothing removes the manual path for an operator who wants zero delegated trust.
+
+**New dependency this creates:** the ferrum project must establish and maintain a curated release
+ref with a pre-publish testing gate. That is an organisational obligation, not code, and it is the
+mechanism the accepted cost rests on.
+
+### The correction that decision forced: two job kinds, not one
+
+`nix flake lock --update-input` **is a write**. Wiring it into Discovery/Preview would violate R3's
+read-only guarantee outright. Verified against `nix 2.35.2`: `nix eval` accepts both
+`--override-input` and `--no-write-lock-file`, which is the read-only path.
+
+- **`CheckUpdate`** (Discovery + Preview), zero fields, strictly read-only: `git ls-remote` against
+  the repo and ref already in `flake.nix` to resolve the candidate SHA, then
+  `nix eval --override-input ... --no-write-lock-file` to compute deltas. Touches neither
+  `flake.nix` nor `flake.lock` — directly testable by hashing both files before and after.
+- **`Update`** (commit), zero fields, the only writer: `nix flake lock --update-input ferrum`,
+  then an unmodified call into `apply::run`.
+
+This also answers **Open Question 2** — the trusted source is `git ls-remote` against the exact
+repo and ref the operator already committed to their own root-owned `flake.nix`. No new artifact,
+no second trust root. And **Open Question 5** — advance-and-apply is one atomic operator action,
+because an advanced-but-unapplied lock is exactly the drift R8 now exists to prevent.
+
+### Findings still open against this spec
+
+The adversarial pass returned **UPHELD**: 3 High, 4 Medium. The planning gate is **FAILED and
+open**; implementation must not start. Resolved above: DA-2 (now R8), DA-3 (gc corrected), DA-4
+(R4's no-change edge case corrected). Still open:
+
+- **DA-1 (High) — R2 proves the request file is inert, not that the candidate is authentic.** All
+  six criteria constrain the request; none constrains the authenticity of what the root process
+  then fetches and evaluates. The amplifier: `apply.rs:239-241` runs `nix build --impure`, whose
+  own comment (`:232-237`) notes this disables the purity sandbox for the whole build — so the
+  candidate is evaluated **impurely, as root**. R2 needs criteria binding: an authenticated
+  candidate (unverifiable is a hard refusal, not a warning), repo identity unchanged by a pin
+  advance, and monotonicity enforced at apply and not only at discovery.
+- **DA-5 (Medium) — `/etc/ferrum` is a git working tree** whose files must all be tracked
+  (`examples/hosts/template/flake.nix:9-12`). A machine-written `flake.lock` leaves it dirty; a
+  later `git checkout` silently reverts the pin and the next ordinary apply **downgrades every
+  package**. R2 must state what happens to that tree.
+- **DA-6 (Medium) — read-only candidate evaluation is unproven machinery.** The
+  `preview-migration` precedent evaluates one cheap integer against the already-locked flake; R1
+  needs a full module-system evaluation of a *candidate* configuration, twice, fetching a different
+  nixpkgs. Needs a measured spike before R1/R3 are estimable.
+- **DA-7 (Medium) — a slow Preview sharing `job_running` could block a rollback** on a host an
+  update just broke (`crates/ferrumd/src/jobs.rs:148-158`; no timeout, no cancel). The invariant
+  belongs in Open Question 3: rollback must never be blocked by a read-only job.
+- **Unverified assumption, highest-value spike:** that every catalog app's nixpkgs
+  `services.<app>` module exposes a uniformly evaluable `.version`. Neither the writer nor the
+  architect could settle it by inspection. One `nix eval` per app against the pinned nixpkgs rev,
+  before any implementation task.
+
 ## Dependencies
 
 - **Per-app version metadata does not exist today** and must be added before Discovery/Preview can
@@ -401,7 +549,8 @@ that I don't assume a per-app control exists and go looking for one that isn't t
 - **The settings-schema-migration write-back step is not yet implemented** — that spec's own Known
   Risk 4 states "No task in the implementing plan built this." R3's unification of app-version and
   schema-migration previews on one screen depends on that gap being closed (see Open Question 6).
-- **`ferrum-apply gc` is not yet implemented** (`crates/ferrum-apply/src/main.rs:373-376`, both the
+- **`ferrum-apply gc` IS implemented** (corrected — see R5's edge cases; the earlier claim came from a
+  stale `README.md` line, now fixed). What remains true is that nothing schedules it. (`crates/ferrum-apply/src/main.rs:397-443`, both the
   bare `Gc` subcommand and its `run-request` dispatch print "not yet implemented" and exit
   non-zero). Update, like any apply, grows the generation/snapshot count; this phase does not
   implement GC but its absence bears directly on Update's practical usability (see Open Question 4).
@@ -510,7 +659,7 @@ that I don't assume a per-app control exists and go looking for one that isn't t
    provably read-only and safe to run concurrently with a build/switch already in progress? Sharing
    it is simplest and consistent with today's code; exempting it needs new interlock machinery this
    spec does not otherwise require.
-4. **Update cadence versus generation growth.** Since `ferrum-apply gc` is not yet implemented
+4. **Update cadence versus generation growth.** Since `ferrum-apply gc` is implemented but unscheduled, and protects only the running generation's snapshot
    (`crates/ferrum-apply/src/main.rs:373-376`), every update — like every apply — grows the
    generation/snapshot history without bound. Should this phase be blocked on GC landing first, or
    ship with an explicit, documented caveat that disk usage grows until GC exists?
