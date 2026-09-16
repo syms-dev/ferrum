@@ -270,6 +270,73 @@
           inherit defaultFailures notRejected;
         };
 
+      # Every schema shape the real settings-schema.json contains must have a
+      # control in ui/forms.js.
+      #
+      # This is the mechanical guard on the phase's central claim -- that
+      # adding a directory under modules/apps/ makes an app appear with no UI
+      # change. Without it the claim decays silently: someone adds an option
+      # shape the renderer has never seen, nothing fails, and an operator
+      # eventually opens a form, saves it, and loses a field. forms.js's
+      # UNSUPPORTED branch stops the data loss; this stops the gap existing.
+      #
+      # It reads forms.js's single exported SUPPORTED_TYPES literal rather than
+      # parsing JavaScript. That is deliberate: one honest declaration a human
+      # maintains beats a parser that would quietly disagree with the code it
+      # claims to describe. The cost is that adding an entry there WITHOUT
+      # adding the matching branch in control() turns this into a rubber stamp
+      # -- a code-review discipline point, the same way schema-uniformity
+      # treats its own throw() messages.
+      uiRendersEverySchemaType =
+        let
+          formsSrc = builtins.readFile ../../../ui/forms.js;
+          # Find the one line declaring the literal, then pull the quoted
+          # names out of it. Line-oriented rather than a multi-line regex:
+          # Nix's regex engine rejects the bracket-negation forms that would
+          # be needed, and a line lookup is clearer than working around it.
+          declLine =
+            let hits = builtins.filter (l: lib.hasInfix "SUPPORTED_TYPES = [" l)
+                         (lib.splitString "\n" formsSrc);
+            in if hits == [ ] then
+                 throw "ui/forms.js no longer declares SUPPORTED_TYPES on a single line that this check can read"
+               else builtins.head hits;
+          declared =
+            map builtins.head
+              (builtins.filter builtins.isList
+                (builtins.split "\"([a-z-]+)\"" declLine));
+
+          schema = builtins.fromJSON (builtins.readFile ../../../modules/lib/settings-schema.json);
+
+          # The shape vocabulary must match forms.js's control() branches
+          # exactly: an enum'd string and a plain string are different
+          # controls, and so is an array by its item type.
+          shapeOf = node:
+            let t = node.type or null; in
+            if t == "string" && node ? enum then [ "string-enum" ]
+            else if t == "array" then
+              [ ("array-of-" + (((node.items or { }).type or "unknown"))) ]
+            else if t != null && builtins.isString t then [ t ]
+            else [ ];
+
+          walk = node:
+            if !(builtins.isAttrs node) then [ ]
+            else
+              shapeOf node
+              ++ lib.concatMap walk (builtins.attrValues (node.properties or { }))
+              ++ lib.concatMap walk (builtins.attrValues (node.patternProperties or { }))
+              ++ (if builtins.isAttrs (node.items or null) then walk node.items else [ ])
+              ++ (if builtins.isAttrs (node.additionalProperties or null)
+                  then walk node.additionalProperties else [ ]);
+
+          present = lib.unique (walk schema);
+          missing = builtins.filter (t: !(builtins.elem t declared)) present;
+        in
+        {
+          ok = missing == [ ];
+          inherit missing declared;
+          schemaShapes = present;
+        };
+
       mkAssertionCheck = name: result:
         pkgs.runCommand "ferrum-check-${name}" { } (
           if result.ok then
@@ -282,6 +349,8 @@
       checks = {
         catalog-consistency = mkAssertionCheck "catalog-consistency" catalogConsistency;
         schema-uniformity = mkAssertionCheck "schema-uniformity" schemaUniformity;
+        ui-renders-every-schema-type =
+          mkAssertionCheck "ui-renders-every-schema-type" uiRendersEverySchemaType;
         sopsfile-are-paths = mkAssertionCheck "sopsfile-are-paths" sopsFilesArePaths;
         migration-mechanism = mkAssertionCheck "migration-mechanism" migrationMechanism;
         journaldir-collision = mkAssertionCheck "journaldir-collision" journalDirCollision;
