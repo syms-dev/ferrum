@@ -446,5 +446,55 @@ pkgs.testers.runNixOSTest {
         "an idempotent apply must not have advanced the system profile again"
     )
     print("PASS: a real repeat apply really was a real no-op")
+
+    # --- Phase 1.5b: what the UI would actually show an operator now ---
+    #
+    # This test has just performed a REAL apply that really switched
+    # generation. These assertions check the read-only APIs the UI is built
+    # on tell the truth about it, rather than a stale or empty answer. A
+    # rollback view that showed the wrong current generation would invite an
+    # operator to roll back to the one they are already running.
+    print("=== GET /api/jobs lists the real apply that just ran ===")
+    listed = json.loads(
+        machine.succeed("curl -s -b /tmp/cookies.txt http://127.0.0.1:7788/api/jobs")
+    )["jobs"]
+    assert listed, "the job list is empty after a real apply really ran"
+    mine = [j for j in listed if j["id"] == job_id]
+    assert mine, f"the real apply job {job_id} is missing from {[j['id'] for j in listed]}"
+    job = mine[0]
+    # `kind` comes from the `started` line ferrum-apply writes before
+    # dispatching. Without that line it would be null for every job.
+    assert job["kind"] == "apply", job
+    assert job["status"] == "complete", job
+    assert job["result"] == "succeeded", job
+    assert job["started_at"] and job["finished_at"], job
+    print(f"PASS: the real job is listed as {job['kind']}/{job['result']}")
+
+    print("=== GET /api/jobs/:id returns the real event log, started FIRST ===")
+    detail = json.loads(
+        machine.succeed(f"curl -s -b /tmp/cookies.txt http://127.0.0.1:7788/api/jobs/{job_id}")
+    )
+    events = detail["events"]
+    assert events, "the real job has no events"
+    assert events[0]["event"] == "started", events[:3]
+    assert events[0]["detail"] == "apply", events[0]
+    assert events[-1]["event"] == "complete", events[-1]
+    print(f"PASS: {len(events)} real events, started first and complete last")
+
+    print("=== GET /api/generations reports the NEW generation as current ===")
+    gens = json.loads(
+        machine.succeed("curl -s -b /tmp/cookies.txt http://127.0.0.1:7788/api/generations")
+    )
+    profile_target = machine.succeed("readlink /nix/var/nix/profiles/system").strip()
+    current = [g for g in gens["generations"] if g["current"]]
+    assert len(current) == 1, gens
+    # The honest end-to-end proof: the number the API calls current is the
+    # number the profile symlink really points at, after a real switch.
+    assert f"system-{current[0]['generation']}-link" == profile_target, (
+        f"the API says generation {current[0]['generation']} but the profile is {profile_target}"
+    )
+    assert current[0]["rollbackable"] is False, current[0]
+    assert "already running" in (current[0]["reason"] or ""), current[0]["reason"]
+    print(f"PASS: the API and the real profile symlink agree on generation {current[0]['generation']}")
   '';
 }

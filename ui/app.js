@@ -6,7 +6,7 @@
 // and exactly when an operator most needs the UI to work.
 
 import * as api from "./api.js";
-import { renderForm, appSchema } from "./forms.js";
+import { renderForm, appSchema, advancedSchema } from "./forms.js";
 
 const $ = (sel) => document.querySelector(sel);
 const view = () => $("#view");
@@ -126,51 +126,46 @@ function appsView() {
 
 function appForm(id) {
   const meta = state.catalog.apps[id];
-  const schema = appSchema(state.catalog.schema, id);
   const current = state.settings?.apps?.[id] ?? {};
-  const form = renderForm(schema, current);
+  const stateRoot = state.settings?.storage?.stateDir ?? "/var/lib/ferrum/state";
 
-  // Secrets are write-only. There is no GET for one and there must never be,
-  // so this can only ever report THAT a value is set -- never what it is.
-  const secretNames = meta.secrets || [];
-  const secretFields = secretNames.map((name) => {
-    const input = el("input", { type: "password", autocomplete: "new-password" });
-    const note = el("span", { class: "hint" });
-    const save = el("button", {
-      type: "button",
-      text: "Set",
-      onclick: async () => {
-        try {
-          await api.putSecret(name, input.value);
-          input.value = "";
-          note.textContent = "A value is set.";
-        } catch (err) {
-          note.textContent = `Could not set it: ${err.message}`;
-        }
-      },
-    });
-    return el("div", { class: "field" }, [
-      el("label", { text: name }),
-      el("div", { class: "row" }, [input, save]),
-      note,
-    ]);
-  });
+  // Two groups, deliberately. The first is what an operator decides; the
+  // second is everything the catalog already answered correctly. Enabling an
+  // app should not be a configuration exercise -- that is the whole point of
+  // having a catalog, and the comparison being made against Saltbox.
+  const primary = renderForm(appSchema(state.catalog.schema, id, meta), current);
+  const advanced = renderForm(advancedSchema(meta, stateRoot, id), current);
+
+  const details = el("details", { class: "advanced" }, [
+    el("summary", { text: "Advanced \u2014 the catalog already set these" }),
+    el("p", {
+      class: "hint",
+      text:
+        "Nothing here needs changing to run the app. A value you leave alone is not " +
+        "written to settings.json at all, so it keeps tracking ferrum's own default " +
+        "instead of being frozen at today's value.",
+    }),
+    advanced.node,
+  ]);
 
   view().replaceChildren(
     el("section", {}, [
-      el("button", { type: "button", class: "ghost", text: "← All apps", onclick: appsView }),
+      el("button", { type: "button", class: "ghost", text: "\u2190 All apps", onclick: appsView }),
       el("h2", { text: meta.displayName || id }),
-      form.node,
-      secretFields.length
-        ? el("fieldset", {}, [el("legend", { text: "Secrets" }), ...secretFields])
-        : null,
+      el("p", { class: "hint", text: meta.summary || "" }),
+      primary.node,
+      details,
       el("button", {
         type: "button",
         text: "Stage changes",
         onclick: () => {
+          // Both groups merge into one app object. Each read() already omits
+          // anything still at its default, so an untouched form stages
+          // nothing and settings.json does not grow.
+          const merged = { ...advanced.read(), ...primary.read() };
           state.settings = {
             ...state.settings,
-            apps: { ...(state.settings.apps || {}), [id]: form.read() },
+            apps: { ...(state.settings.apps || {}), [id]: merged },
           };
           setStatus("Changes staged. Review and apply them on the Apply tab.", "ok");
           location.hash = "#/apply";
@@ -270,6 +265,74 @@ async function applyView() {
     setStatus(`Reattached to a ${running.kind || "job"} already running.`);
     attach(running.id);
   }
+}
+
+// --- secrets -------------------------------------------------------------
+
+/// Write-only, always. There is no GET for a secret and there must never be
+/// one, so this can report only THAT a name has a value set -- never what it
+/// is. The names come from the settings document's own `secrets` map, which
+/// is where ferrum.secrets actually lives; the catalog publishes no per-app
+/// secret list (checked against a real /api/catalog response).
+function secretsView() {
+  closeStream();
+  const declared = Object.keys(state.settings?.secrets || {}).sort();
+  const list = el("div", {});
+
+  const field = (name) => {
+    const input = el("input", { type: "password", autocomplete: "new-password" });
+    const note = el("span", { class: "hint" });
+    return el("div", { class: "field" }, [
+      el("label", { text: name }),
+      el("div", { class: "row" }, [
+        input,
+        el("button", {
+          type: "button",
+          text: "Set value",
+          onclick: async () => {
+            if (!input.value) {
+              note.textContent = "Enter a value first.";
+              return;
+            }
+            try {
+              await api.putSecret(name, input.value);
+              input.value = "";
+              note.textContent = "A value is set. It cannot be read back.";
+            } catch (err) {
+              note.textContent = `Could not set it: ${err.message}`;
+            }
+          },
+        }),
+      ]),
+      note,
+      el("p", {
+        class: "hint",
+        text: state.settings.secrets[name]?.description || "",
+      }),
+    ]);
+  };
+
+  for (const name of declared) list.appendChild(field(name));
+
+  view().replaceChildren(
+    el("section", {}, [
+      el("h2", { text: "Secrets" }),
+      el("p", {
+        class: "hint",
+        text:
+          "Each value is encrypted to this host's own SSH key and written to disk. " +
+          "Nothing here can be read back \u2014 there is no endpoint that returns a " +
+          "secret, by design. Setting a value again simply replaces it.",
+      }),
+      declared.length
+        ? list
+        : el("p", {
+            text:
+              "No secret names are declared in settings.json yet. Add them under " +
+              "\"secrets\" there, then re-apply, and they will appear here to fill in.",
+          }),
+    ]),
+  );
 }
 
 // --- generations + the rollback dialog -----------------------------------
@@ -393,6 +456,7 @@ async function generationsView() {
 const routes = {
   "#/apps": appsView,
   "#/apply": applyView,
+  "#/secrets": secretsView,
   "#/generations": generationsView,
 };
 

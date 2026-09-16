@@ -820,5 +820,80 @@ pkgs.testers.runNixOSTest {
     machine.succeed("systemctl start ferrumd.service")
     machine.wait_for_open_port(7788)
     print("PASS: and starts again for real once the path is back")
+
+    # --- the Phase 1.5b read-only APIs and the UI, on the real booted host ---
+    #
+    # Unit tests cover these handlers against temp directories. What they
+    # cannot cover is whether the real module tree wires the real env vars to
+    # the real packages -- exactly the class of bug that shipped three times
+    # here (ferrum-reconcile, ferrumd, ferrum-catalog: package builds fine,
+    # every host eval then fails with "attribute missing").
+    print("=== GET /api/catalog: the REAL built catalog ===")
+    catalog = json.loads(
+        machine.succeed("curl -s -b /tmp/cookies.txt http://127.0.0.1:7788/api/catalog")
+    )
+    assert set(catalog) >= {"apps", "schema", "schemaVersion"}, list(catalog)
+    assert catalog["apps"], "an empty catalog renders in the UI as 'this host has no apps'"
+    assert "plex" in catalog["apps"], sorted(catalog["apps"])
+    assert catalog["schema"].get("properties"), "the embedded schema is missing -- every form would be empty"
+    print(f"PASS: {len(catalog['apps'])} real apps with a real embedded schema")
+
+    print("=== GET /api/generations: the generation this VM is REALLY running ===")
+    gens = json.loads(
+        machine.succeed("curl -s -b /tmp/cookies.txt http://127.0.0.1:7788/api/generations")
+    )
+    current = [g for g in gens["generations"] if g["current"]]
+    assert len(current) == 1, f"exactly one generation must be current: {gens}"
+    assert current[0]["generation"] == gens["current"], gens
+    assert current[0]["rollbackable"] is False, current[0]
+    assert "already running" in (current[0]["reason"] or ""), current[0]["reason"]
+    print(f"PASS: generation {gens['current']} is current and correctly not rollbackable")
+
+    print("=== GET /api/session: a token a real mutating request really accepts ===")
+    session = json.loads(
+        machine.succeed("curl -s -b /tmp/cookies.txt http://127.0.0.1:7788/api/session")
+    )
+    assert session["username"] == "admin", session
+    fresh = session["csrf_token"]
+    # Spend it. 401 = the CSRF gate PASSED and the handler ran, rejecting the
+    # deliberately wrong password. 403 would mean the token was refused.
+    # Asserting it is a non-empty string would prove nothing.
+    accepted = machine.succeed(
+        "curl -s -o /dev/null -w '%{http_code}' -b /tmp/cookies.txt "
+        "-X POST http://127.0.0.1:7788/api/password "
+        "-H 'Content-Type: application/json' -H 'X-CSRF-Token: " + fresh + "' "
+        """-d '{"current_password":"deliberately-wrong","new_password":"x"}'"""
+    ).strip()
+    assert accepted == "401", f"the session's own token must pass the CSRF gate, got {accepted}"
+    refused = machine.succeed(
+        "curl -s -o /dev/null -w '%{http_code}' -b /tmp/cookies.txt "
+        "-X POST http://127.0.0.1:7788/api/password "
+        "-H 'Content-Type: application/json' -H 'X-CSRF-Token: not-the-token' "
+        """-d '{"current_password":"deliberately-wrong","new_password":"x"}'"""
+    ).strip()
+    assert refused == "403", f"a wrong token must be refused, got {refused}"
+    print("PASS: the returned token really works, and a wrong one really does not")
+
+    print("=== GET /: the REAL packaged UI, unauthenticated ===")
+    index = machine.succeed("curl -s http://127.0.0.1:7788/")
+    assert "<title>ferrum</title>" in index, index[:200]
+    anon = machine.succeed("curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:7788/").strip()
+    assert anon == "200", f"the login page must load without a session, got {anon}"
+    print("PASS: the real ferrum-ui package is really served, without auth")
+
+    print("=== an unknown /api/ path is a real 404 and is NOT html ===")
+    for path in ["/api/nonexistent", "/api/", "/%61pi/nonexistent"]:
+        code = machine.succeed(
+            "curl -s -o /tmp/body -w '%{http_code}' 'http://127.0.0.1:7788" + path + "'"
+        ).strip()
+        body = machine.succeed("cat /tmp/body")
+        assert code == "404", f"{path} must be 404, got {code}"
+        assert "<!DOCTYPE" not in body and "<title>" not in body, (
+            f"{path} returned HTML to an API caller: {body[:120]}"
+        )
+    # The encoded form matters: axum matches routes literally without
+    # percent-decoding, so /%61pi/... bypasses every real /api/* route and
+    # reaches the SPA fallback. Testing the raw path there was a real bug.
+    print("PASS: unknown API paths 404 with no HTML, including percent-encoded")
   '';
 }

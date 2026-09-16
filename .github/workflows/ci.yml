@@ -40,7 +40,8 @@ jobs:
           nix build --print-build-logs \
             .#checks.x86_64-linux.catalog-consistency \
             .#checks.x86_64-linux.schema-uniformity \
-            .#checks.x86_64-linux.sopsfile-are-paths
+            .#checks.x86_64-linux.sopsfile-are-paths \
+            .#checks.x86_64-linux.ui-renders-every-schema-type
 
   # The Rust workspace: ~5,200 lines across four crates and 118 unit tests
   # which, until 2026-09-15, CI never ran even once. The eval checks above

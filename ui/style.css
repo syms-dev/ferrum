@@ -82,3 +82,7 @@ dialog.confirm {
 dialog.confirm h3 { margin-top: 0; }
 dialog::backdrop { background: rgba(0,0,0,.6); }
 .login { max-width: 22rem; margin: 3rem auto; }
+
+details.advanced { margin: 1rem 0; border: 1px solid var(--line); border-radius: .5rem; padding: .5rem .75rem; }
+details.advanced summary { cursor: pointer; font-weight: 600; }
+details.advanced[open] summary { margin-bottom: .5rem; }

@@ -20,6 +20,24 @@
 /// updated. Task 8's eval check exists to keep this honest.
 const UNSUPPORTED = Symbol("unsupported");
 
+/// The type shapes this renderer has a real control for.
+///
+/// A SINGLE honest declaration, exported so `checks.ui-renders-every-schema-type`
+/// can read it without parsing JavaScript. The check walks the real
+/// settings-schema.json, collects every distinct shape it actually contains,
+/// and fails the build if one is missing from this list.
+///
+/// That check is the mechanical guard on "adding an app needs no ui/ change".
+/// Without it the claim decays the first time someone adds an option shape the
+/// renderer has never seen, and nothing fails until an operator opens a form,
+/// saves it, and loses a field. Keep this list honest: adding an entry here
+/// without adding the matching branch in `control()` turns the guard into a
+/// rubber stamp.
+// Kept on ONE line on purpose: checks.nix finds this line and reads the
+// quoted names out of it, which is far more robust than teaching Nix's
+// regex engine to parse a multi-line JavaScript array.
+export const SUPPORTED_TYPES = ["boolean", "integer", "number", "string", "string-enum", "array-of-string", "object"];
+
 let uid = 0;
 const nextId = () => `f${++uid}`;
 
@@ -55,10 +73,41 @@ function control(schema, value, key) {
   const description = schema.description;
   const title = schema.title || key;
 
+  // Show the EFFECTIVE value: what the document says, or -- when it says
+  // nothing -- the default the host is actually running with.
+  //
+  // Populating only from the document was a lie with teeth. Plex's real
+  // mediaAccess default is "read", but with no document value the select fell
+  // to its first option and displayed "none" while the running host had
+  // "read". The number inputs rendered blank rather than 32400. An operator
+  // reading the form saw values the machine was not using -- and worse, the
+  // default-omission logic in renderObject would then compare the displayed
+  // "none" against the default "read", conclude the operator had changed it,
+  // and write mediaAccess:"none" into settings.json, breaking Plex's access
+  // to the library on save. Showing the truth is what makes that logic safe.
+  const effective = value !== undefined ? value : schema.default;
+
+  // A readOnly property is rendered disabled and its value passed straight
+  // through on read, exactly like an unsupported type -- so it displays the
+  // truth without inviting an edit that would break something.
+  if (schema.readOnly) {
+    const shown = effective === undefined ? "" :
+      (typeof effective === "object" ? JSON.stringify(effective) : String(effective));
+    const input = el("input", { type: "text", id: nextId(), value: shown, disabled: true });
+    return {
+      node: el("div", { class: "field" }, [
+        el("label", { for: input.id, text: title }),
+        input,
+        description ? el("p", { class: "hint", text: description }) : null,
+      ]),
+      read: () => value,
+    };
+  }
+
   // boolean -> checkbox
   if (schema.type === "boolean") {
     const input = el("input", { type: "checkbox", id: nextId() });
-    input.checked = value === true;
+    input.checked = effective === true;
     return { node: labelled(title, input, description), read: () => input.checked };
   }
 
@@ -66,7 +115,7 @@ function control(schema, value, key) {
   if (schema.type === "integer" || schema.type === "number") {
     const input = el("input", { type: "number", id: nextId() });
     if (schema.type === "integer") input.step = "1";
-    if (value != null) input.value = value;
+    if (effective != null) input.value = effective;
     return {
       node: labelled(title, input, description),
       read: () => (input.value === "" ? undefined : Number(input.value)),
@@ -79,14 +128,14 @@ function control(schema, value, key) {
       const select = el("select", { id: nextId() });
       for (const option of schema.enum) {
         const o = el("option", { value: option, text: option });
-        if (option === value) o.selected = true;
+        if (option === effective) o.selected = true;
         select.appendChild(o);
       }
       return { node: labelled(title, select, description), read: () => select.value };
     }
     // plain string -> text
     const input = el("input", { type: "text", id: nextId() });
-    if (value != null) input.value = value;
+    if (effective != null) input.value = effective;
     return { node: labelled(title, input, description), read: () => input.value };
   }
 
@@ -107,7 +156,7 @@ function control(schema, value, key) {
       rows.appendChild(row);
     };
 
-    for (const item of Array.isArray(value) ? value : []) addRow(item);
+    for (const item of Array.isArray(effective) ? effective : []) addRow(item);
     const add = el("button", { type: "button", class: "ghost", text: "Add" });
     add.addEventListener("click", () => addRow());
 
@@ -124,7 +173,7 @@ function control(schema, value, key) {
 
   // object -> nested fieldset, recursing
   if (schema.type === "object" && schema.properties) {
-    const inner = renderObject(schema, value || {});
+    const inner = renderObject(schema, effective || {});
     return {
       node: el("fieldset", {}, [
         el("legend", { text: title }),
@@ -138,7 +187,7 @@ function control(schema, value, key) {
   // Anything else. Disabled, visibly explained, and its value passed straight
   // through by `read` -- see UNSUPPORTED above for why this matters more than
   // any other branch in this file.
-  const shown = value === undefined ? "" : JSON.stringify(value);
+  const shown = effective === undefined ? "" : JSON.stringify(effective);
   const input = el("input", { type: "text", id: nextId(), value: shown, disabled: true });
   const note = el("p", {
     class: "hint unsupported",
@@ -179,7 +228,30 @@ function renderObject(schema, value) {
       for (const k of unknownKeys) out[k] = value[k];
       for (const [k, read] of Object.entries(readers)) {
         const v = read();
-        if (v !== undefined) out[k] = v;
+        if (v === undefined) continue;
+
+        // Write a value ONLY when it differs from the default, so the saved
+        // document stays as small as the operator's actual intent.
+        //
+        // This is not tidiness, it is correctness. settings.json on a real
+        // host reads {"apps":{"plex":{"enable":true}}} -- one field, with
+        // everything else coming from app-submodule.nix and each app's meta.
+        // An earlier version of this function wrote back every control it
+        // rendered, which silently froze today's defaults into the document:
+        // if ferrum later changed a default port, or added a path to an app's
+        // authBypassPaths, this host would never receive it, because the UI
+        // had pinned the old value. Nobody would connect the two.
+        //
+        // An explicit value the operator DID set is still written, even when
+        // it happens to equal the default, if it was already in the document
+        // -- removing it would be editing their file behind their back.
+        const def = schema.properties[k]?.default;
+        const wasExplicit = value && Object.prototype.hasOwnProperty.call(value, k);
+        const isDefault = def !== undefined && JSON.stringify(v) === JSON.stringify(def);
+        const isEmptyObject = v && typeof v === "object" && !Array.isArray(v) && Object.keys(v).length === 0;
+
+        if (!wasExplicit && (isDefault || isEmptyObject)) continue;
+        out[k] = v;
       }
       return out;
     },
@@ -191,21 +263,157 @@ export function renderForm(schema, value) {
   return renderObject(schema, value ?? {});
 }
 
-/// Resolves the sub-schema describing one app's settings, from the document
-/// shape the daemon actually serves.
+/// The schema for ONE app's settings.
 ///
-/// Returned separately rather than hard-coded into app.js so the path into
-/// the schema lives beside the renderer that consumes it.
-export function appSchema(fullSchema, appId) {
-  const apps = fullSchema?.properties?.apps;
-  // A uniform submodule: either every app shares one definition, or each is
-  // named. Both shapes are handled; neither is special-cased per app.
-  return (
-    apps?.properties?.[appId] ??
-    apps?.additionalProperties ??
-    apps?.patternProperties?.[Object.keys(apps?.patternProperties || {})[0]] ??
-    { type: "object", properties: {} }
-  );
+/// WHY THIS IS HAND-WRITTEN, and what would replace it.
+///
+/// `GET /api/catalog`'s `schema` does not describe app options at all. Its
+/// own text says so: `apps` is `{"type":"object"}` with the description
+/// "Deep per-app validation is deferred -- a future task tightens this
+/// against the real catalog-driven submodule shape." Task 7 assumed that
+/// schema would drive this form; it cannot, because there is nothing in it
+/// to drive from. Discovered by opening the UI in a browser and finding an
+/// empty form.
+///
+/// So the UNIFORM half below mirrors modules/lib/app-submodule.nix by hand,
+/// and the app-SPECIFIC half comes from that app's own `meta.settingsSchema`,
+/// which the catalog really does publish.
+///
+/// This does NOT abandon the design's central claim. Adding a directory under
+/// modules/apps/ still makes an app appear with zero changes here: every app
+/// shares the uniform half, and its own knobs arrive dynamically. What it
+/// does cost is that adding a new OPTION to app-submodule.nix needs a
+/// matching edit in this function -- which is why the real fix is to generate
+/// the `apps` sub-schema in Nix from the submodule and serve it, at which
+/// point this whole function collapses back to reading `schema`.
+/// Tracked as Task 7.5; do not let this shape quietly become permanent.
+///
+/// Nothing here matches on an app id, and nothing may: that is the line
+/// between "mirrors the uniform submodule" and "hand-written per-app form".
+export function appSchema(fullSchema, appId, meta = {}) {
+  const published = fullSchema?.properties?.apps?.properties?.[appId];
+  if (published?.properties) return published; // the generated schema landed
+
+  // `default` on every property is load-bearing, not documentation: renderObject
+  // omits a value that still equals its default, which is what keeps
+  // settings.json down to the operator's actual intent instead of eleven
+  // frozen fields per app. Defaults come from the catalog where the catalog
+  // publishes them, so they track the app rather than being restated here.
+  return {
+    type: "object",
+    // Three things an operator actually decides. Everything else has a
+    // correct default and lives under `advanced` below -- the whole point of
+    // a catalog is that enabling an app should not be a configuration
+    // exercise.
+    properties: {
+      enable: {
+        type: "boolean",
+        default: false,
+        title: "Enabled",
+        description: "Run this app on this host.",
+      },
+      exposure: {
+        type: "string",
+        enum: ["local", "lan", "public"],
+        default: "local",
+        title: "Reachable from",
+        description:
+          "local: this machine only. lan: your home network, with a self-signed " +
+          "certificate. public: a real hostname with a real certificate.",
+      },
+      subdomain: {
+        type: "string",
+        default: meta.defaultSubdomain,
+        title: "Subdomain",
+        description:
+          "Reached at this label under your base domain. The one knob here people " +
+          "genuinely want to change.",
+      },
+      settings: {
+        ...(meta.settingsSchema ?? { type: "object", properties: {} }),
+        title: `${meta.displayName || appId} options`,
+      },
+    },
+  };
+}
+
+/// The knobs that already have a correct answer.
+///
+/// Separated so the form can collapse them. Every one of these is either
+/// derived from the catalog (port, subdomain, auth policy, media access,
+/// bypass paths), derived from the storage layout (stateDir), or off by
+/// default (resource limits). An operator should be able to enable an app
+/// without reading any of it -- which is the comparison being made against
+/// Saltbox, where you enable a role and it works.
+export function advancedSchema(meta = {}, stateRoot = "/var/lib/ferrum/state", appId = "") {
+  return {
+    type: "object",
+    properties: {
+      // readOnly: shown so an operator can SEE what the host is using, but
+      // not editable. These are answers the catalog already gave correctly,
+      // and changing them is a foot-gun rather than a feature: a port only
+      // matters behind the proxy, and stateDir moved outside the ferrum state
+      // root silently removes the app from snapshot and rollback -- the one
+      // guarantee this whole project exists to provide.
+      port: {
+        type: "integer",
+        default: meta.defaultPort,
+        readOnly: true,
+        title: "Port",
+        description: "Loopback port behind the proxy. Set by the catalog.",
+      },
+      mediaAccess: {
+        type: "string",
+        enum: ["none", "read", "readwrite"],
+        default: meta.defaultMediaAccess ?? "none",
+        title: "Media access",
+      },
+      stateDir: {
+        type: "string",
+        default: `${stateRoot}/${appId}`,
+        readOnly: true,
+        title: "State directory",
+        description:
+          "Derived from your storage layout. Moving it outside the ferrum state root " +
+          "would drop this app out of snapshot and rollback.",
+      },
+      auth: {
+        type: "object",
+        title: "Single sign-on",
+        properties: {
+          policy: {
+            type: "string",
+            enum: ["bypass", "one_factor", "two_factor"],
+            default: meta.defaultAuthPolicy ?? "two_factor",
+            title: "Policy",
+          },
+          bypassPaths: {
+            type: "array",
+            items: { type: "string" },
+            default: meta.authBypassPaths ?? [],
+            readOnly: true,
+            title: "Bypass paths",
+            description:
+              "Paths that skip sign-on, for native clients that cannot follow a login " +
+              "redirect. The catalog already sets the ones each app needs.",
+          },
+        },
+      },
+      resources: {
+        type: "object",
+        title: "Resource limits",
+        properties: {
+          memoryMax: { type: "string", title: "Memory limit", description: "e.g. 2G. Empty means no limit." },
+          cpuQuota: { type: "string", title: "CPU quota", description: "e.g. 150%. Empty means no limit." },
+        },
+      },
+      backup: {
+        type: "object",
+        title: "Backup",
+        properties: { enable: { type: "boolean", default: true, title: "Include in backups" } },
+      },
+    },
+  };
 }
 
 export { UNSUPPORTED };
