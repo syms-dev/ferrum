@@ -6,6 +6,7 @@ mod generations;
 mod jobs;
 mod secrets_api;
 mod settings;
+mod static_files;
 
 use axum::{
     extract::State,
@@ -297,6 +298,11 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route_layer(axum::middleware::from_fn_with_state(state.clone(), require_session));
 
     Router::new()
+        // Unauthenticated ON PURPOSE, and attached as the FALLBACK rather
+        // than a route so it can never shadow an API path: this serves the
+        // login page and its assets, and requiring a session to fetch the
+        // page you log in on would be circular. See static_files.rs's header.
+        .fallback(static_files::serve)
         .route("/api/login", post(login_handler))
         .route("/api/logout", post(logout_handler))
         .merge(protected)

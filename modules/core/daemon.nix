@@ -171,6 +171,7 @@ lib.mkIf ferrum.daemon.enable {
       FERRUM_CATALOG = "${pkgs.ferrum-catalog}/share/ferrum/catalog.json";
       FERRUM_PROFILES_DIR = "/nix/var/nix/profiles";
       FERRUM_JOURNAL_DIR = ferrum.storage.journalDir;
+      FERRUM_UI_DIR = "${pkgs.ferrum-ui}/share/ferrum/ui";
     };
     serviceConfig = {
       Type = "simple";
