@@ -116,6 +116,16 @@ in
             --set-default FERRUM_SNAPSHOT_DIR ${lib.escapeShellArg ferrum.storage.snapshotDir} \
             --set-default FERRUM_JOURNAL_DIR ${lib.escapeShellArg ferrum.storage.journalDir} \
             --set-default FERRUM_MIN_FREE_GIB ${toString ferrum.storage.minFreeGiB} \
+            # FOUND ON THE FIRST REAL HOST: ferrum-apply's own fallback is
+            # "/etc/ferrum#nixosConfigurations.default...", which assumes
+            # every host flake names its configuration `default`. A real
+            # host names it after the machine, so a bare `ferrum-apply
+            # apply` failed with "could not find a flake.nix file" and, had
+            # the file been there, would then have failed on a missing
+            # `default` attribute. Deriving it from the host's OWN hostname
+            # means the operator never has to know this variable exists.
+            --set-default FERRUM_FLAKE_REF ${lib.escapeShellArg
+              "/etc/ferrum#nixosConfigurations.${config.networking.hostName}.config.system.build.toplevel"} \
             --set-default FERRUM_KEEP_GENERATIONS ${toString ferrum.storage.keepGenerations} \
             --set-default FERRUM_HEALTH_CHECK_TIMEOUT_SEC ${toString ferrum.apply.healthCheckTimeoutSec} \
             --set-default FERRUM_SECRETS_DIR ${lib.escapeShellArg ferrum.secretsDir} \
