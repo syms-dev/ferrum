@@ -681,6 +681,7 @@ dependencies = [
  "async-stream",
  "axum",
  "ferrum-secrets",
+ "ferrum-state",
  "futures",
  "jsonschema",
  "password-hash",

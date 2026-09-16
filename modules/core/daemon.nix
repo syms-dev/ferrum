@@ -169,6 +169,8 @@ lib.mkIf ferrum.daemon.enable {
       # and, until now, consumed by nothing -- nix/modules/flake/packages.nix
       # said so in its own header comment.
       FERRUM_CATALOG = "${pkgs.ferrum-catalog}/share/ferrum/catalog.json";
+      FERRUM_PROFILES_DIR = "/nix/var/nix/profiles";
+      FERRUM_JOURNAL_DIR = ferrum.storage.journalDir;
     };
     serviceConfig = {
       Type = "simple";
