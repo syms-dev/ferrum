@@ -838,16 +838,32 @@ pkgs.testers.runNixOSTest {
     assert catalog["schema"].get("properties"), "the embedded schema is missing -- every form would be empty"
     print(f"PASS: {len(catalog['apps'])} real apps with a real embedded schema")
 
-    print("=== GET /api/generations: the generation this VM is REALLY running ===")
-    gens = json.loads(
-        machine.succeed("curl -s -b /tmp/cookies.txt http://127.0.0.1:7788/api/generations")
+    print("=== GET /api/generations on a host with no system profile ===")
+    # This VM deliberately does NOT set virtualisation.useBootLoader, so it has
+    # no /nix/var/nix/profiles/system at all. That makes it the right place to
+    # prove the rule Task 3's DEC-03 established: a FAULT must never render as
+    # ABSENCE. An empty generation list here would tell an operator their
+    # rollback history was gone; a 500 naming the real path tells them what is
+    # actually wrong.
+    #
+    # The happy path -- a real current generation matching the real profile
+    # symlink -- is asserted in tests/daemon-apply-end-to-end.nix, which sets
+    # useBootLoader and performs a real generation switch. Asserting it here
+    # would have meant fabricating a profile the test does not otherwise need.
+    gen_code = machine.succeed(
+        "curl -s -o /tmp/gens -w '%{http_code}' -b /tmp/cookies.txt "
+        "http://127.0.0.1:7788/api/generations"
+    ).strip()
+    gen_body = machine.succeed("cat /tmp/gens")
+    assert gen_code == "500", (
+        f"a host with no system profile must report a fault, not an empty list; "
+        f"got {gen_code} with body {gen_body[:200]}"
     )
-    current = [g for g in gens["generations"] if g["current"]]
-    assert len(current) == 1, f"exactly one generation must be current: {gens}"
-    assert current[0]["generation"] == gens["current"], gens
-    assert current[0]["rollbackable"] is False, current[0]
-    assert "already running" in (current[0]["reason"] or ""), current[0]["reason"]
-    print(f"PASS: generation {gens['current']} is current and correctly not rollbackable")
+    assert "/nix/var/nix/profiles" in gen_body, (
+        f"the error must name the real path an operator has to go look at: {gen_body[:200]}"
+    )
+    assert gen_body.strip() not in ("", "[]", "{}"), gen_body
+    print("PASS: a missing system profile is a real 500 naming the real path, not an empty list")
 
     print("=== GET /api/session: a token a real mutating request really accepts ===")
     session = json.loads(
