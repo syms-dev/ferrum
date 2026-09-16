@@ -44,6 +44,30 @@ enum Command {
     PreviewMigration,
 }
 
+/// Writes the job's `started` line, then runs it.
+///
+/// Extracted from the `RunRequest` arm -- the way this file already extracts
+/// `handle_apply_result` and `restore_state_outcome` -- so that the ORDERING
+/// is testable: the `started` line must be the first line of a dispatched
+/// job's file, before any subcommand writes progress of its own. `GET
+/// /api/jobs` reads that first line to answer "what was this job?", and by
+/// then ferrumd has already deleted the request file that would otherwise
+/// have said.
+///
+/// The kind comes from the parsed `Request`, never re-derived from the raw
+/// file text. `Progress` is passed in rather than opened here so the test
+/// below needs no process-wide environment; in production it is
+/// `Progress::open()`, which is a total no-op when `FERRUM_JOB_ID` is unset,
+/// so a bare `ferrum-apply run-request` over SSH still writes nothing.
+fn run_request(
+    req: request::Request,
+    progress: &mut progress::Progress,
+    run: impl FnOnce(request::Request) -> i32,
+) -> i32 {
+    progress.event("started", req.kind());
+    run(req)
+}
+
 /// Maps an `apply::run` outcome to a process exit code, printing context to
 /// stderr along the way. `Degraded` gets its own distinct code (3) so a
 /// caller (a systemd unit, future automation) can tell "switched but a unit
@@ -428,11 +452,13 @@ fn main() -> anyhow::Result<()> {
         Command::Gc => run_gc(),
         Command::PreviewMigration => run_preview_migration(),
         Command::RunRequest { path } => match request::read_request(&path) {
-            Ok(request::Request::Preflight) => run_preflight(),
-            Ok(request::Request::Apply) => run_apply(),
-            Ok(request::Request::Rollback { to }) => run_rollback(to),
-            Ok(request::Request::RestoreState) => run_restore_state(),
-            Ok(request::Request::Gc) => run_gc(),
+            Ok(req) => run_request(req, &mut progress::Progress::open(), |req| match req {
+                request::Request::Preflight => run_preflight(),
+                request::Request::Apply => run_apply(),
+                request::Request::Rollback { to } => run_rollback(to),
+                request::Request::RestoreState => run_restore_state(),
+                request::Request::Gc => run_gc(),
+            }),
             Err(e) => {
                 eprintln!("run-request: {e}");
                 progress::Progress::open().complete("failed", &e.to_string());
@@ -447,6 +473,48 @@ fn main() -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    /// The `started` line must be the FIRST line of a dispatched job's file.
+    /// `GET /api/jobs` reads only the first line to recover a job's kind, so
+    /// if a subcommand's own progress landed ahead of it the kind would be
+    /// reported as null for every job.
+    ///
+    /// Uses `Progress::to_path` rather than `FERRUM_JOB_ID`/`FERRUM_JOBS_DIR`:
+    /// those are process-wide, and progress.rs's own env test runs in this
+    /// same test binary, so racing it would make this flaky.
+    #[test]
+    fn a_dispatched_jobs_started_line_comes_before_the_subcommands_own_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("job.jsonl");
+        let mut progress = progress::Progress::to_path(&path);
+
+        let code = run_request(request::Request::Gc, &mut progress, |req| {
+            // Stand-in for a real subcommand writing its own progress.
+            progress::Progress::to_path(&path).event("pruning", &format!("ran {}", req.kind()));
+            0
+        });
+        assert_eq!(code, 0, "the runner's exit code must pass through unchanged");
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(lines.len(), 2, "expected exactly the started line then the subcommand's: {content}");
+
+        let first: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(first["event"], "started", "the FIRST line must be the started event");
+        assert_eq!(first["detail"], "gc", "and it must name the request's own kind");
+
+        let second: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(second["event"], "pruning", "the subcommand's progress follows it");
+    }
+
+    /// The exit code is the runner's, not something `run_request` invents --
+    /// a dispatched apply that degrades must still surface its own 3.
+    #[test]
+    fn run_request_returns_the_runners_exit_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut progress = progress::Progress::to_path(&dir.path().join("j.jsonl"));
+        assert_eq!(run_request(request::Request::Apply, &mut progress, |_| 3), 3);
+    }
 
     #[test]
     fn parses_preflight() {
