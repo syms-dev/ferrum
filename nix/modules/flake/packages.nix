@@ -1,7 +1,8 @@
-# Builds the catalog artifact the (future) ferrumd daemon reads at runtime
+# Builds the catalog artifact the ferrumd daemon reads at runtime
 # to render the UI from -- see the plan's "How the UI discovers the
-# catalog" section. Nothing consumes this yet (ferrumd is Phase 1.5), but
-# publishing it now keeps the catalog schema honest as apps are added.
+# catalog" section. Consumed by ferrumd's GET /api/catalog (Phase 1.5b)
+# via $FERRUM_CATALOG, wired in modules/core/daemon.nix;
+# publishing it also keeps the catalog schema honest as apps are added.
 { inputs, ... }:
 {
   perSystem = { pkgs, lib, ... }:
