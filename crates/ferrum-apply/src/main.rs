@@ -2,8 +2,6 @@ use clap::{Parser, Subcommand};
 
 mod apply;
 mod gc;
-mod generations;
-mod journal;
 mod preflight;
 mod progress;
 mod request;
