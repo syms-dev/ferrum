@@ -52,9 +52,22 @@ in
     users.groups.${cfg.mediaGroup} = { };
 
     systemd.tmpfiles.rules = [
-      "d ${cfg.stateDir} 0750 root root - -"
+      # 0751, not 0750, on both of these: every catalog app's stateDir is
+      # ${cfg.stateDir}/<app>, owned by that app's own user, and the app must
+      # be able to TRAVERSE down to it. At 0750 root:root nothing but root
+      # could, so plexmediaserver's prestart `mkdir -p` failed on the first
+      # component with "cannot create directory '/var/lib/ferrum'" and the
+      # unit hit its restart limit -- found on the first real hardware run of
+      # any catalog app, 2026-09-16. /var/lib/ferrum needs it too: app users
+      # are not in the ferrum group, so its group r-x does not help them.
+      #
+      # The extra bit is `x` WITHOUT `r` deliberately. Traversal into a known
+      # path is all an app needs; it cannot list this directory, so one app
+      # still cannot enumerate the others. daemon/ and jobs/ keep their own
+      # 0750 root:ferrum and are unaffected.
+      "d ${cfg.stateDir} 0751 root root - -"
       "d ${cfg.snapshotDir} 0750 root root - -"
-      "d /var/lib/ferrum 0750 root ${ferrumdGroup} - -"
+      "d /var/lib/ferrum 0751 root ${ferrumdGroup} - -"
       "d ${cfg.mediaDir} 0775 root ${cfg.mediaGroup} - -"
       "d ${cfg.mediaDir}/downloads 0775 root ${cfg.mediaGroup} - -"
       "d ${cfg.mediaDir}/library 0775 root ${cfg.mediaGroup} - -"
