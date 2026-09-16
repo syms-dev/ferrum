@@ -23,7 +23,7 @@
 # BEFORE the base overlay, so the base's plain `ferrum-apply =
 # final.callPackage ...` silently clobbered the wrapper). A single list
 # literal has no such ambiguity -- Nix list order is exactly written order.
-{ config, lib, ... }:
+{ config, lib, pkgs, ... }:
 let
   ferrum = config.ferrum;
 
@@ -132,4 +132,26 @@ in
       };
     })
   ];
+
+  # Put the operator's own CLI on PATH.
+  #
+  # FOUND ON THE FIRST REAL INSTALL, 2026-09-15: nothing in this module tree
+  # had ever set environment.systemPackages, so `ferrum-apply` existed only
+  # as a store path referenced by the ferrum-apply@ template unit's
+  # ExecStart. On a real booted ferrum host the operator typed
+  # `ferrum-apply apply` and got "command not found" -- which is the entire
+  # documented workflow (docs/INSTALL.md's own first-boot and rollback
+  # steps, and every "then re-apply" instruction in README.md) rendered
+  # impossible.
+  #
+  # Every VM test missed it for the same structural reason: they invoke the
+  # binary through the systemd unit or by explicit store path, never as a
+  # bare command the way a human does.
+  #
+  # This is `pkgs.ferrum-apply`, so it resolves to the OVERLAID, wrapped
+  # derivation defined above -- the one carrying every FERRUM_* default for
+  # this host. An operator running it by hand gets exactly the same
+  # environment a ferrumd-dispatched run gets, which is what makes the two
+  # paths genuinely equivalent rather than superficially similar.
+  environment.systemPackages = [ pkgs.ferrum-apply ];
 }
