@@ -1,4 +1,4 @@
-use crate::journal::{self, JournalEntry};
+use ferrum_state::journal::{self, JournalEntry};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};

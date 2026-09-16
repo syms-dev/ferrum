@@ -1,5 +1,5 @@
-use crate::generations::{is_rollbackable, snapshot_ts, GenerationInfo};
-use crate::journal;
+use ferrum_state::generations::{is_rollbackable, snapshot_ts, GenerationInfo};
+use ferrum_state::journal;
 use crate::restore_state::RollbackIntent;
 use std::path::Path;
 use std::process::Command;
@@ -141,10 +141,10 @@ fn run_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::journal::JournalEntry;
+    use ferrum_state::journal::JournalEntry;
 
     fn write_journal_entry(dir: &std::path::Path, snapshot: &str, generation: u32) {
-        crate::journal::write(
+        ferrum_state::journal::write(
             dir,
             &JournalEntry {
                 snapshot: snapshot.to_string(),

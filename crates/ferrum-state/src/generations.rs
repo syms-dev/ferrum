@@ -1,19 +1,14 @@
-// Task 7 (rollback) is the first real consumer of this module.
-
 use crate::journal::JournalEntry;
 
 #[derive(Debug)]
 pub struct GenerationInfo {
     pub generation: u32,
-    // Populated for shape-consistency with correlate()'s output (used when
-    // listing all generations, e.g. a future ferrumd-facing API), but
-    // rollback::prepare() only needs `generation`/`snapshot` to validate a
-    // single target -- it constructs this with placeholder values for the
-    // other two, so they're genuinely unread until a real list-generations
-    // consumer exists.
-    #[allow(dead_code)]
+    /// Reported by `GET /api/generations`. `rollback::prepare()` needs only
+    /// `generation`/`snapshot` to validate a single target and constructs
+    /// this with placeholders for these two, so a caller building a
+    /// `GenerationInfo` by hand rather than via `correlate` should not rely
+    /// on them.
     pub date: String,
-    #[allow(dead_code)]
     pub current: bool,
     pub snapshot: Option<JournalEntry>,
 }
@@ -21,9 +16,6 @@ pub struct GenerationInfo {
 /// Parses `nix-env -p /nix/var/nix/profiles/system --list-generations`
 /// output. Validated against real output (Phase 1.0 probe 0.5):
 /// "   1   2026-08-19 23:37:29   \n   3   2026-08-20 00:02:36   (current)\n"
-// Not yet wired into any CLI subcommand -- kept for a future
-// `list-generations` consumer, same as the `date`/`current` fields above.
-#[allow(dead_code)]
 pub fn parse_nix_env_list(output: &str) -> Vec<(u32, String, bool)> {
     output
         .lines()
@@ -48,7 +40,7 @@ pub fn parse_nix_env_list(output: &str) -> Vec<(u32, String, bool)> {
 /// same generation number is the most recent. Shared with
 /// `rollback::prepare`, which picks the latest snapshot for a single target
 /// generation the same way `correlate` does for every generation.
-pub(crate) fn snapshot_ts(snapshot: &str) -> u64 {
+pub fn snapshot_ts(snapshot: &str) -> u64 {
     snapshot
         .split('-')
         .next()
@@ -56,9 +48,6 @@ pub(crate) fn snapshot_ts(snapshot: &str) -> u64 {
         .unwrap_or(0)
 }
 
-// Not yet wired into any CLI subcommand -- kept for a future
-// `list-generations` consumer, same as the `date`/`current` fields above.
-#[allow(dead_code)]
 pub fn correlate(
     generations: Vec<(u32, String, bool)>,
     journal_entries: Vec<JournalEntry>,
