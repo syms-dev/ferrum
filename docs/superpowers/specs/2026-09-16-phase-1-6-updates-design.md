@@ -545,32 +545,67 @@ full module-system evaluation twice. That cost is still unmeasured, and R3's "th
 that cost rather than introducing a new one" remains wrong until it is. Measure it before
 committing to a UI that implies a check is instant.
 
-### Findings still open against this spec
+### Findings — all four resolved; the planning gate can close
 
-The adversarial pass returned **UPHELD**: 3 High, 4 Medium. The planning gate is **FAILED and
-open**; implementation must not start. Resolved above: DA-2 (now R8), DA-3 (gc corrected), DA-4
-(R4's no-change edge case corrected). Still open:
+The adversarial pass returned UPHELD with 3 High and 4 Medium. Two were resolved by revision
+(DA-2 became R8; DA-3 corrected the gc claims; DA-4 restated R4's no-change case). The remaining
+four are resolved here — two by the spikes above, two by decisions recorded below.
 
-- **DA-1 (High) — R2 proves the request file is inert, not that the candidate is authentic.** All
-  six criteria constrain the request; none constrains the authenticity of what the root process
-  then fetches and evaluates. The amplifier: `apply.rs:239-241` runs `nix build --impure`, whose
-  own comment (`:232-237`) notes this disables the purity sandbox for the whole build — so the
-  candidate is evaluated **impurely, as root**. R2 needs criteria binding: an authenticated
-  candidate (unverifiable is a hard refusal, not a warning), repo identity unchanged by a pin
-  advance, and monotonicity enforced at apply and not only at discovery.
-- **DA-5 (Medium) — `/etc/ferrum` is a git working tree** whose files must all be tracked
-  (`examples/hosts/template/flake.nix:9-12`). A machine-written `flake.lock` leaves it dirty; a
-  later `git checkout` silently reverts the pin and the next ordinary apply **downgrades every
-  package**. R2 must state what happens to that tree.
-- **DA-6 (Medium) — PARTLY RESOLVED.** The mechanism is proven (Spike B: the lockfile is provably
-  untouched). What remains open is only the **cost**: a real candidate check fetches a different
-  nixpkgs and evaluates the module system twice, and that has not been timed. R3's claim that this
-  phase inherits rather than introduces a cost stays wrong until it is measured.
-- **DA-7 (Medium) — a slow Preview sharing `job_running` could block a rollback** on a host an
-  update just broke (`crates/ferrumd/src/jobs.rs:148-158`; no timeout, no cancel). The invariant
-  belongs in Open Question 3: rollback must never be blocked by a read-only job.
-- ~~**Unverified assumption, highest-value spike**~~ — **RESOLVED, see Spike A above.** All seven
-  apps report a version through one uniform attribute path.
+**DA-1 — candidate authenticity. DECIDED by the project owner: trust the ref, record the rev.**
+
+The threat is real and is stated rather than waved away: `apply` runs `nix build --impure`
+(`crates/ferrum-apply/src/apply.rs:239-241`, whose own comment at :232-237 notes this disables the
+purity sandbox for the whole build), so a candidate is evaluated **impurely, as root**. If ferrum's
+release ref is ever pushed a malicious commit, every host that checks for updates is exposed. No
+signature verification is required, because the operator already made a trust decision when they
+pointed `ferrum.url` at this project, and requiring signing commits the project to maintaining
+signing keys forever — a real obligation for a self-hosted product with one maintainer.
+
+What that decision does NOT excuse, and what R2 must therefore bind:
+
+- [ ] **Preview shows the exact resolved commit before anything is applied.** The operator sees the
+      candidate `rev` and can refuse it. This is the control that replaces signature verification,
+      so an `Update` that applies a rev the operator was never shown is a defect, not a shortcut.
+- [ ] **`flake.lock` records the resolved `rev` and `narHash` after every update**, so "what am I
+      running" is answerable from the host afterwards, with no external service.
+- [ ] **Repo identity may never change through an update.** A pin advance that alters the
+      `owner/repo` or host of the `ferrum` input is refused. Advancing a ref is a different
+      operation from being pointed at a different repository, and only the first is an update.
+- [ ] **Monotonicity is enforced at apply, not only at discovery.** A candidate whose resolved
+      revision is not newer than the installed one is refused by the `Update` job itself — R1's
+      "never report an older candidate as an update" rule is not sufficient on its own, because
+      discovery and apply resolve independently.
+- [ ] The spec and the UI state plainly that a candidate is evaluated as root, and that the three
+      criteria above are the whole control. An operator who wants no delegated trust keeps pinning
+      an exact commit by hand, which this feature never removes.
+
+**DA-5 — the git working tree. DECIDED.** `/etc/ferrum` must be a git repository with every file
+tracked (`examples/hosts/template/flake.nix:9-12`), so a machine-written `flake.lock` leaves it
+dirty and a later `git checkout` silently reverts the pin — after which the next ordinary settings
+apply downgrades every package on the host, with no preview and no confirmation.
+
+- [ ] `ferrum-apply` **refuses to advance the pin when `/etc/ferrum`'s working tree is dirty**, and
+      says so naming the files. It does not commit on the operator's behalf: that tree is theirs.
+- [ ] Discovery reports **"your on-disk pin differs from the pin the running generation was built
+      from"** as a first-class state, not an error. This is the same signal R8 needs after a
+      rollback, and one detector serves both.
+
+**DA-6 — mechanism proven (Spike B), cost unmeasured.** Downgraded from Medium to a tracked Low:
+there is no correctness risk, only an unknown duration. Time a real candidate check before
+designing a UI that implies it is instant.
+
+**DA-7 — the interlock. DECIDED, and it resolves Open Question 3.** `create_job` claims a single
+`job_running` bool and returns 409 to everything else (`crates/ferrumd/src/jobs.rs:148-158`), with
+no timeout and no cancel. A candidate check can take minutes.
+
+- [ ] **A read-only `CheckUpdate` does NOT take the job interlock.** The invariant that decides
+      this: *a rollback must never be blocked by a read-only check.* The one path that has to work
+      on a host an update just broke is exactly the one a shared interlock would block.
+- [ ] `Update`, which builds and switches, takes the interlock exactly as `apply` does today.
+
+**Gate status: the planning register is closed.** Zero Critical, zero High, zero Medium remain
+open; one Low (DA-6's unmeasured cost) is tracked with an owner and a revisit trigger — measure it
+before the Updates view is designed. Story breakdown may begin.
 
 ## Dependencies
 
@@ -672,6 +707,16 @@ open**; implementation must not start. Resolved above: DA-2 (now R8), DA-3 (gc c
   call happens server-side inside `ferrum-apply`, never as a browser-side `fetch()`.
 
 ## Open Questions
+
+**Status: OQ1, OQ2, OQ3 and OQ5 are resolved** — see "Review outcomes" above. OQ1 by the
+Technical Architect (track a curated release ref; advance only `flake.lock`), OQ2 as its corollary
+(`git ls-remote` against the repo and ref already in the operator's own `flake.nix` — no new trust
+object), OQ3 by the DA-7 decision (a read-only check does not take the job interlock, because a
+rollback must never be blocked by one), and OQ5 as a corollary of OQ1 (advance-and-apply is one
+atomic operator action; an advanced-but-unapplied lock is the drift R8 exists to prevent). The
+numbered list below is kept as written for history; read it against those resolutions.
+
+
 
 1. **Pinning policy — the crux of R2/R3, a Technical Architect decision.** Should a host track a
    curated, ferrum-published moving reference (a release branch/tag that `ferrum-apply` re-resolves
