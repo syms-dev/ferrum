@@ -4,6 +4,7 @@ mod apply;
 mod gc;
 mod preflight;
 mod progress;
+mod put_secret;
 mod request;
 mod restore_state;
 mod rollback;
@@ -37,6 +38,26 @@ enum Command {
     /// polkit rule and systemd template unit that authorize it.
     RunRequest {
         path: std::path::PathBuf,
+    },
+    /// Encrypt an OPERATOR-SUPPLIED secret value, read from stdin, to this
+    /// host's own age recipient and write <secretsDir>/<name>.sops.
+    ///
+    /// Every other secret this binary handles is one it generates itself.
+    /// This is the path for a value only a human has -- today, the
+    /// Cloudflare DNS-01 token, without which a host with any `public` app
+    /// cannot even evaluate (modules/proxy/acme.nix asserts the .sops file
+    /// exists at Nix eval time).
+    ///
+    /// The value comes from stdin, never argv, so it stays out of `ps` and
+    /// shell history. Existing files are left alone unless --replace is
+    /// given, which keeps a resumed install idempotent.
+    PutSecret {
+        /// Secret name, e.g. `acme-dns`. Must match the name declared in
+        /// settings.json's `secrets` map.
+        name: String,
+        /// Overwrite an existing value (use when rotating a credential).
+        #[arg(long)]
+        replace: bool,
     },
     /// Show what a settings.json schema migration would do, without
     /// writing anything. Read-only: evaluates the real flake via `nix
@@ -394,6 +415,47 @@ fn run_preview_migration() -> i32 {
 /// set a retention policy that nothing enforced, and snapshots accumulated
 /// for the life of the host. See gc.rs's own header for why that matters
 /// more than it sounds.
+/// Encrypts an operator-supplied secret read from stdin.
+///
+/// Deliberately does NOT go through `progress::Progress`: that file is the
+/// job stream ferrumd renders, and this subcommand is invoked directly over
+/// SSH by the installer, never dispatched as a ferrumd job (it is absent
+/// from `request::Request` for the same reason). Writing a job file here
+/// would fabricate an entry for work the daemon never asked for.
+///
+/// Returns 0 on success -- including the idempotent "already exists" path,
+/// so a resumed install does not fail at this step.
+fn run_put_secret(name: &str, replace: bool) -> i32 {
+    let secrets_dir: std::path::PathBuf = std::env::var("FERRUM_SECRETS_DIR")
+        .unwrap_or_else(|_| "/etc/ferrum/secrets".to_string())
+        .into();
+    let host_key_pub: std::path::PathBuf = std::env::var("FERRUM_HOST_KEY_PUB")
+        .unwrap_or_else(|_| ferrum_secrets::DEFAULT_HOST_KEY_PUB.to_string())
+        .into();
+
+    match put_secret::run(&secrets_dir, &host_key_pub, name, replace) {
+        Ok(put_secret::Outcome::Wrote) => {
+            println!("put-secret: wrote {}", secrets_dir.join(format!("{name}.sops")).display());
+            0
+        }
+        Ok(put_secret::Outcome::Replaced) => {
+            println!("put-secret: replaced {}", secrets_dir.join(format!("{name}.sops")).display());
+            0
+        }
+        Ok(put_secret::Outcome::Unchanged) => {
+            println!(
+                "put-secret: {} already exists, left unchanged (pass --replace to overwrite)",
+                secrets_dir.join(format!("{name}.sops")).display()
+            );
+            0
+        }
+        Err(e) => {
+            eprintln!("put-secret: {e}");
+            1
+        }
+    }
+}
+
 fn run_gc() -> i32 {
     let mut progress = progress::Progress::open();
     match run_gc_inner(&mut progress) {
@@ -451,6 +513,7 @@ fn main() -> anyhow::Result<()> {
         Command::RestoreState => run_restore_state(),
         Command::Gc => run_gc(),
         Command::PreviewMigration => run_preview_migration(),
+        Command::PutSecret { name, replace } => run_put_secret(&name, replace),
         Command::RunRequest { path } => match request::read_request(&path) {
             Ok(req) => run_request(req, &mut progress::Progress::open(), |req| match req {
                 request::Request::Preflight => run_preflight(),
@@ -548,6 +611,26 @@ mod tests {
     fn parses_preview_migration_subcommand() {
         let cli = Cli::parse_from(["ferrum-apply", "preview-migration"]);
         assert!(matches!(cli.command, Command::PreviewMigration));
+    }
+
+    /// The secret VALUE must never be an argument -- it would land in `ps`
+    /// and in shell history. Only the name and the flag are.
+    #[test]
+    fn put_secret_takes_a_name_and_an_optional_replace_flag() {
+        let cli = Cli::parse_from(["ferrum-apply", "put-secret", "acme-dns"]);
+        match cli.command {
+            Command::PutSecret { ref name, replace } => {
+                assert_eq!(name, "acme-dns");
+                assert!(!replace);
+            }
+            _ => panic!("expected PutSecret, got {:?}", cli.command),
+        }
+
+        let cli = Cli::parse_from(["ferrum-apply", "put-secret", "acme-dns", "--replace"]);
+        match cli.command {
+            Command::PutSecret { replace, .. } => assert!(replace),
+            _ => panic!("expected PutSecret"),
+        }
     }
 
     #[test]
