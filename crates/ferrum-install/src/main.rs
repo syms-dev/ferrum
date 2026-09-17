@@ -16,6 +16,8 @@
 //! step, so its progress is recorded and it is resumable (spec R7). What is
 //! implemented so far is the part that runs before anything is contacted.
 
+mod collect;
+mod inventory;
 mod preconditions;
 
 use clap::Parser;
@@ -75,12 +77,79 @@ fn main() {
         println!("mode:          --fresh (existing install state will be discarded)");
     }
 
+    match inventory_phase(&pre) {
+        Ok(()) => {}
+        Err(e) => {
+            eprintln!("ferrum-install: {e}");
+            std::process::exit(1);
+        }
+    }
+
     eprintln!(
-        "\nferrum-install: preconditions pass. The remaining phases (inventory, \n\
-         confirmation, generation, preflight, install, stage 2, verification) \n\
-         are not implemented yet -- see the Phase 1.6a story breakdown."
+        "\nferrum-install: inventory complete. Nothing on the target has been \n\
+         modified. The remaining phases (confirmation, generation, preflight, \n\
+         install, stage 2, verification) are not implemented yet -- see the \n\
+         Phase 1.6a story breakdown."
     );
     std::process::exit(2);
+}
+
+/// Collects and reports the target's inventory. Read-only throughout.
+fn inventory_phase(pre: &preconditions::Preconditions) -> anyhow::Result<()> {
+    println!("\ncollecting inventory from {} ...", pre.target);
+    let raw = collect::collect(&pre.target, &pre.ssh_auth)?;
+
+    // Refuse an architecture the catalog is not built for, before the
+    // operator invests any more attention in this run.
+    if raw.arch != "x86_64" {
+        anyhow::bail!(
+            "target reports architecture {:?}; ferrum's catalog is built for \
+             x86_64-linux only",
+            raw.arch
+        );
+    }
+
+    let mut devices = inventory::parse_lsblk(&raw.lsblk)?;
+    if devices.is_empty() {
+        anyhow::bail!("the target reports no whole block devices to install onto");
+    }
+    inventory::attach_by_id(&mut devices, &inventory::parse_by_id(&raw.by_id));
+
+    println!(
+        "\nfirmware: {}\narchitecture: {}\n\ndisks:\n{}",
+        if raw.efi_present { "EFI (/sys/firmware/efi present)" } else { "legacy BIOS" },
+        raw.arch,
+        inventory::render(&devices)
+    );
+
+    // Report the firmware consequence PER DISK, before anything is chosen.
+    // Getting this wrong is the worst failure available here -- the install
+    // completes and the machine then does not boot, with the previous OS
+    // already gone -- so the operator should see a conflicting-signals
+    // refusal now, while it costs a question, rather than after they have
+    // committed to a disk.
+    println!("if you install to ...");
+    for d in &devices {
+        match inventory::infer_firmware(raw.efi_present, d) {
+            Ok(fw) => println!("  {:<10} -> {fw:?} bootloader", d.name),
+            Err(e) => println!("  {:<10} -> REFUSED: {e}", d.name),
+        }
+        let mounts = d.mounted_at();
+        if !mounts.is_empty() {
+            println!(
+                "  {:<10}    currently mounted at {} -- destroying this disk \
+                 unmounts them",
+                "",
+                mounts.join(", ")
+            );
+        }
+    }
+
+    // Checked after rendering on purpose: if the serials cannot identify a
+    // disk, the operator still needs to see the inventory to understand
+    // why, and to find the by-id path the error tells them to use.
+    inventory::check_serials_identify(&devices)?;
+    Ok(())
 }
 
 #[cfg(test)]
