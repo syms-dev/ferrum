@@ -449,9 +449,29 @@
         workspace-tests = pkgs.rustPlatform.buildRustPackage {
           pname = "ferrum-workspace-tests";
           version = "0.1.0";
-          src = lib.cleanSource ../../../crates;
+
+          # The source root is the REPOSITORY, not crates/, and must stay
+          # in step with nix/pkgs/ferrum-install/default.nix: render.rs
+          # does include_str! on examples/hosts/template/disko.nix so that
+          # a drift between the generated btrfs subvolume layout and the
+          # template is a compile error rather than a silent host that
+          # cannot roll back. That path escapes crates/.
+          #
+          # This derivation compiles the same crate as that package and was
+          # missed when the package's root was changed -- CI caught it,
+          # because `cargo test` run by hand does not reproduce a Nix
+          # sandbox's view of the tree.
+          src = lib.cleanSourceWith {
+            src = ../../..;
+            filter = path: type:
+              let rel = lib.removePrefix (toString ../../.. + "/") (toString path); in
+              lib.hasPrefix "crates" rel || lib.hasPrefix "examples" rel
+              || (type == "directory" && (rel == "crates" || rel == "examples"));
+          };
           cargoLock.lockFile = ../../../crates/Cargo.lock;
-          nativeCheckInputs = [ pkgs.btrfs-progs pkgs.sops pkgs.ssh-to-age pkgs.authelia ];
+          cargoRoot = "crates";
+          buildAndTestSubdir = "crates";
+          nativeCheckInputs = [ pkgs.btrfs-progs pkgs.sops pkgs.ssh-to-age pkgs.authelia pkgs.git ];
           # The point of this derivation is the checkPhase; nothing consumes
           # its binaries, so skip the install entirely.
           installPhase = "touch $out";
