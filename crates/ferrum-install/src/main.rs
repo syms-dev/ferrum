@@ -18,6 +18,7 @@
 
 mod answers;
 mod collect;
+mod confirm;
 mod inventory;
 mod preconditions;
 mod prompt;
@@ -80,13 +81,13 @@ fn main() {
         println!("mode:          --fresh (existing install state will be discarded)");
     }
 
-    match inventory_phase(&pre) {
-        Ok(()) => {}
+    let (devices, efi_present) = match inventory_phase(&pre) {
+        Ok(v) => v,
         Err(e) => {
             eprintln!("ferrum-install: {e}");
             std::process::exit(1);
         }
-    }
+    };
 
     let answers = match answers::collect(&mut prompt::stdio()) {
         Ok(a) => a,
@@ -108,17 +109,83 @@ fn main() {
         }
     );
 
+    let mut io = prompt::stdio();
+    let approved = match confirm::confirm(&devices, efi_present, &mut io) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("\nferrum-install: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    // Minutes can pass between the inventory being printed and the serial
+    // being typed, and a USB disk can be unplugged or a device renumbered
+    // in that window. Re-read and re-check before recording the approval.
+    // This is the same check S7 runs again after kexec, which is the other
+    // moment enumeration can legitimately change.
+    match recheck(&pre, &approved) {
+        Ok(()) => {}
+        Err(e) => {
+            eprintln!("\nferrum-install: {e}");
+            std::process::exit(1);
+        }
+    }
+
+    // Written BEFORE anything destructive runs (spec R2 A7). The
+    // post-install check re-reads it to assert every data disk it was told
+    // to keep is still mounted with the filesystem recorded here -- a disk
+    // that failed to mount should be a loud failure, not a missing
+    // directory discovered weeks later.
+    let inventory_path = pre.host_dir.join("install-inventory.json");
+    if let Err(e) = write_inventory(&inventory_path, &approved) {
+        eprintln!("ferrum-install: could not record the approved inventory: {e}");
+        std::process::exit(1);
+    }
+
+    println!(
+        "\napproved for erasure: {} ({})\n  bootloader:  {:?}\n  recorded in: {}",
+        approved.device.name,
+        approved.device.by_id.as_deref().unwrap_or("?"),
+        approved.firmware,
+        inventory_path.display()
+    );
+
     eprintln!(
-        "\nferrum-install: answers collected. Nothing on the target has been \n\
-         modified. The remaining phases (disk confirmation, generation, \n\
-         preflight, install, stage 2, verification) are not implemented yet -- \n\
-         see the Phase 1.6a story breakdown."
+        "\nferrum-install: disk approved and recorded. NOTHING on the target has \n\
+         been modified yet. The remaining phases (generation, preflight, \n\
+         install, stage 2, verification) are not implemented yet -- see the \n\
+         Phase 1.6a story breakdown."
     );
     std::process::exit(2);
 }
 
+/// Re-reads the target and confirms the approved disk is still the disk.
+fn recheck(
+    pre: &preconditions::Preconditions,
+    approved: &confirm::Approved,
+) -> anyhow::Result<()> {
+    let raw = collect::collect(&pre.target, &pre.ssh_auth)?;
+    let mut devices = inventory::parse_lsblk(&raw.lsblk)?;
+    inventory::attach_by_id(&mut devices, &inventory::parse_by_id(&raw.by_id));
+    confirm::verify_still(approved, &devices)
+}
+
+/// Records the approved inventory, atomically.
+///
+/// Temp file then rename: a partially-written record of which disk was
+/// approved is worse than none at all, because the next phase reads it.
+fn write_inventory(path: &std::path::Path, approved: &confirm::Approved) -> anyhow::Result<()> {
+    let json = serde_json::to_string_pretty(approved)?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, json)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
 /// Collects and reports the target's inventory. Read-only throughout.
-fn inventory_phase(pre: &preconditions::Preconditions) -> anyhow::Result<()> {
+fn inventory_phase(
+    pre: &preconditions::Preconditions,
+) -> anyhow::Result<(Vec<inventory::Device>, bool)> {
     println!("\ncollecting inventory from {} ...", pre.target);
     let raw = collect::collect(&pre.target, &pre.ssh_auth)?;
 
@@ -172,7 +239,7 @@ fn inventory_phase(pre: &preconditions::Preconditions) -> anyhow::Result<()> {
     // disk, the operator still needs to see the inventory to understand
     // why, and to find the by-id path the error tells them to use.
     inventory::check_serials_identify(&devices)?;
-    Ok(())
+    Ok((devices, raw.efi_present))
 }
 
 #[cfg(test)]

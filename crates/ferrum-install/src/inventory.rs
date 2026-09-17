@@ -15,10 +15,10 @@
 
 use std::collections::BTreeMap;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// One partition or filesystem sitting on a device.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Filesystem {
     pub name: String,
     pub fstype: Option<String>,
@@ -26,7 +26,7 @@ pub struct Filesystem {
 }
 
 /// A whole block device, as the operator needs to see it to identify one.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Device {
     pub name: String,
     pub size: String,
@@ -245,7 +245,7 @@ pub fn check_serials_identify(devices: &[Device]) -> anyhow::Result<()> {
 // R2 A5 -- the firmware truth table
 // ---------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum Firmware {
     Uefi,
     Bios,
