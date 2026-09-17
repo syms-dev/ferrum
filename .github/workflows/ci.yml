@@ -74,4 +74,42 @@ jobs:
             .#ferrumd \
             .#ferrum-reconcile \
             .#ferrum-testapp \
+            .#ferrum-install \
             .#checks.x86_64-linux.workspace-tests
+
+  # The installer's delivery vehicle (Phase 1.6a, DEC-02: Docker is the only
+  # thing the operator's own machine must have). Built here because the
+  # image is the artifact a new user actually pulls, and a broken one is
+  # otherwise discovered by them rather than by us -- the same reasoning
+  # that put the Rust workspace in CI after five thousand lines had never
+  # been compiled by it.
+  #
+  # Its own job, not a step in `rust` above: a layered image build is the
+  # slowest thing in this file, and folding it in would mean a failed image
+  # and a failed unit test are the same red X.
+  installer-image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: DeterminateSystems/nix-installer-action@main
+
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+
+      - name: build the ferrum-install Docker image
+        run: |
+          nix build --print-build-logs .#ferrum-install-image
+
+          # Prove the artifact is a loadable image, not merely a tarball
+          # that built. `nix build` succeeding says nothing about whether
+          # Docker can read the result.
+          docker load < result
+          docker image inspect ferrum-install:latest > /dev/null
+
+          # R1 A3: no target argument means usage and a non-zero exit,
+          # without contacting anything. Asserted against the real image
+          # because this is the operator's very first interaction with it.
+          if docker run --rm ferrum-install:latest; then
+            echo "::error::running with no target should have failed"
+            exit 1
+          fi
