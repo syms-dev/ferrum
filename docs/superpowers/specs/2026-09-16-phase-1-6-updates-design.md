@@ -507,6 +507,44 @@ repo and ref the operator already committed to their own root-owned `flake.nix`.
 no second trust root. And **Open Question 5** — advance-and-apply is one atomic operator action,
 because an advanced-but-unapplied lock is exactly the drift R8 now exists to prevent.
 
+### Pre-implementation spikes — BOTH RUN, both pass
+
+Two findings were flagged as unverified risks that could force a redo. Both were settled
+empirically rather than argued, against the real pinned nixpkgs (`nixos-25.11` at
+`flake.lock`'s locked rev) on 2026-09-16.
+
+**Spike A — does every catalog app expose a uniformly evaluable version?** The architect could not
+settle this by inspection and named it the highest-value spike; R1's per-app delta reporting has no
+data source without it. Evaluated `services.<app>.package.version` for all seven enabled apps
+through a real `mkHost`:
+
+```
+jellyfin 10.11.10          plex 1.42.2.10156-f737b826c   prowlarr 2.4.0.5397
+qbittorrent 5.1.4          radarr 6.2.1.10461            sabnzbd 4.5.5
+sonarr 4.0.18.2971
+```
+
+All seven, one attribute path, no per-app special-casing. **R1's per-app version reporting is
+buildable as specified.** The fallback R1 already describes for a failing app remains the right
+shape if a future app's module differs, but no app needs it today.
+
+**Spike B (closes DA-6's binary question) — can a candidate be evaluated without writing the
+lockfile?** `nix eval --no-write-lock-file --override-input <name> <ref>` against the real flake,
+with `flake.lock` hashed before and after:
+
+```
+flake.lock before: 8d70b2543a394ecb
+flake.lock after:  8d70b2543a394ecb
+RESULT: lockfile UNTOUCHED
+```
+
+**The mechanism R3 depends on exists and does what R3 needs.** What this spike does NOT settle is
+DA-6's cost question: the run above overrode an input already present in the store and finished in
+2s. A real candidate check overrides `ferrum`, which pulls a different nixpkgs tree and forces a
+full module-system evaluation twice. That cost is still unmeasured, and R3's "this phase inherits
+that cost rather than introducing a new one" remains wrong until it is. Measure it before
+committing to a UI that implies a check is instant.
+
 ### Findings still open against this spec
 
 The adversarial pass returned **UPHELD**: 3 High, 4 Medium. The planning gate is **FAILED and
@@ -524,17 +562,15 @@ open**; implementation must not start. Resolved above: DA-2 (now R8), DA-3 (gc c
   (`examples/hosts/template/flake.nix:9-12`). A machine-written `flake.lock` leaves it dirty; a
   later `git checkout` silently reverts the pin and the next ordinary apply **downgrades every
   package**. R2 must state what happens to that tree.
-- **DA-6 (Medium) — read-only candidate evaluation is unproven machinery.** The
-  `preview-migration` precedent evaluates one cheap integer against the already-locked flake; R1
-  needs a full module-system evaluation of a *candidate* configuration, twice, fetching a different
-  nixpkgs. Needs a measured spike before R1/R3 are estimable.
+- **DA-6 (Medium) — PARTLY RESOLVED.** The mechanism is proven (Spike B: the lockfile is provably
+  untouched). What remains open is only the **cost**: a real candidate check fetches a different
+  nixpkgs and evaluates the module system twice, and that has not been timed. R3's claim that this
+  phase inherits rather than introduces a cost stays wrong until it is measured.
 - **DA-7 (Medium) — a slow Preview sharing `job_running` could block a rollback** on a host an
   update just broke (`crates/ferrumd/src/jobs.rs:148-158`; no timeout, no cancel). The invariant
   belongs in Open Question 3: rollback must never be blocked by a read-only job.
-- **Unverified assumption, highest-value spike:** that every catalog app's nixpkgs
-  `services.<app>` module exposes a uniformly evaluable `.version`. Neither the writer nor the
-  architect could settle it by inspection. One `nix eval` per app against the pinned nixpkgs rev,
-  before any implementation task.
+- ~~**Unverified assumption, highest-value spike**~~ — **RESOLVED, see Spike A above.** All seven
+  apps report a version through one uniform attribute path.
 
 ## Dependencies
 
