@@ -459,6 +459,24 @@
 
         smoke-vm = import ../../../tests/smoke.nix { inherit pkgs; };
 
+        # Phase 1.6a: the first test that starts from NOTHING. Two nodes --
+        # an operator machine running the real ferrum-install binary, and a
+        # target whose disk is blank. Every other VM test in this file
+        # builds a host from an expression and then drives it, which is
+        # exactly the gap the design doc's install postmortem names: six of
+        # that install's ten defects were invisible to a suite shaped that
+        # way.
+        #
+        # Stage 2 is deliberately NOT here and cannot be: the sandbox has
+        # no network and no in-guest nixpkgs evaluation, and stage 2 exists
+        # precisely so each app's sopsFile is created at runtime on the
+        # guest, which rules out the pre-built-closure trick that makes the
+        # other tests possible. It lives in the networked CI job instead.
+        install-from-nothing = import ../../../tests/install-from-nothing.nix {
+          inherit pkgs;
+          ferrumInstall = self'.packages.ferrum-install;
+        };
+
         # tests/rollback.nix is the plan's terminal proof: a real rollback
         # reverts application STATE. rollback-proves-necessity.nix is its
         # companion, proving the failure mode the mechanism exists to
