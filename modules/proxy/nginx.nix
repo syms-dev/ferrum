@@ -72,7 +72,32 @@ lib.mkIf proxyEnabled {
     recommendedTlsSettings = true;
     recommendedProxySettings = true;
     recommendedGzipSettings = true;
-    virtualHosts = lib.listToAttrs (lib.mapAttrsToList mkVhost exposedApps)
+    virtualHosts = {
+      # A catch-all that refuses anything we did not explicitly publish.
+      #
+      # Without it nginx makes the FIRST vhost its default server, so any
+      # hostname with no vhost of its own is silently served by whichever app
+      # happens to sort first. Found on a real host: jellyfin was enabled but
+      # left at exposure = "local" (so it correctly got no vhost), and
+      # jellyfin.thesyms.ca then served Plex's login page. The operator
+      # reasonably read that as ferrum routing one app to another.
+      #
+      # 444 -- nginx's own "close without a response" -- rather than 404,
+      # because there is nothing useful to say to a request for a hostname
+      # this box does not serve, and a body would only confirm that something
+      # is listening. This also covers a wildcard DNS record pointed at the
+      # host, which is the normal way these subdomains get resolved.
+      #
+      # `default_server` on a catch-all is only meaningful if it really is
+      # the default: `default = true` is what makes nginx pick this one for
+      # an unmatched Host, instead of the alphabetically-first app.
+      "_ferrum_unmatched" = {
+        default = true;
+        rejectSSL = true;
+        locations."/".return = "444";
+      };
+    }
+      // lib.listToAttrs (lib.mapAttrsToList mkVhost exposedApps)
       // lib.optionalAttrs ferrum.auth.enable {
         "auth.${ferrum.proxy.baseDomain}" = {
           forceSSL = true;

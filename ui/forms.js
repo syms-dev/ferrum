@@ -134,9 +134,19 @@ function control(schema, value, key) {
       return { node: labelled(title, select, description), read: () => select.value };
     }
     // plain string -> text
+    //
+    // An EMPTY box reads as `undefined`, not "". Several of these options are
+    // `nullOr str` in app-submodule.nix (resources.memoryMax, resources.cpuQuota),
+    // and writing "" put `MemoryMax=` into a real systemd unit on a real host
+    // instead of leaving the limit unset -- `serviceConfig`'s own
+    // `filterAttrs (_: v: v != null)` drops null but happily passes through an
+    // empty string. Omitting it is also what keeps the document minimal.
     const input = el("input", { type: "text", id: nextId() });
     if (effective != null) input.value = effective;
-    return { node: labelled(title, input, description), read: () => input.value };
+    return {
+      node: labelled(title, input, description),
+      read: () => (input.value === "" ? undefined : input.value),
+    };
   }
 
   // array of string -> repeated rows with add/remove
@@ -301,25 +311,23 @@ export function appSchema(fullSchema, appId, meta = {}) {
   // publishes them, so they track the app rather than being restated here.
   return {
     type: "object",
-    // Three things an operator actually decides. Everything else has a
-    // correct default and lives under `advanced` below -- the whole point of
-    // a catalog is that enabling an app should not be a configuration
-    // exercise.
+    // Two things an operator actually decides, plus the app's own knobs.
+    //
+    // `exposure` is deliberately NOT here. Every app is published on the
+    // operator's domain -- that is what this product is, the same shape as
+    // Saltbox, and "reachable only from the machine itself" is not a target
+    // state anyone wants. The module default is now "public" whenever a proxy
+    // exists (modules/lib/app-submodule.nix), so there is nothing to choose.
+    // Removing the option from the module tree entirely is the honest finish
+    // and needs a settings-schema migration; until then an existing explicit
+    // `exposure` in a document is preserved untouched by renderObject's
+    // unknown-key handling rather than being silently rewritten.
     properties: {
       enable: {
         type: "boolean",
         default: false,
         title: "Enabled",
         description: "Run this app on this host.",
-      },
-      exposure: {
-        type: "string",
-        enum: ["local", "lan", "public"],
-        default: "local",
-        title: "Reachable from",
-        description:
-          "local: this machine only. lan: your home network, with a self-signed " +
-          "certificate. public: a real hostname with a real certificate.",
       },
       subdomain: {
         type: "string",

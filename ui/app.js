@@ -321,8 +321,15 @@ function secretsView() {
         class: "hint",
         text:
           "Each value is encrypted to this host's own SSH key and written to disk. " +
-          "Nothing here can be read back \u2014 there is no endpoint that returns a " +
-          "secret, by design. Setting a value again simply replaces it.",
+          "Nothing here can be read back \u2014 there is no endpoint that returns a secret, " +
+          "by design, so this page cannot tell you whether a value is already set. " +
+          "Setting one simply replaces whatever is there.",
+      }),
+      el("p", {
+        class: "hint",
+        text:
+          "To check from the host: ls /etc/ferrum/secrets/ \u2014 a <name>.sops file means " +
+          "that secret has a value.",
       }),
       declared.length
         ? list
