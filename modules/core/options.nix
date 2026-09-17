@@ -15,6 +15,9 @@ let
   appsType = import ../lib/app-submodule.nix {
     inherit lib catalog;
     stateRoot = config.ferrum.storage.stateDir;
+    # Threaded the same way stateRoot is, so the exposure default can depend on
+    # whether this host actually has a reverse proxy to publish through.
+    proxyEnabled = config.ferrum.proxy.enable;
   };
 in
 {
