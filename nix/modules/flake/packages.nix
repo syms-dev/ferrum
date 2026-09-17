@@ -32,6 +32,10 @@
         # own header.
         ferrum-install = pkgs.callPackage ../../../nix/pkgs/ferrum-install {
           nixos-anywhere = inputs.nixos-anywhere.packages.${pkgs.stdenv.hostPlatform.system}.default;
+          # Same source as ferrum-catalog's ferrumVersion above. A generated
+          # host pins this exact revision, so the installed machine and the
+          # tool that installed it provably agree.
+          ferrumRev = inputs.self.rev or inputs.self.dirtyRev or "dev";
         };
         ferrum-install-image = pkgs.callPackage ../../../nix/pkgs/ferrum-install/image.nix {
           ferrum-install = config.packages.ferrum-install;

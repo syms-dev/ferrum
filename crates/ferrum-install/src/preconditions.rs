@@ -178,6 +178,54 @@ pub fn check_in(
     })
 }
 
+/// Collects the operator's PUBLIC keys for the generated flake.
+///
+/// Public keys are read; the private key never is (see `find_ssh_auth`).
+/// These are what authorise access to the installed machine, and
+/// nixos-anywhere replaces the whole OS -- so every key previously trusted
+/// by the target is erased. A host with no valid key here boots perfectly
+/// and is unreachable forever.
+///
+/// # Errors
+/// Returns an error when the mount holds no public key at all.
+pub fn find_public_keys(ssh_dir: &Path) -> anyhow::Result<Vec<String>> {
+    let mut keys = Vec::new();
+    let Ok(entries) = std::fs::read_dir(ssh_dir) else {
+        anyhow::bail!("cannot read {}", ssh_dir.display());
+    };
+    let mut paths: Vec<_> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "pub"))
+        .collect();
+    paths.sort();
+
+    for path in paths {
+        let Ok(body) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        for line in body.lines() {
+            let line = line.trim();
+            // Only real key lines: a .pub file can hold comments, and a
+            // malformed entry would fail the host build much later.
+            if line.starts_with("ssh-") || line.starts_with("ecdsa-") {
+                keys.push(line.to_string());
+            }
+        }
+    }
+    if keys.is_empty() {
+        anyhow::bail!(
+            "no SSH public key found in {}. nixos-anywhere replaces the whole \
+             OS, so every key the target trusts today is erased -- a host with \
+             no key here boots perfectly and is unreachable forever.",
+            ssh_dir.display()
+        );
+    }
+    keys.sort();
+    keys.dedup();
+    Ok(keys)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -336,6 +384,32 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("user@host"), "{err}");
+    }
+
+    #[test]
+    fn public_keys_are_collected_and_deduplicated() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("id_ed25519.pub"), "ssh-ed25519 AAAA me@mac\n").unwrap();
+        std::fs::write(
+            dir.path().join("id_rsa.pub"),
+            "# a comment\nssh-rsa BBBB me@other\nssh-ed25519 AAAA me@mac\n",
+        )
+        .unwrap();
+        // The private key must never be picked up as a public one.
+        std::fs::write(dir.path().join("id_ed25519"), "PRIVATE").unwrap();
+
+        let keys = find_public_keys(dir.path()).unwrap();
+        assert_eq!(keys, vec!["ssh-ed25519 AAAA me@mac", "ssh-rsa BBBB me@other"]);
+        assert!(!keys.iter().any(|k| k.contains("PRIVATE")));
+        assert!(!keys.iter().any(|k| k.starts_with('#')));
+    }
+
+    /// A host with no authorised key boots perfectly and is unreachable.
+    #[test]
+    fn no_public_key_is_refused_with_the_consequence_spelled_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = find_public_keys(dir.path()).unwrap_err().to_string();
+        assert!(err.contains("unreachable forever"), "{err}");
     }
 
     #[test]

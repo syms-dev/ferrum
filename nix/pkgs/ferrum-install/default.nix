@@ -17,13 +17,43 @@
 , openssh
 , git
 , coreutils
+  # The ferrum revision this installer pins generated hosts to (R3 A5).
+  # Passed from nix/modules/flake/packages.nix, which is the only place
+  # that can see the flake's own `self`.
+, ferrumRev
 }:
 rustPlatform.buildRustPackage {
   pname = "ferrum-install";
   version = "0.1.0";
-  src = lib.cleanSource ../../../crates;
+  # Unlike the other crates, this one's source root is the REPOSITORY, not
+  # crates/. render.rs does include_str! on
+  # examples/hosts/template/disko.nix so that a drift between the generated
+  # btrfs subvolume layout and the template is a compile-linked test
+  # failure rather than a comment nobody reads -- and that path escapes
+  # crates/. Filtered to the two directories actually needed so an edit to
+  # docs/ or ui/ does not rebuild the installer.
+  src = lib.cleanSourceWith {
+    src = ../../..;
+    filter = path: type:
+      let rel = lib.removePrefix (toString ../../.. + "/") (toString path); in
+      lib.hasPrefix "crates" rel || lib.hasPrefix "examples" rel
+      || (type == "directory" && (rel == "crates" || rel == "examples"));
+  };
   cargoLock.lockFile = ../../../crates/Cargo.lock;
-  buildAndTestSubdir = "ferrum-install";
+  # The workspace lives under crates/, but src is the repository root.
+  cargoRoot = "crates";
+  buildAndTestSubdir = "crates/ferrum-install";
+
+  # R3 A5: the generated host flake pins ferrum to a specific revision, so
+  # the installed host and the tool that built it provably agree. Read at
+  # compile time; a binary built without it refuses to generate rather than
+  # falling back to a branch.
+  FERRUM_INSTALL_REV = ferrumRev;
+
+  # render::write_repo shells out to git, so the checkPhase needs it on
+  # PATH or those tests fail for an environment reason rather than a real
+  # one -- the same trap ferrum-apply hits without btrfs-progs.
+  nativeCheckInputs = [ git ];
 
   nativeBuildInputs = [ makeWrapper ];
 

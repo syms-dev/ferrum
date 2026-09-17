@@ -21,6 +21,7 @@ mod collect;
 mod confirm;
 mod inventory;
 mod preconditions;
+mod render;
 mod prompt;
 mod sso;
 
@@ -150,13 +151,56 @@ fn main() {
         inventory_path.display()
     );
 
+    match generate(&pre, &cli, &answers, &approved) {
+        Ok(paths) => {
+            println!("\ngenerated host repository in {}:", pre.host_dir.display());
+            for p in paths {
+                println!("  {p}");
+            }
+        }
+        Err(e) => {
+            eprintln!("\nferrum-install: {e}");
+            std::process::exit(1);
+        }
+    }
+
     eprintln!(
-        "\nferrum-install: disk approved and recorded. NOTHING on the target has \n\
-         been modified yet. The remaining phases (generation, preflight, \n\
+        "\nferrum-install: host repository generated and committed. NOTHING on \n\
+         the target has been modified. The remaining phases (preflight, \n\
          install, stage 2, verification) are not implemented yet -- see the \n\
          Phase 1.6a story breakdown."
     );
     std::process::exit(2);
+}
+
+/// The ferrum revision this installer was built from.
+///
+/// Injected by nix/pkgs/ferrum-install/default.nix. Absent means this
+/// binary was built outside Nix, and there is no honest revision to pin --
+/// R3 A5 requires a specific revision, never a branch, so a fallback like
+/// "main" would be worse than refusing.
+fn ferrum_revision() -> anyhow::Result<&'static str> {
+    option_env!("FERRUM_INSTALL_REV").ok_or_else(|| {
+        anyhow::anyhow!(
+            "this ferrum-install was built without FERRUM_INSTALL_REV, so it \
+             cannot pin the host to the revision it came from. Use the Docker \
+             image, which is built by Nix and always carries one."
+        )
+    })
+}
+
+/// Renders and commits the host repository.
+fn generate(
+    pre: &preconditions::Preconditions,
+    cli: &Cli,
+    answers: &answers::Answers,
+    approved: &confirm::Approved,
+) -> anyhow::Result<Vec<String>> {
+    let keys = preconditions::find_public_keys(&cli.ssh_dir)?;
+    let rev = ferrum_revision()?;
+    let files = render::render(answers, approved, &keys, rev)?;
+    render::write_repo(&pre.host_dir, &files)?;
+    Ok(files.keys().cloned().collect())
 }
 
 /// Re-reads the target and confirms the approved disk is still the disk.
