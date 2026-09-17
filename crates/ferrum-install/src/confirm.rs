@@ -23,7 +23,7 @@ use crate::inventory::{self, Device, Firmware};
 use crate::prompt::PromptIo;
 
 /// A disk the operator has explicitly approved for destruction.
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct Approved {
     pub device: Device,
     pub firmware: Firmware,

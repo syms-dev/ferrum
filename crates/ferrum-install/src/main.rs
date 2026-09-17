@@ -19,9 +19,14 @@
 mod answers;
 mod collect;
 mod confirm;
+mod install;
 mod inventory;
 mod preconditions;
+mod preflight;
 mod render;
+mod stage2;
+mod state;
+mod verify;
 mod prompt;
 mod sso;
 
@@ -54,123 +59,145 @@ struct Cli {
 
 fn main() {
     let cli = Cli::parse();
-
-    let agent_sock = std::env::var("SSH_AUTH_SOCK").ok();
-    let pre = match preconditions::check_in(
-        &cli.target,
-        &cli.host_dir,
-        &cli.ssh_dir,
-        agent_sock.as_deref(),
-    ) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("ferrum-install: {e}");
-            std::process::exit(1);
-        }
-    };
-
-    // Only the credential's *kind and location* are ever printed. The key
-    // itself is never read by this process (see preconditions::find_ssh_auth).
-    let auth = match &pre.ssh_auth {
-        preconditions::SshAuth::Agent(p) => format!("ssh agent at {}", p.display()),
-        preconditions::SshAuth::Key(p) => format!("key {}", p.display()),
-    };
-    println!("target:        {}", pre.target);
-    println!("host repo:     {}", pre.host_dir.display());
-    println!("credentials:   {auth}");
-    if cli.fresh {
-        println!("mode:          --fresh (existing install state will be discarded)");
-    }
-
-    let (devices, efi_present) = match inventory_phase(&pre) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("ferrum-install: {e}");
-            std::process::exit(1);
-        }
-    };
-
-    let answers = match answers::collect(&mut prompt::stdio()) {
-        Ok(a) => a,
-        Err(e) => {
-            eprintln!("\nferrum-install: {e}");
-            std::process::exit(1);
-        }
-    };
-
-    println!(
-        "\nplanned host: {}\n  domain:  {}\n  apps:    {}\n  sso:     {}",
-        answers.hostname,
-        answers.base_domain.as_deref().unwrap_or("(none -- not published)"),
-        if answers.apps.is_empty() { "(none)".to_string() } else { answers.apps.join(", ") },
-        if answers.sso.enabled {
-            format!("on, admin {}", answers.sso.admin_email.as_deref().unwrap_or("?"))
-        } else {
-            "OFF".to_string()
-        }
-    );
-
-    let mut io = prompt::stdio();
-    let approved = match confirm::confirm(&devices, efi_present, &mut io) {
-        Ok(a) => a,
-        Err(e) => {
-            eprintln!("\nferrum-install: {e}");
-            std::process::exit(1);
-        }
-    };
-
-    // Minutes can pass between the inventory being printed and the serial
-    // being typed, and a USB disk can be unplugged or a device renumbered
-    // in that window. Re-read and re-check before recording the approval.
-    // This is the same check S7 runs again after kexec, which is the other
-    // moment enumeration can legitimately change.
-    match recheck(&pre, &approved) {
-        Ok(()) => {}
-        Err(e) => {
-            eprintln!("\nferrum-install: {e}");
-            std::process::exit(1);
-        }
-    }
-
-    // Written BEFORE anything destructive runs (spec R2 A7). The
-    // post-install check re-reads it to assert every data disk it was told
-    // to keep is still mounted with the filesystem recorded here -- a disk
-    // that failed to mount should be a loud failure, not a missing
-    // directory discovered weeks later.
-    let inventory_path = pre.host_dir.join("install-inventory.json");
-    if let Err(e) = write_inventory(&inventory_path, &approved) {
-        eprintln!("ferrum-install: could not record the approved inventory: {e}");
+    if let Err(e) = run(&cli) {
+        eprintln!("\nferrum-install: {e}");
         std::process::exit(1);
     }
+}
 
-    println!(
-        "\napproved for erasure: {} ({})\n  bootloader:  {:?}\n  recorded in: {}",
-        approved.device.name,
-        approved.device.by_id.as_deref().unwrap_or("?"),
-        approved.firmware,
-        inventory_path.display()
-    );
+/// The whole install, phase by phase.
+///
+/// Each phase records that it happened *before* the next begins, and the
+/// destructive one records that it has STARTED rather than that it
+/// finished -- the wipe happens inside `nixos-anywhere`, so a crash
+/// mid-invocation must never leave the disk gone with the record still
+/// saying nothing was touched.
+fn run(cli: &Cli) -> anyhow::Result<()> {
+    let agent = std::env::var("SSH_AUTH_SOCK").ok();
+    let pre = preconditions::check_in(&cli.target, &cli.host_dir, &cli.ssh_dir, agent.as_deref())?;
+    report_preconditions(&pre, cli.fresh);
 
-    match generate(&pre, &cli, &answers, &approved) {
-        Ok(paths) => {
-            println!("\ngenerated host repository in {}:", pre.host_dir.display());
-            for p in paths {
-                println!("  {p}");
-            }
+    if cli.fresh {
+        state::clear(&pre.host_dir)?;
+    }
+    let prior = state::read(&pre.host_dir)?;
+    let resume = state::plan(prior.as_ref(), &cli.target, cli.fresh);
+    if let state::Resume::Conflict(message) = &resume {
+        anyhow::bail!("{message}");
+    }
+    let reached = match &resume {
+        state::Resume::ContinueAfter(p) => {
+            println!("\nresuming: this directory already reached '{}'", p.describe());
+            Some(*p)
         }
-        Err(e) => {
-            eprintln!("\nferrum-install: {e}");
-            std::process::exit(1);
+        _ => None,
+    };
+
+    // The disk gate is re-run only when nothing has been written yet.
+    // Past `Installing` the named disk is already gone, so re-confirming
+    // protects nothing and only trains the operator to retype a serial.
+    let (mut answers, approved) = if state::needs_disk_confirmation(&resume) {
+        plan_install(&pre)?
+    } else {
+        recover_plan(&pre)?
+    };
+
+    let mut st = state::InstallState {
+        phase: state::Phase::Generated,
+        target: cli.target.clone(),
+        hostname: answers.hostname.clone(),
+        approved_disk: approved.device.by_id.clone().unwrap_or_default(),
+    };
+
+    if reached.is_none() {
+        let files = generate(&pre, cli, &answers, &approved)?;
+        println!("\ngenerated host repository in {}:", pre.host_dir.display());
+        for f in files.keys() {
+            println!("  {f}");
         }
+        state::write(&pre.host_dir, &st)?;
     }
 
-    eprintln!(
-        "\nferrum-install: host repository generated and committed. NOTHING on \n\
-         the target has been modified. The remaining phases (preflight, \n\
-         install, stage 2, verification) are not implemented yet -- see the \n\
-         Phase 1.6a story breakdown."
-    );
-    std::process::exit(2);
+    // --- Tier 1 preflight. Target still untouched. ---
+    let evidence = if reached.unwrap_or(state::Phase::Generated) < state::Phase::PreflightPassed {
+        println!("\npreflight: evaluating the generated configuration ...");
+        let files = read_generated(&pre.host_dir)?;
+        let e = preflight::tier1(&pre.host_dir, &files, &answers.hostname)?;
+        st.phase = state::Phase::PreflightPassed;
+        state::write(&pre.host_dir, &st)?;
+        e
+    } else {
+        preflight::Evidence { evaluated: true, booted: false }
+    };
+    println!("preflight: {}", evidence.describe());
+
+    // --- The destructive step. ---
+    if reached.unwrap_or(state::Phase::Generated) < state::Phase::Installed {
+        let scratch = tempfile::tempdir()?;
+        let extra = install::stage_extra_files(scratch.path(), &pre.host_dir)?;
+
+        st.phase = state::Phase::Installing;
+        state::write(&pre.host_dir, &st)?;
+
+        println!("\ninstalling. THIS ERASES {}.", st.approved_disk);
+        run_streaming(
+            "nixos-anywhere",
+            &install::args(&cli.target, &answers.hostname, &extra),
+            &pre.host_dir,
+        )?;
+
+        st.phase = state::Phase::Installed;
+        state::write(&pre.host_dir, &st)?;
+        println!("installed. waiting for the host to come back ...");
+        wait_for_ssh(&pre)?;
+    }
+
+    // --- Stage 2. The host exists now, so the things that could not exist
+    //     before it can be created. ---
+    if reached.unwrap_or(state::Phase::Generated) < state::Phase::Stage2Applied {
+        if answers.cloudflare_token.is_none()
+            && answers::token_still_needed(&answers, acme_secret_present(&pre)?)
+        {
+            let mut io = prompt::stdio();
+            answers.cloudflare_token = Some(prompt::PromptIo::ask(
+                &mut io,
+                "\nCloudflare API token (not recoverable from the generated files):",
+            )?);
+        }
+
+        println!("\nenabling apps and authentication ...");
+        for command in stage2::commands(&answers) {
+            if command.contains("put-secret") {
+                let token = answers.cloudflare_token.as_deref().unwrap_or_default();
+                collect::run_with_stdin(
+                    &pre.target,
+                    &pre.ssh_auth,
+                    &command,
+                    &stage2::acme_payload(token),
+                )?;
+            } else {
+                collect::run(&pre.target, &pre.ssh_auth, &command)?;
+            }
+        }
+        st.phase = state::Phase::Stage2Applied;
+        state::write(&pre.host_dir, &st)?;
+    }
+
+    // --- Verification, then the report. ---
+    println!("\nverifying ...");
+    let failures = verify_host(&pre, &answers, &approved)?;
+    if !failures.is_empty() {
+        anyhow::bail!(
+            "the host is installed, but {} check(s) failed:\n  {}",
+            failures.len(),
+            failures.join("\n  ")
+        );
+    }
+    st.phase = state::Phase::Verified;
+    state::write(&pre.host_dir, &st)?;
+
+    final_report(&pre, &answers, &evidence)?;
+    Ok(())
 }
 
 /// The ferrum revision this installer was built from.
@@ -195,15 +222,19 @@ fn generate(
     cli: &Cli,
     answers: &answers::Answers,
     approved: &confirm::Approved,
-) -> anyhow::Result<Vec<String>> {
+) -> anyhow::Result<render::Files> {
     let keys = preconditions::find_public_keys(&cli.ssh_dir)?;
     let rev = ferrum_revision()?;
     let files = render::render(answers, approved, &keys, rev)?;
     render::write_repo(&pre.host_dir, &files)?;
-    Ok(files.keys().cloned().collect())
+    Ok(files)
 }
 
 /// Re-reads the target and confirms the approved disk is still the disk.
+///
+/// Minutes pass between the inventory being printed and the serial being
+/// typed, and a USB disk can be unplugged in that window. This is the same
+/// check that runs again after kexec.
 fn recheck(
     pre: &preconditions::Preconditions,
     approved: &confirm::Approved,
@@ -214,18 +245,6 @@ fn recheck(
     confirm::verify_still(approved, &devices)
 }
 
-/// Records the approved inventory, atomically.
-///
-/// Temp file then rename: a partially-written record of which disk was
-/// approved is worse than none at all, because the next phase reads it.
-fn write_inventory(path: &std::path::Path, approved: &confirm::Approved) -> anyhow::Result<()> {
-    let json = serde_json::to_string_pretty(approved)?;
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, json)?;
-    std::fs::rename(&tmp, path)?;
-    Ok(())
-}
-
 /// Collects and reports the target's inventory. Read-only throughout.
 fn inventory_phase(
     pre: &preconditions::Preconditions,
@@ -233,8 +252,6 @@ fn inventory_phase(
     println!("\ncollecting inventory from {} ...", pre.target);
     let raw = collect::collect(&pre.target, &pre.ssh_auth)?;
 
-    // Refuse an architecture the catalog is not built for, before the
-    // operator invests any more attention in this run.
     if raw.arch != "x86_64" {
         anyhow::bail!(
             "target reports architecture {:?}; ferrum's catalog is built for \
@@ -256,12 +273,6 @@ fn inventory_phase(
         inventory::render(&devices)
     );
 
-    // Report the firmware consequence PER DISK, before anything is chosen.
-    // Getting this wrong is the worst failure available here -- the install
-    // completes and the machine then does not boot, with the previous OS
-    // already gone -- so the operator should see a conflicting-signals
-    // refusal now, while it costs a question, rather than after they have
-    // committed to a disk.
     println!("if you install to ...");
     for d in &devices {
         match inventory::infer_firmware(raw.efi_present, d) {
@@ -270,20 +281,207 @@ fn inventory_phase(
         }
         let mounts = d.mounted_at();
         if !mounts.is_empty() {
-            println!(
-                "  {:<10}    currently mounted at {} -- destroying this disk \
-                 unmounts them",
-                "",
-                mounts.join(", ")
-            );
+            println!("  {:<10}    currently mounted at {}", "", mounts.join(", "));
         }
     }
 
-    // Checked after rendering on purpose: if the serials cannot identify a
-    // disk, the operator still needs to see the inventory to understand
-    // why, and to find the by-id path the error tells them to use.
     inventory::check_serials_identify(&devices)?;
     Ok((devices, raw.efi_present))
+}
+
+fn report_preconditions(pre: &preconditions::Preconditions, fresh: bool) {
+    // Only the credential's KIND and LOCATION are ever printed; the key
+    // itself is never read by this process.
+    let auth = match &pre.ssh_auth {
+        preconditions::SshAuth::Agent(p) => format!("ssh agent at {}", p.display()),
+        preconditions::SshAuth::Key(p) => format!("key {}", p.display()),
+    };
+    println!("target:        {}", pre.target);
+    println!("host repo:     {}", pre.host_dir.display());
+    println!("credentials:   {auth}");
+    if fresh {
+        println!("mode:          --fresh (any existing install record is discarded)");
+    }
+}
+
+/// The interactive half: inventory, answers, and the disk gate.
+fn plan_install(
+    pre: &preconditions::Preconditions,
+) -> anyhow::Result<(answers::Answers, confirm::Approved)> {
+    let (devices, efi_present) = inventory_phase(pre)?;
+    let mut io = prompt::stdio();
+    let answers = answers::collect(&mut io)?;
+    let approved = confirm::confirm(&devices, efi_present, &mut io)?;
+
+    recheck(pre, &approved)?;
+    let path = pre.host_dir.join("install-inventory.json");
+    write_json(&path, &approved)?;
+    println!(
+        "\napproved for erasure: {} ({})\n  bootloader:  {:?}\n  recorded in: {}",
+        approved.device.name,
+        approved.device.by_id.as_deref().unwrap_or("?"),
+        approved.firmware,
+        path.display()
+    );
+    Ok((answers, approved))
+}
+
+/// The resume half: recover what was decided, never re-ask.
+fn recover_plan(
+    pre: &preconditions::Preconditions,
+) -> anyhow::Result<(answers::Answers, confirm::Approved)> {
+    let approved: confirm::Approved = serde_json::from_str(&std::fs::read_to_string(
+        pre.host_dir.join("install-inventory.json"),
+    )?)?;
+    let stage2 = std::fs::read_to_string(pre.host_dir.join("settings.stage2.json"))?;
+    let hostname = read_hostname(&pre.host_dir)?;
+    let answers = answers::from_stage2(&stage2, &hostname)?;
+    Ok((answers, approved))
+}
+
+fn read_hostname(dir: &std::path::Path) -> anyhow::Result<String> {
+    let flake = std::fs::read_to_string(dir.join("flake.nix"))?;
+    flake
+        .lines()
+        .find_map(|l| {
+            l.trim()
+                .strip_prefix("networking.hostName = \"")
+                .and_then(|r| r.split('"').next())
+                .map(str::to_string)
+        })
+        .ok_or_else(|| anyhow::anyhow!("could not read the hostname back from flake.nix"))
+}
+
+fn read_generated(dir: &std::path::Path) -> anyhow::Result<render::Files> {
+    let mut files = render::Files::new();
+    for rel in ["flake.nix", "disko.nix", "settings.json", "settings.stage2.json"] {
+        let p = dir.join(rel);
+        if p.exists() {
+            files.insert(rel.to_string(), std::fs::read_to_string(p)?);
+        }
+    }
+    Ok(files)
+}
+
+fn write_json<T: serde::Serialize>(path: &std::path::Path, value: &T) -> anyhow::Result<()> {
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, serde_json::to_string_pretty(value)?)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+/// Runs a long command with its output streaming through, so the operator
+/// sees nixos-anywhere working rather than a silent terminal.
+fn run_streaming(program: &str, args: &[String], cwd: &std::path::Path) -> anyhow::Result<()> {
+    let status = std::process::Command::new(program)
+        .current_dir(cwd)
+        .args(args)
+        .status()
+        .map_err(|e| anyhow::anyhow!("could not run {program}: {e}"))?;
+    if !status.success() {
+        anyhow::bail!("{program} failed ({status})");
+    }
+    Ok(())
+}
+
+/// Polls for the host to answer SSH again.
+///
+/// Polls the observable condition rather than sleeping a fixed time: a
+/// fixed wait is either too short on slow hardware or wastes minutes on
+/// fast hardware, and this runs on real machines with real POST times.
+fn wait_for_ssh(pre: &preconditions::Preconditions) -> anyhow::Result<()> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
+    while std::time::Instant::now() < deadline {
+        if collect::run(&pre.target, &pre.ssh_auth, "true").is_ok() {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_secs(5));
+    }
+    anyhow::bail!(
+        "the host did not answer SSH within 10 minutes. It is installed; check \
+         it on the console before re-running -- a resume will not repartition."
+    )
+}
+
+fn acme_secret_present(pre: &preconditions::Preconditions) -> anyhow::Result<bool> {
+    Ok(collect::run(
+        &pre.target,
+        &pre.ssh_auth,
+        "test -f /etc/ferrum/secrets/acme-dns.sops && echo yes || echo no",
+    )
+    .map(|o| o.trim() == "yes")
+    .unwrap_or(false))
+}
+
+/// Runs every check and returns the ones that failed.
+fn verify_host(
+    pre: &preconditions::Preconditions,
+    answers: &answers::Answers,
+    approved: &confirm::Approved,
+) -> anyhow::Result<Vec<String>> {
+    let kept = render::data_disks(&approved.all_devices, &approved.device);
+    let mut checks = verify::ownership_checks();
+    checks.extend(verify::service_checks());
+    checks.extend(verify::data_disk_checks(&kept));
+    if let Some(domain) = &answers.base_domain {
+        checks.extend(verify::auth_checks(domain, &answers.apps, answers.sso.enabled));
+    }
+
+    let mut failures = Vec::new();
+    for check in checks {
+        match collect::run(&pre.target, &pre.ssh_auth, &check.command) {
+            Ok(out) if out.contains(&check.expect) => println!("  ok: {}", check.what),
+            Ok(out) => failures.push(format!(
+                "{}: expected {:?}, got {:?}  [{}]",
+                check.what,
+                check.expect,
+                out.trim(),
+                check.command
+            )),
+            Err(e) => failures.push(format!("{}: {e}", check.what)),
+        }
+    }
+    Ok(failures)
+}
+
+/// Everything the operator needs to actually use the machine.
+fn final_report(
+    pre: &preconditions::Preconditions,
+    answers: &answers::Answers,
+    evidence: &preflight::Evidence,
+) -> anyhow::Result<()> {
+    println!("\n{}", "=".repeat(64));
+    println!("{} is installed.", answers.hostname);
+    println!("{}", "=".repeat(64));
+    println!("\nproof: {}", evidence.describe());
+
+    if let Some(domain) = &answers.base_domain {
+        println!("\nurls:");
+        println!("  ferrum        https://ferrum.{domain}");
+        if answers.sso.enabled {
+            println!("  sign-in       https://auth.{domain}");
+        }
+        for app in &answers.apps {
+            println!("  {app:<13} https://{app}.{domain}");
+        }
+    }
+
+    // Printed once, to the terminal, and written to no file.
+    println!("\nfirst-run credentials -- shown ONCE, stored nowhere by this installer:");
+    for (what, path) in verify::credential_paths(answers.sso.enabled) {
+        match collect::run(&pre.target, &pre.ssh_auth, &format!("cat {path}")) {
+            Ok(value) => println!("  {what:<15} {}", value.trim()),
+            Err(e) => println!("  {what:<15} (could not read {path}: {e})"),
+        }
+    }
+
+    println!(
+        "\nyour host repository is {}. It is yours: ferrum never rewrites it,\n\
+         and every later `ferrum-apply apply` on the host evaluates its copy\n\
+         at /etc/ferrum.",
+        pre.host_dir.display()
+    );
+    Ok(())
 }
 
 #[cfg(test)]

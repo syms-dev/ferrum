@@ -194,6 +194,60 @@ pub fn collect(io: &mut impl PromptIo) -> anyhow::Result<Answers> {
     })
 }
 
+/// Rebuilds the answers from a generated `settings.stage2.json`.
+///
+/// A resume after the disk has been erased must never re-prompt: the
+/// operator answered these questions before anything was destroyed, and
+/// asking again invites a different answer against a half-installed
+/// machine. The one thing that cannot be recovered is the Cloudflare
+/// token, which was deliberately never written anywhere -- the caller
+/// re-asks for that alone, and only if it is still needed.
+///
+/// # Errors
+/// Malformed JSON, or a document with no hostname to recover.
+pub fn from_stage2(body: &str, hostname: &str) -> anyhow::Result<Answers> {
+    let doc: serde_json::Value = serde_json::from_str(body)?;
+    let sso_enabled = doc
+        .pointer("/auth/enable")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let mut apps: Vec<String> = doc
+        .get("apps")
+        .and_then(serde_json::Value::as_object)
+        .map(|m| m.keys().cloned().collect())
+        .unwrap_or_default();
+    apps.sort();
+
+    Ok(Answers {
+        hostname: hostname.to_string(),
+        base_domain: doc
+            .pointer("/proxy/baseDomain")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        acme_email: doc
+            .pointer("/proxy/acme/email")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        sso: SsoDecision {
+            enabled: sso_enabled,
+            admin_email: doc
+                .pointer("/auth/adminEmail")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+        },
+        apps,
+        cloudflare_token: None,
+    })
+}
+
+/// Whether a resumed run still needs the Cloudflare token.
+///
+/// It does only when the host publishes something and the encrypted file
+/// is not already on the target from an earlier attempt.
+pub fn token_still_needed(a: &Answers, already_on_host: bool) -> bool {
+    a.base_domain.is_some() && needs_acme_credential(&a.apps) && !already_on_host
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -301,6 +355,57 @@ mod tests {
             io.transcript()
         );
         assert_eq!(a.cloudflare_token.as_deref(), Some("secret-token"));
+    }
+
+    /// A resume must never re-prompt: the operator answered before
+    /// anything was destroyed.
+    #[test]
+    fn answers_are_recovered_from_the_generated_stage_two_document() {
+        let doc = serde_json::json!({
+            "schemaVersion": 1,
+            "proxy": { "enable": true, "baseDomain": "thesyms.ca", "acme": { "email": "me@thesyms.ca" } },
+            "apps": { "sonarr": { "enable": true }, "plex": { "enable": true } },
+            "auth": { "enable": true, "adminEmail": "admin@thesyms.ca" }
+        });
+        let a = from_stage2(&doc.to_string(), "saltbox").unwrap();
+        assert_eq!(a.hostname, "saltbox");
+        assert_eq!(a.base_domain.as_deref(), Some("thesyms.ca"));
+        assert_eq!(a.apps, vec!["plex", "sonarr"]);
+        assert!(a.sso.enabled);
+        assert_eq!(a.sso.admin_email.as_deref(), Some("admin@thesyms.ca"));
+    }
+
+    /// The token was deliberately never written anywhere, so it cannot be
+    /// recovered -- and must not be silently treated as absent-and-fine.
+    #[test]
+    fn the_token_is_never_recovered_from_disk() {
+        let doc = serde_json::json!({ "apps": { "sonarr": { "enable": true } } });
+        let a = from_stage2(&doc.to_string(), "h").unwrap();
+        assert_eq!(a.cloudflare_token, None);
+    }
+
+    #[test]
+    fn a_resume_re_asks_for_the_token_only_when_it_is_still_needed() {
+        let doc = serde_json::json!({
+            "proxy": { "enable": true, "baseDomain": "d.com" },
+            "apps": { "sonarr": { "enable": true } }
+        });
+        let a = from_stage2(&doc.to_string(), "h").unwrap();
+        assert!(token_still_needed(&a, false));
+        assert!(!token_still_needed(&a, true), "already delivered");
+
+        let no_apps = from_stage2(
+            &serde_json::json!({ "proxy": { "baseDomain": "d.com" }, "apps": {} }).to_string(),
+            "h",
+        )
+        .unwrap();
+        assert!(!token_still_needed(&no_apps, false));
+    }
+
+    #[test]
+    fn a_recovered_document_without_auth_reads_as_sso_off() {
+        let a = from_stage2(&serde_json::json!({ "apps": {} }).to_string(), "h").unwrap();
+        assert!(!a.sso.enabled);
     }
 
     #[test]

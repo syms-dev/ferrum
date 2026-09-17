@@ -62,6 +62,49 @@ pub fn run(target: &Target, auth: &SshAuth, command: &str) -> anyhow::Result<Str
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+/// Runs a command on the target with `payload` on its stdin.
+///
+/// Used for `ferrum-apply put-secret`: the secret value goes over stdin
+/// rather than in argv so it never appears in the target's `ps` output or
+/// in any shell history.
+///
+/// # Errors
+/// Returns an error carrying ssh's own stderr. The payload is never
+/// included in an error message.
+pub fn run_with_stdin(
+    target: &Target,
+    auth: &SshAuth,
+    command: &str,
+    payload: &str,
+) -> anyhow::Result<String> {
+    use std::io::Write;
+
+    let mut child = Command::new("ssh")
+        .args(base_args(auth))
+        .arg(target.to_string())
+        .arg(command)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("could not run ssh: {e}"))?;
+
+    child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("ssh stdin unavailable"))?
+        .write_all(payload.as_bytes())?;
+
+    let output = child.wait_with_output()?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "ssh {target} failed running {command:?}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
 /// Everything the inventory needs, collected in one connection.
 ///
 /// One `ssh` invocation rather than five: each connection costs a round
