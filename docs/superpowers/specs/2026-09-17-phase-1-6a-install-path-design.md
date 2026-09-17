@@ -811,3 +811,44 @@ property that makes closing here defensible — but it is not the same assurance
 as a fourth adversarial pass, and the implementation should treat R4 A3b's
 table and R3 A8's new subcommand as the two highest-risk items to verify first
 in code.
+
+
+## Story S13 — deferred, with its requirements written down
+
+Every story in the Phase 1.6a breakdown is implemented except **S13**, the
+networked CI job that drives stage 2 end to end with `sonarr` *and*
+`sabnzbd` enabled, proves a rollback on an installer-generated host, and
+kills `nixos-anywhere` mid-run to exercise R7's resume.
+
+It is deferred rather than delivered, and the honest reason is that it
+cannot be written and left unverified without being worse than nothing. It
+needs all of: a KVM-capable runner, a network inside the guest (so the
+stage-2 build can evaluate nixpkgs and reach a substituter), two QEMU
+nodes with real `nixos-anywhere` between them, and a live ACME path or a
+convincing stand-in for one. None of that is exercisable from the
+development machine this was built on, which has no `/dev/kvm` at all.
+
+What that leaves unproven, stated plainly rather than implied by silence:
+
+- **R8 A2** — that the two-stage bootstrap works end to end against real
+  sops secret generation on a real host. The *command sequence* is
+  exhaustively unit-tested in `crates/ferrum-install/src/stage2.rs`,
+  including the five-variable override table and its ordering, but nothing
+  has yet run it against a machine.
+- **R8 A3** — that rollback still works on an installer-generated host.
+  The `disko.nix` subvolume layout is proven byte-identical to the
+  template's by `render.rs`'s `include_str!` test, which is what would
+  catch the realistic drift; an end-to-end rollback is still unproven.
+- **R8 A4** — resume after a partial `nixos-anywhere`. The state machine's
+  logic is fully unit-tested (`state.rs`), the invocation is not.
+- **R5 A6/A7** — Tier 2's build-and-boot proof, which is the same job.
+
+`tests/install-from-nothing.nix` (S12) covers what the sandbox genuinely
+can: a two-node run of the real binary against a blank disk, every
+pre-destructive refusal, and an assertion that no refusal wrote anything.
+
+**The single highest-value thing to build next in this phase is S13**, and
+specifically its sabnzbd leg: `FERRUM_SABNZBD_STATE_DIR` is the variable
+most likely to be got wrong by a future change, and CI enabling sabnzbd
+alongside sonarr is what turns that from an operator's problem into a red
+build.

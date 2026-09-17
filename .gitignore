@@ -23,3 +23,18 @@ CLAUDE.md
 # Secrets should never land unencrypted
 *.env
 *.env.local
+
+# ckit shared runtime state and recoverable sidecars
+.ckit/state/*
+!.ckit/state/.gitkeep
+.ckit/tmp/*
+!.ckit/tmp/.gitkeep
+.ckit/config/upgrade-in-progress.json
+.ckit.bak-*/
+.claude.bak-*/
+.codex.bak-*/
+.agents.bak-*/
+.claude-kit-txn-*/
+.claude-kit-managed-execution.lock
+*.claude-kit
+*.codex-kit

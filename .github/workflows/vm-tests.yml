@@ -94,4 +94,5 @@ jobs:
             .#checks.x86_64-linux.state-restore-interlock \
             .#checks.x86_64-linux.privilege-boundary \
             .#checks.x86_64-linux.daemon-end-to-end \
-            .#checks.x86_64-linux.daemon-apply-end-to-end
+            .#checks.x86_64-linux.daemon-apply-end-to-end \
+            .#checks.x86_64-linux.install-from-nothing
