@@ -16,9 +16,12 @@
 //! step, so its progress is recorded and it is resumable (spec R7). What is
 //! implemented so far is the part that runs before anything is contacted.
 
+mod answers;
 mod collect;
 mod inventory;
 mod preconditions;
+mod prompt;
+mod sso;
 
 use clap::Parser;
 
@@ -85,11 +88,31 @@ fn main() {
         }
     }
 
+    let answers = match answers::collect(&mut prompt::stdio()) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("\nferrum-install: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    println!(
+        "\nplanned host: {}\n  domain:  {}\n  apps:    {}\n  sso:     {}",
+        answers.hostname,
+        answers.base_domain.as_deref().unwrap_or("(none -- not published)"),
+        if answers.apps.is_empty() { "(none)".to_string() } else { answers.apps.join(", ") },
+        if answers.sso.enabled {
+            format!("on, admin {}", answers.sso.admin_email.as_deref().unwrap_or("?"))
+        } else {
+            "OFF".to_string()
+        }
+    );
+
     eprintln!(
-        "\nferrum-install: inventory complete. Nothing on the target has been \n\
-         modified. The remaining phases (confirmation, generation, preflight, \n\
-         install, stage 2, verification) are not implemented yet -- see the \n\
-         Phase 1.6a story breakdown."
+        "\nferrum-install: answers collected. Nothing on the target has been \n\
+         modified. The remaining phases (disk confirmation, generation, \n\
+         preflight, install, stage 2, verification) are not implemented yet -- \n\
+         see the Phase 1.6a story breakdown."
     );
     std::process::exit(2);
 }

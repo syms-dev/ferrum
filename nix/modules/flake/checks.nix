@@ -287,6 +287,42 @@
       # adding the matching branch in control() turns this into a rubber stamp
       # -- a code-review discipline point, the same way schema-uniformity
       # treats its own throw() messages.
+      # The installer offers the operator a list of apps to enable. That
+      # list lives in Rust, on the operator's machine, and the catalog it
+      # must match lives in Nix -- nothing connects them at compile time,
+      # so a new catalog app would silently be un-installable: present on
+      # a host that already has it, and absent from every new install.
+      # Same mechanism, and same one-line-literal constraint, as
+      # uiRendersEverySchemaType below.
+      installerOffersEveryCatalogApp =
+        let
+          answersSrc = builtins.readFile ../../../crates/ferrum-install/src/answers.rs;
+          declLine =
+            let hits = builtins.filter (l: lib.hasInfix "pub const CATALOG_APPS" l)
+                         (lib.splitString "\n" answersSrc);
+            in if hits == [ ] then
+                 throw "crates/ferrum-install/src/answers.rs no longer declares CATALOG_APPS on a single line that this check can read"
+               else builtins.head hits;
+          declared =
+            map builtins.head
+              (builtins.filter builtins.isList
+                (builtins.split "\"([a-z0-9-]+)\"" declLine));
+
+          catalogApps = builtins.attrNames (import ../../../modules/lib/catalog.nix { inherit lib; });
+          missing = builtins.filter (a: !(builtins.elem a declared)) catalogApps;
+          extra = builtins.filter (a: !(builtins.elem a catalogApps)) declared;
+        in
+        {
+          ok = missing == [ ] && extra == [ ];
+          message =
+            "crates/ferrum-install/src/answers.rs's CATALOG_APPS is out of step with "
+            + "modules/lib/catalog.nix."
+            + (lib.optionalString (missing != [ ])
+                " In the catalog but not offered by the installer: ${lib.concatStringsSep ", " missing}.")
+            + (lib.optionalString (extra != [ ])
+                " Offered by the installer but not in the catalog: ${lib.concatStringsSep ", " extra}.");
+        };
+
       uiRendersEverySchemaType =
         let
           formsSrc = builtins.readFile ../../../ui/forms.js;
@@ -351,6 +387,8 @@
         schema-uniformity = mkAssertionCheck "schema-uniformity" schemaUniformity;
         ui-renders-every-schema-type =
           mkAssertionCheck "ui-renders-every-schema-type" uiRendersEverySchemaType;
+        installer-offers-every-catalog-app =
+          mkAssertionCheck "installer-offers-every-catalog-app" installerOffersEveryCatalogApp;
         sopsfile-are-paths = mkAssertionCheck "sopsfile-are-paths" sopsFilesArePaths;
         migration-mechanism = mkAssertionCheck "migration-mechanism" migrationMechanism;
         journaldir-collision = mkAssertionCheck "journaldir-collision" journalDirCollision;
