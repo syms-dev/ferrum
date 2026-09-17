@@ -592,10 +592,15 @@ stop. These were surfaced at planning time and authorized:
 - **A new `ferrum-apply put-secret <name>` subcommand** (R3 A8). New
   implementation surface in an existing crate, not a new dependency, and the
   first operator-value ingestion path ferrum has had.
-- New Nix surface: `nix/pkgs/ferrum-install/`, wired into **both**
-  `nix/modules/flake/packages.nix` **and** `nix/overlays/default.nix` — a
-  package referenced as `pkgs.<name>` that is missing from the overlay has
-  been a repeated defect in this repository (four instances).
+- New Nix surface: `nix/pkgs/ferrum-install/{default.nix,image.nix}`, wired
+  into `nix/modules/flake/packages.nix` — and **deliberately not** into
+  `nix/overlays/default.nix`. *(Corrected during S1: this bullet originally
+  said "both". The overlay exists so a `pkgs.<name>` reference from inside
+  the NixOS module tree resolves, which has been a repeated defect here —
+  but nothing in `modules/` references the installer and nothing can,
+  because by the time a host is being evaluated the installer's work is
+  finished. Adding it would have repeated the shape of the rule without its
+  reason.)*
 
 ## Out of scope for 1.6a
 
