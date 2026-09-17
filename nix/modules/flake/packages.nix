@@ -5,7 +5,7 @@
 # publishing it also keeps the catalog schema honest as apps are added.
 { inputs, ... }:
 {
-  perSystem = { pkgs, lib, ... }:
+  perSystem = { config, pkgs, lib, ... }:
     let
       catalog = import ../../../modules/lib/catalog.nix { inherit lib; };
     in
@@ -24,6 +24,18 @@
         ferrum-apply = pkgs.callPackage ../../../nix/pkgs/ferrum-apply { };
         ferrum-reconcile = pkgs.callPackage ../../../nix/pkgs/ferrum-reconcile { };
         ferrumd = pkgs.callPackage ../../../nix/pkgs/ferrumd { };
+        # Deliberately NOT in nix/overlays/default.nix, unlike every
+        # package above it. The overlay exists so `pkgs.<name>` resolves
+        # from inside the NixOS module tree; nothing in modules/ references
+        # the installer and nothing can, because by the time a host is
+        # being evaluated this binary's work is finished. See the package's
+        # own header.
+        ferrum-install = pkgs.callPackage ../../../nix/pkgs/ferrum-install {
+          nixos-anywhere = inputs.nixos-anywhere.packages.${pkgs.stdenv.hostPlatform.system}.default;
+        };
+        ferrum-install-image = pkgs.callPackage ../../../nix/pkgs/ferrum-install/image.nix {
+          ferrum-install = config.packages.ferrum-install;
+        };
         # Also present in nix/overlays/default.nix -- modules/core/daemon.nix
         # reads pkgs.ferrum-ui, and a package defined ONLY here builds fine
         # and then fails at host eval with "attribute missing". That has now
