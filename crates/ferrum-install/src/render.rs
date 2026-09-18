@@ -129,17 +129,38 @@ pub fn data_disks<'a>(all: &'a [Device], target: &Device) -> Vec<&'a Device> {
 /// newlines -- can do the second layer, rather than inventing a second
 /// escaper for indented strings.
 fn precreate_serial_guard(os_disk: &str, serial: &str) -> String {
+    // Each value is single-quoted ONCE, at a top-level assignment, and
+    // referenced through a variable everywhere else.
+    //
+    // This shape is the fix for a real root-shell injection. Splicing the
+    // quoted path directly into the messages -- `echo "  {disk}"` -- put a
+    // `'...'` fragment inside DOUBLE quotes, where single quotes are inert,
+    // so a `$(...)` in a by-id path executed as root inside the kexec'd
+    // installer. Nix escaping does not help: `$(` is not antiquotation, so
+    // it passes through the Nix layer verbatim and lands in the shell.
+    //
+    // The general rule, learned the expensive way: **shell-quoted is not
+    // shell-safe -- what matters is the context the quoted text lands in.**
+    // A `'...'` is inert inside `"..."`, inside a here-doc, inside `eval`,
+    // and inside another `'...'`. Assigning once at top level is the only
+    // placement where the quoting is actually doing anything.
+    //
+    // The by-id path is not hypothetical input: on a resume it comes from a
+    // plain deserialize of install-inventory.json in the operator's
+    // writable bind mount, which this codebase already documents as
+    // untrusted in two other places.
     let disk = shell_single_quote(os_disk);
     let want = shell_single_quote(serial);
     format!(
         r#"      # ferrum: R2 A9. Runs after kexec, immediately before this disk is
       # partitioned -- the one moment device enumeration can legitimately
       # change. An unreadable serial counts as a mismatch.
+      ferrum_disk={disk}
       ferrum_want={want}
-      ferrum_got="$(lsblk -no SERIAL {disk} 2>/dev/null | head -n1 | tr -d '[:space:]')"
+      ferrum_got="$(lsblk -no SERIAL "$ferrum_disk" 2>/dev/null | head -n1 | tr -d '[:space:]')"
       if [ "$ferrum_got" != "$ferrum_want" ]; then
         echo "ferrum: REFUSING TO PARTITION." >&2
-        echo "  {disk}" >&2
+        echo "  $ferrum_disk" >&2
         echo "  was approved with serial $ferrum_want" >&2
         echo "  but now reports '$ferrum_got'." >&2
         echo "  Device enumeration changed after kexec. Nothing has been written." >&2
@@ -224,6 +245,14 @@ fn disko(os_disk: &str, firmware: Firmware, serial: Option<&str>) -> String {
 }
 
 fn flake(hostname: &str, ferrum_rev: &str, ssh_keys: &[String], firmware: Firmware, os_disk: &str) -> String {
+    // Escaped like every other value reaching generated Nix. On the
+    // interactive path `validate_hostname` has already constrained this to
+    // [a-z0-9-], but on a resume it is scraped back out of the operator's
+    // own flake.nix -- so the validator is not the only way it can arrive.
+    // Defence in depth: no privilege is gained by an attacker who can
+    // already write the file being evaluated, but the escaping is a
+    // one-liner and its absence here was the only gap left in render.rs.
+    let hostname = &nix_str(hostname);
     let keys = ssh_keys
         .iter()
         .map(|k| format!("              \"{}\"", nix_str(k)))
@@ -654,10 +683,51 @@ mod tests {
         assert!(d.contains("exit 1"), "{d}");
     }
 
+    /// **Executes** the generated guard rather than substring-matching it.
+    ///
+    /// Three consecutive security cycles found an injection in this one
+    /// function, and every time the test beside it asserted "the quoted
+    /// form appears in the output" -- which is true of text that is inert
+    /// where it sits AND of text that is not. The only assertion that
+    /// distinguishes them is running the thing.
+    #[cfg(unix)]
     #[test]
-    fn the_serial_guard_is_shell_quoted() {
-        let g = precreate_serial_guard("/dev/disk/by-id/x", "a'b;id");
-        assert!(g.contains(r"'a'\''b;id'"), "{g}");
+    fn the_generated_guard_cannot_be_made_to_execute_anything() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("OWNED");
+        let payload = format!("$(touch {})", marker.display());
+
+        for (disk, serial) in [
+            (format!("/dev/disk/by-id/ata-X{payload}"), "SER".to_string()),
+            ("/dev/disk/by-id/ata-X".to_string(), format!("SER{payload}")),
+            (format!("/dev/disk/by-id/`touch {}`", marker.display()), "SER".into()),
+            (format!("/dev/disk/by-id/ata-X'; touch {}; '", marker.display()), "SER".into()),
+        ] {
+            let script = precreate_serial_guard(&disk, &serial);
+            // The guard is expected to FAIL (the serial will not match a
+            // device that does not exist); what must not happen is the
+            // payload running.
+            let _ = std::process::Command::new("sh").arg("-c").arg(&script).output();
+            assert!(
+                !marker.exists(),
+                "the guard executed an injected payload.\n  disk: {disk}\n  serial: {serial}\n\n{script}"
+            );
+        }
+    }
+
+    /// Each untrusted value must appear exactly once, at a top-level
+    /// assignment -- anywhere else the single-quoting is inert.
+    #[test]
+    fn untrusted_values_are_quoted_once_at_top_level() {
+        let g = precreate_serial_guard("/dev/disk/by-id/DISK", "SERIAL");
+        assert_eq!(
+            g.matches("'/dev/disk/by-id/DISK'").count(),
+            1,
+            "the device path must be spliced once, not repeated into messages:\n{g}"
+        );
+        assert!(g.contains("ferrum_disk='/dev/disk/by-id/DISK'"), "{g}");
+        assert!(g.contains("\"$ferrum_disk\""), "later uses must go through the variable:\n{g}");
+        assert_eq!(g.matches("'SERIAL'").count(), 1, "{g}");
     }
 
     /// The serial is device-derived, exactly like the fields
