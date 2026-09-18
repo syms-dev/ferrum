@@ -101,11 +101,35 @@ step "run the installer end to end (sonarr + sabnzbd, SSO on)"
   echo "$SERIAL"                 # the disk to erase, by typed serial
 } > "$WORK/answers"
 
+# STREAMED, not redirected-then-tailed.
+#
+# Two consecutive CI runs died at the 180-minute job cap having printed
+# NOTHING from the installer, because its output went to a file that was
+# only tailed after it exited -- and it never exited. Three hours of
+# compute produced zero diagnostic information twice. `tee` keeps the file
+# for the later greps while making the log show where it actually is.
+#
+# A heartbeat runs alongside it: nixos-anywhere builds the whole closure
+# on the target (`--build-on remote`), and long silences during a nested-VM
+# build are normal, so "no output" alone cannot distinguish building from
+# hung. The heartbeat says which.
+(
+  while true; do
+    sleep 120
+    printf '::notice::still running at %s -- installer log is %s lines\n' \
+      "$(date -u +%H:%M:%S)" "$(wc -l < "$WORK/install.log" 2>/dev/null || echo 0)"
+  done
+) & HEARTBEAT=$!
+trap 'kill $HEARTBEAT 2>/dev/null || true' EXIT
+
+set +e
 "$INSTALLER" root@127.0.0.1 --ssh-port 2222 \
-  --host-dir "$WORK/host" --ssh-dir "$WORK/ssh" < "$WORK/answers" \
-  > "$WORK/install.log" 2>&1
-RC=$?
-tail -40 "$WORK/install.log"
+  --host-dir "$WORK/host" --ssh-dir "$WORK/ssh" < "$WORK/answers" 2>&1 \
+  | tee "$WORK/install.log"
+RC=${PIPESTATUS[0]}
+set -e
+kill $HEARTBEAT 2>/dev/null || true
+
 [ "$RC" -eq 0 ] || die "the installer exited $RC"
 ok
 
