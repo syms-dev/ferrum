@@ -67,8 +67,12 @@ jobs:
   # x86_64 only, deliberately: the aarch64 hosted runners have no /dev/kvm
   # (see the matrix comment above), so there is nowhere to run these today.
   # Phase 1.6a story S13: the half of the installer that a sandboxed
-  # runNixOSTest cannot reach. tests/install-from-nothing.nix covers
-  # everything up to `installed`; stage 2 exists so each app's sopsFile is
+  # runNixOSTest cannot reach. tests/install-from-nothing.nix covers the
+  # PRE-DESTRUCTIVE refusals and the blank-disk invariant only -- NOT the
+  # install itself, because Tier 1 evaluates a flake whose ferrum input is
+  # a remote `github:` reference and the sandbox has no network. Everything
+  # from the install onward is proven here or nowhere. Stage 2 additionally
+  # exists so each app's sopsFile is
   # created at RUNTIME on the guest, which rules out the pre-built-closure
   # trick the other VM tests rely on and needs a network to build in place.
   #

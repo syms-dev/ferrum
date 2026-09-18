@@ -502,13 +502,24 @@ target splits by what the sandbox can hold.
 
 **Acceptance criteria.**
 - A1. **Sandboxed, in `nix flake check`:** a two-node `runNixOSTest` where one
-  node runs `ferrum-install` against a peer whose disk starts blank, covering
-  `generated` → `preflight-passed` → `installed`. It asserts R6 A3's checks on
-  the result: `/etc/ferrum/settings.json` is `root:ferrum 0664`, `secrets/` is
-  `ferrum:ferrum 0750`, `custom/` is `root:root 0755`, `ferrumd` is active,
-  and `ferrum-apply` resolves **as a bare command on `PATH`** — the
-  operator's own interface, which is how three of the first install's ten
-  defects were found.
+  node runs `ferrum-install` against a peer whose disk starts blank. It
+  covers the **pre-destructive half only**: every refusal that happens
+  before anything is written (no target argument, a non-root target, a
+  missing `/host` mount), that the inventory really reads the target's
+  block devices over SSH, and — the assertion that matters — that the blank
+  disk is *still blank* after every refusal path.
+
+  *Corrected after the test-coverage review.* This criterion originally
+  claimed the sandboxed test covered `generated` → `preflight-passed` →
+  `installed` and asserted R6 A3's ownership and service checks. **It does
+  not, and could not**: Tier 1 evaluates a flake whose `ferrum` input is a
+  remote `github:` reference, and `runNixOSTest`'s sandbox has no network,
+  so a real install can never reach `PreflightPassed` inside that harness.
+  The claim was repeated in the traceability table and in the CI workflow's
+  own comment; all three are corrected. R6 A3 is asserted by the networked
+  `stage2` job (A2) and nowhere else, which is the honest position — the
+  same discipline R5 A7 applies to itself about never implying a boot it
+  did not perform.
 - A2. **Networked, KVM-capable CI job, separately gated:** the same install
   continued through stage 2 with **`sonarr` enabled** — a secret-declaring app.
   Naming matters: `jellyfin` and `plex` declare no sops secret at HEAD, so
@@ -713,7 +724,7 @@ stop. These were surfaced at planning time and authorized:
 | R5 | Steps 5 and 5b | `crates/ferrum-install/src/preflight.rs` |
 | R6 | Steps 3, 6 and 7 | `crates/ferrum-install/src/install.rs`, `verify.rs` |
 | R7 | "Recovering a failed install" | `crates/ferrum-install/src/state.rs` |
-| R8 | — (new test target) | `tests/install-from-nothing.nix`, CI |
+| R8 | — (new test target) | `tests/install-from-nothing.nix` (pre-destructive refusals + the blank-disk invariant, sandboxed), `tests/stage2/run.sh` + `resume.sh` (the install itself and R6 A3, networked CI only) |
 | R9 | — (new; closes a defect the manual path also has) | `crates/ferrum-install/src/render.rs`, `preflight.rs`, `verify.rs` |
 
 
