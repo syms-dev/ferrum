@@ -82,14 +82,21 @@ pkgs.testers.runNixOSTest {
         assert "does not exist" in out, out
         assert "-v" in out, out
 
-    with subtest("the inventory sees the target's real disks"):
-        # Answer only far enough to print the inventory, then abort at the
-        # disk gate by pressing enter -- which must NOT accept anything.
+    with subtest("the inventory reads the target's real disks over SSH"):
+        # A single blank line. This aborts at the FIRST question (hostname),
+        # which is well before the disk gate -- an earlier comment here
+        # claimed otherwise and was wrong. What it does prove is that the
+        # installer reached the target, read its block devices and rendered
+        # them, which is the read-only half this sandbox can cover.
         out = operator.fail(
             "printf '\\n' | ferrum-install root@target "
             "--host-dir /host --ssh-dir /ssh 2>&1"
         )
         assert "collecting inventory" in out, out
+        # The real disks, not just the banner -- otherwise this passes on an
+        # installer that printed the heading and then fell over.
+        assert "vdb" in out, out
+        assert "x86_64" in out, out
 
     with subtest("nothing on the target was modified by any refusal"):
         # The blank disk is still blank: no partition table was written.

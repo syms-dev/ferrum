@@ -323,6 +323,28 @@ fn recheck(
     confirm::verify_still(approved, &devices)
 }
 
+/// Refuses a target whose architecture ferrum has no catalog for.
+///
+/// Every app in the catalog is built for `x86_64-linux`. Installing onto an
+/// aarch64 box would get as far as a flake evaluation that cannot produce a
+/// single service, so this refuses while the target is still untouched.
+///
+/// # Arguments
+/// * `arch` - the `uname -m` the target reported.
+///
+/// # Errors
+/// Returns an error naming the reported architecture when it is not `x86_64`.
+fn check_arch(arch: &str) -> anyhow::Result<()> {
+    if arch != "x86_64" {
+        anyhow::bail!(
+            "target reports architecture {:?}; ferrum's catalog is built for \
+             x86_64-linux only",
+            arch
+        );
+    }
+    Ok(())
+}
+
 /// Collects and reports the target's inventory. Read-only throughout.
 fn inventory_phase(
     pre: &preconditions::Preconditions,
@@ -330,13 +352,7 @@ fn inventory_phase(
     println!("\ncollecting inventory from {} ...", pre.target);
     let raw = collect::collect(&pre.target, &pre.ssh_auth)?;
 
-    if raw.arch != "x86_64" {
-        anyhow::bail!(
-            "target reports architecture {:?}; ferrum's catalog is built for \
-             x86_64-linux only",
-            raw.arch
-        );
-    }
+    check_arch(&raw.arch)?;
 
     let mut devices = inventory::parse_lsblk(&raw.lsblk)?;
     if devices.is_empty() {
@@ -612,6 +628,23 @@ fn final_report(
 
 #[cfg(test)]
 mod tests {
+    use super::check_arch;
+
+    #[test]
+    fn an_x86_64_target_is_accepted() {
+        assert!(check_arch("x86_64").is_ok());
+    }
+
+    #[test]
+    fn a_non_x86_64_target_is_refused_by_name() {
+        // Refused BEFORE the disk gate, so an operator who points the
+        // installer at an ARM box is told why rather than watching a flake
+        // evaluation fail after the disks are already partitioned.
+        let err = check_arch("aarch64").unwrap_err().to_string();
+        assert!(err.contains("aarch64"), "{err}");
+        assert!(err.contains("x86_64-linux"), "{err}");
+    }
+
     use super::*;
     use clap::CommandFactory;
 
