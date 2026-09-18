@@ -190,54 +190,65 @@ fn strip_controls(s: &str) -> String {
 /// The value with control characters removed, or `"?"` if nothing is left
 /// -- never an empty cell, which would be indistinguishable from a
 /// rendering bug.
-/// Re-asserts, on a device that did NOT come from `parse_lsblk`, every
-/// property `parse_lsblk` would have established.
+/// Makes a `Device` recovered from disk satisfy what `parse_lsblk` would
+/// have established -- refusing where a field drives a decision, and
+/// normalising where it only renders.
 ///
 /// The resume path deserializes `Device` straight out of
 /// `install-inventory.json`, which lives in the operator's writable bind
 /// mount. That file is as forgeable as anything else there, and a
-/// deserialize is not a validation -- a lesson this installer has already
-/// had to learn once for `by_id`, where only half of it was applied: the
-/// by-id path was re-checked and the fields that render into the disk
-/// table were not.
+/// deserialize is not a validation -- a lesson already learned once here
+/// for `by_id`, where only half of it was applied.
+///
+/// **Why two different treatments, and not refusal for everything.** An
+/// earlier version refused any field that was not byte-identical to what
+/// today's cleaner produces. That stranded legitimate resumes: real ATA
+/// model strings are vendor-padded (`"WDC  WD40EFRX-68N32N0"`), so the
+/// whitespace collapse added in the same cycle retroactively invalidated
+/// every inventory file written before it. Past the wipe this is the ONLY
+/// path -- `needs_disk_confirmation` is false -- so the refusal landed
+/// with the disk already erased, and its advice to delete the inventory
+/// file could not work, because this function's caller opens that file
+/// first. The general form is what makes it worth avoiding: every future
+/// tightening of `strip_controls` would invalidate every existing record.
+///
+/// So:
+/// * `name` and `serial` are REFUSED if they do not survive cleaning.
+///   `name` feeds `attach_by_id`, and `serial` is what the post-kexec
+///   guard re-verifies before the partition table is destroyed. A
+///   mismatch there is a wrong-disk risk, and refusing is right.
+/// * `size`, `model`, `fstype` and `mountpoint` are NORMALISED in place.
+///   After the wipe they influence no decision; they only render. Cleaning
+///   them removes the display-forgery risk without a refusal that has no
+///   safe landing.
 ///
 /// # Arguments
-/// * `d` - a device recovered from disk.
+/// * `d` - a device recovered from disk, normalised in place.
 ///
 /// # Errors
-/// When the name is not a kernel name, or any field differs from its
-/// cleaned form -- i.e. when the recovered record could render something
-/// other than what it says it is.
-pub fn check_recovered_device(d: &Device) -> anyhow::Result<()> {
+/// When `name` or `serial` does not survive cleaning.
+pub fn check_recovered_device(d: &mut Device) -> anyhow::Result<()> {
     check_device_name(&d.name)?;
-    let mut check = |what: &str, value: &str| -> anyhow::Result<()> {
-        if strip_controls(value) != value {
+    if let Some(serial) = d.serial.as_deref() {
+        if strip_controls(serial) != serial {
             anyhow::bail!(
-                "the recovered inventory's {what} for {} does not survive \
-                 cleaning, so it could render as something other than itself. \
-                 Delete install-inventory.json and re-run rather than \
-                 continuing from a record that cannot be trusted to display \
-                 honestly.",
-                d.name
+                "the recovered inventory records a serial for {} that does not \
+                 survive cleaning. That value is what the post-kexec guard \
+                 re-verifies immediately before the partition table is \
+                 destroyed, so it cannot be normalised away. Correct the \
+                 \"serial\" field for {} in install-inventory.json, or re-run \
+                 the install from the beginning.",
+                d.name, d.name
             );
         }
-        Ok(())
-    };
-    check("size", &d.size)?;
-    if let Some(v) = d.model.as_deref() {
-        check("model", v)?;
     }
-    if let Some(v) = d.serial.as_deref() {
-        check("serial", v)?;
-    }
-    for f in &d.children {
+    // Display-only from here down: normalise, never refuse.
+    d.size = clean_required(std::mem::take(&mut d.size));
+    d.model = clean(d.model.take());
+    for f in &mut d.children {
         check_device_name(&f.name)?;
-        if let Some(v) = f.fstype.as_deref() {
-            check("fstype", v)?;
-        }
-        if let Some(v) = f.mountpoint.as_deref() {
-            check("mountpoint", v)?;
-        }
+        f.fstype = clean(f.fstype.take());
+        f.mountpoint = clean(f.mountpoint.take());
     }
     Ok(())
 }
@@ -301,8 +312,7 @@ fn clean(v: Option<String>) -> Option<String> {
 /// Returns an error if the JSON does not parse or lacks `blockdevices`.
 pub fn parse_lsblk(json: &str) -> anyhow::Result<Vec<Device>> {
     let root: LsblkRoot = serde_json::from_str(json)?;
-    Ok(root
-        .blockdevices
+    root.blockdevices
         .into_iter()
         .filter(|d| d.dev_type.as_deref() == Some("disk"))
         .map(|d| -> anyhow::Result<Device> {
@@ -324,7 +334,7 @@ pub fn parse_lsblk(json: &str) -> anyhow::Result<Vec<Device>> {
                 .collect(),
             })
         })
-        .collect::<anyhow::Result<Vec<_>>>()?)
+        .collect::<anyhow::Result<Vec<_>>>()
 }
 
 // ---------------------------------------------------------------------
@@ -598,7 +608,7 @@ pub fn render(devices: &[Device]) -> String {
     }
     if devices.len() > shown {
         out.push_str(&format!(
-            "  ... and {} more device(s) not shown. Selection is by SERIAL, \n             \x20 so a disk missing from this list can still be named -- but \n             \x20 check the machine if you did not expect this many.\n",
+            "  ... and {} more device(s) not shown.\n             Selection is by SERIAL, so a disk missing from this\n             list can still be named -- but check the machine if\n             you did not expect this many.\n",
             devices.len() - shown
         ));
     }
@@ -619,33 +629,69 @@ mod tests {
         }
     }
 
-    /// SEC-L-N7. `install-inventory.json` lives in the operator's writable
-    /// bind mount, and the resume path deserializes `Device` straight out
-    /// of it. Only `by_id` was re-validated -- so a recovered record could
-    /// still render as a different disk than it is, which is SEC-C1
-    /// arriving by the other ingress.
+    /// SEC-L-N7 and SEC-M6 together: refuse where a field decides,
+    /// normalise where it only renders.
     ///
-    /// Mutation check: remove the `check_recovered_device` call in
-    /// `main.rs`'s recover path, or make this function return `Ok(())`.
+    /// Mutation check: make `check_recovered_device` return `Ok(())` and
+    /// the refusal half fails; drop either `clean` call and the
+    /// normalisation half fails.
     #[test]
-    fn a_forged_recovered_device_is_refused() {
-        // Clean records pass.
-        super::check_recovered_device(&dev("sda", Some("WD-WCC4N5PJ"))).unwrap();
+    fn a_recovered_device_is_refused_where_it_decides_and_cleaned_where_it_renders() {
+        // REFUSED: name and serial drive attach_by_id and the post-kexec
+        // guard respectively.
+        let mut bad = dev("sda\u{1b}[2K\r", None);
+        assert!(super::check_recovered_device(&mut bad).is_err());
 
-        // A name that would not survive cleaning.
-        assert!(super::check_recovered_device(&dev("sda\u{1b}[2K\r", None)).is_err());
-        // Bidi in a serial -- not is_control(), and the whole of SEC-C1-R1.
-        let err = super::check_recovered_device(&dev("sda", Some("\u{202e}321AIDEM")))
+        let mut bidi = dev("sda", Some("\u{202e}321AIDEM"));
+        let err = super::check_recovered_device(&mut bidi)
             .expect_err("a recovered serial must survive cleaning");
-        assert!(err.to_string().contains("serial"), "{err}");
-        // And in a field on a child filesystem.
+        let msg = err.to_string();
+        assert!(msg.contains("post-kexec guard"), "{msg}");
+        // The advice it gives must be advice that WORKS. "Delete
+        // install-inventory.json" does not: recover_plan opens that file
+        // before this runs, so the operator would be stranded with an
+        // erased disk following an instruction that cannot succeed.
+        assert!(!msg.contains("Delete install-inventory.json"), "{msg}");
+        assert!(msg.contains("install-inventory.json"), "{msg}");
+
+        // NORMALISED, never refused: these render and decide nothing once
+        // the disk is gone. Real ATA models are vendor-padded, so an
+        // earlier refusal here stranded legitimate resumes -- after the
+        // wipe, when recover_plan is the only path there is.
+        for model in [
+            "WDC  WD40EFRX-68N32N0",
+            "ATA     ST4000VN008-2DR1",
+            "Samsung SSD 870 EVO 4TB",
+        ] {
+            let mut d = dev("sda", Some("S1"));
+            d.model = Some(model.to_string());
+            super::check_recovered_device(&mut d)
+                .unwrap_or_else(|e| panic!("legitimate model {model:?} refused: {e}"));
+        }
+
+        // ...and the normalisation actually happens, so a forged display
+        // field cannot survive into the table either.
         let mut d = dev("sda", Some("S1"));
+        d.model = Some("EVIL\u{202e}\u{1b}[2K\rsda   8T".into());
+        d.size = "8T\u{202e}".into();
         d.children.push(super::Filesystem {
             name: "sda1".into(),
             fstype: Some("ext4\u{202e}".into()),
-            mountpoint: None,
+            mountpoint: Some("/mnt\u{1b}[2K\r".into()),
         });
-        assert!(super::check_recovered_device(&d).is_err());
+        super::check_recovered_device(&mut d).unwrap();
+        for v in [
+            d.model.as_deref().unwrap(),
+            d.size.as_str(),
+            d.children[0].fstype.as_deref().unwrap(),
+            d.children[0].mountpoint.as_deref().unwrap(),
+        ] {
+            assert!(
+                v.chars().all(|c| c.is_ascii_graphic() || c == ' '),
+                "{v:?} was not normalised"
+            );
+        }
+        assert!(!d.model.as_deref().unwrap().contains("  "), "{:?}", d.model);
     }
 
     /// SEC-L-N9. 5000 devices rendered 913,890 bytes, scrolling the table
