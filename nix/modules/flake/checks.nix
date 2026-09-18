@@ -373,6 +373,59 @@
           schemaShapes = present;
         };
 
+      # The auth model, asserted against the GENERATED nginx config rather
+      # than against the metadata that describes it.
+      #
+      # This exists because the metadata and the behaviour disagreed for
+      # three phases. Every app's meta.nix declared authBypassPaths, the
+      # app submodule exposed it as an option, the UI mentioned it -- and
+      # modules/proxy/nginx.nix put auth_request on locations."/" and
+      # generated nothing else. Reading any one of those files suggested
+      # the feature worked. Only the rendered vhost shows that it did not.
+      authModelEnforced =
+        let
+          host = ferrumLib.mkHost {
+            inherit system;
+            settings = {
+              schemaVersion = realMigrations.currentVersion;
+              proxy = { enable = true; baseDomain = "example.test"; acme.email = "a@example.test"; };
+              auth = { enable = true; adminEmail = "a@example.test"; };
+              apps = {
+                plex.enable = true;
+                sonarr.enable = true;
+              };
+            };
+            modules = [ ../../../examples/hosts/minimal/configuration.nix ];
+          };
+          vhosts = host.config.services.nginx.virtualHosts;
+          plexV = vhosts."plex.example.test" or null;
+          sonarrV = vhosts."sonarr.example.test" or null;
+          hasAuth = v: loc:
+            v != null && (v.locations.${loc} or null) != null
+            && lib.hasInfix "auth_request /authelia" (v.locations.${loc}.extraConfig or "");
+          problems =
+            lib.optional (plexV == null) "no vhost generated for plex"
+            ++ lib.optional (sonarrV == null) "no vhost generated for sonarr"
+            # Plex authenticates itself; forward-auth in front of it breaks
+            # every native client.
+            ++ lib.optional (hasAuth plexV "/")
+                 "plex's / is behind forward-auth, which breaks Roku/TV/mobile clients"
+            # Sonarr has no real login of its own, so its UI must be gated.
+            ++ lib.optional (!(hasAuth sonarrV "/"))
+                 "sonarr's / is NOT behind forward-auth, so it is published unauthenticated"
+            # ...but its API must not be, or Prowlarr, mobile clients and
+            # ferrum's own reconciler all break.
+            ++ lib.optional (sonarrV != null && (sonarrV.locations."/api" or null) == null)
+                 "sonarr has no /api location, so its API is behind forward-auth"
+            ++ lib.optional (hasAuth sonarrV "/api")
+                 "sonarr's /api is behind forward-auth, which breaks Prowlarr and ferrum-reconcile";
+        in
+        {
+          ok = problems == [ ];
+          message = "the generated nginx config does not match the declared auth model";
+          inherit problems;
+        };
+
       mkAssertionCheck = name: result:
         pkgs.runCommand "ferrum-check-${name}" { } (
           if result.ok then
@@ -383,6 +436,7 @@
     in
     {
       checks = {
+        auth-model-enforced = mkAssertionCheck "auth-model-enforced" authModelEnforced;
         catalog-consistency = mkAssertionCheck "catalog-consistency" catalogConsistency;
         schema-uniformity = mkAssertionCheck "schema-uniformity" schemaUniformity;
         ui-renders-every-schema-type =

@@ -14,7 +14,23 @@
   defaultPort = 32400;
   defaultSubdomain = "plex";
   defaultMediaAccess = "read";
-  defaultAuthPolicy = "one_factor";
+  # "bypass", not one_factor, and this is a correctness matter rather than
+  # a convenience one. Plex's native clients (Roku, Apple TV, game consoles, mobile)
+  # authenticate with Plex's own token and have no browser to
+  # complete an Authelia redirect with -- forward-auth in front of them does
+  # not prompt for a login, it makes every native client fail to connect,
+  # while a desktop browser still works. That asymmetry is what makes it
+  # easy to misdiagnose.
+  #
+  # This app is NOT thereby unauthenticated: it ships its own login, which
+  # is why crates/ferrum-install/src/sso.rs lists it in APPS_WITH_OWN_LOGIN
+  # and does not count it among the apps left open when Authelia is off.
+  # Keep those two facts in step.
+  #
+  # authBypassPaths below stays as documentation of the endpoints clients
+  # hit before authenticating; with a bypass policy the whole vhost is
+  # already unguarded, so it has no additional effect here.
+  defaultAuthPolicy = "bypass";
 
   # nixpkgs' plexmediaserver package is licensed unfree; without allowing
   # it, the whole host config fails to evaluate the moment this app is
