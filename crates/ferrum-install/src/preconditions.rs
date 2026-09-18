@@ -33,6 +33,12 @@ const KEY_NAMES: &[&str] = &["id_ed25519", "id_ecdsa", "id_rsa"];
 pub struct Target {
     pub user: String,
     pub host: String,
+    /// SSH port. Not every machine runs on 22 -- and a QEMU guest behind a
+    /// port forward is how the stage-2 CI job reaches its target.
+    pub port: u16,
+    /// Directory holding the persisted `known_hosts`. See
+    /// `collect::base_args_in` for why this must outlive the container.
+    pub known_hosts_dir: Option<PathBuf>,
 }
 
 impl std::fmt::Display for Target {
@@ -68,7 +74,7 @@ pub struct Preconditions {
 /// Returns an error when the target has no `@`, either side is empty, or
 /// the user is not `root`. nixos-anywhere needs root on the target, and a
 /// non-root target fails much later with a far less obvious message.
-pub fn parse_target(raw: &str) -> anyhow::Result<Target> {
+pub fn parse_target(raw: &str, port: u16) -> anyhow::Result<Target> {
     let (user, host) = raw
         .split_once('@')
         .ok_or_else(|| anyhow::anyhow!("target {raw:?} is not user@host -- try root@{raw}"))?;
@@ -87,6 +93,8 @@ pub fn parse_target(raw: &str) -> anyhow::Result<Target> {
     Ok(Target {
         user: user.to_string(),
         host: host.to_string(),
+        port,
+        known_hosts_dir: None,
     })
 }
 
@@ -164,12 +172,15 @@ pub fn find_ssh_auth(ssh_dir: &Path, agent_sock: Option<&str>) -> anyhow::Result
 /// any path through this function, including the failing ones.
 pub fn check_in(
     raw_target: &str,
+    port: u16,
     host_dir: &Path,
     ssh_dir: &Path,
     agent_sock: Option<&str>,
 ) -> anyhow::Result<Preconditions> {
-    let target = parse_target(raw_target)?;
+    let mut target = parse_target(raw_target, port)?;
     check_host_dir(host_dir)?;
+    // Remembered in the bind mount, so trust survives `docker run --rm`.
+    target.known_hosts_dir = Some(host_dir.to_path_buf());
     let ssh_auth = find_ssh_auth(ssh_dir, agent_sock)?;
     Ok(Preconditions {
         target,
@@ -239,17 +250,33 @@ mod tests {
     #[test]
     fn parses_a_root_target() {
         assert_eq!(
-            parse_target("root@192.168.2.50").unwrap(),
+            parse_target("root@192.168.2.50", 22).unwrap(),
             Target {
                 user: "root".into(),
-                host: "192.168.2.50".into()
+                host: "192.168.2.50".into(),
+                port: 22,
+                known_hosts_dir: None
             }
         );
     }
 
     #[test]
+    fn a_port_can_be_given_explicitly() {
+        let t = parse_target("root@127.0.0.1", 2222).unwrap();
+        assert_eq!(t.port, 2222);
+        // Display stays user@host: that is what ssh takes as its argument,
+        // and the port travels as -p.
+        assert_eq!(t.to_string(), "root@127.0.0.1");
+    }
+
+    #[test]
+    fn the_default_port_is_22() {
+        assert_eq!(parse_target("root@h", 22).unwrap().port, 22);
+    }
+
+    #[test]
     fn refuses_a_non_root_target_and_says_why() {
-        let err = parse_target("cs@saltbox").unwrap_err().to_string();
+        let err = parse_target("cs@saltbox", 22).unwrap_err().to_string();
         assert!(err.contains("must connect as root"), "{err}");
         assert!(err.contains("nixos-anywhere"), "{err}");
     }
@@ -257,7 +284,7 @@ mod tests {
     #[test]
     fn refuses_malformed_targets() {
         for bad in ["saltbox", "@saltbox", "root@", "", "root@a@b"] {
-            let err = parse_target(bad).unwrap_err().to_string();
+            let err = parse_target(bad, 22).unwrap_err().to_string();
             assert!(
                 err.contains("user@host") || err.contains("more than one"),
                 "target {bad:?} gave: {err}"
@@ -269,7 +296,7 @@ mod tests {
     /// contain the corrected command rather than just describing the rule.
     #[test]
     fn a_bare_hostname_is_refused_with_the_fix_in_the_message() {
-        let err = parse_target("saltbox").unwrap_err().to_string();
+        let err = parse_target("saltbox", 22).unwrap_err().to_string();
         assert!(err.contains("root@saltbox"), "{err}");
     }
 
@@ -380,7 +407,7 @@ mod tests {
     fn check_in_reports_the_target_problem_before_the_mount_problem() {
         // Both are wrong; the target is the one the operator typed, so it
         // is the one worth reporting first.
-        let err = check_in("saltbox", Path::new("/definitely/not/here"), Path::new("/ssh"), None)
+        let err = check_in("saltbox", 22, Path::new("/definitely/not/here"), Path::new("/ssh"), None)
             .unwrap_err()
             .to_string();
         assert!(err.contains("user@host"), "{err}");
@@ -421,7 +448,7 @@ mod tests {
         std::fs::create_dir(&ssh).unwrap();
         write_key(&ssh, "id_ed25519");
 
-        let pre = check_in("root@192.168.2.50", &host, &ssh, None).unwrap();
+        let pre = check_in("root@192.168.2.50", 22, &host, &ssh, None).unwrap();
         assert_eq!(pre.target.to_string(), "root@192.168.2.50");
         assert_eq!(pre.host_dir, host);
     }

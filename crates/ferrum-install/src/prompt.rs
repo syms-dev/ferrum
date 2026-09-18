@@ -22,6 +22,19 @@ pub trait PromptIo {
 
     /// Prints a line of context. Not a question.
     fn say(&mut self, message: &str);
+
+    /// Asks for a value that must not appear on screen.
+    ///
+    /// The Cloudflare token is the one genuinely high-value credential
+    /// this installer handles -- it grants DNS-zone-wide control -- and an
+    /// install is very often done over a shared screen or a recorded
+    /// session. Echoing it leaves it in scrollback for the rest of the day.
+    ///
+    /// # Errors
+    /// As `ask`.
+    fn ask_secret(&mut self, question: &str) -> anyhow::Result<String> {
+        self.ask(question)
+    }
 }
 
 /// The real terminal.
@@ -48,6 +61,28 @@ impl<R: BufRead, W: Write> PromptIo for Terminal<R, W> {
 
     fn say(&mut self, message: &str) {
         let _ = writeln!(self.writer, "{message}");
+    }
+
+    fn ask_secret(&mut self, question: &str) -> anyhow::Result<String> {
+        // `stty` rather than a termios crate: this repo's convention is to
+        // shell out to a tool already on PATH rather than grow the Rust
+        // dependency tree, and echo suppression is not worth a new package.
+        // Restored on every path, including the error one -- leaving a
+        // terminal with echo off is a worse failure than the leak.
+        let off = std::process::Command::new("stty")
+            .arg("-echo")
+            .stdin(std::process::Stdio::inherit())
+            .status();
+        let result = self.ask(question);
+        if off.map(|s| s.success()).unwrap_or(false) {
+            let _ = std::process::Command::new("stty")
+                .arg("echo")
+                .stdin(std::process::Stdio::inherit())
+                .status();
+            // The newline the operator typed was swallowed with the echo.
+            let _ = writeln!(self.writer);
+        }
+        result
     }
 }
 
@@ -89,6 +124,7 @@ pub(crate) mod testing {
         answers: Vec<String>,
         pub said: Vec<String>,
         pub asked: Vec<String>,
+        pub secret_asks: Vec<String>,
     }
 
     impl Scripted {
@@ -97,6 +133,7 @@ pub(crate) mod testing {
                 answers: answers.iter().rev().map(|s| s.to_string()).collect(),
                 said: Vec::new(),
                 asked: Vec::new(),
+                secret_asks: Vec::new(),
             }
         }
 
@@ -121,6 +158,13 @@ pub(crate) mod testing {
         }
         fn say(&mut self, message: &str) {
             self.said.push(message.to_string());
+        }
+
+        /// The double records that a secret prompt was used, so a test can
+        /// assert the token never goes through the echoing path.
+        fn ask_secret(&mut self, question: &str) -> anyhow::Result<String> {
+            self.secret_asks.push(question.to_string());
+            self.ask(question)
         }
     }
 }

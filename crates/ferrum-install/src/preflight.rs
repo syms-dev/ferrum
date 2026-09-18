@@ -81,7 +81,10 @@ pub fn check_attr_matches_hostname(files: &Files, hostname: &str) -> anyhow::Res
 ///
 /// # Errors
 /// Names every app that would be published unauthenticated.
-pub fn check_published_apps_are_authenticated(files: &Files) -> anyhow::Result<()> {
+pub fn check_published_apps_are_authenticated(
+    files: &Files,
+    unauthenticated_accepted: bool,
+) -> anyhow::Result<()> {
     let Some(body) = files.get("settings.stage2.json") else {
         return Ok(());
     };
@@ -112,6 +115,13 @@ pub fn check_published_apps_are_authenticated(files: &Files) -> anyhow::Result<(
         .unwrap_or_default();
     let open = crate::sso::apps_left_open(&apps);
     if open.is_empty() {
+        return Ok(());
+    }
+    if unauthenticated_accepted {
+        // The operator reached this by typing R9 A2's phrase after being
+        // shown this exact list. Refusing here anyway would make that path
+        // impossible to complete, which is not a safer outcome -- it is a
+        // guard that only ever fires on people who already said no.
         return Ok(());
     }
     anyhow::bail!(
@@ -160,10 +170,15 @@ pub fn evaluate(host_dir: &Path, hostname: &str) -> anyhow::Result<()> {
 ///
 /// # Errors
 /// The first failing check's error, unchanged.
-pub fn tier1(host_dir: &Path, files: &Files, hostname: &str) -> anyhow::Result<Evidence> {
+pub fn tier1(
+    host_dir: &Path,
+    files: &Files,
+    hostname: &str,
+    unauthenticated_accepted: bool,
+) -> anyhow::Result<Evidence> {
     render::check_no_placeholders(files)?;
     check_attr_matches_hostname(files, hostname)?;
-    check_published_apps_are_authenticated(files)?;
+    check_published_apps_are_authenticated(files, unauthenticated_accepted)?;
     evaluate(host_dir, hostname)?;
     Ok(Evidence {
         evaluated: true,
@@ -222,16 +237,18 @@ mod tests {
 
     #[test]
     fn authenticated_apps_pass() {
-        check_published_apps_are_authenticated(&files(published(&["sonarr"], true), "h")).unwrap();
+        check_published_apps_are_authenticated(&files(published(&["sonarr"], true), "h"), false).unwrap();
     }
 
     /// The check that must not be vacuous.
     #[test]
     fn unauthenticated_published_apps_are_refused_by_name() {
-        let err =
-            check_published_apps_are_authenticated(&files(published(&["sonarr", "sabnzbd"], false), "h"))
-                .unwrap_err()
-                .to_string();
+        let err = check_published_apps_are_authenticated(
+            &files(published(&["sonarr", "sabnzbd"], false), "h"),
+            false,
+        )
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("sonarr") && err.contains("sabnzbd"), "{err}");
         assert!(err.contains("Nothing has been changed"), "{err}");
     }
@@ -239,7 +256,7 @@ mod tests {
     /// Plex and Jellyfin carry their own login.
     #[test]
     fn apps_with_their_own_login_are_not_flagged() {
-        check_published_apps_are_authenticated(&files(published(&["plex", "jellyfin"], false), "h"))
+        check_published_apps_are_authenticated(&files(published(&["plex", "jellyfin"], false), "h"), false)
             .unwrap();
     }
 
@@ -247,7 +264,7 @@ mod tests {
     fn nothing_published_means_nothing_to_check() {
         let mut doc = published(&["sonarr"], false);
         doc["proxy"]["enable"] = serde_json::json!(false);
-        check_published_apps_are_authenticated(&files(doc, "h")).unwrap();
+        check_published_apps_are_authenticated(&files(doc, "h"), false).unwrap();
     }
 
     /// The reason this reads settings.stage2.json rather than the Nix
@@ -259,7 +276,7 @@ mod tests {
         stage1["apps"] = serde_json::json!({});
         let mut f = Files::new();
         f.insert("settings.stage2.json".into(), stage1.to_string());
-        check_published_apps_are_authenticated(&f).unwrap();
+        check_published_apps_are_authenticated(&f, false).unwrap();
 
         // ...whereas the real stage-2 document does fire.
         let mut f2 = Files::new();
@@ -267,7 +284,11 @@ mod tests {
             "settings.stage2.json".into(),
             published(&["sonarr"], false).to_string(),
         );
-        assert!(check_published_apps_are_authenticated(&f2).is_err());
+        assert!(check_published_apps_are_authenticated(&f2, false).is_err());
+
+        // ...unless the operator passed R9 A2's typed confirmation, which
+        // is the only way the decline path can ever complete an install.
+        check_published_apps_are_authenticated(&f2, true).unwrap();
     }
 
     #[test]
@@ -275,7 +296,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut f = files(published(&[], true), "saltbox");
         f.insert("disko.nix".into(), "device = \"/dev/disk/by-id/CHANGE-ME\";".into());
-        let err = tier1(dir.path(), &f, "saltbox").unwrap_err().to_string();
+        let err = tier1(dir.path(), &f, "saltbox", false).unwrap_err().to_string();
         assert!(err.contains("CHANGE-ME"), "{err}");
     }
 
