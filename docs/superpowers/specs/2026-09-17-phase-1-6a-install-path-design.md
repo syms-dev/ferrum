@@ -126,12 +126,29 @@ unrecoverable data loss, and the protection today is entirely structural
   requiring the full `by-id` path instead. Empty and duplicate serials are
   ordinary on virtio devices, USB bridges that report the enclosure's serial,
   and same-batch drives.
-- A9. **The approved device is re-verified at the last safe moment.** Inside
-  the kexec'd installer, immediately before disko runs, the approved `by-id`
-  path is re-resolved and its serial re-compared against
-  `install-inventory.json`; a mismatch aborts before any write. kexec loads a
-  different kernel with a different driver set, and that is the one moment
-  device enumeration can legitimately change.
+- A9. **The approved device is re-verified before the install is invoked.**
+  The approved `by-id` path is re-resolved and its serial re-compared
+  against `install-inventory.json`; a mismatch aborts before any write.
+
+  *Revised after the security review.* This criterion originally required
+  the check to run **inside the kexec'd installer, immediately before
+  disko**, on the grounds that kexec's different driver set is the one
+  moment enumeration can legitimately change. That is not implemented and
+  the code and its doc comments wrongly claimed it was — found
+  independently by both the code reviewer and the security reviewer.
+  `nixos-anywhere` runs kexec, disko, install and reboot as one external
+  process with no hook back into the installer; `--phases` exists and could
+  in principle split them, but resuming the remaining phases in a second
+  invocation is not documented as supported and has not been tested.
+
+  What is implemented catches a device that changed between the inventory
+  being printed and the serial being typed — minutes of human reading, and
+  a genuine window. **The residual risk is that a post-kexec
+  re-enumeration is not caught**, bounded by the fact that the only aliases
+  this installer accepts are udev `model_serial` forms derived from the
+  hardware rather than from enumeration order, and a device without one is
+  refused outright (A4, and `confirm.rs`'s by-id refusal). Accepting or
+  closing that residual is an owner decision, recorded in the run ledger.
 
 **Edge cases.** One disk only → still requires typed confirmation. No
 `/dev/disk/by-id/` entry for the chosen device (some virtio setups) → refuse

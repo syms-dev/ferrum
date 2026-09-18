@@ -15,9 +15,26 @@
 //! Typing a serial is a real gate but a narrow one. It defeats a reflex
 //! "y", and it proves the operator read the line they are typing from. It
 //! cannot prove they read the *right* line, which is why the proposal is
-//! never a default, why a typo is a refusal rather than a different disk,
-//! and why the approved device is re-verified after kexec (`verify_still`)
-//! at the last moment enumeration can legitimately change.
+//! never a default and why a typo is a refusal rather than a different
+//! disk.
+//!
+//! **Known gap, stated plainly rather than papered over.** Spec R2 A9 asks
+//! for the approved device to be re-verified *inside the kexec'd installer,
+//! immediately before disko* -- the one moment a different driver set could
+//! legitimately re-enumerate devices and point the approved `by-id` alias
+//! at a different physical disk. `verify_still` does not run there. It runs
+//! before `nixos-anywhere` is invoked at all, because `nixos-anywhere`
+//! performs kexec, disko, install and reboot as one external process with
+//! no hook back into this code. `--phases` could in principle split kexec
+//! from disko, but running the remaining phases as a second invocation is
+//! not documented as supported and has not been tested here.
+//!
+//! What the pre-invocation check does buy is real but smaller: minutes pass
+//! while the operator reads the inventory and types, and a USB disk can be
+//! unplugged in that window. The residual risk is bounded by the aliases
+//! this installer accepts -- udev `model_serial` forms, which are derived
+//! from the hardware rather than from enumeration order, and a device with
+//! no such alias is refused outright.
 
 use crate::inventory::{self, Device, Firmware};
 use crate::prompt::PromptIo;
@@ -140,13 +157,15 @@ pub fn confirm(
     })
 }
 
-/// Re-checks, after kexec and immediately before disko, that the approved
-/// `by-id` path still resolves to a device bearing the approved serial.
+/// Re-checks that the approved `by-id` path still resolves to a device
+/// bearing the approved serial.
 ///
-/// kexec loads a different kernel with a different driver set, and that is
-/// the one moment device enumeration can legitimately change between the
-/// inventory and the write. Nothing else in this installer re-reads the
-/// disk identity after the operator approved it.
+/// **This runs before `nixos-anywhere` is invoked, not inside the kexec'd
+/// installer.** See the module header: spec R2 A9 asks for the latter and
+/// there is no hook to hang it on. What this catches is a device that
+/// changed between the inventory being printed and the serial being typed
+/// -- a real window, since that is minutes of human reading, but not the
+/// post-kexec re-enumeration R2 A9 names.
 ///
 /// # Errors
 /// Any mismatch, which must abort before disko touches anything.

@@ -469,10 +469,11 @@ mod tests {
             acme_email: Some("me@thesyms.ca".into()),
             sso: SsoDecision {
                 enabled: true,
+                unauthenticated_accepted: false,
                 admin_email: Some("admin@thesyms.ca".into()),
             },
             apps: vec!["sonarr".into(), "plex".into()],
-            cloudflare_token: Some("tok".into()),
+            cloudflare_token: Some(crate::answers::Secret::new("tok".into())),
         }
     }
 

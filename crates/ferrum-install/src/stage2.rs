@@ -161,10 +161,11 @@ mod tests {
             acme_email: Some("me@thesyms.ca".into()),
             sso: SsoDecision {
                 enabled: sso,
+                unauthenticated_accepted: false,
                 admin_email: sso.then(|| "admin@thesyms.ca".to_string()),
             },
             apps: apps.iter().map(|s| s.to_string()).collect(),
-            cloudflare_token: Some("tok".into()),
+            cloudflare_token: Some(crate::answers::Secret::new("tok".into())),
         }
     }
 

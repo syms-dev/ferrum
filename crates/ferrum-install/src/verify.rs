@@ -73,21 +73,49 @@ pub fn auth_checks(domain: &str, apps: &[String], sso_enabled: bool) -> Vec<Chec
     if !sso_enabled {
         return Vec::new();
     }
+    let url = |host: String| {
+        // Quoted at the sink even though `domain` is allowlist-validated on
+        // the way in: the validator is three modules away from here.
+        format!(
+            "curl -sS -o /dev/null -w '%{{http_code}}' {}",
+            crate::collect::sh_quote(&host)
+        )
+    };
     let mut checks = vec![Check {
         what: "the authentication host answers",
-        command: format!("curl -sS -o /dev/null -w '%{{http_code}}' https://auth.{domain}/"),
+        command: url(format!("https://auth.{domain}/")),
         expect: "200".into(),
     }];
     for app in crate::sso::apps_left_open(apps) {
         checks.push(Check {
             what: "the app redirects to authentication",
-            command: format!(
-                "curl -sS -o /dev/null -w '%{{http_code}}' https://{app}.{domain}/"
-            ),
+            command: url(format!("https://{app}.{domain}/")),
             expect: "302".into(),
         });
     }
     checks
+}
+
+/// R9 A4's other half: when the operator **declined** SSO, the assertion
+/// inverts. A published app with no authentication in front of it must
+/// answer directly, and a redirect to an auth host would mean something
+/// other than what they asked for is happening.
+///
+/// Returning no checks at all for the decline path -- as an earlier version
+/// did -- meant the one configuration the operator had to type a phrase to
+/// reach was the only one verified by nothing.
+pub fn unauthenticated_checks(domain: &str, apps: &[String]) -> Vec<Check> {
+    crate::sso::apps_left_open(apps)
+        .into_iter()
+        .map(|app| Check {
+            what: "the app answers directly, as the operator accepted",
+            command: format!(
+                "curl -sS -o /dev/null -w '%{{http_code}}' {}",
+                crate::collect::sh_quote(&format!("https://{app}.{domain}/"))
+            ),
+            expect: "200".into(),
+        })
+        .collect()
 }
 
 /// Asserts every data disk the operator kept is still mounted with the
@@ -185,9 +213,26 @@ mod tests {
         assert!(!c.iter().any(|c| c.command.contains("plex.thesyms.ca")));
     }
 
+    /// R9 A4: declining does not mean verifying nothing -- it means the
+    /// assertion inverts.
     #[test]
-    fn no_sso_means_no_auth_checks() {
-        assert!(auth_checks("d.com", &["sonarr".into()], false).is_empty());
+    fn declining_sso_inverts_the_assertion_rather_than_skipping_it() {
+        let apps = vec!["sonarr".to_string(), "plex".to_string()];
+        assert!(auth_checks("d.com", &apps, false).is_empty());
+
+        let inverted = unauthenticated_checks("d.com", &apps);
+        let sonarr = inverted.iter().find(|c| c.command.contains("sonarr")).unwrap();
+        assert_eq!(sonarr.expect, "200", "a redirect would mean SSO is on after all");
+        assert!(
+            !inverted.iter().any(|c| c.command.contains("plex")),
+            "plex has its own login and is not part of this claim"
+        );
+    }
+
+    #[test]
+    fn remote_urls_are_shell_quoted_at_the_sink() {
+        let c = auth_checks("d.com", &["sonarr".into()], true);
+        assert!(c.iter().all(|c| c.command.contains("'https://")), "{:?}", c[0].command);
     }
 
     #[test]

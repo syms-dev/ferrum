@@ -62,6 +62,20 @@ pub struct InstallState {
     /// so a resume can tell it is continuing the same install and not a
     /// different one against the same directory.
     pub approved_disk: String,
+    /// Whether the operator passed R9 A2's typed confirmation to publish
+    /// apps with no authentication.
+    ///
+    /// Recorded HERE rather than in `settings.stage2.json` on purpose:
+    /// that file is evaluated by Nix against the module schema, so an
+    /// installer-private flag in it would be an unknown option. This file
+    /// is the operator's own and never reaches the host.
+    ///
+    /// Without it the two halves contradict each other -- `sso::decide`
+    /// lets the operator decline behind a typed phrase, and preflight then
+    /// refuses exactly the state they just consented to, so the decline
+    /// path could never complete an install.
+    #[serde(default)]
+    pub unauthenticated_accepted: bool,
 }
 
 fn path_in(dir: &Path) -> PathBuf {
@@ -188,6 +202,7 @@ mod tests {
             target: "root@saltbox".into(),
             hostname: "saltbox".into(),
             approved_disk: "/dev/disk/by-id/ata-OS_1".into(),
+            unauthenticated_accepted: false,
         }
     }
 
@@ -305,6 +320,20 @@ mod tests {
             }
             other => panic!("expected a conflict, got {other:?}"),
         }
+    }
+
+    /// An older record without the field must still load -- and must read
+    /// as "no consent given", never as consent.
+    #[test]
+    fn a_record_without_the_consent_flag_reads_as_no_consent() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("install-state.json"),
+            r#"{"phase":"Installed","target":"root@h","hostname":"h","approved_disk":"/d"}"#,
+        )
+        .unwrap();
+        let st = read(dir.path()).unwrap().unwrap();
+        assert!(!st.unauthenticated_accepted, "absence must never mean consent");
     }
 
     #[test]

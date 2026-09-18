@@ -39,7 +39,8 @@ modules/             the NixOS module tree — the product
   core/              cross-cutting ferrum.* options, storage, generations
   apps/<name>/       one directory per catalog app: meta.nix + service.nix
 crates/              Rust workspace: ferrum-apply (the rollback engine), ferrumd (the
-                     daemon), ferrum-reconcile (cross-app registration), ferrum-secrets
+                     daemon), ferrum-install (the installer), ferrum-reconcile
+                     (cross-app registration), ferrum-secrets, ferrum-state
 ui/                  the web UI — hand-written HTML/CSS/ES modules, no build step
 tests/               NixOS VM tests
 examples/hosts/      example settings.json + host config used by the guard checks
@@ -49,6 +50,23 @@ docs/design/         the approved design spec
 ## Secrets
 
 Every secret on a ferrum host is a [sops](https://github.com/getsops/sops)-encrypted file under `ferrum.secretsDir` (default `/etc/ferrum/secrets`), decrypted at boot into a runtime-only path by [sops-nix](https://github.com/Mic92/sops-nix). The box's age decryption identity is derived from its own SSH host key — nothing to provision or lose track of separately.
+
+**Installing a host takes one command.** `ferrum-install` ships as a Docker
+image, so Docker is the only thing your own machine needs. It inventories the
+target, makes you type the serial of the disk it will erase, generates the
+whole host repository, installs, enables the apps behind single sign-on, and
+prints the URLs and both first-run passwords. See `docs/INSTALL.md`; the manual
+path is still documented there for anyone modifying ferrum itself.
+
+```bash
+docker run --rm -it -v ~/.ssh:/ssh:ro -v ~/ferrum-host:/host \
+  ghcr.io/syms-dev/ferrum-install root@YOUR-TARGET
+```
+
+**Operator-supplied secrets go in with `ferrum-apply put-secret <name>`**, which
+reads the value from stdin (never argv, so it stays out of `ps` and shell
+history) and encrypts it to the host's own age recipient. The Cloudflare DNS-01
+token is the one you will need; the installer handles it for you.
 
 **Sonarr, Radarr and Prowlarr's API keys are fully automatic.** `ferrum-apply` generates and encrypts a random key for each enabled app on first apply; there is nothing an operator needs to do.
 

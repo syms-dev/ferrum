@@ -34,6 +34,11 @@ pub const PUBLISH_UNAUTHENTICATED_PHRASE: &str = "publish without authentication
 #[derive(Debug, PartialEq, Eq)]
 pub struct SsoDecision {
     pub enabled: bool,
+    /// The operator passed R9 A2's typed confirmation to publish apps with
+    /// no authentication. Carried so preflight can distinguish informed
+    /// consent from an accidental default -- without it, declining is a
+    /// path the operator can enter and never complete.
+    pub unauthenticated_accepted: bool,
     /// Required by `modules/proxy/authelia.nix`, which asserts it is
     /// non-empty whenever auth is on.
     pub admin_email: Option<String>,
@@ -54,7 +59,7 @@ pub fn apps_left_open(apps: &[String]) -> Vec<&str> {
 /// about the shapes that are certainly wrong: the cost of a false reject
 /// is one retyped answer, and the cost of a false accept is discovering it
 /// after the host is built.
-fn validate_email(raw: &str) -> anyhow::Result<String> {
+pub fn validate_email(raw: &str) -> anyhow::Result<String> {
     let email = raw.trim();
     let Some((local, domain)) = email.split_once('@') else {
         anyhow::bail!("{email:?} is not an email address");
@@ -65,8 +70,17 @@ fn validate_email(raw: &str) -> anyhow::Result<String> {
     if !domain.contains('.') || domain.starts_with('.') || domain.ends_with('.') {
         anyhow::bail!("{email:?} has no usable domain part");
     }
-    if email.chars().any(char::is_whitespace) {
-        anyhow::bail!("{email:?} contains whitespace");
+    // An allowlist, not a denylist. This value is interpolated into
+    // commands that run as root on the target, so "no whitespace" is not a
+    // safety property -- backticks, $, ;, |, & and quotes all pass that.
+    if !email
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || "._%+-@".contains(c))
+    {
+        anyhow::bail!(
+            "{email:?} contains characters that are not allowed in an address \
+             here (letters, digits and . _ % + - @ only)"
+        );
     }
     Ok(email.to_string())
 }
@@ -91,6 +105,7 @@ pub fn decide(
     let Some(domain) = base_domain.filter(|d| !d.is_empty()) else {
         return Ok(SsoDecision {
             enabled: false,
+            unauthenticated_accepted: false,
             admin_email: None,
         });
     };
@@ -113,6 +128,7 @@ pub fn decide(
             );
             return Ok(SsoDecision {
                 enabled: false,
+                unauthenticated_accepted: false,
                 admin_email: None,
             });
         }
@@ -136,6 +152,7 @@ pub fn decide(
         }
         return Ok(SsoDecision {
             enabled: false,
+            unauthenticated_accepted: true,
             admin_email: None,
         });
     }
@@ -148,6 +165,7 @@ pub fn decide(
             Ok(email) => {
                 return Ok(SsoDecision {
                     enabled: true,
+                    unauthenticated_accepted: false,
                     admin_email: Some(email),
                 })
             }
@@ -175,6 +193,7 @@ mod tests {
             d,
             SsoDecision {
                 enabled: true,
+                unauthenticated_accepted: false,
                 admin_email: Some("admin@thesyms.ca".into())
             },
             "an empty answer must take the safe path"
@@ -207,6 +226,25 @@ mod tests {
         let d = decide(Some("thesyms.ca"), &apps(&["sonarr", "sabnzbd"]), &mut io).unwrap();
         assert!(!d.enabled);
         assert_eq!(io.asked.len(), 2, "expected a second confirmation");
+        assert!(
+            d.unauthenticated_accepted,
+            "the consent must be RECORDED, or preflight refuses the very state \
+             the operator just typed a phrase to reach"
+        );
+    }
+
+    /// Consent is only recorded when it was actually given.
+    #[test]
+    fn consent_is_not_recorded_on_any_other_path() {
+        let mut io = Scripted::new(&["", "a@b.co"]);
+        assert!(!decide(Some("d.com"), &apps(&["sonarr"]), &mut io).unwrap().unauthenticated_accepted);
+
+        let mut io = Scripted::new(&["n"]);
+        assert!(!decide(Some("d.com"), &apps(&["plex"]), &mut io).unwrap().unauthenticated_accepted,
+                "nothing was left open, so nothing was consented to");
+
+        let mut io = Scripted::new(&[]);
+        assert!(!decide(None, &apps(&["sonarr"]), &mut io).unwrap().unauthenticated_accepted);
     }
 
     #[test]

@@ -50,6 +50,10 @@ struct Cli {
     #[arg(long, default_value = preconditions::DEFAULT_SSH_DIR)]
     ssh_dir: std::path::PathBuf,
 
+    /// SSH port on the target, when it is not 22.
+    #[arg(long, default_value_t = 22)]
+    ssh_port: u16,
+
     /// Discard any existing install state and start over, re-running the
     /// disk confirmation in full. Never implied by a stale directory: a
     /// resume that silently restarted would re-run the destructive step.
@@ -74,7 +78,13 @@ fn main() {
 /// saying nothing was touched.
 fn run(cli: &Cli) -> anyhow::Result<()> {
     let agent = std::env::var("SSH_AUTH_SOCK").ok();
-    let pre = preconditions::check_in(&cli.target, &cli.host_dir, &cli.ssh_dir, agent.as_deref())?;
+    let pre = preconditions::check_in(
+        &cli.target,
+        cli.ssh_port,
+        &cli.host_dir,
+        &cli.ssh_dir,
+        agent.as_deref(),
+    )?;
     report_preconditions(&pre, cli.fresh);
 
     if cli.fresh {
@@ -107,6 +117,10 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
         target: cli.target.clone(),
         hostname: answers.hostname.clone(),
         approved_disk: approved.device.by_id.clone().unwrap_or_default(),
+        unauthenticated_accepted: prior
+            .as_ref()
+            .map(|p| p.unauthenticated_accepted)
+            .unwrap_or(answers.sso.unauthenticated_accepted),
     };
 
     if reached.is_none() {
@@ -119,10 +133,21 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
     }
 
     // --- Tier 1 preflight. Target still untouched. ---
+    //
+    // The authentication backstop is re-checked on EVERY invocation,
+    // including resumes that skip the expensive evaluation. settings.
+    // stage2.json lives in the operator's bind mount and they are told the
+    // repository is theirs, so between an interrupted run and a resume it
+    // can legitimately have changed. Skipping this on resume meant the one
+    // guard against publishing an unauthenticated admin panel could be
+    // stepped around by the most ordinary sequence there is: get
+    // interrupted, run the same command again.
+    let files = read_generated(&pre.host_dir)?;
+    preflight::check_published_apps_are_authenticated(&files, st.unauthenticated_accepted)?;
+
     let evidence = if reached.unwrap_or(state::Phase::Generated) < state::Phase::PreflightPassed {
         println!("\npreflight: evaluating the generated configuration ...");
-        let files = read_generated(&pre.host_dir)?;
-        let e = preflight::tier1(&pre.host_dir, &files, &answers.hostname)?;
+        let e = preflight::tier1(&pre.host_dir, &files, &answers.hostname, st.unauthenticated_accepted)?;
         st.phase = state::Phase::PreflightPassed;
         state::write(&pre.host_dir, &st)?;
         e
@@ -142,7 +167,7 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
         println!("\ninstalling. THIS ERASES {}.", st.approved_disk);
         run_streaming(
             "nixos-anywhere",
-            &install::args(&cli.target, &answers.hostname, &extra),
+            &install::args(&cli.target, &answers.hostname, &extra, cli.ssh_port),
             &pre.host_dir,
         )?;
 
@@ -150,6 +175,7 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
         state::write(&pre.host_dir, &st)?;
         println!("installed. waiting for the host to come back ...");
         wait_for_ssh(&pre)?;
+        transfer_hardware_config(&pre)?;
     }
 
     // --- Stage 2. The host exists now, so the things that could not exist
@@ -159,16 +185,16 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
             && answers::token_still_needed(&answers, acme_secret_present(&pre)?)
         {
             let mut io = prompt::stdio();
-            answers.cloudflare_token = Some(prompt::PromptIo::ask(
+            answers.cloudflare_token = Some(answers::Secret::new(prompt::PromptIo::ask_secret(
                 &mut io,
                 "\nCloudflare API token (not recoverable from the generated files):",
-            )?);
+            )?));
         }
 
         println!("\nenabling apps and authentication ...");
         for command in stage2::commands(&answers) {
             if command.contains("put-secret") {
-                let token = answers.cloudflare_token.as_deref().unwrap_or_default();
+                let token = answers.cloudflare_token.as_ref().map(answers::Secret::expose).unwrap_or_default();
                 collect::run_with_stdin(
                     &pre.target,
                     &pre.ssh_auth,
@@ -179,6 +205,24 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
                 collect::run(&pre.target, &pre.ssh_auth, &command)?;
             }
         }
+        // R4 A5: the repository the operator keeps must end up holding the
+        // settings the host is actually running. Left at stage 1, a later
+        // reinstall from this same directory would silently produce an
+        // app-less machine.
+        let stage2_path = pre.host_dir.join("settings.stage2.json");
+        let stage1_path = pre.host_dir.join("settings.stage1.json");
+        let live = pre.host_dir.join("settings.json");
+        if stage2_path.exists() {
+            if !stage1_path.exists() {
+                std::fs::rename(&live, &stage1_path)?;
+            }
+            std::fs::copy(&stage2_path, &live)?;
+            let mut files = render::Files::new();
+            files.insert("settings.json".into(), std::fs::read_to_string(&live)?);
+            files.insert("settings.stage1.json".into(), std::fs::read_to_string(&stage1_path)?);
+            render::write_repo(&pre.host_dir, &files)?;
+        }
+
         st.phase = state::Phase::Stage2Applied;
         state::write(&pre.host_dir, &st)?;
     }
@@ -233,8 +277,11 @@ fn generate(
 /// Re-reads the target and confirms the approved disk is still the disk.
 ///
 /// Minutes pass between the inventory being printed and the serial being
-/// typed, and a USB disk can be unplugged in that window. This is the same
-/// check that runs again after kexec.
+/// typed, and a USB disk can be unplugged in that window.
+///
+/// This is the ONLY time the check runs. An earlier comment here claimed it
+/// ran "again after kexec"; it does not, and there is currently no hook to
+/// make it. See `confirm`'s module header for the residual risk.
 fn recheck(
     pre: &preconditions::Preconditions,
     approved: &confirm::Approved,
@@ -384,6 +431,37 @@ fn run_streaming(program: &str, args: &[String], cwd: &std::path::Path) -> anyho
     Ok(())
 }
 
+/// Puts the generated hardware configuration onto the target and commits
+/// it, then commits it locally too (R6 A2).
+///
+/// Separate from `--extra-files` of necessity: see
+/// `install::hardware_config_commands`. Without this, `/etc/ferrum`'s
+/// flake imports a file that is not there and every later apply -- stage 2
+/// included -- fails to evaluate.
+fn transfer_hardware_config(pre: &preconditions::Preconditions) -> anyhow::Result<()> {
+    let local = pre.host_dir.join(install::HARDWARE_CONFIG);
+    let body = std::fs::read_to_string(&local).map_err(|e| {
+        anyhow::anyhow!(
+            "nixos-anywhere did not leave {} behind ({e}). The generated flake \
+             imports it unconditionally, so the host cannot evaluate its own \
+             configuration without it.",
+            local.display()
+        )
+    })?;
+
+    let cmds = install::hardware_config_commands();
+    collect::run_with_stdin(&pre.target, &pre.ssh_auth, &cmds[0], &body)?;
+    collect::run(&pre.target, &pre.ssh_auth, &cmds[1])?;
+
+    // R6 A2: the repository the operator keeps is the one that built the
+    // machine, so the generated file belongs in it too.
+    let mut files = render::Files::new();
+    files.insert(install::HARDWARE_CONFIG.to_string(), body);
+    render::write_repo(&pre.host_dir, &files)?;
+    println!("hardware configuration transferred and committed");
+    Ok(())
+}
+
 /// Polls for the host to answer SSH again.
 ///
 /// Polls the observable condition rather than sleeping a fixed time: a
@@ -424,7 +502,12 @@ fn verify_host(
     checks.extend(verify::service_checks());
     checks.extend(verify::data_disk_checks(&kept));
     if let Some(domain) = &answers.base_domain {
-        checks.extend(verify::auth_checks(domain, &answers.apps, answers.sso.enabled));
+        if answers.sso.enabled {
+            checks.extend(verify::auth_checks(domain, &answers.apps, true));
+        } else {
+            // R9 A4: declining inverts the assertion rather than skipping it.
+            checks.extend(verify::unauthenticated_checks(domain, &answers.apps));
+        }
     }
 
     let mut failures = Vec::new();

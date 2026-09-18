@@ -10,6 +10,7 @@
 //! target: the destructive step belongs to `nixos-anywhere`, later, after a
 //! human has confirmed a specific disk.
 
+use std::path::Path;
 use std::process::Command;
 
 use crate::preconditions::{SshAuth, Target};
@@ -19,13 +20,43 @@ use crate::preconditions::{SshAuth, Target};
 /// `BatchMode=yes` matters: without it a host whose key is unknown, or a
 /// key needing a passphrase, makes `ssh` sit waiting on a prompt that
 /// nobody is there to answer, and the installer hangs instead of failing.
-fn base_args(auth: &SshAuth) -> Vec<String> {
+/// Where trusted host keys are remembered.
+///
+/// Inside the `/host` bind mount, deliberately: the container is run with
+/// `--rm`, so anywhere else the trust decision would evaporate and every
+/// run would be a first contact. Excluded from `install::copy_tree`, since
+/// it is the operator's record and has no meaning on the installed host.
+pub const KNOWN_HOSTS: &str = "known_hosts";
+
+/// Options applied to every connection.
+///
+/// `BatchMode=yes` matters: without it a host whose key is unknown, or a
+/// key needing a passphrase, makes `ssh` sit waiting on a prompt that
+/// nobody is there to answer, and the installer hangs instead of failing.
+///
+/// The host-key policy is **explicit and persisted**, which it has to be
+/// for two separate reasons. Left unset, `BatchMode=yes` makes ssh *refuse*
+/// an unknown host outright -- and this installer's whole job is to contact
+/// a freshly-imaged machine it has never seen, so the first connection of
+/// every real run would fail. `accept-new` trusts a genuinely new host once
+/// and records it; a host whose key later *changes* is still refused, which
+/// is the case worth catching. Writing the file into `/host` is what makes
+/// "later" mean anything across a `--rm` container.
+fn base_args_in(auth: &SshAuth, port: u16, host_dir: Option<&Path>) -> Vec<String> {
     let mut args = vec![
         "-o".into(),
         "BatchMode=yes".into(),
         "-o".into(),
         "ConnectTimeout=10".into(),
+        "-o".into(),
+        "StrictHostKeyChecking=accept-new".into(),
+        "-p".into(),
+        port.to_string(),
     ];
+    if let Some(dir) = host_dir {
+        args.push("-o".into());
+        args.push(format!("UserKnownHostsFile={}", dir.join(KNOWN_HOSTS).display()));
+    }
     if let SshAuth::Key(path) = auth {
         // IdentitiesOnly stops ssh from silently trying agent keys when we
         // asked for a specific one, which otherwise makes a wrong-key
@@ -38,6 +69,17 @@ fn base_args(auth: &SshAuth) -> Vec<String> {
     args
 }
 
+/// Quotes a value for safe interpolation into a remote shell command.
+///
+/// Defence in depth. Every value that reaches here is already validated by
+/// an allowlist at its entry point, but those allowlists live far from the
+/// sinks and a future one could be loosened without anyone noticing the
+/// connection. Wrapping in single quotes and escaping embedded single
+/// quotes is the whole of it.
+pub fn sh_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', r"'\''"))
+}
+
 /// Runs one command on the target and returns its stdout.
 ///
 /// # Errors
@@ -46,7 +88,7 @@ fn base_args(auth: &SshAuth) -> Vec<String> {
 /// problems, and ssh already words them better than a wrapper would.
 pub fn run(target: &Target, auth: &SshAuth, command: &str) -> anyhow::Result<String> {
     let output = Command::new("ssh")
-        .args(base_args(auth))
+        .args(base_args_in(auth, target.port, target.known_hosts_dir.as_deref()))
         .arg(target.to_string())
         .arg(command)
         .output()
@@ -80,7 +122,7 @@ pub fn run_with_stdin(
     use std::io::Write;
 
     let mut child = Command::new("ssh")
-        .args(base_args(auth))
+        .args(base_args_in(auth, target.port, target.known_hosts_dir.as_deref()))
         .arg(target.to_string())
         .arg(command)
         .stdin(std::process::Stdio::piped())
@@ -169,21 +211,58 @@ mod tests {
         Target {
             user: "root".into(),
             host: "saltbox".into(),
+            port: 22,
+            known_hosts_dir: None,
         }
+    }
+
+    /// Left unset, BatchMode=yes makes ssh REFUSE an unknown host, so the
+    /// installer could never reach a freshly-imaged machine at all.
+    #[test]
+    fn a_new_host_is_accepted_once_and_remembered() {
+        let args = base_args_in(&SshAuth::Agent(PathBuf::from("/s")), 22, Some(Path::new("/host")));
+        assert!(args.contains(&"StrictHostKeyChecking=accept-new".to_string()));
+        assert!(args.contains(&"UserKnownHostsFile=/host/known_hosts".to_string()),
+                "trust must persist across a --rm container: {args:?}");
+    }
+
+    /// accept-new trusts a NEW host; a CHANGED key is still refused. That
+    /// distinction is the whole reason not to use `no`.
+    #[test]
+    fn the_policy_is_accept_new_never_disabled() {
+        let args = base_args_in(&SshAuth::Agent(PathBuf::from("/s")), 22, None);
+        assert!(!args.iter().any(|a| a.contains("StrictHostKeyChecking=no")));
+    }
+
+    #[test]
+    fn sh_quote_neutralises_every_metacharacter_that_matters() {
+        for raw in ["a;id", "a`id`", "a$(id)", "a|id", "a&id", "a>f", "a<f", "a\nb"] {
+            let q = sh_quote(raw);
+            assert!(q.starts_with('\'') && q.ends_with('\''), "{q}");
+        }
+        // The one character that can end the quoting is escaped.
+        assert_eq!(sh_quote("a'b"), r"'a'\''b'");
+    }
+
+    #[test]
+    fn a_non_default_port_is_passed_to_ssh() {
+        let args = base_args_in(&SshAuth::Agent(PathBuf::from("/s")), 2222, None);
+        let i = args.iter().position(|a| a == "-p").unwrap();
+        assert_eq!(args[i + 1], "2222");
     }
 
     /// A hanging installer is worse than a failing one: it happens on a
     /// headless box, after the operator has walked away.
     #[test]
     fn every_connection_is_non_interactive() {
-        let args = base_args(&SshAuth::Agent(PathBuf::from("/tmp/a.sock")));
+        let args = base_args_in(&SshAuth::Agent(PathBuf::from("/tmp/a.sock")), 22, None);
         assert!(args.contains(&"BatchMode=yes".to_string()));
         assert!(args.contains(&"ConnectTimeout=10".to_string()));
     }
 
     #[test]
     fn an_explicit_key_is_used_exclusively() {
-        let args = base_args(&SshAuth::Key(PathBuf::from("/ssh/id_ed25519")));
+        let args = base_args_in(&SshAuth::Key(PathBuf::from("/ssh/id_ed25519")), 22, None);
         assert!(args.contains(&"IdentitiesOnly=yes".to_string()));
         assert!(args.contains(&"/ssh/id_ed25519".to_string()));
     }
@@ -191,7 +270,7 @@ mod tests {
     /// With an agent, no -i is passed at all -- the agent decides.
     #[test]
     fn an_agent_connection_names_no_key_file() {
-        let args = base_args(&SshAuth::Agent(PathBuf::from("/tmp/a.sock")));
+        let args = base_args_in(&SshAuth::Agent(PathBuf::from("/tmp/a.sock")), 22, None);
         assert!(!args.contains(&"-i".to_string()));
         assert!(!args.contains(&"IdentitiesOnly=yes".to_string()));
     }
