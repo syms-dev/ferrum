@@ -126,6 +126,13 @@ struct LsblkDevice {
 /// terminal. 64 is comfortably wider than any real model or serial.
 const MAX_FIELD: usize = 64;
 
+/// The most devices the disk table will render.
+///
+/// A machine with more real disks than this exists, so the overflow is
+/// reported rather than hidden -- and selection is by serial, which is
+/// unaffected by what the table shows.
+const MAX_DEVICES: usize = 32;
+
 /// Reduces one untrusted `lsblk` field to something that cannot lie about
 /// the line it is printed on.
 ///
@@ -156,6 +163,12 @@ fn strip_controls(s: &str) -> String {
         .chars()
         .filter(|c| c.is_ascii_graphic() || *c == ' ')
         .collect();
+    // Runs of spaces collapse to one. Space has to stay in the allowlist
+    // -- real models contain them -- but a run of them lets a <=64-char
+    // model imitate the table's own columns on its own row, e.g.
+    // "sda  1T  OS          8T  serial: MEDIA123". Real models never
+    // contain runs, so collapsing costs nothing and removes the imitation.
+    let kept = kept.split_whitespace().collect::<Vec<_>>().join(" ");
     let kept = kept.trim();
     if kept.chars().count() > MAX_FIELD {
         let head: String = kept.chars().take(MAX_FIELD - 3).collect();
@@ -177,6 +190,58 @@ fn strip_controls(s: &str) -> String {
 /// The value with control characters removed, or `"?"` if nothing is left
 /// -- never an empty cell, which would be indistinguishable from a
 /// rendering bug.
+/// Re-asserts, on a device that did NOT come from `parse_lsblk`, every
+/// property `parse_lsblk` would have established.
+///
+/// The resume path deserializes `Device` straight out of
+/// `install-inventory.json`, which lives in the operator's writable bind
+/// mount. That file is as forgeable as anything else there, and a
+/// deserialize is not a validation -- a lesson this installer has already
+/// had to learn once for `by_id`, where only half of it was applied: the
+/// by-id path was re-checked and the fields that render into the disk
+/// table were not.
+///
+/// # Arguments
+/// * `d` - a device recovered from disk.
+///
+/// # Errors
+/// When the name is not a kernel name, or any field differs from its
+/// cleaned form -- i.e. when the recovered record could render something
+/// other than what it says it is.
+pub fn check_recovered_device(d: &Device) -> anyhow::Result<()> {
+    check_device_name(&d.name)?;
+    let mut check = |what: &str, value: &str| -> anyhow::Result<()> {
+        if strip_controls(value) != value {
+            anyhow::bail!(
+                "the recovered inventory's {what} for {} does not survive \
+                 cleaning, so it could render as something other than itself. \
+                 Delete install-inventory.json and re-run rather than \
+                 continuing from a record that cannot be trusted to display \
+                 honestly.",
+                d.name
+            );
+        }
+        Ok(())
+    };
+    check("size", &d.size)?;
+    if let Some(v) = d.model.as_deref() {
+        check("model", v)?;
+    }
+    if let Some(v) = d.serial.as_deref() {
+        check("serial", v)?;
+    }
+    for f in &d.children {
+        check_device_name(&f.name)?;
+        if let Some(v) = f.fstype.as_deref() {
+            check("fstype", v)?;
+        }
+        if let Some(v) = f.mountpoint.as_deref() {
+            check("mountpoint", v)?;
+        }
+    }
+    Ok(())
+}
+
 /// Validates a kernel device name, which must survive cleaning unchanged.
 ///
 /// `attach_by_id` looks a device up by this name, so a name that CHANGES
@@ -191,7 +256,22 @@ fn strip_controls(s: &str) -> String {
 /// # Errors
 /// When the name is empty or contains anything outside `[A-Za-z0-9._-]`.
 fn check_device_name(name: &str) -> anyhow::Result<()> {
-    if name.is_empty() || name.chars().any(|c| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))) {
+    // BOTH checks, because neither implies the other.
+    //
+    // The charset alone let a 70-character all-valid name through, which
+    // then truncated to 64 -- so the name used for the by-id lookup still
+    // differed from the one displayed, which is the whole thing this
+    // guards. That is what the survives-cleaning invariant catches.
+    //
+    // But the invariant alone is WEAKER for spaces: " " is inside the
+    // allowlist and a single space survives cleaning untouched, so "sd a"
+    // would pass. A kernel device name never contains a space. Keeping the
+    // charset check is what rejects it.
+    let charset_ok = !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+    if !charset_ok || strip_controls(name) != name {
         anyhow::bail!(
             "the target reported a block device named {name:?}, which is not a \
              kernel device name. Refusing: this name is used to match the \
@@ -471,7 +551,15 @@ pub fn infer_firmware(efi_present: bool, target_disk: &Device) -> anyhow::Result
 /// on it" is how people actually identify a drive.
 pub fn render(devices: &[Device]) -> String {
     let mut out = String::new();
-    for d in devices {
+    // SEC-L-N9. 5000 devices rendered 913,890 bytes across 25,000 lines,
+    // which scrolls the table off screen just as effectively as an
+    // oversized field did. Every rendered row stays faithful to its
+    // device, so this is confusion rather than misdirection -- but the
+    // confusion happens immediately above "type the SERIAL of the disk to
+    // erase", so it is capped and the remainder is COUNTED rather than
+    // silently dropped.
+    let shown = devices.len().min(MAX_DEVICES);
+    for d in &devices[..shown] {
         out.push_str(&format!(
             "  {:<10} {:>8}  {}\n",
             d.name,
@@ -508,11 +596,80 @@ pub fn render(devices: &[Device]) -> String {
         }
         out.push('\n');
     }
+    if devices.len() > shown {
+        out.push_str(&format!(
+            "  ... and {} more device(s) not shown. Selection is by SERIAL, \n             \x20 so a disk missing from this list can still be named -- but \n             \x20 check the machine if you did not expect this many.\n",
+            devices.len() - shown
+        ));
+    }
+
     out
 }
 
 #[cfg(test)]
 mod tests {
+    fn dev(name: &str, serial: Option<&str>) -> super::Device {
+        super::Device {
+            name: name.into(),
+            size: "8T".into(),
+            model: None,
+            serial: serial.map(|s| s.into()),
+            by_id: None,
+            children: Vec::new(),
+        }
+    }
+
+    /// SEC-L-N7. `install-inventory.json` lives in the operator's writable
+    /// bind mount, and the resume path deserializes `Device` straight out
+    /// of it. Only `by_id` was re-validated -- so a recovered record could
+    /// still render as a different disk than it is, which is SEC-C1
+    /// arriving by the other ingress.
+    ///
+    /// Mutation check: remove the `check_recovered_device` call in
+    /// `main.rs`'s recover path, or make this function return `Ok(())`.
+    #[test]
+    fn a_forged_recovered_device_is_refused() {
+        // Clean records pass.
+        super::check_recovered_device(&dev("sda", Some("WD-WCC4N5PJ"))).unwrap();
+
+        // A name that would not survive cleaning.
+        assert!(super::check_recovered_device(&dev("sda\u{1b}[2K\r", None)).is_err());
+        // Bidi in a serial -- not is_control(), and the whole of SEC-C1-R1.
+        let err = super::check_recovered_device(&dev("sda", Some("\u{202e}321AIDEM")))
+            .expect_err("a recovered serial must survive cleaning");
+        assert!(err.to_string().contains("serial"), "{err}");
+        // And in a field on a child filesystem.
+        let mut d = dev("sda", Some("S1"));
+        d.children.push(super::Filesystem {
+            name: "sda1".into(),
+            fstype: Some("ext4\u{202e}".into()),
+            mountpoint: None,
+        });
+        assert!(super::check_recovered_device(&d).is_err());
+    }
+
+    /// SEC-L-N9. 5000 devices rendered 913,890 bytes, scrolling the table
+    /// off screen as effectively as one oversized field did.
+    ///
+    /// Mutation check: remove the `MAX_DEVICES` cap and this fails.
+    #[test]
+    fn the_disk_table_caps_how_many_devices_it_renders() {
+        let many: Vec<super::Device> = (0..5000)
+            .map(|i| dev(&format!("sd{i}"), Some(&format!("S{i}"))))
+            .collect();
+        let table = super::render(&many);
+        let lines = table.lines().count();
+        assert!(lines < 200, "{lines} lines is still a flood");
+        // The remainder is REPORTED, never silently dropped -- a disk
+        // missing from the table can still be named by serial.
+        assert!(table.contains("more device(s) not shown"), "{table}");
+        assert!(table.contains(&format!("{} more", 5000 - super::MAX_DEVICES)), "{table}");
+
+        // An ordinary machine is unaffected.
+        let few = vec![dev("sda", Some("A")), dev("sdb", Some("B"))];
+        assert!(!super::render(&few).contains("not shown"));
+    }
+
     /// SEC-M3. The disk table is what the operator reads to choose which
     /// disk to erase, and every string in it comes from `lsblk` on a
     /// machine this installer does not control.
@@ -535,6 +692,27 @@ mod tests {
                 .expect_err(&format!("{bad:?} is not a kernel device name"));
             assert!(err.to_string().contains("kernel device name"), "{err}");
         }
+        // A name that is entirely valid CHARSET but does not survive
+        // cleaning, because it exceeds MAX_FIELD and truncates. The
+        // charset check alone passes it, and then the name used for the
+        // by-id lookup differs from the one displayed -- which is the
+        // whole thing this guards. Mutation check: delete the
+        // `strip_controls(name) != name` clause and this fails. It
+        // survived the first time, which is why it is here.
+        let long = "a".repeat(70);
+        let json = format!(
+            r#"{{"blockdevices":[{{"name":"{long}","type":"disk","size":"1T"}}]}}"#
+        );
+        let err = super::parse_lsblk(&json)
+            .expect_err("a name that truncates under cleaning must be refused");
+        assert!(err.to_string().contains("kernel device name"), "{err}");
+        // Exactly at the cap is fine.
+        let at_cap = "a".repeat(super::MAX_FIELD);
+        let json = format!(
+            r#"{{"blockdevices":[{{"name":"{at_cap}","type":"disk","size":"1T"}}]}}"#
+        );
+        assert_eq!(super::parse_lsblk(&json).unwrap()[0].name, at_cap);
+
         // Real names still parse.
         for good in ["sda", "nvme0n1", "vdb", "mmcblk0", "dm-0"] {
             let json = format!(
@@ -636,7 +814,9 @@ mod tests {
         let evil = Some("EVIL\u{1b}[2K\rsda  8T  My Media Disk".to_string());
         let got = super::clean(evil).unwrap();
         assert!(!got.chars().any(|c| c.is_control()), "{got:?}");
-        assert_eq!(got, "EVIL[2Ksda  8T  My Media Disk");
+        // Runs of spaces are collapsed too (SEC-L-N6), so a model can no
+        // longer imitate the table's own columns on its own row.
+        assert_eq!(got, "EVIL[2Ksda 8T My Media Disk");
 
         // A serial that would otherwise redraw itself as a decoy.
         let decoy = super::clean(Some("S\u{1b}[2K\rDECOY".into())).unwrap();
