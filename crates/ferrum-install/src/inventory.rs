@@ -140,6 +140,16 @@ pub fn parse_lsblk(json: &str) -> anyhow::Result<Vec<Device>> {
 /// the screen cannot tell which physical drive it is. `nvme-eui.` is the
 /// same problem in NVMe's spelling.
 fn is_unusable_alias(alias: &str) -> bool {
+    // An allowlist first. udev builds these from model and serial strings,
+    // and on a resume the stored value is deserialized from a file in the
+    // operator's writable bind mount -- so a shell metacharacter here is
+    // not impossible, only unusual, and it would reach a remote root shell.
+    if !alias
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || "._-:".contains(c))
+    {
+        return true;
+    }
     alias.contains("-part")
         || alias.starts_with("wwn-")
         || alias.starts_with("nvme-eui.")
@@ -442,6 +452,16 @@ lrwxrwxrwx 1 root root 13 Sep 17 10:00 nvme-Samsung_SSD_980_S5P2NG0N123456 -> ..
             m.get("nvme0n1").map(String::as_str),
             Some("nvme-Samsung_SSD_980_S5P2NG0N123456")
         );
+    }
+
+    /// These strings reach a remote root shell on the verification path.
+    #[test]
+    fn an_alias_with_shell_metacharacters_is_not_usable() {
+        let listing = "lrwxrwxrwx 1 root root 9 x x x ata-EVIL$(id) -> ../../sdz\n\
+                       lrwxrwxrwx 1 root root 9 x x x ata-OK_123 -> ../../sda\n";
+        let m = parse_by_id(listing);
+        assert!(!m.values().any(|v| v.contains("$(")), "{m:?}");
+        assert_eq!(m.get("sda").map(String::as_str), Some("ata-OK_123"));
     }
 
     #[test]

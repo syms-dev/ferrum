@@ -100,7 +100,9 @@ pub fn env(answers: &Answers) -> Vec<(String, String)> {
 pub fn env_prefix(answers: &Answers) -> String {
     env(answers)
         .into_iter()
-        .map(|(k, v)| format!("{k}='{}'", v.replace('\'', r"'\''")))
+        // The shared quoter, not a second copy of the same logic -- a
+        // duplicate defeats the single-source-of-truth this exists for.
+        .map(|(k, v)| format!("{k}={}", crate::collect::sh_quote(&v)))
         .collect::<Vec<_>>()
         .join(" ")
 }
@@ -161,7 +163,7 @@ mod tests {
             acme_email: Some("me@thesyms.ca".into()),
             sso: SsoDecision {
                 enabled: sso,
-                unauthenticated_accepted: false,
+                unauthenticated_accepted_for: Vec::new(),
                 admin_email: sso.then(|| "admin@thesyms.ca".to_string()),
             },
             apps: apps.iter().map(|s| s.to_string()).collect(),

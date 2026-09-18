@@ -34,11 +34,10 @@ pub const PUBLISH_UNAUTHENTICATED_PHRASE: &str = "publish without authentication
 #[derive(Debug, PartialEq, Eq)]
 pub struct SsoDecision {
     pub enabled: bool,
-    /// The operator passed R9 A2's typed confirmation to publish apps with
-    /// no authentication. Carried so preflight can distinguish informed
-    /// consent from an accidental default -- without it, declining is a
-    /// path the operator can enter and never complete.
-    pub unauthenticated_accepted: bool,
+    /// Exactly the apps the operator was shown when they typed R9 A2's
+    /// phrase. A bare boolean was an authorization bypass: unscoped
+    /// consent for one app silently covered any app added later.
+    pub unauthenticated_accepted_for: Vec<String>,
     /// Required by `modules/proxy/authelia.nix`, which asserts it is
     /// non-empty whenever auth is on.
     pub admin_email: Option<String>,
@@ -105,7 +104,7 @@ pub fn decide(
     let Some(domain) = base_domain.filter(|d| !d.is_empty()) else {
         return Ok(SsoDecision {
             enabled: false,
-            unauthenticated_accepted: false,
+            unauthenticated_accepted_for: Vec::new(),
             admin_email: None,
         });
     };
@@ -128,7 +127,7 @@ pub fn decide(
             );
             return Ok(SsoDecision {
                 enabled: false,
-                unauthenticated_accepted: false,
+                unauthenticated_accepted_for: Vec::new(),
                 admin_email: None,
             });
         }
@@ -152,7 +151,7 @@ pub fn decide(
         }
         return Ok(SsoDecision {
             enabled: false,
-            unauthenticated_accepted: true,
+            unauthenticated_accepted_for: open.iter().map(|a| a.to_string()).collect(),
             admin_email: None,
         });
     }
@@ -165,7 +164,7 @@ pub fn decide(
             Ok(email) => {
                 return Ok(SsoDecision {
                     enabled: true,
-                    unauthenticated_accepted: false,
+                    unauthenticated_accepted_for: Vec::new(),
                     admin_email: Some(email),
                 })
             }
@@ -193,7 +192,7 @@ mod tests {
             d,
             SsoDecision {
                 enabled: true,
-                unauthenticated_accepted: false,
+                unauthenticated_accepted_for: Vec::new(),
                 admin_email: Some("admin@thesyms.ca".into())
             },
             "an empty answer must take the safe path"
@@ -226,10 +225,11 @@ mod tests {
         let d = decide(Some("thesyms.ca"), &apps(&["sonarr", "sabnzbd"]), &mut io).unwrap();
         assert!(!d.enabled);
         assert_eq!(io.asked.len(), 2, "expected a second confirmation");
-        assert!(
-            d.unauthenticated_accepted,
-            "the consent must be RECORDED, or preflight refuses the very state \
-             the operator just typed a phrase to reach"
+        assert_eq!(
+            d.unauthenticated_accepted_for,
+            vec!["sonarr", "sabnzbd"],
+            "consent must record WHICH apps were shown, not merely that it \
+             was given -- an unscoped bit silently covers apps added later"
         );
     }
 
@@ -237,14 +237,14 @@ mod tests {
     #[test]
     fn consent_is_not_recorded_on_any_other_path() {
         let mut io = Scripted::new(&["", "a@b.co"]);
-        assert!(!decide(Some("d.com"), &apps(&["sonarr"]), &mut io).unwrap().unauthenticated_accepted);
+        assert!(decide(Some("d.com"), &apps(&["sonarr"]), &mut io).unwrap().unauthenticated_accepted_for.is_empty());
 
         let mut io = Scripted::new(&["n"]);
-        assert!(!decide(Some("d.com"), &apps(&["plex"]), &mut io).unwrap().unauthenticated_accepted,
+        assert!(decide(Some("d.com"), &apps(&["plex"]), &mut io).unwrap().unauthenticated_accepted_for.is_empty(),
                 "nothing was left open, so nothing was consented to");
 
         let mut io = Scripted::new(&[]);
-        assert!(!decide(None, &apps(&["sonarr"]), &mut io).unwrap().unauthenticated_accepted);
+        assert!(decide(None, &apps(&["sonarr"]), &mut io).unwrap().unauthenticated_accepted_for.is_empty());
     }
 
     #[test]

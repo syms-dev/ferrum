@@ -69,6 +69,8 @@ fn copy_tree(from: &Path, to: &Path) -> anyhow::Result<()> {
         // this run's progress and has no meaning on the installed machine.
         if name == "install-state.json"
             || name == "install-state.json.tmp"
+            || name == "install-inventory.json"
+            || name == "install-inventory.json.tmp"
             || name == crate::collect::KNOWN_HOSTS
         {
             continue;

@@ -517,9 +517,14 @@ target splits by what the sandbox can hold.
   `docs/INSTALL.md`'s "Recovering a failed install" claim, which that document
   itself asserts without demonstration.
 - A5. The R2 guards are **mutation-tested**: a wrong serial refuses; a
-  duplicate or empty serial refuses (R2 A8); the post-kexec re-verification
-  aborts on mismatch (R2 A9). Deleting each check must make a test go red. A
+  duplicate or empty serial refuses (R2 A8); the pre-invocation
+  re-verification aborts on mismatch (R2 A9, as revised -- there is no
+  post-kexec check to test). Deleting each check must make a test go red. A
   guard whose test passes when the guard is deleted is not a guard.
+- A5b. The **authentication backstop's position** is pinned by a test too.
+  It was skipped on resume once (SEC-CRIT-001) and every test stayed green,
+  which is the same failure mode this criterion exists to prevent, applied
+  to a call site rather than a condition.
 - A6. `ferrum-install`'s pure logic — inventory parsing, `by-id` alias
   filtering, the R2 A5 firmware truth table, host-repository rendering, state
   transitions — is unit-tested without touching a network or a disk. Follow

@@ -130,7 +130,15 @@ pub fn data_disk_checks(kept: &[&Device]) -> Vec<Check> {
             let fstype = d.children.iter().find_map(|c| c.fstype.as_deref())?;
             Some(Check {
                 what: "a kept data disk is mounted",
-                command: format!("findmnt -no FSTYPE --source {by_id}"),
+                // Quoted like every other remote interpolation. On a resume
+                // this value comes from a plain deserialize of
+                // install-inventory.json, which sits in the operator's
+                // writable bind mount -- so "it came from lsblk" is not
+                // true on every path that reaches here.
+                command: format!(
+                    "findmnt -no FSTYPE --source {}",
+                    crate::collect::sh_quote(by_id)
+                ),
                 expect: fstype.to_string(),
             })
         })
@@ -241,6 +249,7 @@ mod tests {
         let c = data_disk_checks(&[&d]);
         assert_eq!(c.len(), 1);
         assert!(c[0].command.contains("ata-DATA_1"));
+        assert!(c[0].command.contains("'/dev/disk/by-id/ata-DATA_1'"), "must be quoted: {}", c[0].command);
         assert_eq!(c[0].expect, "ext4");
     }
 

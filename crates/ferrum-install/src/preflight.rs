@@ -83,10 +83,16 @@ pub fn check_attr_matches_hostname(files: &Files, hostname: &str) -> anyhow::Res
 /// Names every app that would be published unauthenticated.
 pub fn check_published_apps_are_authenticated(
     files: &Files,
-    unauthenticated_accepted: bool,
+    accepted_for: &[String],
 ) -> anyhow::Result<()> {
     let Some(body) = files.get("settings.stage2.json") else {
-        return Ok(());
+        // Fail CLOSED. A guard whose correctness depends on the run failing
+        // later for some unrelated reason is not a guard.
+        anyhow::bail!(
+            "settings.stage2.json is missing, so it cannot be checked for \
+             apps that would be published without authentication. Refusing \
+             to continue."
+        );
     };
     let doc: serde_json::Value = serde_json::from_str(body)?;
 
@@ -117,12 +123,30 @@ pub fn check_published_apps_are_authenticated(
     if open.is_empty() {
         return Ok(());
     }
-    if unauthenticated_accepted {
-        // The operator reached this by typing R9 A2's phrase after being
-        // shown this exact list. Refusing here anyway would make that path
-        // impossible to complete, which is not a safer outcome -- it is a
-        // guard that only ever fires on people who already said no.
+    // Consent covers the exact list the operator was shown, and nothing
+    // else. Comparing sorted sets rather than trusting a boolean is what
+    // stops consent for [sonarr] silently covering a later-added
+    // qbittorrent -- the two apps that can write files anywhere.
+    let mut granted: Vec<&str> = accepted_for.iter().map(String::as_str).collect();
+    granted.sort_unstable();
+    let mut asked = open.clone();
+    asked.sort_unstable();
+    if !asked.is_empty() && granted == asked {
         return Ok(());
+    }
+    let newly_open: Vec<&str> = asked
+        .iter()
+        .copied()
+        .filter(|a| !granted.contains(a))
+        .collect();
+    if !granted.is_empty() && !newly_open.is_empty() {
+        anyhow::bail!(
+            "these apps would be published with no authentication and are NOT \
+             covered by what you confirmed: {}. You confirmed: {}. Nothing has \
+             been changed.",
+            newly_open.join(", "),
+            granted.join(", ")
+        );
     }
     anyhow::bail!(
         "these apps would be published with no authentication: {}. The operator \
@@ -174,11 +198,11 @@ pub fn tier1(
     host_dir: &Path,
     files: &Files,
     hostname: &str,
-    unauthenticated_accepted: bool,
+    accepted_for: &[String],
 ) -> anyhow::Result<Evidence> {
     render::check_no_placeholders(files)?;
     check_attr_matches_hostname(files, hostname)?;
-    check_published_apps_are_authenticated(files, unauthenticated_accepted)?;
+    check_published_apps_are_authenticated(files, accepted_for)?;
     evaluate(host_dir, hostname)?;
     Ok(Evidence {
         evaluated: true,
@@ -237,7 +261,7 @@ mod tests {
 
     #[test]
     fn authenticated_apps_pass() {
-        check_published_apps_are_authenticated(&files(published(&["sonarr"], true), "h"), false).unwrap();
+        check_published_apps_are_authenticated(&files(published(&["sonarr"], true), "h"), &[]).unwrap();
     }
 
     /// The check that must not be vacuous.
@@ -245,7 +269,7 @@ mod tests {
     fn unauthenticated_published_apps_are_refused_by_name() {
         let err = check_published_apps_are_authenticated(
             &files(published(&["sonarr", "sabnzbd"], false), "h"),
-            false,
+            &[],
         )
         .unwrap_err()
         .to_string();
@@ -256,7 +280,7 @@ mod tests {
     /// Plex and Jellyfin carry their own login.
     #[test]
     fn apps_with_their_own_login_are_not_flagged() {
-        check_published_apps_are_authenticated(&files(published(&["plex", "jellyfin"], false), "h"), false)
+        check_published_apps_are_authenticated(&files(published(&["plex", "jellyfin"], false), "h"), &[])
             .unwrap();
     }
 
@@ -264,7 +288,7 @@ mod tests {
     fn nothing_published_means_nothing_to_check() {
         let mut doc = published(&["sonarr"], false);
         doc["proxy"]["enable"] = serde_json::json!(false);
-        check_published_apps_are_authenticated(&files(doc, "h"), false).unwrap();
+        check_published_apps_are_authenticated(&files(doc, "h"), &[]).unwrap();
     }
 
     /// The reason this reads settings.stage2.json rather than the Nix
@@ -276,7 +300,7 @@ mod tests {
         stage1["apps"] = serde_json::json!({});
         let mut f = Files::new();
         f.insert("settings.stage2.json".into(), stage1.to_string());
-        check_published_apps_are_authenticated(&f, false).unwrap();
+        check_published_apps_are_authenticated(&f, &[]).unwrap();
 
         // ...whereas the real stage-2 document does fire.
         let mut f2 = Files::new();
@@ -284,11 +308,11 @@ mod tests {
             "settings.stage2.json".into(),
             published(&["sonarr"], false).to_string(),
         );
-        assert!(check_published_apps_are_authenticated(&f2, false).is_err());
+        assert!(check_published_apps_are_authenticated(&f2, &[]).is_err());
 
         // ...unless the operator passed R9 A2's typed confirmation, which
         // is the only way the decline path can ever complete an install.
-        check_published_apps_are_authenticated(&f2, true).unwrap();
+        check_published_apps_are_authenticated(&f2, &["sonarr".to_string()]).unwrap();
     }
 
     #[test]
@@ -296,8 +320,41 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut f = files(published(&[], true), "saltbox");
         f.insert("disko.nix".into(), "device = \"/dev/disk/by-id/CHANGE-ME\";".into());
-        let err = tier1(dir.path(), &f, "saltbox", false).unwrap_err().to_string();
+        let err = tier1(dir.path(), &f, "saltbox", &[]).unwrap_err().to_string();
         assert!(err.contains("CHANGE-ME"), "{err}");
+    }
+
+    /// The bypass this replaced a boolean to close: consent for one app
+    /// must not cover an app added to the settings file afterwards.
+    #[test]
+    fn consent_does_not_stretch_to_apps_it_was_not_given_for() {
+        let f = |apps: &[&str]| {
+            let mut m = Files::new();
+            m.insert("settings.stage2.json".into(), published(apps, false).to_string());
+            m
+        };
+        // Granted for sonarr, and sonarr is what is published: fine.
+        check_published_apps_are_authenticated(&f(&["sonarr"]), &["sonarr".into()]).unwrap();
+
+        // qbittorrent appears afterwards. It writes files anywhere.
+        let err = check_published_apps_are_authenticated(
+            &f(&["sonarr", "qbittorrent"]),
+            &["sonarr".into()],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("qbittorrent"), "{err}");
+        assert!(err.contains("NOT covered"), "{err}");
+        assert!(!err.contains("You confirmed: sonarr, qbittorrent"), "{err}");
+    }
+
+    /// A missing settings document must fail closed, not pass silently.
+    #[test]
+    fn an_absent_settings_document_is_refused_not_ignored() {
+        let err = check_published_apps_are_authenticated(&Files::new(), &[])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("missing"), "{err}");
     }
 
     #[test]

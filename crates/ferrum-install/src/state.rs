@@ -62,20 +62,28 @@ pub struct InstallState {
     /// so a resume can tell it is continuing the same install and not a
     /// different one against the same directory.
     pub approved_disk: String,
-    /// Whether the operator passed R9 A2's typed confirmation to publish
-    /// apps with no authentication.
+    /// What the operator consented to publish without authentication, as
+    /// the exact sorted app list they were shown when they typed R9 A2's
+    /// phrase -- **not a bare boolean**.
     ///
-    /// Recorded HERE rather than in `settings.stage2.json` on purpose:
-    /// that file is evaluated by Nix against the module schema, so an
-    /// installer-private flag in it would be an unknown option. This file
-    /// is the operator's own and never reaches the host.
+    /// A boolean here was a genuine authorization bypass, and worth
+    /// recording why. It lived in `install-state.json`, in the same
+    /// operator-writable bind mount as everything else, and it was
+    /// unscoped: consent given for `[sonarr]` in one run silently covered
+    /// `[sonarr, qbittorrent, sabnzbd]` after an edit to
+    /// `settings.stage2.json` between runs -- a file the installer itself
+    /// tells the operator is theirs. No forgery required. And forging it
+    /// was trivial anyway.
     ///
-    /// Without it the two halves contradict each other -- `sso::decide`
-    /// lets the operator decline behind a typed phrase, and preflight then
-    /// refuses exactly the state they just consented to, so the decline
-    /// path could never complete an install.
+    /// The list makes consent checkable rather than merely present: the
+    /// guard recomputes the open-app set and compares, so consent covers
+    /// only what was actually on screen.
+    ///
+    /// Still recorded here rather than in `settings.stage2.json` because
+    /// Nix evaluates that file against the module schema and an
+    /// installer-private key would be an unknown option.
     #[serde(default)]
-    pub unauthenticated_accepted: bool,
+    pub unauthenticated_accepted_for: Vec<String>,
 }
 
 fn path_in(dir: &Path) -> PathBuf {
@@ -202,7 +210,7 @@ mod tests {
             target: "root@saltbox".into(),
             hostname: "saltbox".into(),
             approved_disk: "/dev/disk/by-id/ata-OS_1".into(),
-            unauthenticated_accepted: false,
+            unauthenticated_accepted_for: Vec::new(),
         }
     }
 
@@ -333,7 +341,7 @@ mod tests {
         )
         .unwrap();
         let st = read(dir.path()).unwrap().unwrap();
-        assert!(!st.unauthenticated_accepted, "absence must never mean consent");
+        assert!(st.unauthenticated_accepted_for.is_empty(), "absence must never mean consent");
     }
 
     #[test]
