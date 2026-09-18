@@ -645,7 +645,7 @@ lrwxrwxrwx 1 root root 13 Sep 17 10:00 nvme-Samsung_SSD_980_S5P2NG0N123456 -> ..
             serial: None, by_id: None, children: vec![],
         }];
         let out = render(&d);
-        assert!(out.contains("(none reported)"), "{out}");
+        assert!(out.contains("cannot be selected"), "{out}");
         assert!(out.contains("(no stable /dev/disk/by-id path)"), "{out}");
     }
 
