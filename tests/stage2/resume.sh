@@ -84,7 +84,13 @@ step "R7 A1d: a resume does NOT ask for the serial again"
 # No serial in the answers this time. If the installer asks, it will read
 # EOF and fail -- which is exactly what must not happen.
 { echo ""; } > "$WORK/answers2"
-timeout 3600 "$INSTALLER" root@127.0.0.1 --ssh-port 2222 \
+# 9000s, not 3600. The resumed installer re-runs nixos-anywhere in full
+# and then applies stage 2, which is the same work the non-resume job needs
+# 85+ minutes for -- so a 60-minute cap failed a run whose guest had
+# already booted successfully. Kept well inside the job's own 180-minute
+# budget so THIS timeout is what fires on a genuine hang, with a
+# diagnosable message, rather than the job cap killing the log.
+timeout 9000 "$INSTALLER" root@127.0.0.1 --ssh-port 2222 \
   --host-dir "$WORK/host" --ssh-dir "$WORK/ssh" < "$WORK/answers2" \
   > "$WORK/install2.log" 2>&1
 RC=$?
