@@ -248,7 +248,7 @@ fn disko(os_disk: &str, firmware: Firmware, serial: Option<&str>) -> String {
     )
 }
 
-fn flake(hostname: &str, ferrum_rev: &str, ssh_keys: &[String], firmware: Firmware, os_disk: &str) -> String {
+fn flake(hostname: &str, ferrum_rev: &str, ssh_keys: &[String], firmware: Firmware) -> String {
     // Escaped like every other value reaching generated Nix. On the
     // interactive path `validate_hostname` has already constrained this to
     // [a-z0-9-], but on a resume it is scraped back out of the operator's
@@ -263,12 +263,16 @@ fn flake(hostname: &str, ferrum_rev: &str, ssh_keys: &[String], firmware: Firmwa
         .collect::<Vec<_>>()
         .join("\n");
 
-    let os_disk = nix_str(os_disk);
     let bootloader = match firmware {
         Firmware::Uefi => "            boot.loader.systemd-boot.enable = true;\n            boot.loader.efi.canTouchEfiVariables = true;".to_string(),
-        Firmware::Bios => format!(
-            "            boot.loader.grub = {{\n              enable = true;\n              devices = [ \"{os_disk}\" ];\n              efiSupport = false;\n            }};"
-        ),
+        // NOTE the absence of `devices`. disko sets
+        // `boot.loader.grub.devices = [ config.device ]` itself whenever it
+        // creates the EF02 bios-boot partition (its lib/types/gpt.nix), so
+        // naming the same disk here puts it in the list twice and the host
+        // fails to evaluate with "You cannot have duplicated devices in
+        // mirroredBoots". Found by the stage-2 CI job; the host template's
+        // own comment suggests doing it, and has the same defect.
+        Firmware::Bios => "            boot.loader.grub = {\n              enable = true;\n              efiSupport = false;\n              # devices is set by disko from disko.nix's own `device`.\n            };".to_string(),
     };
 
     format!(
@@ -461,7 +465,7 @@ pub fn render(
     );
     files.insert(
         "flake.nix".into(),
-        flake(&answers.hostname, ferrum_rev, ssh_keys, approved.firmware, os_disk),
+        flake(&answers.hostname, ferrum_rev, ssh_keys, approved.firmware),
     );
     files.insert(
         "settings.json".into(),
@@ -923,9 +927,12 @@ mod tests {
         assert!(f["disko.nix"].contains("EF02"), "{}", f["disko.nix"]);
         assert!(!f["disko.nix"].contains("EF00"));
         assert!(f["flake.nix"].contains("boot.loader.grub"));
+        // disko already sets grub.devices from disko.nix's `device`.
+        // Setting it here too duplicates the entry and the host refuses to
+        // evaluate: "You cannot have duplicated devices in mirroredBoots".
         assert!(
-            f["flake.nix"].contains("devices = [ \"/dev/disk/by-id/ata-OS_1\" ]"),
-            "grub must be installed to the disk being erased:\n{}",
+            !f["flake.nix"].contains("devices = ["),
+            "grub.devices must be left to disko:\n{}",
             f["flake.nix"]
         );
         assert!(!f["flake.nix"].contains("systemd-boot"));
