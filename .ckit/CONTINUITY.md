@@ -11,77 +11,53 @@ S13 deferral section). Story map: `.ckit/state/phase-1-6a-stories.md`.
 `crates/ferrum-install/` — 14 modules. Invariants are documented in the commit messages and
 module headers; the load-bearing ones are restated where the reviews touch them below.
 
-## BOTH REVIEWS ARE IN. BOTH BLOCK. Do not push or close gates yet.
+## Review fixes COMMITTED as `fc27b86` (local, NOT pushed)
+Both reviews of `9e66264..9f12af8` blocked. **Every Critical, High and Medium is now fixed.**
 
-### code-review: CHANGES REQUESTED — Critical 1 · High 3 · Medium 1 · Low 1
-- **CRITICAL — FIXED locally, uncommitted.** `hardware-configuration.nix` never reached
-  `/etc/ferrum`. `stage_extra_files` snapshots the repo at `main.rs:147`; nixos-anywhere runs at
-  `:153` and only THEN does `--generate-hardware-config` write the file — so the transferred tree
-  structurally cannot contain it, while the transferred `flake.nix` imports it unconditionally.
-  EVERY later apply fails, **including stage 2 in the same run**. **I verified this myself.**
-  Fixed via `install::hardware_config_commands()` + `main::transfer_hardware_config()` after
-  `wait_for_ssh`, committed on the target AND back into /host. Test asserts the staged tree
-  CANNOT contain it, so the step is never mistaken for redundant.
-- **HIGH still open:** (a) R2 A9 recheck runs PRE-kexec while docstrings claim post-kexec.
-  (b) Resume from `PreflightPassed` re-prompts every answer but never re-runs `generate()`, so
-  in-memory answers diverge from disk. (c) R9 A4 decline-path inversion unimplemented —
-  `auth_checks` returns EMPTY when SSO is off, so declining verifies nothing.
-- **MEDIUM:** R4 A5 — local `/host/settings.json` never swapped post-install; no
-  `settings.stage1.json`. **LOW:** README not updated.
-- **CLEAN:** the five-variable table (all 14 `--set-default` enumerated; exactly 5 covered), no
-  unwrap/expect outside tests, no dead code.
+- **code-review CRITICAL** `hardware-configuration.nix` never reached `/etc/ferrum`
+  (staged BEFORE nixos-anywhere writes it; flake imports it unconditionally => every apply fails,
+  stage 2 included). Now transferred+committed after install. Test asserts the staged tree CANNOT
+  contain it.
+- **SEC-CRIT-001** resume skipped the auth backstop AND `from_stage2` re-read settings off disk
+  with zero validation. Now the auth check runs on EVERY invocation regardless of phase, and every
+  recovered field is re-validated. *"Don't re-ask" had become "don't re-check."*
+- **SEC-CRIT-002 / HIGH(a)** the pre-disko re-verification is inert (runs pre-kexec). Found by
+  BOTH reviewers. `--phases` exists but a second invocation is undocumented + untested, so rather
+  than ship unverifiable machinery the code, docstrings and **spec R2 A9** now state exactly what
+  is and is not checked. **RESIDUAL RISK for the owner to accept or close:** a post-kexec
+  re-enumeration is not caught; bounded because only udev `model_serial` aliases are accepted.
+- **SEC-MED-001** real domain allowlist + shared `collect::sh_quote` at the remote sinks.
+- **SEC-MED-002** `StrictHostKeyChecking=accept-new` + `UserKnownHostsFile=<host_dir>/known_hosts`
+  (persists across `--rm`; excluded from copy_tree). **This was likely breaking the shipped Docker
+  path outright** — BatchMode=yes REFUSES an unknown host. The VM test hid it by ssh-keyscan.
+- **SEC-MED-003** token in a `Secret` newtype, `Debug` prints `<redacted>`, asserted.
+- **SEC-LOW-001** copy_tree refuses symlinks · **002** token read with echo off via `stty` ·
+  **003** cargo-audit CI job · **004/HIGH(c)** SSO-decline could NEVER complete; consent now
+  recorded in install-state.json (NOT settings.json — Nix schema-validates that) and honoured,
+  and R9 A4's inverted assertion implemented.
+- **MEDIUM (R4 A5)** local settings.json swapped to stage-2 post-install, stage1 kept.
+  **LOW** README documents the installer + put-secret.
+- **Deleted `tests/stage2/`** — it stopped before the install and would have been a green check
+  proving nothing.
 
-### security-reviewer: BLOCKED — Critical 2 · Medium 3 · Low 4 · Cosmetic 1
-- **SEC-CRIT-001 — resume skips the auth backstop.** Any resume at `PreflightPassed` or later
-  takes the `else` branch and **never re-runs `preflight::tier1()`**, so
-  `check_published_apps_are_authenticated` never fires again; meanwhile `recover_plan`/
-  `from_stage2` re-read `settings.stage2.json` fresh off disk with **zero re-validation** (no
-  `validate_domain`, no `validate_email`, no CATALOG_APPS membership). Interrupted run + plain
-  resume + the operator's own edit to a file we told them is theirs = an unauthenticated admin
-  app published on a real cert. **"Don't re-ask" silently became "don't re-check."**
-- **SEC-CRIT-002** = the same defect as code-review's HIGH (a): the documented pre-disko
-  re-verification is inert. Two independent reviewers found it. Either wire a real pre-disko hook
-  via `--extra-files`, or rewrite spec R2 A9 + the docstrings to admit it is pre-kexec only.
-- **SEC-MED-001 shell injection:** `base_domain` is interpolated UNESCAPED into
-  `format!("curl ... https://{app}.{domain}/")` in `verify.rs:78,85` and run as **root on the
-  target**. `validate_domain` is a typo-catcher, not an allowlist — it permits `` ` $ ; | & ' " ``.
-  Fix: real allowlist `[a-z0-9.-]`, plus lift `stage2::env_prefix`'s `'\''` escaping into a shared
-  `sh_quote()` used at EVERY remote interpolation site.
-- **SEC-MED-002 host keys:** no `StrictHostKeyChecking` policy + no HOME/known_hosts in the image.
-  Measured on OpenSSH 10.3p1: `BatchMode=yes` **refuses** an unknown host — so **the shipped
-  Docker path may fail on first contact every time**. The VM test hides it by pre-seeding via
-  `ssh-keyscan`, which the real path never does. Fix: `-o StrictHostKeyChecking=accept-new -o
-  UserKnownHostsFile=<host_dir>/known_hosts` (and exclude it from `copy_tree`), plus a test that
-  connects WITHOUT pre-seeding.
-- **SEC-MED-003:** `Answers` derives `Debug` unredacted with the Cloudflare token in it. No active
-  leak today; one `dbg!` away from one.
-- **SEC-LOW-001** `copy_tree` follows symlinks on the copy (plant `x -> /ssh/id_ed25519`).
-  **SEC-LOW-002** the token is echoed to the terminal — no `ask_secret`/ECHO suppression.
-  **SEC-LOW-003** no `cargo audit` in CI. **SEC-LOW-004 (functional, important):** the SSO-decline
-  path can NEVER complete — `sso::decide` lets you decline, then `preflight` unconditionally
-  bails on exactly that state. Two independently-tested paths that contradict each other.
+## VERIFIED for `fc27b86` (real output)
+`cargo test --workspace`: **8/8 binaries ok, 0 failed, 351 total** (was 342).
+`cargo clippy -p ferrum-install --all-targets -- -D warnings`: **exit 0**.
+Workspace-wide clippy still shows exactly the **3 pre-existing** `assert_eq!`-literal-bool errors
+in ferrum-apply — standing policy says note, never repair.
+**`nix build .#checks.aarch64-linux.workspace-tests` GREEN** (351 in the sandbox) and
+**`.#packages.aarch64-linux.ferrum-install` GREEN** (176). Ran because cargo green does NOT prove
+the Nix derivations build — that is what broke CI on the first push.
 
 ## Next Steps (in order)
-1. Fix the 2 security Criticals + 3 code-review Highs. SEC-CRIT-002 and code-review HIGH(a) are
-   ONE defect. SEC-CRIT-001 and code-review HIGH(b) are ONE root cause: resume trusts disk.
-2. Fix SEC-MED-001/002/003 (all small; 002 may be breaking the shipped path outright).
-3. Re-run `cargo test --workspace` AND **`nix build .#checks.<sys>.workspace-tests`** and
-   `.#ferrum-install` — cargo green does NOT prove the Nix derivations build (see the harness
-   lesson below).
-4. Re-dispatch owasp-reviewer + policy-validator on the affected files only (security cycle 1 of 2
-   used). Then close `code-review`, then `build-green` — the ledger enforces that order.
-5. `tests/stage2/` is scaffolding that stops before the install. **Finish it or delete it** — as
-   is it would be a green check proving nothing.
-
-## VERIFIED just now (real output)
-`cargo test --workspace` (rust:1-bookworm + btrfs-progs + git, examples/ copied in):
-**8 binaries all `test result: ok`, 0 failed, 342 total.**
-`cargo clippy -p ferrum-install --all-targets -- -D warnings` -> **exit 0**.
-**NOT re-run since these edits:** `nix build .#checks.<sys>.workspace-tests`, `.#ferrum-install`.
-
-## Uncommitted right now
-`crates/ferrum-install/src/{collect,install,main,preconditions}.rs` (--ssh-port + the Critical
-fix) and `tests/stage2/`. Nothing staged, nothing pushed. Last pushed commit: `9f12af8` (CI green).
+1. **Push `fc27b86`** (needs the owner's per-push approval) and watch CI + VM tests.
+2. **Owner decision needed:** accept or close SEC-CRIT-002's residual (post-kexec re-enumeration
+   not caught). Critical/High are never waivable, so if it must be CLOSED the work is a
+   `--phases`-split spike; if the corrected claims are sufficient, it is now a documented
+   limitation rather than a false claim, and the reviewer offered that as an acceptable outcome.
+3. Re-dispatch `owasp-reviewer` + `policy-validator` on the affected files only (security cycle
+   1 of 2 used). Then close `code-review`, then `build-green` — the ledger enforces that order.
+4. S13 still the one unimplemented story; its requirements are written into the spec.
 
 
 ## Blind-spot patterns (full text in the spec's revision logs)

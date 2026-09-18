@@ -106,7 +106,8 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
     // The disk gate is re-run only when nothing has been written yet.
     // Past `Installing` the named disk is already gone, so re-confirming
     // protects nothing and only trains the operator to retype a serial.
-    let (mut answers, approved) = if state::needs_disk_confirmation(&resume) {
+    let asked_fresh = state::needs_disk_confirmation(&resume);
+    let (mut answers, approved) = if asked_fresh {
         plan_install(&pre)?
     } else {
         recover_plan(&pre)?
@@ -117,13 +118,28 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
         target: cli.target.clone(),
         hostname: answers.hostname.clone(),
         approved_disk: approved.device.by_id.clone().unwrap_or_default(),
-        unauthenticated_accepted: prior
-            .as_ref()
-            .map(|p| p.unauthenticated_accepted)
-            .unwrap_or(answers.sso.unauthenticated_accepted),
+        // Consent from THIS run wins whenever this run actually asked.
+        // Preferring the stored value unconditionally -- as the first
+        // version did -- meant a resume that re-ran the interactive flow
+        // discarded the operator's live answer in favour of a boolean
+        // sitting in a writable file. The stored value is reused only on
+        // the path that deliberately does not re-prompt.
+        unauthenticated_accepted_for: if asked_fresh {
+            answers.sso.unauthenticated_accepted_for.clone()
+        } else {
+            prior
+                .as_ref()
+                .map(|p| p.unauthenticated_accepted_for.clone())
+                .unwrap_or_default()
+        },
     };
 
-    if reached.is_none() {
+    // Regenerate whenever this run collected answers -- not only on a
+    // fresh run. A resume before the wipe re-runs the whole interactive
+    // flow, so skipping regeneration installed a host from the PREVIOUS
+    // run's settings while reporting the new ones. Both phases here are
+    // pre-destructive, so re-rendering costs nothing.
+    if asked_fresh {
         let files = generate(&pre, cli, &answers, &approved)?;
         println!("\ngenerated host repository in {}:", pre.host_dir.display());
         for f in files.keys() {
@@ -143,11 +159,11 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
     // stepped around by the most ordinary sequence there is: get
     // interrupted, run the same command again.
     let files = read_generated(&pre.host_dir)?;
-    preflight::check_published_apps_are_authenticated(&files, st.unauthenticated_accepted)?;
+    preflight::check_published_apps_are_authenticated(&files, &st.unauthenticated_accepted_for)?;
 
     let evidence = if reached.unwrap_or(state::Phase::Generated) < state::Phase::PreflightPassed {
         println!("\npreflight: evaluating the generated configuration ...");
-        let e = preflight::tier1(&pre.host_dir, &files, &answers.hostname, st.unauthenticated_accepted)?;
+        let e = preflight::tier1(&pre.host_dir, &files, &answers.hostname, &st.unauthenticated_accepted_for)?;
         st.phase = state::Phase::PreflightPassed;
         state::write(&pre.host_dir, &st)?;
         e
@@ -618,6 +634,33 @@ mod tests {
         ]);
         assert_eq!(cli.host_dir, std::path::PathBuf::from("/tmp/h"));
         assert_eq!(cli.ssh_dir, std::path::PathBuf::from("/tmp/s"));
+    }
+
+    /// SEC-CRIT-001 was "the backstop is skipped on resume", and it was
+    /// reintroducible precisely because no test pinned the call. This reads
+    /// the source of `run()` and asserts the call happens before every
+    /// destructive branch -- crude, but it fails if someone deletes or
+    /// moves it, which is the property that was missing.
+    #[test]
+    fn the_authentication_backstop_runs_before_anything_destructive() {
+        let src = include_str!("main.rs");
+        let body = &src[src.find("fn run(cli: &Cli)").expect("run() exists")..];
+
+        let backstop = body
+            .find("check_published_apps_are_authenticated")
+            .expect("the authentication backstop call has been REMOVED from run()");
+        for destructive in ["stage_extra_files", "Phase::Installing", "nixos-anywhere"] {
+            let at = body.find(destructive).unwrap_or(usize::MAX);
+            assert!(
+                backstop < at,
+                "the backstop must run before {destructive:?}; SEC-CRIT-001 was \
+                 exactly this call being skipped"
+            );
+        }
+        // ...and it must not be inside the phase-gated block, or a resume
+        // skips it again.
+        let gated = body.find("< state::Phase::PreflightPassed").unwrap_or(usize::MAX);
+        assert!(backstop < gated, "the backstop must not be phase-gated");
     }
 
     #[test]

@@ -326,7 +326,7 @@ pub fn from_stage2(body: &str, hostname: &str) -> anyhow::Result<Answers> {
             // Never recovered from disk: consent is a fact about what the
             // operator was shown and typed, not a property of a file that
             // anything with write access could add.
-            unauthenticated_accepted: false,
+            unauthenticated_accepted_for: Vec::new(),
             admin_email,
         },
         apps,
