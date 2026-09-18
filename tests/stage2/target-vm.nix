@@ -9,7 +9,11 @@
 # job needs what the test sandbox cannot give it: a network. Stage 2 exists
 # precisely so each app's `sopsFile` is created at runtime ON the guest,
 # which means the stage-2 closure cannot be pre-built and injected the way
-# tests/install-from-nothing.nix injects stage 1's.
+# tests/daemon-apply-end-to-end.nix injects its own (`additionalPaths` +
+# `builtins.storePath`, that file's lines 32-53). Note it is NOT
+# tests/install-from-nothing.nix that does the injecting -- that test
+# injects nothing and performs no install at all; an earlier version of
+# this comment said otherwise.
 { nixpkgs, system, sshPublicKey }:
 (import "${nixpkgs}/nixos/lib/eval-config.nix" {
   inherit system;
