@@ -562,6 +562,42 @@
           installPhase = "mkdir -p $out";
         };
 
+        # ferrum-install had NO lint gate at all -- the three derivations
+        # around it scope to ferrum-apply, ferrum-reconcile and ferrumd via
+        # buildAndTestSubdir, and none covered it. That made the one crate
+        # holding every Critical in this feature the one crate nothing
+        # linted, and two real clippy errors had accumulated unnoticed.
+        #
+        # Unlike its siblings this cannot use `src = cleanSource ../crates`:
+        # render.rs include_str!s examples/hosts/template/disko.nix and
+        # flake.lock, both of which escape crates/. Same root and filter as
+        # workspace-tests above -- keep the three in step.
+        #
+        # --all-targets, so test code is linted too. One of the two errors
+        # this found was in a test.
+        clippy-ferrum-install = pkgs.rustPlatform.buildRustPackage {
+          pname = "ferrum-install-clippy";
+          version = "0.1.0";
+          src = lib.cleanSourceWith {
+            src = ../../..;
+            filter = path: type:
+              let rel = lib.removePrefix (toString ../../.. + "/") (toString path); in
+              lib.hasPrefix "crates" rel || lib.hasPrefix "examples" rel
+              || rel == "flake.lock"
+              || (type == "directory" && (rel == "crates" || rel == "examples"));
+          };
+          cargoLock.lockFile = ../../../crates/Cargo.lock;
+          cargoRoot = "crates";
+          buildAndTestSubdir = "crates";
+          nativeBuildInputs = [ pkgs.clippy ];
+          buildPhase = "true";
+          # cd explicitly: the custom buildPhase above skips the step that
+          # would otherwise honour cargoRoot, so cargo runs at the source
+          # root where there is no Cargo.toml.
+          checkPhase = "cd crates && cargo clippy --offline -p ferrum-install --all-targets -- -D warnings";
+          installPhase = "mkdir -p $out";
+        };
+
         cargo-test-ferrum-reconcile = self'.packages.ferrum-reconcile;
 
         clippy-ferrum-reconcile = pkgs.rustPlatform.buildRustPackage {

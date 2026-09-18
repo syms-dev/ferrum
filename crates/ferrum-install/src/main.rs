@@ -444,7 +444,7 @@ fn plan_install(
 fn recover_plan(
     pre: &preconditions::Preconditions,
 ) -> anyhow::Result<(answers::Answers, confirm::Approved)> {
-    let approved: confirm::Approved = serde_json::from_str(&std::fs::read_to_string(
+    let mut approved: confirm::Approved = serde_json::from_str(&std::fs::read_to_string(
         pre.host_dir.join("install-inventory.json"),
     )?)?;
 
@@ -453,7 +453,7 @@ fn recover_plan(
     // file is as writable as anything else in host_dir -- the by-id path
     // flows on into generated Nix and into disko's own unquoted device
     // loop, so "it came from lsblk" has to be made true on this path too.
-    for device in std::iter::once(&approved.device).chain(approved.all_devices.iter()) {
+    for device in std::iter::once(&mut approved.device).chain(approved.all_devices.iter_mut()) {
         if let Some(by_id) = device.by_id.as_deref() {
             inventory::validate_by_id_path(by_id)?;
         }
@@ -461,6 +461,8 @@ fn recover_plan(
         // Nix. Only by_id was re-checked here, so a recovered record could
         // still display as a different disk than it is -- the same
         // property SEC-C1 was about, arriving by the other ingress.
+        // Refuses on name/serial, normalises the display-only fields; see
+        // that function for why the two are treated differently.
         inventory::check_recovered_device(device)?;
     }
 
