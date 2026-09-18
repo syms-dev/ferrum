@@ -126,3 +126,64 @@ jobs:
             echo "::error::running with no target should have failed"
             exit 1
           fi
+
+      # The step above exits before the installer opens a single SSH
+      # connection, which is why it did not catch the defect that made this
+      # step necessary: the image shipped with no /etc/passwd, OpenSSH
+      # refuses to start when it cannot resolve its own uid, and EVERY
+      # target interaction failed with "No user exists for uid 0". The
+      # image could not collect an inventory, let alone install. 394 unit
+      # tests and six security review cycles all passed with it broken,
+      # because every one of them runs the binary OUTSIDE the image.
+      #
+      # So this drives the real image against a real SSH server and
+      # asserts it gets far enough to have actually talked to it.
+      - name: the image can reach a target over SSH
+        run: |
+          set -euo pipefail
+          work="$(mktemp -d)"
+          mkdir -p "$work/ssh" "$work/host"
+          ssh-keygen -t ed25519 -N "" -f "$work/ssh/id_ed25519" -q
+
+          # A stand-in target: sshd with our key. It is NOT installable --
+          # it has no real disks -- and it does not need to be. What is
+          # being proved is that the image can authenticate, run a command
+          # and parse what comes back.
+          cat > "$work/Dockerfile" <<'DOCKERFILE'
+          FROM debian:bookworm-slim
+          RUN apt-get update -qq && apt-get install -y -qq openssh-server util-linux >/dev/null            && mkdir -p /run/sshd /root/.ssh
+          COPY id_ed25519.pub /root/.ssh/authorized_keys
+          RUN chmod 700 /root/.ssh && chmod 600 /root/.ssh/authorized_keys            && sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config            && ssh-keygen -A
+          CMD ["/usr/sbin/sshd","-D","-e"]
+          DOCKERFILE
+          cp "$work/ssh/id_ed25519.pub" "$work/"
+          docker build -q -t ferrum-fake-target "$work" > /dev/null
+          docker network create ferrum-ci-net > /dev/null
+          docker run -d --name ferrum-ci-target --network ferrum-ci-net ferrum-fake-target > /dev/null
+          sleep 5
+
+          set +e
+          out="$(printf 'ci-host\n\n\n' | docker run --rm -i --network ferrum-ci-net \
+                   -v "$work/host:/host" -v "$work/ssh:/ssh:ro" \
+                   ferrum-install:latest root@ferrum-ci-target 2>&1)"
+          set -e
+          echo "$out"
+
+          # The assertion that matters. "No user exists for uid 0" is the
+          # exact symptom of the shipped defect; anything mentioning a
+          # failure to RUN ssh means the image is broken regardless of the
+          # target.
+          if echo "$out" | grep -q "No user exists for uid"; then
+            echo "::error::the image cannot run ssh -- /etc/passwd is missing from it"
+            exit 1
+          fi
+
+          # Positive proof it really reached the target and read it, rather
+          # than failing early for some unrelated reason.
+          echo "$out" | grep -q "collecting inventory" || {
+            echo "::error::the image never got as far as collecting an inventory"; exit 1; }
+          echo "$out" | grep -q "architecture: x86_64" || {
+            echo "::error::the image did not read the target's architecture over SSH"; exit 1; }
+
+          docker rm -f ferrum-ci-target > /dev/null
+          docker network rm ferrum-ci-net > /dev/null
