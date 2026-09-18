@@ -158,12 +158,14 @@ pub fn confirm(
 /// Re-checks that the approved `by-id` path still resolves to a device
 /// bearing the approved serial.
 ///
-/// **This runs before `nixos-anywhere` is invoked, not inside the kexec'd
-/// installer.** See the module header: spec R2 A9 asks for the latter and
-/// there is no hook to hang it on. What this catches is a device that
-/// changed between the inventory being printed and the serial being typed
-/// -- a real window, since that is minutes of human reading, but not the
-/// post-kexec re-enumeration R2 A9 names.
+/// **This is the pre-invocation half of R2 A9**, and it catches a device
+/// that changed between the inventory being printed and the serial being
+/// typed -- minutes of human reading, and a real window.
+///
+/// The post-kexec half is a separate mechanism in a separate place:
+/// `render::precreate_serial_guard` generates it into the host's
+/// `disko.nix` as a disko `preCreateHook`, because `nixos-anywhere`
+/// exposes no hook back into this code. See this module's header.
 ///
 /// # Errors
 /// Any mismatch, which must abort before disko touches anything.

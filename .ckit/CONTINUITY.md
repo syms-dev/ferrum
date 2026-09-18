@@ -46,41 +46,51 @@ each redden exactly their own test; restored 183 pass.
 `ureq` <- `ferrum-reconcile`, which only ever calls `http://` on loopback (`main.rs:53`) and
 declares no TLS feature — so it looks unreachable, but it is a real advisory in the tree.
 
-## Owner said: "keep going until it's fixed and no more medium or above"
-That authorizes (a) the rustls bump despite the dependency hard stop, (b) FIXING the SEC-CRIT-002
-residual rather than accepting it, and (c) security cycles past the 2-cycle budget.
+## Owner bar: "keep going until it's fixed and no more medium or above"
+Authorizes the rustls bump despite the dependency hard stop, FIXING the SEC-CRIT-002 residual
+rather than accepting it, and security cycles past the 2-cycle budget.
 
-## `d5e48aa` — both remaining Mediums CLOSED
-- **R2 A9 is now REAL.** disko exposes **`preCreateHook`** ("shell commands to run before
-  create"), which runs **inside the kexec'd installer immediately before partitioning** — exactly
-  the seam that was missing, because nixos-anywhere does kexec+disko+install+reboot as one opaque
-  process. So the guard is GENERATED INTO the host's `disko.nix` (`render::precreate_serial_guard`)
-  rather than run from the installer. Re-reads the serial of the approved by-id path, aborts on
-  mismatch, **fails closed** (unreadable serial = mismatch).
-  **VERIFIED:** `preCreateHook` is real (`disko/lib/default.nix` `mkSubType`) and a real
-  `nixosSystem` eval ACCEPTS it at `disko.devices.disk.main.preCreateHook` and round-trips the
-  text. **NOT VERIFIED:** that it executes — building the x86_64 disko script on this aarch64
-  machine fails for unrelated reasons. Do NOT claim it is proven. S13 is what would prove it.
-- **RUSTSEC-2026-0285** rustls 0.23.43 -> 0.23.45. Lockfile delta is exactly one package, patch
-  version, 2 lines, no package added. `cargo audit`: 277 deps scanned, **no vulnerabilities**.
+## `1b02cb7` — cycle 3 found a CRITICAL IN CYCLE 3's OWN FIX
+`precreate_serial_guard` shell-quoted the serial and stopped. `shell_single_quote` emits `'\''`
+for an apostrophe and **`''` terminates a Nix INDENTED string** — so a serial with an apostrophe
+(plausible on real hardware) broke the generated disko.nix, and a crafted one injected Nix that
+`nix build --dry-run` evaluates on the OPERATOR's machine and nixos-anywhere builds as root.
+Every other device string in that same commit already went through `nix_str`; the serial was the
+one omission, in the newest function — and the test beside it asserted only shell-quoting while
+exercising a benign value.
+**Fix:** emit the hook as a **double-quoted** Nix string and pass the whole rendered script
+through `nix_str`. Composition order matters and is correct: shell-quote first, then Nix-escape
+everything, because Nix un-escapes at eval time producing exactly the intended shell text.
+**PROVEN, not reasoned:** reproduced the break with `nix-instantiate`, then generated a real
+disko.nix with serial `abc'def"x${builtins.currentSystem}` and confirmed `nix-instantiate --parse`
+accepts it (`${` -> `\${`, `"` -> `\"`).
 
-## VERIFIED for `d5e48aa` (real output)
-`cargo test --workspace` 8/8 binaries ok, 0 failed · `clippy -p ferrum-install --all-targets
--D warnings` 0 errors · `cargo audit` clean · `nix build .#checks.aarch64-linux.workspace-tests`
-8/8 ok · `.#packages.aarch64-linux.ferrum-install` built.
+**THREE CYCLES, THREE TIMES A FIX CARRIED A DEFECT.** cycle1 fix -> cycle2 Critical (consent
+bool) -> cycle3 Critical (serial escaping). The pattern: each fix was written and tested by the
+same reasoning that produced the gap, so its test agreed with it. Adversarial input tests and an
+EMPIRICAL check (run the parser, don't read the grammar) are what actually caught these.
+
+## Docs reconciled in the same commit
+`confirm.rs` header, `main.rs::recheck` comment and spec R2 A9 all still claimed there was no
+post-kexec hook, contradicting the `preCreateHook` added one commit earlier. R2 A9 now describes
+BOTH checks, records the double-escaping requirement and why, and states plainly the hook is
+**still unproven at runtime** — which makes S13 load-bearing, not optional.
+
+## VERIFIED for `1b02cb7` (real output)
+`cargo test --workspace` 8/8 binaries ok · `clippy -p ferrum-install --all-targets -D warnings`
+0 errors · `nix build .#checks.aarch64-linux.workspace-tests` and `.#packages...ferrum-install`
+both built · `nix-instantiate --parse` on an adversarially-generated disko.nix: PARSES CLEANLY.
 
 ## In flight
-**Security cycle 3** dispatched against `fc27b86..d5e48aa`, explicitly authorized by the owner's
-"no medium or above" instruction. Cycle 2 found a Critical inside cycle 1's fixes, so the brief
-tells it to hunt hardest in the new code — especially whether a crafted `install-state.json` can
-still grant consent for apps the operator never saw.
+**Cycle 4** (owasp-reviewer, injection class only) against `d5e48aa..1b02cb7`. Asked specifically
+whether the TWO escaping layers compose correctly for backslashes, whether `nix_str` is complete
+for double-quoted Nix (`\r`/`\t`), and for an explicit statement of zero-Medium-or-above.
 
 ## Next Steps
-1. Act on cycle 3. Repeat until zero Medium-and-above, per the owner's bar.
-2. Push `646a365`+`d5e48aa` (per-push approval) and watch CI — `cargo-audit` should now pass.
-3. Then `code-review` gate, then `build-green` — the ledger enforces that order.
-4. S13 is the one unimplemented story AND the only thing that can prove the preCreateHook guard
-   actually executes. That link is now load-bearing, not just nice-to-have.
+1. Act on cycle 4; repeat until zero Medium-and-above.
+2. Push `646a365` `d5e48aa` `1b02cb7` (per-push approval) — `cargo-audit` should now pass.
+3. Then `code-review` gate, then `build-green` (ledger enforces that order).
+4. S13 — the only thing that can prove the preCreateHook actually executes.
 
 
 ## Blind-spot patterns (full text in the spec's revision logs)
