@@ -81,7 +81,15 @@ jobs:
   # other. Both are slow -- a real QEMU guest builds its own closure.
   stage2:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    # 90 was too small and killed real, healthy runs. Measured on run
+    # 35347617925: `stage2` was still building past 85 minutes and would
+    # have hit the cap, and `stage2-resume` failed at exactly 60 minutes on
+    # its own inner `timeout` with the guest already booted -- both budget
+    # exhaustion, neither a defect. A from-scratch NixOS install plus a
+    # stage-2 rebuild with sonarr and sabnzbd, against a routinely
+    # throttled CI cache, is simply an hour-plus of work; the resume does
+    # all of it again after the kill.
+    timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
       - uses: DeterminateSystems/nix-installer-action@main
@@ -93,7 +101,15 @@ jobs:
 
   stage2-resume:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    # 90 was too small and killed real, healthy runs. Measured on run
+    # 35347617925: `stage2` was still building past 85 minutes and would
+    # have hit the cap, and `stage2-resume` failed at exactly 60 minutes on
+    # its own inner `timeout` with the guest already booted -- both budget
+    # exhaustion, neither a defect. A from-scratch NixOS install plus a
+    # stage-2 rebuild with sonarr and sabnzbd, against a routinely
+    # throttled CI cache, is simply an hour-plus of work; the resume does
+    # all of it again after the kill.
+    timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
       - uses: DeterminateSystems/nix-installer-action@main

@@ -25,8 +25,27 @@ pub enum Phase {
     PreflightPassed,
     /// `nixos-anywhere` has been STARTED. The disk may already be gone.
     Installing,
-    /// `nixos-anywhere` returned successfully.
+    /// `nixos-anywhere` returned successfully. The disk is written and the
+    /// host will boot, but NOTHING after that has happened yet -- in
+    /// particular the real `hardware-configuration.nix` has not been
+    /// transferred. Do not read this as "finished".
     Installed,
+    /// The host came back on SSH and its real `hardware-configuration.nix`
+    /// is in place.
+    ///
+    /// This phase exists because of a defect it is the whole fix for.
+    /// `Installed` used to be written BEFORE `wait_for_ssh` and the
+    /// transfer, both of which lived inside the same `reached < Installed`
+    /// block. A run interrupted in that window -- or one whose
+    /// `wait_for_ssh` timed out -- recorded `Installed`, and the next run
+    /// evaluated `Installed < Installed == false` and skipped the transfer
+    /// FOREVER. The staged placeholder (`{ ... }: { }`, a valid empty
+    /// module) then stayed as the host's real hardware configuration, so
+    /// the install reported success with no `availableKernelModules` and
+    /// no microcode. Splitting the phases is what makes the transfer
+    /// resumable; recording `Installed` still happens immediately after
+    /// `nixos-anywhere` so a resume can never repartition a live disk.
+    HardwareConfigured,
     /// Stage 2 applied: apps and auth are enabled on the host.
     Stage2Applied,
     /// Post-install verification passed.
@@ -46,7 +65,10 @@ impl Phase {
             Phase::Generated => "host repository generated",
             Phase::PreflightPassed => "preflight passed, target untouched",
             Phase::Installing => "install STARTED -- the disk may already be erased",
-            Phase::Installed => "installed and booted",
+            // NOT "and booted": this is recorded the instant nixos-anywhere
+            // returns, which is before wait_for_ssh has proved anything.
+            Phase::Installed => "installed -- not yet confirmed booted",
+            Phase::HardwareConfigured => "booted, with its real hardware configuration in place",
             Phase::Stage2Applied => "apps and authentication enabled",
             Phase::Verified => "verified",
         }
@@ -312,6 +334,46 @@ mod tests {
     /// because the recorded phase said it had already passed -- for content
     /// that no longer existed. Same shape as the resume that skipped the
     /// authentication backstop.
+    /// The regression test for the defect `HardwareConfigured` exists for.
+    ///
+    /// `Installed` used to be the phase recorded before `wait_for_ssh` and
+    /// the hardware-config transfer, all inside one `reached < Installed`
+    /// block. A run interrupted in that window recorded `Installed`, and
+    /// the next run's `Installed < Installed` was false, so it skipped the
+    /// transfer permanently and the host kept the placeholder hardware
+    /// configuration -- while reporting success.
+    ///
+    /// Mutation check: collapse `HardwareConfigured` back into `Installed`
+    /// (make them the same phase) and this fails.
+    #[test]
+    fn a_run_interrupted_after_install_still_has_the_transfer_left_to_do() {
+        assert!(
+            Phase::Installed < Phase::HardwareConfigured,
+            "a state recorded at Installed MUST still be behind the transfer \
+             gate, or an interrupted run never transfers the real \
+             hardware-configuration.nix and the placeholder becomes the \
+             installed host's real hardware config"
+        );
+        // ...and the transfer still happens before stage 2, which needs a
+        // host that evaluates.
+        assert!(Phase::HardwareConfigured < Phase::Stage2Applied);
+        // The destructive boundary is unmoved: the new phase is past it,
+        // so a resume from it can never repartition.
+        assert!(Phase::HardwareConfigured.is_destructive());
+    }
+
+    /// `Installed` is recorded before anything has proved the host booted,
+    /// so its description must not claim it did.
+    #[test]
+    fn the_installed_phase_does_not_claim_a_boot_it_has_not_seen() {
+        // "and booted" was the exact old claim, and it was false: this
+        // phase is recorded before wait_for_ssh runs.
+        assert!(!Phase::Installed.describe().contains("and booted"));
+        assert!(Phase::Installed.describe().contains("not yet confirmed"));
+        // The phase that IS recorded after the host answered may say so.
+        assert!(Phase::HardwareConfigured.describe().contains("booted"));
+    }
+
     #[test]
     fn a_resume_that_re_asks_carries_no_phase_forward() {
         for phase in [Phase::Generated, Phase::PreflightPassed] {

@@ -69,6 +69,44 @@ const SUBVOLUMES: &str = r#"            subvolumes = {
 /// `a_real_ed25519_key_is_not_mistaken_for_a_placeholder`.
 pub const PLACEHOLDERS: &[&str] = &["CHANGE-ME", "example.invalid", "YOUR-USER", "AAAA..."];
 
+/// The marker identifying a `hardware-configuration.nix` that is still the
+/// stand-in this installer wrote, not the real one `nixos-anywhere
+/// --generate-hardware-config` reads off the target.
+///
+/// The stand-in exists so Tier 1 can evaluate the configuration before
+/// anything is destroyed (the flake imports the file unconditionally). But
+/// `{ ... }: { }` is a perfectly valid empty module, so if it ever survives
+/// onto the installed host the machine evaluates and boots with NO
+/// `availableKernelModules`, no microcode and no host hardware settings --
+/// and reports success. An existence check cannot catch that, because this
+/// file now always exists. Only a CONTENT check can.
+pub const HARDWARE_CONFIG_SENTINEL: &str = "# PLACEHOLDER";
+
+/// Writes the stand-in `hardware-configuration.nix` into `files`.
+///
+/// Its body begins with [`HARDWARE_CONFIG_SENTINEL`], which is what the
+/// transfer step and post-install verification check for. Deliberately NOT
+/// listed in [`PLACEHOLDERS`]: `check_no_placeholders` runs over this
+/// function's own output, so listing it there would make `render` reject
+/// itself.
+///
+/// # Arguments
+/// * `files` - the generated file set to insert into.
+pub fn insert_hardware_config_placeholder(files: &mut Files) {
+    files.insert(
+        "hardware-configuration.nix".into(),
+        "# PLACEHOLDER -- replaced during the install by\n\
+         # `nixos-anywhere --generate-hardware-config`, which writes the real\n\
+         # hardware configuration read off the target itself.\n\
+         #\n\
+         # It exists so the preflight can evaluate this configuration before\n\
+         # anything is destroyed. disko supplies every fileSystems entry for\n\
+         # the OS disk, so an empty module evaluates cleanly here.\n\
+         { ... }: { }\n"
+            .into(),
+    );
+}
+
 /// Escapes a value for use inside a Nix `"..."` string literal.
 ///
 /// Device-derived strings -- `by_id`, `model`, `size`, `fstype` -- come
@@ -509,18 +547,7 @@ pub fn render(
     // single-invocation design removed that step; this restores what it
     // provided. nixos-anywhere overwrites this file with the real one, and
     // R6 A2 then commits that back.
-    files.insert(
-        "hardware-configuration.nix".into(),
-        "# PLACEHOLDER -- replaced during the install by\n\
-         # `nixos-anywhere --generate-hardware-config`, which writes the real\n\
-         # hardware configuration read off the target itself.\n\
-         #\n\
-         # It exists so the preflight can evaluate this configuration before\n\
-         # anything is destroyed. disko supplies every fileSystems entry for\n\
-         # the OS disk, so an empty module evaluates cleanly here.\n\
-         { ... }: { }\n"
-            .into(),
-    );
+    insert_hardware_config_placeholder(&mut files);
 
     files.insert(
         "custom/.gitkeep".into(),
@@ -600,6 +627,41 @@ pub fn write_repo(dir: &Path, files: &Files) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    /// The transfer guard and the verify check both look for
+    /// [`HARDWARE_CONFIG_SENTINEL`] in this file's body. If the placeholder
+    /// stopped containing it, both guards would silently pass a stand-in
+    /// through onto a real host.
+    ///
+    /// Mutation check: change either the sentinel or the placeholder text
+    /// and this fails.
+    #[test]
+    fn the_placeholder_hardware_config_carries_the_sentinel_the_guards_look_for() {
+        let mut files = Files::new();
+        insert_hardware_config_placeholder(&mut files);
+        let body = &files["hardware-configuration.nix"];
+        assert!(
+            body.contains(HARDWARE_CONFIG_SENTINEL),
+            "the transfer step refuses on this exact substring; without it a \
+             host installs with no kernel modules and no microcode, and boots \
+             looking fine"
+        );
+        // It must still be a valid empty module, or Tier 1 cannot evaluate
+        // before the disk is touched -- which is the whole reason it exists.
+        assert!(body.contains("{ ... }: { }"));
+    }
+
+    /// The sentinel must NOT be in `PLACEHOLDERS`: that list is checked
+    /// against render's own output, so listing it would make `render`
+    /// reject every configuration it generates.
+    #[test]
+    fn the_hardware_config_sentinel_is_not_in_the_placeholder_list() {
+        assert!(!PLACEHOLDERS.contains(&HARDWARE_CONFIG_SENTINEL));
+        let mut files = Files::new();
+        insert_hardware_config_placeholder(&mut files);
+        check_no_placeholders(&files)
+            .expect("render must not reject its own placeholder file");
+    }
     use super::*;
     use crate::inventory::Filesystem;
     use crate::sso::SsoDecision;

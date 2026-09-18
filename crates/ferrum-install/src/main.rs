@@ -175,15 +175,23 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
     let files = read_generated(&pre.host_dir)?;
     preflight::check_published_apps_are_authenticated(&files, &st.unauthenticated_accepted_for)?;
 
-    let evidence = if reached.unwrap_or(state::Phase::Generated) < state::Phase::PreflightPassed {
-        println!("\npreflight: evaluating the generated configuration ...");
-        let e = preflight::tier1(&pre.host_dir, &files, &answers.hostname, &st.unauthenticated_accepted_for)?;
+    // ALWAYS evaluate, including on a resume. The old code skipped Tier 1
+    // once `PreflightPassed` had been reached and then hardcoded
+    // `Evidence { evaluated: true }`, so `describe()` printed "evaluation
+    // verified here" on a run that evaluated nothing -- the exact dishonesty
+    // Evidence's own doc comment says it exists to prevent. Tier 1 is
+    // eval-only and needs no builder, which is precisely what makes it
+    // cheap enough to re-run; and re-running is not just honesty, it also
+    // re-checks a host_dir the operator can legitimately have edited
+    // between an interrupted run and this one -- the same reasoning as the
+    // authenticated-apps check directly above.
+    println!("\npreflight: evaluating the generated configuration ...");
+    let evidence =
+        preflight::tier1(&pre.host_dir, &files, &answers.hostname, &st.unauthenticated_accepted_for)?;
+    if reached.unwrap_or(state::Phase::Generated) < state::Phase::PreflightPassed {
         st.phase = state::Phase::PreflightPassed;
         state::write(&pre.host_dir, &st)?;
-        e
-    } else {
-        preflight::Evidence { evaluated: true, booted: false }
-    };
+    }
     println!("preflight: {}", evidence.describe());
 
     // --- The destructive step. ---
@@ -201,11 +209,23 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
             &pre.host_dir,
         )?;
 
+        // Recorded IMMEDIATELY, while still inside this block: from here
+        // the disk is written, and a resume must never repartition it.
         st.phase = state::Phase::Installed;
         state::write(&pre.host_dir, &st)?;
+    }
+
+    // Deliberately its OWN block, not the tail of the one above. Both steps
+    // are idempotent and neither touches the partition table, so a resume
+    // can safely repeat them -- whereas leaving them inside the destructive
+    // block meant an interruption in this window skipped them forever and
+    // left the placeholder hardware configuration installed for good.
+    if reached.unwrap_or(state::Phase::Generated) < state::Phase::HardwareConfigured {
         println!("installed. waiting for the host to come back ...");
         wait_for_ssh(&pre)?;
         transfer_hardware_config(&pre)?;
+        st.phase = state::Phase::HardwareConfigured;
+        state::write(&pre.host_dir, &st)?;
     }
 
     // --- Stage 2. The host exists now, so the things that could not exist
@@ -507,6 +527,22 @@ fn transfer_hardware_config(pre: &preconditions::Preconditions) -> anyhow::Resul
             local.display()
         )
     })?;
+
+    // The file always EXISTS now -- render() writes a placeholder so the
+    // preflight can evaluate. So existence proves nothing; only the content
+    // does. Shipping the placeholder to the host would install a machine
+    // with no hardware configuration at all, and it would boot and look
+    // fine.
+    if body.contains(render::HARDWARE_CONFIG_SENTINEL) {
+        anyhow::bail!(
+            "{} is still the placeholder this installer wrote -- \
+             `nixos-anywhere --generate-hardware-config` never replaced it. \
+             Transferring it would install a host with no hardware \
+             configuration: no initrd kernel modules, no microcode. Re-run \
+             the install rather than continuing from here.",
+            local.display()
+        );
+    }
 
     let cmds = install::hardware_config_commands();
     collect::run_with_stdin(&pre.target, &pre.ssh_auth, &cmds[0], &body)?;

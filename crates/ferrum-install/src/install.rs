@@ -201,23 +201,41 @@ mod tests {
         );
     }
 
-    /// The file nixos-anywhere generates DURING its run cannot be in the
-    /// tree staged BEFORE it. Proving that here so the separate transfer
-    /// step is never mistaken for redundant.
+    /// The staged tree carries only the PLACEHOLDER hardware config, never
+    /// a real one -- which is why the separate transfer step exists.
+    ///
+    /// This test used to assert the file was ABSENT from the staged tree,
+    /// and it built its own `host_dir` containing just a flake, so it kept
+    /// passing after `render()` started writing the placeholder
+    /// unconditionally. The property it claimed had become false for real
+    /// render output, and it would not have caught shipping the placeholder
+    /// to the host. It now asserts the thing that is actually true and
+    /// actually load-bearing: what travels is still the stand-in.
     #[test]
-    fn the_staged_tree_cannot_contain_the_generated_hardware_config() {
+    fn the_staged_tree_carries_only_the_placeholder_hardware_config() {
         let scratch = tempfile::tempdir().unwrap();
         let host = tempfile::tempdir().unwrap();
         std::fs::write(host.path().join("flake.nix"), "./hardware-configuration.nix").unwrap();
+        // Exactly what render() writes at this point in the run.
+        let mut files = crate::render::Files::new();
+        crate::render::insert_hardware_config_placeholder(&mut files);
+        std::fs::write(
+            host.path().join(HARDWARE_CONFIG),
+            &files[HARDWARE_CONFIG],
+        )
+        .unwrap();
 
-        // The state of host_dir at staging time: nixos-anywhere has not
-        // run, so the file does not exist yet.
         let root = stage_extra_files(scratch.path(), host.path()).unwrap();
+        let staged = std::fs::read_to_string(root.join("etc/ferrum").join(HARDWARE_CONFIG))
+            .expect("the placeholder travels -- the flake imports it unconditionally");
         assert!(
-            !root.join("etc/ferrum").join(HARDWARE_CONFIG).exists(),
-            "if this ever passes, the separate transfer step may be removable"
+            staged.contains(crate::render::HARDWARE_CONFIG_SENTINEL),
+            "the staged tree must carry the STAND-IN, never a real hardware \
+             configuration: nixos-anywhere generates the real one during its \
+             own run, which is after this tree is built. If this ever fails, \
+             something is staging a real config and the transfer step's \
+             sentinel check will reject the install."
         );
-        // ...and the flake that DID travel imports it unconditionally.
         let flake = std::fs::read_to_string(root.join("etc/ferrum/flake.nix")).unwrap();
         assert!(flake.contains("hardware-configuration.nix"));
     }

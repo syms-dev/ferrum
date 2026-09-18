@@ -38,6 +38,19 @@ pub fn ownership_checks() -> Vec<Check> {
             command: "stat -c '%U:%G %a' /etc/ferrum/custom".into(),
             expect: "root:root 755".into(),
         },
+        // The last line of defence for the defect that made this check
+        // necessary. The installer writes a stand-in
+        // hardware-configuration.nix so Tier 1 can evaluate before
+        // anything is destroyed, and `{ ... }: { }` is a valid empty
+        // module -- so a host that ends up with the stand-in boots, runs,
+        // and passes every other check here while having NO initrd kernel
+        // modules and no microcode. The transfer step refuses to send it;
+        // this proves it did not arrive by some other route.
+        Check {
+            what: "the host has a real hardware configuration, not the stand-in",
+            command: "grep -c '# PLACEHOLDER' /etc/ferrum/hardware-configuration.nix || true".into(),
+            expect: "0".into(),
+        },
     ]
 }
 
