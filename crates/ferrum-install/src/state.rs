@@ -311,7 +311,7 @@ mod tests {
     /// a resume must not ask for the serial again.
     #[test]
     fn a_resume_past_the_wipe_does_not_re_ask_for_the_serial() {
-        for phase in [Phase::Installing, Phase::Installed, Phase::Stage2Applied] {
+        for phase in [Phase::Installing, Phase::Installed, Phase::HardwareConfigured, Phase::Stage2Applied] {
             let r = plan(Some(&state(phase)), "root@saltbox", false);
             assert!(
                 !needs_disk_confirmation(&r),
@@ -392,7 +392,7 @@ mod tests {
     /// regenerate, so its recorded progress still stands.
     #[test]
     fn a_resume_past_the_wipe_keeps_its_progress() {
-        for phase in [Phase::Installing, Phase::Installed, Phase::Stage2Applied] {
+        for phase in [Phase::Installing, Phase::Installed, Phase::HardwareConfigured, Phase::Stage2Applied] {
             let r = plan(Some(&state(phase)), "root@saltbox", false);
             assert_eq!(effective_reached(&r), Some(phase), "{phase:?}");
         }

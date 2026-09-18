@@ -220,7 +220,7 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
     // can safely repeat them -- whereas leaving them inside the destructive
     // block meant an interruption in this window skipped them forever and
     // left the placeholder hardware configuration installed for good.
-    if reached.unwrap_or(state::Phase::Generated) < state::Phase::HardwareConfigured {
+    if needs_hardware_config_transfer(reached) {
         println!("installed. waiting for the host to come back ...");
         wait_for_ssh(&pre)?;
         transfer_hardware_config(&pre)?;
@@ -517,6 +517,50 @@ fn run_streaming(program: &str, args: &[String], cwd: &std::path::Path) -> anyho
 /// `install::hardware_config_commands`. Without this, `/etc/ferrum`'s
 /// flake imports a file that is not there and every later apply -- stage 2
 /// included -- fails to evaluate.
+/// Whether this run still owes the host its real `hardware-configuration.nix`.
+///
+/// Split out so the CONTROL FLOW is pinned by a test, not just the phase
+/// constants. A security re-scan showed that reverting the comparison here
+/// to `< Phase::Installed` -- which is exactly the SEC-H1 defect -- left
+/// all 205 tests passing, because the existing tests asserted the ordering
+/// of the enum rather than the decision made from it.
+///
+/// # Arguments
+/// * `reached` - the phase a previous run got to, or `None` for a fresh run
+///   (or a resume that re-asked and therefore regenerated).
+///
+/// # Returns
+/// `true` when the transfer must still run.
+fn needs_hardware_config_transfer(reached: Option<state::Phase>) -> bool {
+    reached.unwrap_or(state::Phase::Generated) < state::Phase::HardwareConfigured
+}
+
+/// Refuses a `hardware-configuration.nix` body that is still the stand-in.
+///
+/// Content, never existence: `render()` always writes this file now, so
+/// its presence proves nothing. `{ ... }: { }` evaluates and boots
+/// perfectly well, which is what makes shipping it silent.
+///
+/// # Arguments
+/// * `body` - the file's contents as read from the host directory.
+/// * `local` - the path, for the error message.
+///
+/// # Errors
+/// When `body` still carries [`render::HARDWARE_CONFIG_SENTINEL`].
+fn check_hardware_config_body(body: &str, local: &std::path::Path) -> anyhow::Result<()> {
+    if body.contains(render::HARDWARE_CONFIG_SENTINEL) {
+        anyhow::bail!(
+            "{} is still the placeholder this installer wrote -- \
+             `nixos-anywhere --generate-hardware-config` never replaced it. \
+             Transferring it would install a host with no hardware \
+             configuration: no initrd kernel modules, no microcode. Re-run \
+             the install rather than continuing from here.",
+            local.display()
+        );
+    }
+    Ok(())
+}
+
 fn transfer_hardware_config(pre: &preconditions::Preconditions) -> anyhow::Result<()> {
     let local = pre.host_dir.join(install::HARDWARE_CONFIG);
     let body = std::fs::read_to_string(&local).map_err(|e| {
@@ -533,16 +577,7 @@ fn transfer_hardware_config(pre: &preconditions::Preconditions) -> anyhow::Resul
     // does. Shipping the placeholder to the host would install a machine
     // with no hardware configuration at all, and it would boot and look
     // fine.
-    if body.contains(render::HARDWARE_CONFIG_SENTINEL) {
-        anyhow::bail!(
-            "{} is still the placeholder this installer wrote -- \
-             `nixos-anywhere --generate-hardware-config` never replaced it. \
-             Transferring it would install a host with no hardware \
-             configuration: no initrd kernel modules, no microcode. Re-run \
-             the install rather than continuing from here.",
-            local.display()
-        );
-    }
+    check_hardware_config_body(&body, &local)?;
 
     let cmds = install::hardware_config_commands();
     collect::run_with_stdin(&pre.target, &pre.ssh_auth, &cmds[0], &body)?;
@@ -664,6 +699,55 @@ fn final_report(
 
 #[cfg(test)]
 mod tests {
+    use super::{check_hardware_config_body, needs_hardware_config_transfer};
+    use crate::state::Phase;
+
+    /// SEC-H1, pinned at the decision rather than the enum.
+    ///
+    /// Mutation check: revert the comparison in
+    /// `needs_hardware_config_transfer` to `< Phase::Installed` and this
+    /// fails. Before this test that mutation was silent.
+    #[test]
+    fn a_run_recorded_at_installed_still_owes_the_hardware_config_transfer() {
+        assert!(
+            needs_hardware_config_transfer(Some(Phase::Installed)),
+            "this is SEC-H1: a run interrupted between nixos-anywhere \
+             returning and the transfer records Installed, and must still \
+             transfer on the next run -- otherwise the placeholder becomes \
+             the host's permanent hardware configuration"
+        );
+        // Fresh runs and every earlier phase also owe it.
+        for p in [None, Some(Phase::Generated), Some(Phase::PreflightPassed), Some(Phase::Installing)] {
+            assert!(needs_hardware_config_transfer(p), "{p:?}");
+        }
+        // ...and once done, it is not repeated.
+        for p in [Phase::HardwareConfigured, Phase::Stage2Applied, Phase::Verified] {
+            assert!(!needs_hardware_config_transfer(Some(p)), "{p:?}");
+        }
+    }
+
+    /// Mutation check: replace the body of `check_hardware_config_body`
+    /// with `Ok(())` and this fails. Before this test that mutation was
+    /// silent.
+    #[test]
+    fn the_placeholder_hardware_config_is_refused_at_the_transfer() {
+        let path = std::path::Path::new("/etc/ferrum/hardware-configuration.nix");
+        let mut files = render::Files::new();
+        render::insert_hardware_config_placeholder(&mut files);
+        let err = check_hardware_config_body(&files["hardware-configuration.nix"], path)
+            .expect_err("the stand-in must never be transferred to the host");
+        let msg = err.to_string();
+        assert!(msg.contains("still the placeholder"), "{msg}");
+        assert!(msg.contains("no microcode"), "{msg}");
+
+        // A real generated config passes.
+        check_hardware_config_body(
+            "{ config, lib, modulesPath, ... }:\n{\n  boot.initrd.availableKernelModules = [ \"nvme\" ];\n}\n",
+            path,
+        )
+        .expect("a real hardware configuration must be accepted");
+    }
+
     use super::check_arch;
 
     #[test]

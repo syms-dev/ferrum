@@ -466,6 +466,14 @@
             filter = path: type:
               let rel = lib.removePrefix (toString ../../.. + "/") (toString path); in
               lib.hasPrefix "crates" rel || lib.hasPrefix "examples" rel
+              # flake.lock too: render.rs include_str!s it so the disko
+              # revision generated hosts pin cannot drift from the one this
+              # repository tests against. disko partitions the target as
+              # root, so an unpinned or untested revision there is remote
+              # code execution on the destructive path. Same class of
+              # escape-from-crates/ as the template above -- and, again,
+              # invisible to `cargo test` run by hand.
+              || rel == "flake.lock"
               || (type == "directory" && (rel == "crates" || rel == "examples"));
           };
           cargoLock.lockFile = ../../../crates/Cargo.lock;

@@ -48,8 +48,15 @@ pub fn ownership_checks() -> Vec<Check> {
         // this proves it did not arrive by some other route.
         Check {
             what: "the host has a real hardware configuration, not the stand-in",
-            command: "grep -c '# PLACEHOLDER' /etc/ferrum/hardware-configuration.nix || true".into(),
-            expect: "0".into(),
+            // `expect` is matched with `contains`, so a COUNT is the wrong
+            // shape here: "0" is a substring of "10" and "100", and the
+            // check would pass on a file full of sentinels. Emit a word
+            // instead, and build the pattern from the one constant.
+            command: format!(
+                "grep -q '{}' /etc/ferrum/hardware-configuration.nix && echo STANDIN || echo REAL",
+                crate::render::HARDWARE_CONFIG_SENTINEL
+            ),
+            expect: "REAL".into(),
         },
     ]
 }

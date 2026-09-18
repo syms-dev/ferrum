@@ -135,6 +135,62 @@ pub fn hardware_config_commands() -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    /// SEC-M5, asserted through the real git history rather than the file
+    /// list.
+    ///
+    /// `copy_tree` excludes the operator's files, and there was a test for
+    /// that. But `.git` ships to the host by design, and `write_repo` runs
+    /// `git add -A` -- so anything committed BEFORE the copy travels inside
+    /// the history regardless, and the exclusion proves nothing. This
+    /// reaches for the content the way an attacker on the installed host
+    /// would: `git show HEAD:<file>` against the staged `.git`.
+    #[test]
+    fn the_operators_own_files_are_unreachable_in_the_shipped_git_history() {
+        use std::process::Command;
+        let host = tempfile::tempdir().unwrap();
+        let h = host.path();
+
+        let mut files = crate::render::Files::new();
+        files.insert("flake.nix".into(), "{ }\n".into());
+        crate::render::insert_hardware_config_placeholder(&mut files);
+        // The .gitignore is what has to do the work.
+        files.insert(
+            ".gitignore".into(),
+            "install-state.json\ninstall-inventory.json\nknown_hosts\n".into(),
+        );
+        crate::render::write_repo(h, &files).unwrap();
+
+        // Written by the installer into the same directory, then committed
+        // again -- exactly the real ordering.
+        std::fs::write(h.join("install-inventory.json"), "{\"secret\":\"disks\"}").unwrap();
+        std::fs::write(h.join(crate::collect::KNOWN_HOSTS), "saltbox ssh-ed25519 AAAA").unwrap();
+        crate::render::write_repo(h, &files).unwrap();
+
+        let scratch = tempfile::tempdir().unwrap();
+        let root = stage_extra_files(scratch.path(), h).unwrap();
+        let git_dir = root.join("etc/ferrum/.git");
+        assert!(git_dir.is_dir(), ".git must travel, or the host cannot evaluate");
+
+        for name in ["install-inventory.json", "known_hosts"] {
+            // Not in the working tree...
+            assert!(
+                !root.join("etc/ferrum").join(name).exists(),
+                "{name} was copied into the staged tree"
+            );
+            // ...and not reachable through the history that DID travel.
+            let out = Command::new("git")
+                .arg("--git-dir").arg(&git_dir)
+                .arg("show").arg(format!("HEAD:{name}"))
+                .output()
+                .expect("git must be available");
+            assert!(
+                !out.status.success(),
+                "{name} is readable from the shipped .git history: {}",
+                String::from_utf8_lossy(&out.stdout)
+            );
+        }
+    }
+
     use super::*;
 
     #[test]

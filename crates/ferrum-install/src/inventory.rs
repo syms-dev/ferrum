@@ -89,11 +89,56 @@ struct LsblkDevice {
     children: Vec<LsblkDevice>,
 }
 
+/// Normalises one `lsblk` field into `Some(real value)` or `None`.
+///
+/// Two separate jobs, both load-bearing.
+///
 /// `lsblk` renders absent values as JSON null and, on some versions, as an
 /// empty string. Both mean "unknown", and treating `""` as a real value is
 /// exactly how an empty serial becomes an identifier (R2 A8).
+///
+/// It also **strips control characters**. These strings come from `lsblk`
+/// on a machine this installer does not control, and they are printed
+/// straight into the disk table the operator reads to choose which disk to
+/// DESTROY. A model or serial containing `\x1b[2K\r` erases and rewrites
+/// the line on a real terminal, so a crafted device can make the table
+/// show a different disk, size or serial than the one it is about to
+/// select. Trimming alone does not touch interior control bytes.
+///
+/// Stripped rather than rejected: a control byte in a model string is a
+/// cosmetic defect on a legitimate disk, and refusing to install because a
+/// vendor put a stray byte in a product name would be its own failure. The
+/// value stays usable and stops being able to lie about the line it is on.
+///
+/// # Arguments
+/// * `v` - the raw field, as deserialized.
+///
+/// # Returns
+/// `None` when absent, empty, or empty once cleaned; otherwise the cleaned
+/// value.
+fn strip_controls(s: &str) -> String {
+    s.chars().filter(|c| !c.is_control()).collect::<String>().trim().to_string()
+}
+
+/// `clean` for a field that is always present, such as a device name.
+///
+/// `name` reaches the operator's table like every other field and was NOT
+/// being cleaned at all. That is the whole of SEC-C1: see `clean`.
+///
+/// # Arguments
+/// * `v` - the raw field.
+///
+/// # Returns
+/// The value with control characters removed, or `"?"` if nothing is left
+/// -- never an empty cell, which would be indistinguishable from a
+/// rendering bug.
+fn clean_required(v: String) -> String {
+    let c = strip_controls(&v);
+    if c.is_empty() { "?".to_string() } else { c }
+}
+
 fn clean(v: Option<String>) -> Option<String> {
-    v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+    v.map(|s| strip_controls(&s)).filter(|s| !s.is_empty())
 }
 
 /// Parses `lsblk -O --json` output into whole devices.
@@ -111,7 +156,7 @@ pub fn parse_lsblk(json: &str) -> anyhow::Result<Vec<Device>> {
         .into_iter()
         .filter(|d| d.dev_type.as_deref() == Some("disk"))
         .map(|d| Device {
-            name: d.name,
+            name: clean_required(d.name),
             size: clean(d.size).unwrap_or_else(|| "?".to_string()),
             model: clean(d.model),
             serial: clean(d.serial),
@@ -120,7 +165,7 @@ pub fn parse_lsblk(json: &str) -> anyhow::Result<Vec<Device>> {
                 .children
                 .into_iter()
                 .map(|c| Filesystem {
-                    name: c.name,
+                    name: clean_required(c.name),
                     fstype: clean(c.fstype),
                     mountpoint: clean(c.mountpoint),
                 })
@@ -395,6 +440,78 @@ pub fn render(devices: &[Device]) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// SEC-M3. The disk table is what the operator reads to choose which
+    /// disk to erase, and every string in it comes from `lsblk` on a
+    /// machine this installer does not control.
+    ///
+    /// Mutation check: drop the `is_control` filter from `clean` and this
+    /// fails.
+    #[test]
+    fn the_rendered_table_can_never_contain_a_control_character() {
+        // SEC-C1, asserted where it actually matters: not on one helper,
+        // but on the exact text the operator reads before naming a disk to
+        // destroy.
+        //
+        // The attack this blocks is NOT display-only. `ESC[2K` + CR erases
+        // and rewrites the line, so the row shown as `sda` can be made to
+        // display the serial that genuinely belongs to `sdb`. The operator
+        // types the serial they were shown; `match_serial` then correctly
+        // selects the device that really owns it -- sdb -- and the
+        // post-kexec guard re-verifies that disk's serial and agrees,
+        // because nothing is malfunctioning. Every control behaves as
+        // designed and the wrong disk is erased. No later guard can catch
+        // it, which is why it has to be stopped here.
+        let json = r#"{"blockdevices":[
+          {"name":"sda\u001b[2K\r","type":"disk","size":"1T\u001b[2K\r",
+           "model":"EVIL\u001b[2K\rsda  8T  My Media Disk","serial":"S\u001b[2K\rDECOY",
+           "children":[{"name":"sda1\u001b[2K\r","fstype":"ext4\u001b[2K\r",
+                        "mountpoint":"/mnt\u001b[2K\r"}]}
+        ]}"#;
+        let devices = super::parse_lsblk(json).expect("hostile lsblk must still parse");
+        let table = super::render(&devices);
+        assert!(
+            !table.chars().any(|c| c.is_control() && c != '\n'),
+            "a control character reached the disk table: {table:?}"
+        );
+        // Every field, not just the ones that happened to be cleaned before.
+        let d = &devices[0];
+        for field in [&d.name, &d.size] {
+            assert!(!field.chars().any(|c| c.is_control()), "{field:?}");
+        }
+        for field in [d.model.as_deref(), d.serial.as_deref()] {
+            assert!(!field.unwrap().chars().any(|c| c.is_control()), "{field:?}");
+        }
+        let f = &d.children[0];
+        assert!(!f.name.chars().any(|c| c.is_control()), "{:?}", f.name);
+        for field in [f.fstype.as_deref(), f.mountpoint.as_deref()] {
+            assert!(!field.unwrap().chars().any(|c| c.is_control()), "{field:?}");
+        }
+    }
+
+    #[test]
+    fn control_characters_cannot_reach_the_disk_table() {
+        // ESC [ 2K CR -- erase-line then carriage-return, which on a real
+        // terminal makes everything printed before it on that line vanish.
+        let evil = Some("EVIL\u{1b}[2K\rsda  8T  My Media Disk".to_string());
+        let got = super::clean(evil).unwrap();
+        assert!(!got.chars().any(|c| c.is_control()), "{got:?}");
+        assert_eq!(got, "EVIL[2Ksda  8T  My Media Disk");
+
+        // A serial that would otherwise redraw itself as a decoy.
+        let decoy = super::clean(Some("S\u{1b}[2K\rDECOY".into())).unwrap();
+        assert!(!decoy.chars().any(|c| c.is_control()), "{decoy:?}");
+
+        // Ordinary values are untouched, and absent ones stay absent.
+        assert_eq!(super::clean(Some("  WD-WCC4N5PJ  ".into())), Some("WD-WCC4N5PJ".into()));
+        assert_eq!(super::clean(Some("   ".into())), None);
+        // Stripping the ESC leaves the literal text "[2K", which is inert --
+        // it cannot move a cursor or erase a line. A value that is ONLY
+        // control bytes does become None.
+        assert_eq!(super::clean(Some("\u{1b}[2K".into())), Some("[2K".into()));
+        assert_eq!(super::clean(Some("\u{1b}\r\u{7}".into())), None, "control-only is not a value");
+        assert_eq!(super::clean(None), None);
+    }
+
     use super::*;
 
     fn disk(name: &str, serial: Option<&str>, children: Vec<Filesystem>) -> Device {
