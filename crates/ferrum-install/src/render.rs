@@ -477,6 +477,25 @@ pub fn render(
         files.insert("custom/media.nix".into(), media(&disks));
     }
 
+    // `custom/` must ALWAYS exist, even with nothing in it. The generated
+    // flake calls `ferrum.lib.importDir ./custom` unconditionally, and
+    // that does `builtins.readDir` -- so on a host with no data disks the
+    // whole configuration failed to evaluate with "cannot read directory
+    // .../custom". Found by the first stage-2 CI run that got far enough
+    // to evaluate what it had generated.
+    //
+    // A placeholder file rather than an empty directory, for two reasons:
+    // git does not track empty directories, and Nix ignores untracked
+    // files inside a git tree -- so an untracked empty directory would
+    // simply not be in the store copy the host evaluates.
+    files.insert(
+        "custom/.gitkeep".into(),
+        "# Hand-written host-specific Nix goes here; ferrum never rewrites it.\n\
+         # This file only keeps the directory tracked -- the generated flake\n\
+         # imports every *.nix in here, and readDir needs the directory to exist.\n"
+            .into(),
+    );
+
     check_no_placeholders(&files)?;
     Ok(files)
 }
@@ -899,6 +918,42 @@ mod tests {
         assert!(m.contains("ata-DATA_1") && m.contains("ext4"));
         assert!(m.contains("nofail"), "a missing disk must not break boot: {m}");
         assert!(!m.contains("ata-EMPTY_1"), "an empty disk is not a data disk: {m}");
+    }
+
+    /// `importDir ./custom` is unconditional in the generated flake, and
+    /// `readDir` on a missing directory is a hard evaluation error -- so a
+    /// host with no data disks produced a configuration that could not be
+    /// evaluated at all.
+    #[test]
+    fn custom_always_exists_even_with_no_data_disks() {
+        let mut a = approved(Firmware::Uefi);
+        a.all_devices.retain(|d| d.name == "sda");
+        let f = render(&answers(), &a, &keys(), "abc").unwrap();
+        assert!(!f.contains_key("custom/media.nix"), "nothing to mount");
+        assert!(
+            f.keys().any(|k| k.starts_with("custom/")),
+            "custom/ must still be created, or importDir cannot readDir it: {:?}",
+            f.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// git does not track empty directories and Nix ignores untracked
+    /// files, so the placeholder has to be a real tracked file.
+    #[test]
+    fn the_custom_placeholder_is_written_and_tracked() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = approved(Firmware::Uefi);
+        a.all_devices.retain(|d| d.name == "sda");
+        let f = render(&answers(), &a, &keys(), "abc").unwrap();
+        write_repo(dir.path(), &f).unwrap();
+
+        let tracked = std::process::Command::new("git")
+            .current_dir(dir.path())
+            .args(["ls-files"])
+            .output()
+            .unwrap();
+        let list = String::from_utf8(tracked.stdout).unwrap();
+        assert!(list.contains("custom/"), "custom/ is untracked:\n{list}");
     }
 
     #[test]

@@ -43,7 +43,11 @@ SERIAL="$(tssh "lsblk -no SERIAL /dev/vdb | head -n1 | tr -d '[:space:]'")"
 ok
 
 step "start the install, then kill it once the disk has been touched"
-{ echo "s13resume"; echo ""; echo "sonarr"; echo ""; echo "$SERIAL"; } > "$WORK/answers"
+# hostname, base domain (empty), apps, serial. With NO domain, collect()
+# skips the ACME contact, the SSO question and the Cloudflare token -- an
+# extra blank here is consumed as the serial, which the first run proved by
+# failing with "no serial typed".
+{ echo "s13resume"; echo ""; echo "sonarr"; echo "$SERIAL"; } > "$WORK/answers"
 "$INSTALLER" root@127.0.0.1 --ssh-port 2222 --host-dir "$WORK/host" --ssh-dir "$WORK/ssh" \
   < "$WORK/answers" > "$WORK/install1.log" 2>&1 &
 INST_PID=$!

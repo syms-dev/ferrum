@@ -50,45 +50,42 @@ declares no TLS feature — so it looks unreachable, but it is a real advisory i
 Authorizes the rustls bump despite the dependency hard stop, FIXING the SEC-CRIT-002 residual
 rather than accepting it, and security cycles past the 2-cycle budget.
 
-## ALL 14 STORIES IMPLEMENTED. `08e3817` pushed; S13's CI jobs are the proof.
-S13 = `tests/stage2/{run,resume}.sh` + CI jobs `stage2` and `stage2-resume` (KVM runner).
-Shell scripts driving a real QEMU guest, NOT `runNixOSTest` — forced, because the sandbox has no
-network and stage 2 exists so each `sopsFile` is created AT RUNTIME on the guest, ruling out the
-pre-built-closure trick every other VM test uses. Two jobs: each needs its own blank target.
-Closes R8 A2 (sonarr AND **sabnzbd** — `FERRUM_SABNZBD_STATE_DIR` is the var most likely to be got
-wrong), R8 A3 (rollback), R8 A4 (kill mid-install, resume fed **NO serial** so a re-ask hits EOF),
-**R2 A9b (the preCreateHook actually EXECUTES — pull it from the generated disko.nix, substitute a
-wrong serial, run it on the target, assert it refuses)**, R6 A3.
-**Still not proven: physical hardware.** A QEMU guest is a real kexec/disko/closure build, but the
-firmware, disks and timing are virtual.
+## All 14 stories implemented. S13 is ITERATING IN CI and finding real bugs.
+Each CI run of `tests/stage2/run.sh` has found a genuine product defect — which is the whole
+reason the story exists ("a test that never acts like a human never finds what a human hits"):
+1. **Run 1:** a plain QEMU virtio disk reports NO SERIAL, and R2 A8 refused the inventory. That
+   was the gate working — the serial is what the operator types to confirm destruction. Fixed by
+   giving the target disk one via `emptyDiskImages[].driveConfig.deviceExtraOpts.serial`.
+2. **Run 2:** `check_serials_identify` refused the WHOLE machine because **`fd0` (a floppy)** has
+   no serial. Real hardware does this too — empty optical drive, card reader. **The installer
+   would have refused those machines and nobody would have known until it happened to them.**
+   Fixed: a device with no serial is **unselectable** (`match_serial` can never return it), not
+   disqualifying. Still refused: a duplicate serial, or a machine where NOTHING can be named.
 
-## Code review cycle 2: all 6 prior findings RESOLVED; found 1 High **that my own fix caused**
-Regenerating on `asked_fresh` met the phase gate: resuming from exactly `PreflightPassed`
-regenerated the repo then **SKIPPED Tier 1** (`PreflightPassed < PreflightPassed` is false) while
-reporting `evaluated: true`. Reachable by the most ordinary sequence there is — interrupt right
-after the preflight line prints, before the erase warning, which is the natural place to pause.
-**Same shape as the resume that skipped the auth backstop — the FIFTH time a fix carried a defect.**
-Fixed: the rule now lives in **`state::effective_reached`** (unit-testable, mutation-proved) —
-*a phase recorded by a run whose content this run replaced is not evidence about this run.*
-Also fixed its Medium (render.rs had grown a SECOND copy of the shell quoter, in the one function
-that needed three Critical fixes) and a Low (consent is now a superset check, not exact equality).
+## PROCESS FAILURE — three times now, same shape
+I trusted a command/edit instead of the result it produced:
+1. a mutation test that silently failed to apply and showed a **false pass**;
+2. a string `replace` that no-opped, so I **claimed a test in a commit message that did not
+   exist** (the code reviewer caught it);
+3. `83216ac` **pushed with a failing test**, because my chain used `;` instead of `&&` before the
+   git block — and the failure was printed in output I had read.
+**Every edit now asserts its anchor was found AND that the result landed; verification must gate
+the commit with `&&`, never `;`.**
 
-## CI status
-**`a281b29`: CI success AND VM tests success** — including `cargo-audit` now that rustls is bumped.
-`08e3817` running: ci[flake-check, rust, cargo-audit, installer-image] + vm-tests[smoke, **stage2**,
-**stage2-resume**, vm-tests].
+## Gate progress
+- `spec-complete` PASSED · `em-approved` PASSED · **`code-review` PASSED** (3 reviewer passes,
+  ending APPROVED, 0 C/H/M; evidence records the Critical no test could catch and the High my own
+  fix caused).
+- **NEXT: `build-green`** — waits on CI for the current HEAD.
+- `contract-clear`: evidence WRITTEN and verified — `git diff 9e66264..HEAD -- crates/ferrumd
+  modules/lib/settings-schema.json modules/core/options.nix modules/apps` is **empty**, so the
+  condition `no-api-contract-surface` genuinely holds. Resolve with
+  `not-applicable contract-clear --condition no-api-contract-surface`.
+- `test-coverage`, then `security-clear` (evidence already written, cycle 5 PASS).
 
-## VERIFIED for `08e3817` (real output)
-`cargo test --workspace` 8/8 binaries ok · `clippy -p ferrum-install --all-targets -D warnings` 0 ·
-`nix build .#checks.aarch64-linux.workspace-tests` green · both new scripts pass `bash -n`.
-**The S13 jobs themselves are unproven until CI runs them** — exactly as install-from-nothing was.
-
-## Next Steps
-1. Watch `stage2` / `stage2-resume`. They are new and slow (90-min timeouts); expect iteration.
-2. Then close gates IN ORDER: `code-review` (re-check was CHANGES REQUESTED; its High is now fixed
-   — consider one more targeted pass), `build-green`, `contract-clear` (likely not-applicable,
-   needs the catalog condition), `test-coverage`, `security-clear` (evidence already written).
-3. Release blockers, not gate blockers: OQ4 ghcr publish credential, OQ5 pull image by digest.
+## VERIFIED for `2587799` (real output, gathered BEFORE the push this time)
+`cargo test --workspace`: all 8 binaries `test result: ok`, 0 failed (196 in ferrum-install).
+`clippy -p ferrum-install --all-targets -D warnings`: 0.
 
 
 ## Blind-spot patterns (full text in the spec's revision logs)
