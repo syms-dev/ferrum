@@ -133,6 +133,10 @@ const MAX_FIELD: usize = 64;
 /// unaffected by what the table shows.
 const MAX_DEVICES: usize = 32;
 
+/// The file a resume recovers its decisions from, named in every refusal
+/// that can only happen after the disk is already erased.
+const RECOVERY_FILE: &str = "install-inventory.json";
+
 /// Reduces one untrusted `lsblk` field to something that cannot lie about
 /// the line it is printed on.
 ///
@@ -218,9 +222,30 @@ fn strip_controls(s: &str) -> String {
 ///   guard re-verifies before the partition table is destroyed. A
 ///   mismatch there is a wrong-disk risk, and refusing is right.
 /// * `size`, `model`, `fstype` and `mountpoint` are NORMALISED in place.
-///   After the wipe they influence no decision; they only render. Cleaning
-///   them removes the display-forgery risk without a refusal that has no
-///   safe landing.
+///   Cleaning them removes the display-forgery risk without a refusal that
+///   has no safe landing.
+///
+/// **These four are not "cosmetic" -- they decide nothing ON THIS PATH,
+/// which is a different and much narrower claim.** `fstype` in particular
+/// is decision-bearing elsewhere: it drives `has_vfat` -> `infer_firmware`
+/// (UEFI versus BIOS, where the wrong answer boots to nothing on a
+/// headless box whose previous OS is already gone) and it is emitted into
+/// the installed host's real configuration as
+/// `fileSystems."/mnt/media-N".fsType`. `mountpoint` feeds `mounted_at` ->
+/// `confirm::propose`, and a non-empty `children` feeds `is_blank` ->
+/// `infer_firmware`.
+///
+/// Normalising them is safe *here* only because of where "here" is: on a
+/// resume `Approved.firmware` is deserialized rather than recomputed, so
+/// `infer_firmware` never runs; `propose` and `confirm` run only on the
+/// fresh path, and past the wipe `needs_disk_confirmation` is false. For
+/// `fstype` reaching generated Nix, cleaning is strictly safer than
+/// passing the raw value through, and it is `nix_str`-escaped at the sink
+/// regardless.
+///
+/// So do not reuse this function on the fresh path on the strength of the
+/// list above. The refusal/normalise split is a statement about the resume
+/// path, not about the fields.
 ///
 /// # Arguments
 /// * `d` - a device recovered from disk, normalised in place.
@@ -228,16 +253,28 @@ fn strip_controls(s: &str) -> String {
 /// # Errors
 /// When `name` or `serial` does not survive cleaning.
 pub fn check_recovered_device(d: &mut Device) -> anyhow::Result<()> {
-    check_device_name(&d.name)?;
+    // Every refusal below happens AFTER the disk is erased, because past
+    // the wipe this is the only path there is. So each one has to name a
+    // way out that actually works -- see SEC-M6, where the advice given
+    // could not succeed.
+    let recovery = |e: anyhow::Error| -> anyhow::Error {
+        e.context(format!(
+            "reading the recorded inventory in {RECOVERY_FILE}. Correct that \
+             file, or re-run with --fresh to discard the recorded state and \
+             start over. Re-running the SAME command will hit this again."
+        ))
+    };
+    check_device_name(&d.name).map_err(&recovery)?;
     if let Some(serial) = d.serial.as_deref() {
         if strip_controls(serial) != serial {
             anyhow::bail!(
                 "the recovered inventory records a serial for {} that does not \
                  survive cleaning. That value is what the post-kexec guard \
                  re-verifies immediately before the partition table is \
-                 destroyed, so it cannot be normalised away. Correct the \
-                 \"serial\" field for {} in install-inventory.json, or re-run \
-                 the install from the beginning.",
+                 destroyed, so it cannot be normalised away. Either correct \
+                 the \"serial\" field for {} in {RECOVERY_FILE}, or re-run with \
+                 --fresh to discard the recorded state and start over. \
+                 Re-running the SAME command will hit this again.",
                 d.name, d.name
             );
         }
@@ -246,7 +283,7 @@ pub fn check_recovered_device(d: &mut Device) -> anyhow::Result<()> {
     d.size = clean_required(std::mem::take(&mut d.size));
     d.model = clean(d.model.take());
     for f in &mut d.children {
-        check_device_name(&f.name)?;
+        check_device_name(&f.name).map_err(&recovery)?;
         f.fstype = clean(f.fstype.take());
         f.mountpoint = clean(f.mountpoint.take());
     }
@@ -283,11 +320,16 @@ fn check_device_name(name: &str) -> anyhow::Result<()> {
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
     if !charset_ok || strip_controls(name) != name {
+        // Deliberately says nothing about WHERE this came from. It is
+        // reached from two paths -- fresh (the target's lsblk) and resume
+        // (install-inventory.json) -- and the old wording asserted the
+        // target had reported it, which is false on the resume path and
+        // pointed the operator at the wrong thing to fix.
         anyhow::bail!(
-            "the target reported a block device named {name:?}, which is not a \
-             kernel device name. Refusing: this name is used to match the \
-             device against its /dev/disk/by-id alias, so accepting a forged \
-             one risks resolving to a different disk than the table shows."
+            "a block device named {name:?} is not a kernel device name. \
+             Refusing: this name matches the device against its \
+             /dev/disk/by-id alias, so accepting a forged one risks \
+             resolving to a different disk than the table shows."
         );
     }
     Ok(())
@@ -316,7 +358,8 @@ pub fn parse_lsblk(json: &str) -> anyhow::Result<Vec<Device>> {
         .into_iter()
         .filter(|d| d.dev_type.as_deref() == Some("disk"))
         .map(|d| -> anyhow::Result<Device> {
-            check_device_name(&d.name)?;
+            check_device_name(&d.name)
+                .map_err(|e| e.context("the target's own lsblk reported this device"))?;
             Ok(Device {
             name: clean_required(d.name),
             size: clean(d.size).unwrap_or_else(|| "?".to_string()),
@@ -653,6 +696,23 @@ mod tests {
         // erased disk following an instruction that cannot succeed.
         assert!(!msg.contains("Delete install-inventory.json"), "{msg}");
         assert!(msg.contains("install-inventory.json"), "{msg}");
+        // It must name --fresh. "Re-run the install from the beginning"
+        // sends an operator back to the SAME command, which hits the same
+        // recorded state and the same error.
+        assert!(msg.contains("--fresh"), "{msg}");
+
+        // The OTHER post-wipe refusal -- a forged name -- must carry the
+        // same working advice. It did not: its message claimed "the target
+        // reported" a device that in fact came from the recorded file, and
+        // it offered no way out at all.
+        let mut bad_name = dev("sd a", Some("S1"));
+        let e = format!(
+            "{:#}",
+            super::check_recovered_device(&mut bad_name).unwrap_err()
+        );
+        assert!(e.contains("install-inventory.json"), "{e}");
+        assert!(e.contains("--fresh"), "{e}");
+        assert!(!e.contains("the target reported"), "false on the resume path: {e}");
 
         // NORMALISED, never refused: these render and decide nothing once
         // the disk is gone. Real ATA models are vendor-padded, so an
@@ -736,7 +796,11 @@ mod tests {
             );
             let err = super::parse_lsblk(&json)
                 .expect_err(&format!("{bad:?} is not a kernel device name"));
-            assert!(err.to_string().contains("kernel device name"), "{err}");
+            // `{:#}` walks the context chain -- the fresh path now adds
+            // "the target's own lsblk reported this device", so the root
+            // cause is no longer what `to_string()` returns.
+            assert!(format!("{err:#}").contains("kernel device name"), "{err:#}");
+            assert!(format!("{err:#}").contains("lsblk"), "{err:#}");
         }
         // A name that is entirely valid CHARSET but does not survive
         // cleaning, because it exceeds MAX_FIELD and truncates. The
@@ -751,7 +815,7 @@ mod tests {
         );
         let err = super::parse_lsblk(&json)
             .expect_err("a name that truncates under cleaning must be refused");
-        assert!(err.to_string().contains("kernel device name"), "{err}");
+        assert!(format!("{err:#}").contains("kernel device name"), "{err:#}");
         // Exactly at the cap is fine.
         let at_cap = "a".repeat(super::MAX_FIELD);
         let json = format!(
