@@ -50,52 +50,44 @@ declares no TLS feature — so it looks unreachable, but it is a real advisory i
 Authorizes the rustls bump despite the dependency hard stop, FIXING the SEC-CRIT-002 residual
 rather than accepting it, and security cycles past the 2-cycle budget.
 
-## FOUR security cycles, FOUR Criticals, THREE in one function
-- cycle 2 -> Critical in cycle 1's fix (consent bool = authorization bypass)
-- cycle 3 -> Critical in cycle 3's fix (`1b02cb7`): serial shell-quoted but NOT Nix-escaped;
-  `shell_single_quote` emits `'\''` and **`''` terminates a Nix indented string**. Fixed by
-  emitting the hook as a DOUBLE-quoted Nix string + `nix_str` over the whole script.
-- cycle 4 -> Critical in cycle 3's fix (`f866983`): `echo "  {disk}"` put the shell-quoted path
-  inside DOUBLE quotes, **where single quotes are inert**, so `$(...)` in a by-id path ran AS ROOT
-  in the kexec'd installer. Proven with a real exploit (/tmp/OWNED). `$(` is not Nix
-  antiquotation so `nix_str` passes it through verbatim — the Nix layer cannot save the shell
-  layer. Fixed: assign each untrusted value ONCE at a top-level assignment, reference via
-  `"$ferrum_disk"` thereafter.
+## SECURITY BAR MET — cycle 5 PASS: 0 Critical / 0 High / 0 Medium
+Five cycles. Criticals in cycles 1-4, THREE of them in `precreate_serial_guard` alone. Cycle 5
+verified empirically: 28 payloads x 3 shells x 5 wrapping contexts through real Rust -> real Nix
+-> real shells with a hostile `lsblk` on PATH, **mutation-proved** against the cycle-4 defect
+(restoring it pops 6 payloads). All five of its Low notes are now also fixed (`a281b29`).
 
-**THE ROOT CAUSE, and the durable lesson:** every one of those tests asserted *"the quoted form
-appears in the output"* — which is equally true of text that is inert where it sits and text that
-is not. **Shell-quoted is not shell-safe; the context the quoted text lands in is what matters.**
-A `'...'` is inert inside `"..."`, a here-doc, `eval`, or another `'...'`.
-**The fix that actually holds is a test that RENDERS THE GUARD AND EXECUTES IT** against payloads
-(`the_generated_guard_cannot_be_made_to_execute_anything`, 4 payloads, mutation-proved: restoring
-the vulnerable echo makes it fail). My first mutation attempt SILENTLY FAILED TO APPLY and showed
-a false pass — always confirm the mutation actually landed before trusting the result.
+**THE DURABLE LESSONS — these are what actually stopped it:**
+1. **Shell-quoted is not shell-safe.** A `'...'` is INERT inside `"..."`, a here-doc, `eval`, or
+   another `'...'`. What matters is the context the quoted text lands in. Assign untrusted values
+   ONCE at a top-level assignment and reference via `"$var"`.
+2. **Escaped-for-the-inner-layer is not safe at the outer sink.** The value was correctly
+   `nix_str`-escaped for Nix and still landed unquoted in disko's own `for dev in ${toString …}`.
+3. **A test that asserts "the quoted form appears" is worthless** — equally true of text that is
+   inert and text that is not. **RENDER IT AND EXECUTE IT** against payloads
+   (`the_generated_guard_cannot_be_made_to_execute_anything`), and execute the POST-Nix text, not
+   the pre-escaping text.
+4. **Validate once at the boundary with an allowlist, on EVERY ingress.** Three injections all
+   came from re-deriving safety per call site. `inventory::validate_by_id_path` now runs on the
+   resume deserialize too. **A deserialize is not a validation.**
+5. **Confirm a mutation actually applied** before trusting a mutation test — mine silently failed
+   once and showed a false pass.
+6. `install-inventory.json` / `install-state.json` are ATTACKER-CONTROLLED on the resume path.
 
-Also: `by_id`/`serial` come from a plain deserialize of `install-inventory.json` in the operator's
-WRITABLE bind mount on the resume path. The codebase documents this as untrusted in two places.
-**Any new sink consuming `approved.device.*` must be checked against that.** `verify.rs:140` does
-it right; `render.rs` did not, twice.
+## VERIFIED for `a281b29` (real output)
+`cargo test --workspace` 8/8 binaries ok (191 in ferrum-install) · `clippy -p ferrum-install
+--all-targets -D warnings` 0 · `nix build .#checks.aarch64-linux.workspace-tests` +
+`.#packages...ferrum-install` both built.
 
-## VERIFIED for `f866983` (real output)
-`cargo test --workspace` 8/8 binaries ok · `clippy -p ferrum-install --all-targets -D warnings` 0
-· `nix build .#checks.aarch64-linux.workspace-tests` + `.#packages...ferrum-install` both built ·
-executing-guard test mutation-proved.
-Cycle 4 also confirmed: `nix_str` IS complete for double-quoted Nix (`\r`/`\t` are producer
-escapes, not terminators — omitting them fails closed); the two escaping layers compose correctly
-because `nix_str` does `\`->`\\` FIRST; and every other sink (`verify.rs`, `stage2.rs`,
-`main.rs`, `install.rs`) is clean.
-
-## In flight
-**Cycle 5** (owasp-reviewer, injection only) against `1b02cb7..f866983`. Briefed to re-derive the
-exploit empirically rather than trust my test, try payloads mine do not cover (newline, `IFS`,
-`"`/`\` in the path, crafted `lsblk` OUTPUT), and state explicitly whether zero-Medium-or-above
-is met.
+## Unpushed commits (5): 646a365 d5e48aa 1b02cb7 f866983 a281b29
+Last PUSHED is `fc27b86`, whose CI was green except `cargo-audit` (the rustls advisory, fixed in
+`d5e48aa`).
 
 ## Next Steps
-1. Act on cycle 5; repeat until an explicit zero-Medium-or-above.
-2. Push `646a365` `d5e48aa` `1b02cb7` `f866983` (per-push approval); `cargo-audit` should pass.
-3. Then `code-review` gate, then `build-green` (ledger enforces order).
-4. S13 — still the only thing that can prove the preCreateHook actually executes on a real host.
+1. **Push** the five commits (per-push approval) and watch CI — `cargo-audit` should now pass.
+2. Close the `code-review` gate, then `build-green` — the ledger enforces that order and refused
+   an out-of-order attempt already. Record the security-clear evidence.
+3. S13 remains the one unimplemented story, and the ONLY thing that can prove the `preCreateHook`
+   actually executes on a real host. Its requirements are written into the spec.
 
 
 ## Blind-spot patterns (full text in the spec's revision logs)

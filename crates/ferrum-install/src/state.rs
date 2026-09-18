@@ -200,6 +200,29 @@ pub fn needs_disk_confirmation(resume: &Resume) -> bool {
     }
 }
 
+/// The phase this run may treat as already reached.
+///
+/// `None` means "validate everything again". A run that collected answers
+/// also regenerated the repository, so the previous run's recorded phase
+/// describes content that no longer exists -- and carrying it forward
+/// skipped Tier 1 entirely when resuming from exactly `PreflightPassed`,
+/// because `PreflightPassed < PreflightPassed` is false.
+///
+/// Kept beside `needs_disk_confirmation` because the two answer the same
+/// question from opposite ends: that one decides whether this run ASKS,
+/// this one decides whether what a previous run proved still applies.
+pub fn effective_reached(resume: &Resume) -> Option<Phase> {
+    match resume {
+        Resume::Fresh | Resume::Conflict(_) => None,
+        Resume::ContinueAfter(p) if needs_disk_confirmation(resume) => {
+            // Re-asked, so re-generated, so nothing is carried forward.
+            let _ = p;
+            None
+        }
+        Resume::ContinueAfter(p) => Some(*p),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -282,6 +305,40 @@ mod tests {
             let r = plan(Some(&state(phase)), "root@saltbox", false);
             assert!(needs_disk_confirmation(&r), "{phase:?} touched nothing");
         }
+    }
+
+    /// The defect this closes: resuming from `PreflightPassed` re-ran the
+    /// interactive flow and regenerated the repository, then skipped Tier 1
+    /// because the recorded phase said it had already passed -- for content
+    /// that no longer existed. Same shape as the resume that skipped the
+    /// authentication backstop.
+    #[test]
+    fn a_resume_that_re_asks_carries_no_phase_forward() {
+        for phase in [Phase::Generated, Phase::PreflightPassed] {
+            let r = plan(Some(&state(phase)), "root@saltbox", false);
+            assert!(needs_disk_confirmation(&r), "{phase:?} re-asks");
+            assert_eq!(
+                effective_reached(&r),
+                None,
+                "{phase:?}: this run regenerated the repository, so the previous \
+                 run's phase is not evidence about this one"
+            );
+        }
+    }
+
+    /// ...but a resume PAST the wipe did not re-ask and did not
+    /// regenerate, so its recorded progress still stands.
+    #[test]
+    fn a_resume_past_the_wipe_keeps_its_progress() {
+        for phase in [Phase::Installing, Phase::Installed, Phase::Stage2Applied] {
+            let r = plan(Some(&state(phase)), "root@saltbox", false);
+            assert_eq!(effective_reached(&r), Some(phase), "{phase:?}");
+        }
+    }
+
+    #[test]
+    fn a_fresh_run_carries_nothing_forward() {
+        assert_eq!(effective_reached(&Resume::Fresh), None);
     }
 
     #[test]

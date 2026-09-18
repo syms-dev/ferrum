@@ -154,8 +154,12 @@ fn precreate_serial_guard(os_disk: &str, serial: &str) -> String {
     // plain deserialize of install-inventory.json in the operator's
     // writable bind mount, which this codebase already documents as
     // untrusted in two other places.
-    let disk = shell_single_quote(os_disk);
-    let want = shell_single_quote(serial);
+    // The shared quoter. A second copy here would be the same
+    // single-source-of-truth mistake `stage2.rs` already corrected -- and
+    // in the one function that has needed three Critical fixes, a quoting
+    // change that failed to propagate is exactly the likely next defect.
+    let disk = crate::collect::sh_quote(os_disk);
+    let want = crate::collect::sh_quote(serial);
     format!(
         r#"      # ferrum: R2 A9. Runs after kexec, immediately before this disk is
       # partitioned -- the one moment device enumeration can legitimately
@@ -173,11 +177,6 @@ fn precreate_serial_guard(os_disk: &str, serial: &str) -> String {
       fi
 "#
     )
-}
-
-/// Single-quotes a value for a POSIX shell.
-fn shell_single_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', r"'\''"))
 }
 
 fn disko(os_disk: &str, firmware: Firmware, serial: Option<&str>) -> String {

@@ -131,7 +131,12 @@ pub fn check_published_apps_are_authenticated(
     granted.sort_unstable();
     let mut asked = open.clone();
     asked.sort_unstable();
-    if !asked.is_empty() && granted == asked {
+    // A SUPERSET, not exact equality: the operator consented to this set,
+    // so a run in which fewer apps end up open is covered by what they
+    // already agreed to. Requiring equality refused that -- safely, but
+    // wrongly. What must never be covered is an app they were not shown,
+    // which is what the `newly_open` check below catches.
+    if !asked.is_empty() && asked.iter().all(|a| granted.contains(a)) {
         return Ok(());
     }
     let newly_open: Vec<&str> = asked
@@ -346,6 +351,14 @@ mod tests {
         assert!(err.contains("qbittorrent"), "{err}");
         assert!(err.contains("NOT covered"), "{err}");
         assert!(!err.contains("You confirmed: sonarr, qbittorrent"), "{err}");
+
+        // Consenting to more than ends up open is covered: they agreed to
+        // a superset of what is actually being published.
+        check_published_apps_are_authenticated(
+            &f(&["sonarr"]),
+            &["qbittorrent".into(), "sonarr".into()],
+        )
+        .unwrap();
     }
 
     /// A missing settings document must fail closed, not pass silently.
