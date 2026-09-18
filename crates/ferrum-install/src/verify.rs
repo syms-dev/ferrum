@@ -52,9 +52,16 @@ pub fn ownership_checks() -> Vec<Check> {
             // shape here: "0" is a substring of "10" and "100", and the
             // check would pass on a file full of sentinels. Emit a word
             // instead, and build the pattern from the one constant.
+            // Three outcomes, not two. `grep -q ... && echo STANDIN || echo
+            // REAL` prints REAL when the file is ABSENT, which is the one
+            // state that must never pass -- the flake imports this file
+            // unconditionally, so a missing one is a host that cannot
+            // evaluate at all. The count form this replaced failed closed
+            // on absence by accident; this does it on purpose.
             command: format!(
-                "grep -q '{}' /etc/ferrum/hardware-configuration.nix && echo STANDIN || echo REAL",
-                crate::render::HARDWARE_CONFIG_SENTINEL
+                "test -f {f} && {{ grep -q '{s}' {f} && echo STANDIN || echo REAL; }} || echo MISSING",
+                f = "/etc/ferrum/hardware-configuration.nix",
+                s = crate::render::HARDWARE_CONFIG_SENTINEL
             ),
             expect: "REAL".into(),
         },
