@@ -34,7 +34,19 @@
         cores = 2;
         # The disk the installer will erase. Separate from the VM's own
         # boot disk so the run genuinely starts from something blank.
-        emptyDiskImages = [ 20480 ];
+        #
+        # **The serial is mandatory, and the first CI run is what taught us
+        # that.** A plain QEMU virtio disk reports no serial at all, and
+        # R2 A8 refuses an inventory whose serials cannot identify a disk --
+        # so the installer would decline to install onto a default QEMU
+        # disk, exactly as it declines a real one that cannot be named
+        # unambiguously. That is the gate working, not a test-harness
+        # problem: the serial is what the operator types to confirm
+        # destruction, and a blank one identifies nothing.
+        emptyDiskImages = [{
+          size = 20480;
+          driveConfig.deviceExtraOpts.serial = "FERRUM-S13-TARGET";
+        }];
         forwardPorts = [{ from = "host"; host.port = 2222; guest.port = 22; }];
       };
 

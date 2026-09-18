@@ -776,6 +776,22 @@ mod tests {
         }
     }
 
+    /// One quoter, not two. The duplicate lived in the function that has
+    /// needed three Critical fixes, where a quoting change failing to
+    /// propagate is the obvious next defect.
+    #[test]
+    fn the_guard_uses_the_shared_quoter() {
+        for v in ["a'b", "a\"b", "plain", "a b", "", "a$(id)b"] {
+            assert!(
+                precreate_serial_guard("/d", v).contains(&crate::collect::sh_quote(v)),
+                "the guard must quote {v:?} exactly as collect::sh_quote does"
+            );
+        }
+        // ...and the device path too, not only the serial.
+        let d = "/dev/disk/by-id/a'b";
+        assert!(precreate_serial_guard(d, "S").contains(&crate::collect::sh_quote(d)));
+    }
+
     /// Each untrusted value must appear exactly once, at a top-level
     /// assignment -- anywhere else the single-quoting is inert.
     #[test]
