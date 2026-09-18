@@ -11,53 +11,55 @@ S13 deferral section). Story map: `.ckit/state/phase-1-6a-stories.md`.
 `crates/ferrum-install/` — 14 modules. Invariants are documented in the commit messages and
 module headers; the load-bearing ones are restated where the reviews touch them below.
 
-## Review fixes COMMITTED as `fc27b86` (local, NOT pushed)
-Both reviews of `9e66264..9f12af8` blocked. **Every Critical, High and Medium is now fixed.**
+## Security cycle 2 found a CRITICAL IN MY OWN FIX. Fixed in `646a365` (local).
+`fc27b86` closed SEC-LOW-004 by recording consent as a **boolean** in install-state.json. That
+boolean was an authorization bypass: forgeable by hand in the operator's own bind mount, and —
+with no forgery at all — **unscoped**, so consent for `[sonarr]` covered a `qbittorrent` added to
+settings.stage2.json between an interrupted run and a resume. The same commit contradicted itself
+one file over: `answers.rs` refuses to recover consent from disk ("consent is a fact about what
+the operator was shown and typed"), while `main.rs` recovered the identical bit from a sibling
+file with the same write properties.
+**Now:** consent is the sorted app list actually shown; preflight recomputes and compares; this
+run's live answer wins whenever this run asked.
 
-- **code-review CRITICAL** `hardware-configuration.nix` never reached `/etc/ferrum`
-  (staged BEFORE nixos-anywhere writes it; flake imports it unconditionally => every apply fails,
-  stage 2 included). Now transferred+committed after install. Test asserts the staged tree CANNOT
-  contain it.
-- **SEC-CRIT-001** resume skipped the auth backstop AND `from_stage2` re-read settings off disk
-  with zero validation. Now the auth check runs on EVERY invocation regardless of phase, and every
-  recovered field is re-validated. *"Don't re-ask" had become "don't re-check."*
-- **SEC-CRIT-002 / HIGH(a)** the pre-disko re-verification is inert (runs pre-kexec). Found by
-  BOTH reviewers. `--phases` exists but a second invocation is undocumented + untested, so rather
-  than ship unverifiable machinery the code, docstrings and **spec R2 A9** now state exactly what
-  is and is not checked. **RESIDUAL RISK for the owner to accept or close:** a post-kexec
-  re-enumeration is not caught; bounded because only udev `model_serial` aliases are accepted.
-- **SEC-MED-001** real domain allowlist + shared `collect::sh_quote` at the remote sinks.
-- **SEC-MED-002** `StrictHostKeyChecking=accept-new` + `UserKnownHostsFile=<host_dir>/known_hosts`
-  (persists across `--rm`; excluded from copy_tree). **This was likely breaking the shipped Docker
-  path outright** — BatchMode=yes REFUSES an unknown host. The VM test hid it by ssh-keyscan.
-- **SEC-MED-003** token in a `Secret` newtype, `Debug` prints `<redacted>`, asserted.
-- **SEC-LOW-001** copy_tree refuses symlinks · **002** token read with echo off via `stty` ·
-  **003** cargo-audit CI job · **004/HIGH(c)** SSO-decline could NEVER complete; consent now
-  recorded in install-state.json (NOT settings.json — Nix schema-validates that) and honoured,
-  and R9 A4's inverted assertion implemented.
-- **MEDIUM (R4 A5)** local settings.json swapped to stage-2 post-install, stage1 kept.
-  **LOW** README documents the installer + put-secret.
-- **Deleted `tests/stage2/`** — it stopped before the install and would have been a green check
-  proving nothing.
+Also fixed in `646a365`: verify.rs's unquoted `findmnt --source {by_id}` (CRITICAL — the one sink
+I was asked to check and missed) + a by-id allowlist · pre-destructive resume now RE-RENDERS
+(HIGH — could install the previous run's settings while reporting the new ones) · `nix_str`
+escaping of device strings into generated Nix evaluated as root (HIGH) · missing
+settings.stage2.json now fails CLOSED (was fail-open) · **a test pins the backstop's call order**
+(deleting it used to leave the suite green — that is how SEC-CRIT-001 got in) · sh_quote shared ·
+install-inventory.json excluded from copy_tree · stale spec line removed.
+SEC-CRIT-002 was dispositioned **fixed as filed** (the false claims are gone); the reviewer
+explicitly declined to call the missing post-kexec check Critical and reclassified the residual
+**Medium**, which still blocks an ordinary PASS until the owner runs `accept-risk`.
 
-## VERIFIED for `fc27b86` (real output)
-`cargo test --workspace`: **8/8 binaries ok, 0 failed, 351 total** (was 342).
+## VERIFIED for `646a365` (real output)
+`cargo test --workspace`: **8/8 binaries ok, 0 failed** (183 in ferrum-install).
 `cargo clippy -p ferrum-install --all-targets -- -D warnings`: **exit 0**.
-Workspace-wide clippy still shows exactly the **3 pre-existing** `assert_eq!`-literal-bool errors
-in ferrum-apply — standing policy says note, never repair.
-**`nix build .#checks.aarch64-linux.workspace-tests` GREEN** (351 in the sandbox) and
-**`.#packages.aarch64-linux.ferrum-install` GREEN** (176). Ran because cargo green does NOT prove
-the Nix derivations build — that is what broke CI on the first push.
+`nix build .#checks.aarch64-linux.workspace-tests` GREEN · `.#packages.aarch64-linux.ferrum-install` GREEN.
+**Mutation-tested**: deleting the backstop call, un-scoping consent, and removing Nix escaping
+each redden exactly their own test; restored 183 pass.
 
-## Next Steps (in order)
-1. **Push `fc27b86`** (needs the owner's per-push approval) and watch CI + VM tests.
-2. **Owner decision needed:** accept or close SEC-CRIT-002's residual (post-kexec re-enumeration
-   not caught). Critical/High are never waivable, so if it must be CLOSED the work is a
-   `--phases`-split spike; if the corrected claims are sufficient, it is now a documented
-   limitation rather than a false claim, and the reviewer offered that as an acceptable outcome.
-3. Re-dispatch `owasp-reviewer` + `policy-validator` on the affected files only (security cycle
-   1 of 2 used). Then close `code-review`, then `build-green` — the ledger enforces that order.
-4. S13 still the one unimplemented story; its requirements are written into the spec.
+## CI on `fc27b86` (pushed)
+`flake-check` `rust` `installer-image` **success**; **VM tests success**. `cargo-audit` **FAILED**
+— and correctly: **RUSTSEC-2026-0285, rustls 0.23.43, CVSS 5.3, fix = >=0.23.45.** Reached via
+`ureq` <- `ferrum-reconcile`, which only ever calls `http://` on loopback (`main.rs:53`) and
+declares no TLS feature — so it looks unreachable, but it is a real advisory in the tree.
+
+## BLOCKED ON THE OWNER — three decisions
+1. **rustls bump** — bumping a third-party package is a HARD STOP under standing policy. Options:
+   authorize the patch bump; or `--ignore RUSTSEC-2026-0285` in CI with the reasoning and a
+   revisit trigger; or leave CI red.
+2. **SEC-CRIT-002 residual (now Medium)** — accept via `claude-kit pipeline accept-risk`, or build
+   a real pre-disko check (a `--phases`-split spike; a second invocation is undocumented).
+3. **Security defect-loop budget is EXHAUSTED (cycle 2 of 2).** A third scan needs the owner's
+   authorization per `.claude/rules/human-in-the-loop.md`. `646a365`'s fixes are therefore
+   UNREVIEWED — and cycle 2 found a Critical in cycle 1's fixes, so "unreviewed" is not nothing.
+
+## Next Steps
+1. Get those three decisions. 2. Push `646a365` (needs per-push approval) and watch CI.
+3. Then `code-review` gate, then `build-green` — the ledger enforces that order.
+4. S13 remains the one unimplemented story; its requirements are in the spec.
 
 
 ## Blind-spot patterns (full text in the spec's revision logs)
