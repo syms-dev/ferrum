@@ -56,7 +56,11 @@ INST_PID=$!
 # That phase exists precisely because the wipe happens inside
 # nixos-anywhere, so a crash between those two moments must not look like
 # "nothing was touched".
-for _ in $(seq 1 120); do
+# Generous: before `Installing` the installer runs Tier 1, which is a real
+# `nix build --dry-run` of the generated flake against the pinned ferrum
+# revision -- and the CI cache is routinely throttled, so it comes from
+# cache.nixos.org. Ten minutes was not enough on the first real run.
+for _ in $(seq 1 360); do
   grep -q '"Installing"' "$WORK/host/install-state.json" 2>/dev/null && break
   kill -0 "$INST_PID" 2>/dev/null || break
   sleep 5

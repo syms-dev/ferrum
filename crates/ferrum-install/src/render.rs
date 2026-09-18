@@ -488,6 +488,36 @@ pub fn render(
     // git does not track empty directories, and Nix ignores untracked
     // files inside a git tree -- so an untracked empty directory would
     // simply not be in the store copy the host evaluates.
+    // A placeholder `hardware-configuration.nix`, for an ordering reason
+    // rather than a cosmetic one.
+    //
+    // The generated flake imports this file unconditionally, but the real
+    // one is produced by `nixos-anywhere --generate-hardware-config`
+    // DURING the install -- which happens after Tier 1 preflight. So
+    // without a placeholder, preflight's `nix build --dry-run` of the
+    // configuration it just generated fails with "path
+    // .../hardware-configuration.nix does not exist" on every fresh
+    // install, and the check that exists to catch problems before anything
+    // is destroyed could never run at all.
+    //
+    // `docs/INSTALL.md`'s manual path avoided this because its Step 3
+    // generates and commits the file before Step 5's dry run. The
+    // single-invocation design removed that step; this restores what it
+    // provided. nixos-anywhere overwrites this file with the real one, and
+    // R6 A2 then commits that back.
+    files.insert(
+        "hardware-configuration.nix".into(),
+        "# PLACEHOLDER -- replaced during the install by\n\
+         # `nixos-anywhere --generate-hardware-config`, which writes the real\n\
+         # hardware configuration read off the target itself.\n\
+         #\n\
+         # It exists so the preflight can evaluate this configuration before\n\
+         # anything is destroyed. disko supplies every fileSystems entry for\n\
+         # the OS disk, so an empty module evaluates cleanly here.\n\
+         { ... }: { }\n"
+            .into(),
+    );
+
     files.insert(
         "custom/.gitkeep".into(),
         "# Hand-written host-specific Nix goes here; ferrum never rewrites it.\n\
@@ -924,6 +954,21 @@ mod tests {
     /// `readDir` on a missing directory is a hard evaluation error -- so a
     /// host with no data disks produced a configuration that could not be
     /// evaluated at all.
+    /// Preflight evaluates the generated flake BEFORE the install runs,
+    /// and the flake imports hardware-configuration.nix unconditionally --
+    /// but nixos-anywhere only writes the real one during the install. A
+    /// placeholder is what lets the pre-destructive check run at all.
+    #[test]
+    fn a_placeholder_hardware_config_exists_so_preflight_can_evaluate() {
+        let f = render(&answers(), &approved(Firmware::Uefi), &keys(), "abc").unwrap();
+        let hw = f
+            .get("hardware-configuration.nix")
+            .expect("preflight cannot evaluate the flake without this file");
+        assert!(hw.contains("PLACEHOLDER"), "it must be obviously temporary: {hw}");
+        assert!(hw.contains("{ ... }: { }"), "it must be a valid empty module: {hw}");
+        assert!(f["flake.nix"].contains("./hardware-configuration.nix"));
+    }
+
     #[test]
     fn custom_always_exists_even_with_no_data_disks() {
         let mut a = approved(Firmware::Uefi);
