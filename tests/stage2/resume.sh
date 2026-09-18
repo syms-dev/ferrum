@@ -80,34 +80,54 @@ grep -q '"Installing"' "$WORK/host/install-state.json" \
   || die "the record does not show Installing -- an unrecorded destructive action"
 ok
 
-step "R7 A1d: a resume does NOT ask for the serial again"
-# No serial in the answers this time. If the installer asks, it will read
-# EOF and fail -- which is exactly what must not happen.
+step "R7 A1d: a resume refuses FAST instead of hanging, and does not re-ask"
+# What this used to assert, and why it was wrong.
+#
+# It expected the resume to complete and produce a working host. It cannot.
+# The first run kexec'd the target, and the system now in its RAM accepts
+# only the keys THAT run installed. A second nixos-anywhere invocation
+# generates a fresh keypair and ssh-copy-id's it using the operator's
+# credentials, which that environment does not accept -- and nixos-anywhere
+# then retries forever rather than failing. Measured on run 35354737401:
+# 150 minutes of silent looping on "Permission denied
+# (publickey,keyboard-interactive)", killed by the outer timeout, with no
+# output an operator could act on.
+#
+# So the installer now refuses to hand control to nixos-anywhere in that
+# state, and this asserts the refusal: fast, and with a recovery that
+# works. The recovery itself -- power-cycle, then --fresh -- is an ordinary
+# fresh install, which tests/stage2/run.sh already covers end to end.
 { echo ""; } > "$WORK/answers2"
-# 9000s, not 3600. The resumed installer re-runs nixos-anywhere in full
-# and then applies stage 2, which is the same work the non-resume job needs
-# 85+ minutes for -- so a 60-minute cap failed a run whose guest had
-# already booted successfully. Kept well inside the job's own 180-minute
-# budget so THIS timeout is what fires on a genuine hang, with a
-# diagnosable message, rather than the job cap killing the log.
-timeout 9000 "$INSTALLER" root@127.0.0.1 --ssh-port 2222 \
+START=$(date +%s)
+timeout 900 "$INSTALLER" root@127.0.0.1 --ssh-port 2222 \
   --host-dir "$WORK/host" --ssh-dir "$WORK/ssh" < "$WORK/answers2" \
   > "$WORK/install2.log" 2>&1
 RC=$?
+ELAPSED=$(( $(date +%s) - START ))
 tail -40 "$WORK/install2.log"
+
 grep -qi "Type the SERIAL" "$WORK/install2.log" \
   && die "the resume re-asked for the serial after the disk was already erased"
-[ "$RC" -eq 0 ] || die "the resume exited $RC"
-ok
 
-step "the resumed install produced a working host"
-wait_for_ssh 180 || die "the host never came back"
-tssh 'test -f /etc/ferrum/flake.nix' || die "/etc/ferrum has no flake"
-tssh 'systemctl is-active ferrumd' | grep -q active || die "ferrumd is not running"
+# It must FAIL, not hang: 124 is the timeout firing, which is the bug.
+[ "$RC" -ne 124 ] || die "the resume HUNG again (timeout fired after ${ELAPSED}s)"
+[ "$RC" -ne 0 ] || die "the resume reported success, but it cannot reach the kexec'd target"
+
+# Fast: the probe window is 5 minutes, so anything near the old 150 is a
+# regression even if it eventually exits.
+[ "$ELAPSED" -lt 600 ] || die "the refusal took ${ELAPSED}s -- it must be prompt"
+
+# And it must say what to do. This is the whole point: the operator is
+# standing at a half-installed machine.
+grep -q "cannot authenticate" "$WORK/install2.log" || die "no explanation of the failure"
+grep -q "kexec"               "$WORK/install2.log" || die "does not name the cause"
+grep -q -- "--fresh"          "$WORK/install2.log" || die "does not name the recovery"
+grep -q "power-cycle"         "$WORK/install2.log" || die "does not say to reboot the target"
 ok
 
 echo
 echo "================================================================"
-echo "S13 RESUME PASSED: killed mid-install, resumed without"
-echo "re-confirming the disk, and reached a working host."
-echo "================================================================"
+echo "S13 RESUME PASSED: killed mid-install, and the resume REFUSED"
+echo "promptly with a recovery -- instead of looping on ssh-copy-id"
+echo "for 150 minutes as it did before."
+
