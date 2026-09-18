@@ -50,47 +50,52 @@ declares no TLS feature — so it looks unreachable, but it is a real advisory i
 Authorizes the rustls bump despite the dependency hard stop, FIXING the SEC-CRIT-002 residual
 rather than accepting it, and security cycles past the 2-cycle budget.
 
-## `1b02cb7` — cycle 3 found a CRITICAL IN CYCLE 3's OWN FIX
-`precreate_serial_guard` shell-quoted the serial and stopped. `shell_single_quote` emits `'\''`
-for an apostrophe and **`''` terminates a Nix INDENTED string** — so a serial with an apostrophe
-(plausible on real hardware) broke the generated disko.nix, and a crafted one injected Nix that
-`nix build --dry-run` evaluates on the OPERATOR's machine and nixos-anywhere builds as root.
-Every other device string in that same commit already went through `nix_str`; the serial was the
-one omission, in the newest function — and the test beside it asserted only shell-quoting while
-exercising a benign value.
-**Fix:** emit the hook as a **double-quoted** Nix string and pass the whole rendered script
-through `nix_str`. Composition order matters and is correct: shell-quote first, then Nix-escape
-everything, because Nix un-escapes at eval time producing exactly the intended shell text.
-**PROVEN, not reasoned:** reproduced the break with `nix-instantiate`, then generated a real
-disko.nix with serial `abc'def"x${builtins.currentSystem}` and confirmed `nix-instantiate --parse`
-accepts it (`${` -> `\${`, `"` -> `\"`).
+## FOUR security cycles, FOUR Criticals, THREE in one function
+- cycle 2 -> Critical in cycle 1's fix (consent bool = authorization bypass)
+- cycle 3 -> Critical in cycle 3's fix (`1b02cb7`): serial shell-quoted but NOT Nix-escaped;
+  `shell_single_quote` emits `'\''` and **`''` terminates a Nix indented string**. Fixed by
+  emitting the hook as a DOUBLE-quoted Nix string + `nix_str` over the whole script.
+- cycle 4 -> Critical in cycle 3's fix (`f866983`): `echo "  {disk}"` put the shell-quoted path
+  inside DOUBLE quotes, **where single quotes are inert**, so `$(...)` in a by-id path ran AS ROOT
+  in the kexec'd installer. Proven with a real exploit (/tmp/OWNED). `$(` is not Nix
+  antiquotation so `nix_str` passes it through verbatim — the Nix layer cannot save the shell
+  layer. Fixed: assign each untrusted value ONCE at a top-level assignment, reference via
+  `"$ferrum_disk"` thereafter.
 
-**THREE CYCLES, THREE TIMES A FIX CARRIED A DEFECT.** cycle1 fix -> cycle2 Critical (consent
-bool) -> cycle3 Critical (serial escaping). The pattern: each fix was written and tested by the
-same reasoning that produced the gap, so its test agreed with it. Adversarial input tests and an
-EMPIRICAL check (run the parser, don't read the grammar) are what actually caught these.
+**THE ROOT CAUSE, and the durable lesson:** every one of those tests asserted *"the quoted form
+appears in the output"* — which is equally true of text that is inert where it sits and text that
+is not. **Shell-quoted is not shell-safe; the context the quoted text lands in is what matters.**
+A `'...'` is inert inside `"..."`, a here-doc, `eval`, or another `'...'`.
+**The fix that actually holds is a test that RENDERS THE GUARD AND EXECUTES IT** against payloads
+(`the_generated_guard_cannot_be_made_to_execute_anything`, 4 payloads, mutation-proved: restoring
+the vulnerable echo makes it fail). My first mutation attempt SILENTLY FAILED TO APPLY and showed
+a false pass — always confirm the mutation actually landed before trusting the result.
 
-## Docs reconciled in the same commit
-`confirm.rs` header, `main.rs::recheck` comment and spec R2 A9 all still claimed there was no
-post-kexec hook, contradicting the `preCreateHook` added one commit earlier. R2 A9 now describes
-BOTH checks, records the double-escaping requirement and why, and states plainly the hook is
-**still unproven at runtime** — which makes S13 load-bearing, not optional.
+Also: `by_id`/`serial` come from a plain deserialize of `install-inventory.json` in the operator's
+WRITABLE bind mount on the resume path. The codebase documents this as untrusted in two places.
+**Any new sink consuming `approved.device.*` must be checked against that.** `verify.rs:140` does
+it right; `render.rs` did not, twice.
 
-## VERIFIED for `1b02cb7` (real output)
-`cargo test --workspace` 8/8 binaries ok · `clippy -p ferrum-install --all-targets -D warnings`
-0 errors · `nix build .#checks.aarch64-linux.workspace-tests` and `.#packages...ferrum-install`
-both built · `nix-instantiate --parse` on an adversarially-generated disko.nix: PARSES CLEANLY.
+## VERIFIED for `f866983` (real output)
+`cargo test --workspace` 8/8 binaries ok · `clippy -p ferrum-install --all-targets -D warnings` 0
+· `nix build .#checks.aarch64-linux.workspace-tests` + `.#packages...ferrum-install` both built ·
+executing-guard test mutation-proved.
+Cycle 4 also confirmed: `nix_str` IS complete for double-quoted Nix (`\r`/`\t` are producer
+escapes, not terminators — omitting them fails closed); the two escaping layers compose correctly
+because `nix_str` does `\`->`\\` FIRST; and every other sink (`verify.rs`, `stage2.rs`,
+`main.rs`, `install.rs`) is clean.
 
 ## In flight
-**Cycle 4** (owasp-reviewer, injection class only) against `d5e48aa..1b02cb7`. Asked specifically
-whether the TWO escaping layers compose correctly for backslashes, whether `nix_str` is complete
-for double-quoted Nix (`\r`/`\t`), and for an explicit statement of zero-Medium-or-above.
+**Cycle 5** (owasp-reviewer, injection only) against `1b02cb7..f866983`. Briefed to re-derive the
+exploit empirically rather than trust my test, try payloads mine do not cover (newline, `IFS`,
+`"`/`\` in the path, crafted `lsblk` OUTPUT), and state explicitly whether zero-Medium-or-above
+is met.
 
 ## Next Steps
-1. Act on cycle 4; repeat until zero Medium-and-above.
-2. Push `646a365` `d5e48aa` `1b02cb7` (per-push approval) — `cargo-audit` should now pass.
-3. Then `code-review` gate, then `build-green` (ledger enforces that order).
-4. S13 — the only thing that can prove the preCreateHook actually executes.
+1. Act on cycle 5; repeat until an explicit zero-Medium-or-above.
+2. Push `646a365` `d5e48aa` `1b02cb7` `f866983` (per-push approval); `cargo-audit` should pass.
+3. Then `code-review` gate, then `build-green` (ledger enforces order).
+4. S13 — still the only thing that can prove the preCreateHook actually executes on a real host.
 
 
 ## Blind-spot patterns (full text in the spec's revision logs)
