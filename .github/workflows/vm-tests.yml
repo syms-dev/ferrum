@@ -66,6 +66,39 @@ jobs:
   #
   # x86_64 only, deliberately: the aarch64 hosted runners have no /dev/kvm
   # (see the matrix comment above), so there is nowhere to run these today.
+  # Phase 1.6a story S13: the half of the installer that a sandboxed
+  # runNixOSTest cannot reach. tests/install-from-nothing.nix covers
+  # everything up to `installed`; stage 2 exists so each app's sopsFile is
+  # created at RUNTIME on the guest, which rules out the pre-built-closure
+  # trick the other VM tests rely on and needs a network to build in place.
+  #
+  # Two jobs rather than one: they need separate blank targets (the first
+  # leaves its machine installed), and a failure in one should not hide the
+  # other. Both are slow -- a real QEMU guest builds its own closure.
+  stage2:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+      - name: /dev/kvm is available
+        run: test -r /dev/kvm && test -w /dev/kvm
+      - name: install a real host end to end, with sonarr and sabnzbd
+        run: ./tests/stage2/run.sh
+
+  stage2-resume:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+      - name: /dev/kvm is available
+        run: test -r /dev/kvm && test -w /dev/kvm
+      - name: kill nixos-anywhere mid-install, then resume
+        run: ./tests/stage2/resume.sh
+
   vm-tests:
     runs-on: ubuntu-latest
     steps:

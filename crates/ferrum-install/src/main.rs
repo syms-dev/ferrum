@@ -95,18 +95,32 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
     if let state::Resume::Conflict(message) = &resume {
         anyhow::bail!("{message}");
     }
-    let reached = match &resume {
-        state::Resume::ContinueAfter(p) => {
-            println!("\nresuming: this directory already reached '{}'", p.describe());
-            Some(*p)
-        }
-        _ => None,
-    };
+    if let state::Resume::ContinueAfter(p) = &resume {
+        println!("\nresuming: this directory already reached '{}'", p.describe());
+    }
 
     // The disk gate is re-run only when nothing has been written yet.
     // Past `Installing` the named disk is already gone, so re-confirming
     // protects nothing and only trains the operator to retype a serial.
     let asked_fresh = state::needs_disk_confirmation(&resume);
+
+    // **If this run collected answers, it also regenerates the repository,
+    // so nothing the PREVIOUS run validated applies any more.** Carrying
+    // its recorded phase forward would skip the checks that validate the
+    // content -- and resuming from exactly `PreflightPassed` did precisely
+    // that: it regenerated from new answers and then skipped Tier 1,
+    // because `PreflightPassed < PreflightPassed` is false. The evidence
+    // even claimed `evaluated: true`.
+    //
+    // Reachable by the most ordinary sequence there is: interrupt right
+    // after the preflight line prints and before the erase warning -- the
+    // natural place to pause and double-check -- then run it again.
+    //
+    // This is the same shape as the resume that skipped the authentication
+    // backstop. A phase recorded by a run whose content this run replaced
+    // is not evidence about this run. `state::effective_reached` owns that
+    // rule so it is unit-testable rather than implicit here.
+    let reached = state::effective_reached(&resume);
     let (mut answers, approved) = if asked_fresh {
         plan_install(&pre)?
     } else {
