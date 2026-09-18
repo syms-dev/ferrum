@@ -46,20 +46,41 @@ each redden exactly their own test; restored 183 pass.
 `ureq` <- `ferrum-reconcile`, which only ever calls `http://` on loopback (`main.rs:53`) and
 declares no TLS feature — so it looks unreachable, but it is a real advisory in the tree.
 
-## BLOCKED ON THE OWNER — three decisions
-1. **rustls bump** — bumping a third-party package is a HARD STOP under standing policy. Options:
-   authorize the patch bump; or `--ignore RUSTSEC-2026-0285` in CI with the reasoning and a
-   revisit trigger; or leave CI red.
-2. **SEC-CRIT-002 residual (now Medium)** — accept via `claude-kit pipeline accept-risk`, or build
-   a real pre-disko check (a `--phases`-split spike; a second invocation is undocumented).
-3. **Security defect-loop budget is EXHAUSTED (cycle 2 of 2).** A third scan needs the owner's
-   authorization per `.claude/rules/human-in-the-loop.md`. `646a365`'s fixes are therefore
-   UNREVIEWED — and cycle 2 found a Critical in cycle 1's fixes, so "unreviewed" is not nothing.
+## Owner said: "keep going until it's fixed and no more medium or above"
+That authorizes (a) the rustls bump despite the dependency hard stop, (b) FIXING the SEC-CRIT-002
+residual rather than accepting it, and (c) security cycles past the 2-cycle budget.
+
+## `d5e48aa` — both remaining Mediums CLOSED
+- **R2 A9 is now REAL.** disko exposes **`preCreateHook`** ("shell commands to run before
+  create"), which runs **inside the kexec'd installer immediately before partitioning** — exactly
+  the seam that was missing, because nixos-anywhere does kexec+disko+install+reboot as one opaque
+  process. So the guard is GENERATED INTO the host's `disko.nix` (`render::precreate_serial_guard`)
+  rather than run from the installer. Re-reads the serial of the approved by-id path, aborts on
+  mismatch, **fails closed** (unreadable serial = mismatch).
+  **VERIFIED:** `preCreateHook` is real (`disko/lib/default.nix` `mkSubType`) and a real
+  `nixosSystem` eval ACCEPTS it at `disko.devices.disk.main.preCreateHook` and round-trips the
+  text. **NOT VERIFIED:** that it executes — building the x86_64 disko script on this aarch64
+  machine fails for unrelated reasons. Do NOT claim it is proven. S13 is what would prove it.
+- **RUSTSEC-2026-0285** rustls 0.23.43 -> 0.23.45. Lockfile delta is exactly one package, patch
+  version, 2 lines, no package added. `cargo audit`: 277 deps scanned, **no vulnerabilities**.
+
+## VERIFIED for `d5e48aa` (real output)
+`cargo test --workspace` 8/8 binaries ok, 0 failed · `clippy -p ferrum-install --all-targets
+-D warnings` 0 errors · `cargo audit` clean · `nix build .#checks.aarch64-linux.workspace-tests`
+8/8 ok · `.#packages.aarch64-linux.ferrum-install` built.
+
+## In flight
+**Security cycle 3** dispatched against `fc27b86..d5e48aa`, explicitly authorized by the owner's
+"no medium or above" instruction. Cycle 2 found a Critical inside cycle 1's fixes, so the brief
+tells it to hunt hardest in the new code — especially whether a crafted `install-state.json` can
+still grant consent for apps the operator never saw.
 
 ## Next Steps
-1. Get those three decisions. 2. Push `646a365` (needs per-push approval) and watch CI.
+1. Act on cycle 3. Repeat until zero Medium-and-above, per the owner's bar.
+2. Push `646a365`+`d5e48aa` (per-push approval) and watch CI — `cargo-audit` should now pass.
 3. Then `code-review` gate, then `build-green` — the ledger enforces that order.
-4. S13 remains the one unimplemented story; its requirements are in the spec.
+4. S13 is the one unimplemented story AND the only thing that can prove the preCreateHook guard
+   actually executes. That link is now load-bearing, not just nice-to-have.
 
 
 ## Blind-spot patterns (full text in the spec's revision logs)

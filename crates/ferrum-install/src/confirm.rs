@@ -18,23 +18,21 @@
 //! never a default and why a typo is a refusal rather than a different
 //! disk.
 //!
-//! **Known gap, stated plainly rather than papered over.** Spec R2 A9 asks
-//! for the approved device to be re-verified *inside the kexec'd installer,
-//! immediately before disko* -- the one moment a different driver set could
-//! legitimately re-enumerate devices and point the approved `by-id` alias
-//! at a different physical disk. `verify_still` does not run there. It runs
-//! before `nixos-anywhere` is invoked at all, because `nixos-anywhere`
-//! performs kexec, disko, install and reboot as one external process with
-//! no hook back into this code. `--phases` could in principle split kexec
-//! from disko, but running the remaining phases as a second invocation is
-//! not documented as supported and has not been tested here.
+//! **Two checks, at two different moments.** `verify_still` here runs
+//! before `nixos-anywhere` is invoked, and catches a device that changed
+//! while the operator was reading the inventory and typing -- minutes of
+//! human time, and a real window in which a USB disk can be unplugged.
 //!
-//! What the pre-invocation check does buy is real but smaller: minutes pass
-//! while the operator reads the inventory and types, and a USB disk can be
-//! unplugged in that window. The residual risk is bounded by the aliases
-//! this installer accepts -- udev `model_serial` forms, which are derived
-//! from the hardware rather than from enumeration order, and a device with
-//! no such alias is refused outright.
+//! The *post-kexec* check R2 A9 asks for lives somewhere else, because
+//! `nixos-anywhere` performs kexec, disko, install and reboot as one
+//! external process with no hook back into this code. disko's own
+//! `preCreateHook` is the seam: `render::precreate_serial_guard` generates
+//! the check INTO the host's `disko.nix`, so it runs inside the kexec'd
+//! installer immediately before that disk is partitioned -- the one moment
+//! a different driver set could legitimately re-enumerate devices and point
+//! the approved `by-id` alias at a different physical disk. It fails closed,
+//! and the serial it embeds is escaped for both the shell it runs in and
+//! the Nix string it is spliced into.
 
 use crate::inventory::{self, Device, Firmware};
 use crate::prompt::PromptIo;

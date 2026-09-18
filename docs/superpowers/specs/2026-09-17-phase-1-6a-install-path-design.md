@@ -130,25 +130,36 @@ unrecoverable data loss, and the protection today is entirely structural
   The approved `by-id` path is re-resolved and its serial re-compared
   against `install-inventory.json`; a mismatch aborts before any write.
 
-  *Revised after the security review.* This criterion originally required
-  the check to run **inside the kexec'd installer, immediately before
-  disko**, on the grounds that kexec's different driver set is the one
-  moment enumeration can legitimately change. That is not implemented and
-  the code and its doc comments wrongly claimed it was — found
-  independently by both the code reviewer and the security reviewer.
-  `nixos-anywhere` runs kexec, disko, install and reboot as one external
-  process with no hook back into the installer; `--phases` exists and could
-  in principle split them, but resuming the remaining phases in a second
-  invocation is not documented as supported and has not been tested.
+- A9b. **And again inside the kexec'd installer, immediately before disko
+  partitions**, which is what this criterion always asked for.
 
-  What is implemented catches a device that changed between the inventory
-  being printed and the serial being typed — minutes of human reading, and
-  a genuine window. **The residual risk is that a post-kexec
-  re-enumeration is not caught**, bounded by the fact that the only aliases
-  this installer accepts are udev `model_serial` forms derived from the
-  hardware rather than from enumeration order, and a device without one is
-  refused outright (A4, and `confirm.rs`'s by-id refusal). Accepting or
-  closing that residual is an owner decision, recorded in the run ledger.
+  *History, because it is instructive.* This was first written as a single
+  criterion, then implemented only as the pre-invocation check above while
+  the code and its doc comments claimed otherwise — a false claim found
+  independently by the code reviewer and the security reviewer. The
+  obstacle was real: `nixos-anywhere` runs kexec, disko, install and reboot
+  as one external process with no hook back into the installer, and
+  `--phases` cannot be resumed across invocations in any documented way.
+  The seam is **disko's own `preCreateHook`**, so the check is *generated
+  into the host's `disko.nix`* rather than run from the installer
+  (`render::precreate_serial_guard`). It re-reads the serial of the
+  approved `by-id` path and exits non-zero on mismatch; an unreadable
+  serial counts as a mismatch, so it fails closed.
+
+  The embedded serial is escaped **twice** — once for the shell inside the
+  hook, once for the Nix string the hook is spliced into. Getting only the
+  first was itself a Critical: shell-quoting emits `'\''` for an
+  apostrophe, and `''` terminates a Nix indented string, so a serial with
+  an apostrophe broke the parse and a crafted one injected Nix that is
+  evaluated and built as root. The hook is therefore emitted as a
+  double-quoted Nix string escaped by the same tested `nix_str` every other
+  device-derived value uses.
+
+  **Still unproven:** that the hook *executes*. The option is real and a
+  real `nixosSystem` evaluation accepts it, and a generated `disko.nix`
+  carrying an adversarial serial parses cleanly under `nix-instantiate` —
+  but nothing here has watched it run. S13 is what would, which makes that
+  deferred story load-bearing rather than optional.
 
 **Edge cases.** One disk only → still requires typed confirmation. No
 `/dev/disk/by-id/` entry for the chosen device (some virtio setups) → refuse
@@ -518,8 +529,9 @@ target splits by what the sandbox can hold.
   itself asserts without demonstration.
 - A5. The R2 guards are **mutation-tested**: a wrong serial refuses; a
   duplicate or empty serial refuses (R2 A8); the pre-invocation
-  re-verification aborts on mismatch (R2 A9, as revised -- there is no
-  post-kexec check to test). Deleting each check must make a test go red. A
+  re-verification aborts on mismatch (R2 A9), and the generated
+  `preCreateHook` refuses a changed serial (R2 A9b). Deleting each check
+  must make a test go red. A
   guard whose test passes when the guard is deleted is not a guard.
 - A5b. The **authentication backstop's position** is pinned by a test too.
   It was skipped on resume once (SEC-CRIT-001) and every test stayed green,

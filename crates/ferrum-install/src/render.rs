@@ -112,6 +112,22 @@ pub fn data_disks<'a>(all: &'a [Device], target: &Device) -> Vec<&'a Device> {
 /// is the seam.
 ///
 /// Fails closed: an unreadable serial is a mismatch, not a pass.
+///
+/// **Two escaping layers, and both are required.** The values are first
+/// made safe for the *shell* that runs inside the hook, then the whole
+/// rendered script is made safe for the *Nix string* it is spliced into.
+/// Getting only the first was a real injection: `shell_single_quote`
+/// emits `'\''` for an apostrophe, and `''` is Nix's indented-string
+/// terminator -- so a serial containing an apostrophe (plausible on real
+/// hardware, not merely adversarial) broke the parse, and a crafted one
+/// escaped the string into Nix that `nix build` then evaluates and
+/// `nixos-anywhere` builds as root. Proven with `nix-instantiate`, not
+/// inferred from the grammar.
+///
+/// The hook is emitted as a **double-quoted** Nix string precisely so that
+/// `nix_str` -- which is already tested against `"`, `\`, `${` and
+/// newlines -- can do the second layer, rather than inventing a second
+/// escaper for indented strings.
 fn precreate_serial_guard(os_disk: &str, serial: &str) -> String {
     let disk = shell_single_quote(os_disk);
     let want = shell_single_quote(serial);
@@ -169,8 +185,8 @@ fn disko(os_disk: &str, firmware: Firmware, serial: Option<&str>) -> String {
     let guard = serial
         .map(|sn| {
             format!(
-                "\n    preCreateHook = \'\'\n{}    \'\';\n",
-                precreate_serial_guard(os_disk, sn)
+                "\n    preCreateHook = \"{}\";\n",
+                nix_str(&precreate_serial_guard(os_disk, sn))
             )
         })
         .unwrap_or_default();
@@ -632,7 +648,9 @@ mod tests {
         assert!(d.contains("REFUSING TO PARTITION"), "{d}");
         // Fails closed: the comparison is against the read value, so an
         // unreadable serial is an empty string and therefore a mismatch.
-        assert!(d.contains(r#"[ "$ferrum_got" != "$ferrum_want" ]"#), "{d}");
+        // The quotes are Nix-escaped, because the hook is a double-quoted
+        // Nix string -- see a_serial_containing_an_apostrophe_... for why.
+        assert!(d.contains(r#"[ \"$ferrum_got\" != \"$ferrum_want\" ]"#), "{d}");
         assert!(d.contains("exit 1"), "{d}");
     }
 
@@ -640,6 +658,57 @@ mod tests {
     fn the_serial_guard_is_shell_quoted() {
         let g = precreate_serial_guard("/dev/disk/by-id/x", "a'b;id");
         assert!(g.contains(r"'a'\''b;id'"), "{g}");
+    }
+
+    /// The serial is device-derived, exactly like the fields
+    /// `device_strings_cannot_break_out_of_the_generated_nix` covers -- and
+    /// it was the one field that reached generated Nix with only SHELL
+    /// quoting. `shell_single_quote` emits `'\''` for an apostrophe, and
+    /// `''` terminates a Nix indented string.
+    /// Writes a real generated disko.nix carrying an adversarial serial,
+    /// so it can be parsed by an actual Nix. Reading the grammar is not
+    /// proof; this defect was found and fixed by running nix-instantiate.
+    #[test]
+    fn dump_adversarial_disko_for_nix_parsing() {
+        let Ok(dest) = std::env::var("FERRUM_DUMP_DISKO") else { return };
+        let mut a = approved(Firmware::Uefi);
+        a.device.serial = Some("abc'def\"x${builtins.currentSystem}".into());
+        let f = render(&answers(), &a, &keys(), "abc").unwrap();
+        std::fs::write(dest, &f["disko.nix"]).unwrap();
+    }
+
+    #[test]
+    fn a_serial_containing_an_apostrophe_cannot_break_the_generated_nix() {
+        let mut a = approved(Firmware::Uefi);
+        a.device.serial = Some("abc'def".into());
+        let f = render(&answers(), &a, &keys(), "abc").unwrap();
+        let d = &f["disko.nix"];
+
+        // The hook is a double-quoted string, so the shell's `'\''` is
+        // inert; what must never appear is an unescaped `"` closing it.
+        let hook_start = d.find("preCreateHook = \"").expect("hook present");
+        let rest = &d[hook_start + "preCreateHook = \"".len()..];
+        let end = rest.find("\";").expect("the hook string must be closed");
+        let body = &rest[..end];
+        assert!(body.contains("abc"), "the serial must still be there: {body}");
+        // No unescaped double quote inside the body.
+        let unescaped_quote = body
+            .match_indices('"')
+            .any(|(i, _)| i == 0 || !body[..i].ends_with('\\'));
+        assert!(!unescaped_quote, "an unescaped quote closes the hook early: {body}");
+    }
+
+    /// A serial crafted to inject Nix must be inert.
+    #[test]
+    fn a_serial_cannot_inject_an_antiquotation() {
+        let mut a = approved(Firmware::Uefi);
+        a.device.serial = Some("s${builtins.currentSystem}".into());
+        let f = render(&answers(), &a, &keys(), "abc").unwrap();
+        let d = &f["disko.nix"];
+        let unescaped = d
+            .match_indices("${builtins")
+            .any(|(i, _)| i == 0 || !d[..i].ends_with('\\'));
+        assert!(!unescaped, "an unescaped antiquotation survived:\n{d}");
     }
 
     #[test]

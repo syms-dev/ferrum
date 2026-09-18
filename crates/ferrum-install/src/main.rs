@@ -295,9 +295,10 @@ fn generate(
 /// Minutes pass between the inventory being printed and the serial being
 /// typed, and a USB disk can be unplugged in that window.
 ///
-/// This is the ONLY time the check runs. An earlier comment here claimed it
-/// ran "again after kexec"; it does not, and there is currently no hook to
-/// make it. See `confirm`'s module header for the residual risk.
+/// This is the pre-invocation half. The post-kexec half is generated into
+/// the host's `disko.nix` as a `preCreateHook` -- see
+/// `render::precreate_serial_guard` -- because nixos-anywhere exposes no
+/// hook back into this code.
 fn recheck(
     pre: &preconditions::Preconditions,
     approved: &confirm::Approved,
