@@ -457,6 +457,11 @@ fn recover_plan(
         if let Some(by_id) = device.by_id.as_deref() {
             inventory::validate_by_id_path(by_id)?;
         }
+        // ...and the fields that RENDER, not just the one that reaches
+        // Nix. Only by_id was re-checked here, so a recovered record could
+        // still display as a different disk than it is -- the same
+        // property SEC-C1 was about, arriving by the other ingress.
+        inventory::check_recovered_device(device)?;
     }
 
     let stage2 = std::fs::read_to_string(pre.host_dir.join("settings.stage2.json"))?;

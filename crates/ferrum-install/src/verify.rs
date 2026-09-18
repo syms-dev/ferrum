@@ -58,14 +58,32 @@ pub fn ownership_checks() -> Vec<Check> {
             // unconditionally, so a missing one is a host that cannot
             // evaluate at all. The count form this replaced failed closed
             // on absence by accident; this does it on purpose.
-            command: format!(
-                "test -f {f} && {{ grep -q '{s}' {f} && echo STANDIN || echo REAL; }} || echo MISSING",
-                f = "/etc/ferrum/hardware-configuration.nix",
-                s = crate::render::HARDWARE_CONFIG_SENTINEL
-            ),
+            command: hardware_config_command("/etc/ferrum/hardware-configuration.nix"),
             expect: "REAL".into(),
         },
     ]
+}
+
+/// Builds the shell command behind the hardware-configuration check.
+///
+/// Split out so its THREE outcomes can be executed in a test. They were
+/// not pinned: reverting this to the two-outcome form -- which prints
+/// REAL for a file that does not exist -- passed the entire suite. The fix
+/// was live and nothing held it, which is the third time that has happened
+/// in this feature.
+///
+/// # Arguments
+/// * `path` - the file to inspect on the target.
+///
+/// # Returns
+/// A command printing exactly one of `REAL`, `STANDIN` or `MISSING`. None
+/// is a substring of another, because `Check::expect` is matched with
+/// `contains`.
+pub fn hardware_config_command(path: &str) -> String {
+    format!(
+        "test -f {path} && {{ grep -q '{s}' {path} && echo STANDIN || echo REAL; }} || echo MISSING",
+        s = crate::render::HARDWARE_CONFIG_SENTINEL
+    )
 }
 
 /// The service and operator-interface checks.
@@ -195,6 +213,42 @@ pub fn credential_paths(sso_enabled: bool) -> Vec<(&'static str, &'static str)> 
 
 #[cfg(test)]
 mod tests {
+    /// SEC-L-N5. Executes the real command against real files, because the
+    /// bug being guarded is a SHELL semantics bug -- `grep -q ... && A ||
+    /// B` prints B when the file is absent -- and no amount of reading the
+    /// string catches that.
+    #[test]
+    fn the_hardware_config_check_distinguishes_real_standin_and_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hardware-configuration.nix");
+        let run = || {
+            let out = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(super::hardware_config_command(path.to_str().unwrap()))
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+
+        // Absent -- the state that must never pass. The two-outcome form
+        // this replaced printed REAL here.
+        assert_eq!(run(), "MISSING");
+
+        let mut files = crate::render::Files::new();
+        crate::render::insert_hardware_config_placeholder(&mut files);
+        std::fs::write(&path, &files["hardware-configuration.nix"]).unwrap();
+        assert_eq!(run(), "STANDIN");
+
+        std::fs::write(&path, "{ ... }:\n{ boot.initrd.availableKernelModules = [ \"nvme\" ]; }\n").unwrap();
+        assert_eq!(run(), "REAL");
+
+        // `expect` is matched with `contains`, so the three words must not
+        // shadow each other.
+        for (a, b) in [("REAL", "STANDIN"), ("REAL", "MISSING"), ("STANDIN", "MISSING")] {
+            assert!(!b.contains(a) && !a.contains(b), "{a} / {b}");
+        }
+    }
+
     use super::*;
     use crate::inventory::Filesystem;
 
