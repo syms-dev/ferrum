@@ -3,10 +3,12 @@
 #
 # tests/install-from-nothing.nix covers everything `runNixOSTest` can: the
 # real binary, a blank disk, and every refusal that happens before anything
-# is destroyed. It stops at `installed`, because stage 2 exists so that each
-# app's `sopsFile` is created at RUNTIME on the guest -- which rules out the
-# pre-built-closure trick the other VM tests rely on, and the sandbox has no
-# network to build it in place.
+# is destroyed. It stops SHORT OF the install -- it never reaches
+# `installed` -- because Tier 1 evaluates a flake whose ferrum input is a
+# remote `github:` reference and the sandbox has no network. Stage 2 is
+# further out of its reach again, because each app's `sopsFile` is created
+# at RUNTIME on the guest, which rules out the pre-built-closure trick the
+# other VM tests rely on.
 #
 # So this runs on a CI runner: real KVM, real network, a real QEMU guest,
 # and the real installer driven end to end.

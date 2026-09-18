@@ -23,9 +23,11 @@
 # whose entire reason to exist is that each app's `sopsFile` is created at
 # RUNTIME on the guest and so cannot be in a pre-built closure.
 #
-# Stage 2 therefore lives in the networked, KVM-capable CI job
-# (tests/install-stage2.nix). Splitting them is not a compromise; it is the
-# only split that lets each half actually run.
+# Stage 2 therefore lives in the networked, KVM-capable CI jobs
+# (tests/stage2/run.sh and tests/stage2/resume.sh, driven by the `stage2`
+# and `stage2-resume` jobs in .github/workflows/vm-tests.yml). Splitting
+# them is not a compromise; it is the only split that lets each half
+# actually run.
 { pkgs, ferrumInstall }:
 pkgs.testers.runNixOSTest {
   name = "ferrum-install-from-nothing";

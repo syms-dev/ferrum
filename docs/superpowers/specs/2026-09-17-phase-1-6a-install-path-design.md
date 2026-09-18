@@ -387,7 +387,11 @@ by what each moment can actually support.
 
 **Tier 2 — CI-side, on every change to this repository, not on every install.**
 - A6. The full build-and-boot proof lives in CI, on a KVM-capable Linux
-  runner, as R8's install-from-nothing test. That is where it belongs: the
+  runner, as R8 A2's **`stage2` job** — *not* the sandboxed
+  install-from-nothing test, which has no network and boots nothing (an
+  earlier revision of this clause said otherwise; it was the same false
+  attribution the test-coverage review caught in four other places). That is
+  where it belongs: the
   design doc's concern is that *the install path rots between releases*, which
   is a property of the repository, not of any one operator's laptop. A green
   CI run is what licenses a release; re-proving it on every operator's machine
