@@ -99,12 +99,14 @@ step "R7 A1d: a resume refuses FAST instead of hanging, and does not re-ask"
 # fresh install, which tests/stage2/run.sh already covers end to end.
 { echo ""; } > "$WORK/answers2"
 START=$(date +%s)
+# Streamed, for the same reason run.sh is: a redirected log tells you
+# nothing when the process never exits, and this test hit exactly that
+# twice, burning 150 minutes each time with no output.
 timeout 900 "$INSTALLER" root@127.0.0.1 --ssh-port 2222 \
-  --host-dir "$WORK/host" --ssh-dir "$WORK/ssh" < "$WORK/answers2" \
-  > "$WORK/install2.log" 2>&1
-RC=$?
+  --host-dir "$WORK/host" --ssh-dir "$WORK/ssh" < "$WORK/answers2" 2>&1 \
+  | tee "$WORK/install2.log"
+RC=${PIPESTATUS[0]}
 ELAPSED=$(( $(date +%s) - START ))
-tail -40 "$WORK/install2.log"
 
 grep -qi "Type the SERIAL" "$WORK/install2.log" \
   && die "the resume re-asked for the serial after the disk was already erased"

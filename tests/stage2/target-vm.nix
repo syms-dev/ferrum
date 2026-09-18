@@ -34,8 +34,16 @@
         # builds its OWN closure (--build-on remote), so this needs real
         # room -- both are why the sandboxed test cannot do stage 2.
         memorySize = 6144;
-        diskSize = 12288;
-        cores = 2;
+        # 12G was not obviously enough: nixos-anywhere builds the ENTIRE
+        # closure on this guest (`--build-on remote`), including ferrum's
+        # own Rust binaries, which are in no binary cache. A build that
+        # runs out of space here fails in a way that looks like a hang from
+        # outside.
+        diskSize = 24576;
+        # ubuntu-latest gives 4 vCPU and this guest was taking 2 of them
+        # while the runner sat idle. The closure build is the long pole of
+        # the whole job.
+        cores = 4;
         # The disk the installer will erase. Separate from the VM's own
         # boot disk so the run genuinely starts from something blank.
         #
