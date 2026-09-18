@@ -249,24 +249,32 @@ pub fn attach_by_id(devices: &mut [Device], by_id: &BTreeMap<String, String>) {
 /// Names the colliding or unidentified devices, and says to use the full
 /// `by-id` path instead.
 pub fn check_serials_identify(devices: &[Device]) -> anyhow::Result<()> {
-    let missing: Vec<&str> = devices
-        .iter()
-        .filter(|d| d.serial.is_none())
-        .map(|d| d.name.as_str())
-        .collect();
-    if !missing.is_empty() {
+    // A device with no serial is simply **not selectable** -- the operator
+    // confirms by typing a serial, so one that reports none can never be
+    // named, and `match_serial` will never return it.
+    //
+    // It is NOT a reason to refuse the whole machine. The first CI run of
+    // the stage-2 test found this the hard way: a QEMU guest reports a
+    // floppy device `fd0` with no serial, and the installer declined to
+    // proceed at all. Real machines do the same with an empty optical
+    // drive or a card reader. Refusing there protects nothing and makes
+    // the installer unusable on ordinary hardware.
+    //
+    // What genuinely breaks the gate is a serial that identifies more than
+    // one device, or a machine where nothing can be named at all.
+    let named: Vec<&Device> = devices.iter().filter(|d| d.serial.is_some()).collect();
+    if named.is_empty() {
         anyhow::bail!(
-            "these devices report no serial: {}. A serial is what you type to \
-             confirm the disk to destroy, so it must identify exactly one \
-             device -- re-run naming the full /dev/disk/by-id/ path instead",
-            missing.join(", ")
+            "no device on this machine reports a serial, so there is nothing \
+             you could confirm by typing one. Re-run naming the full \
+             /dev/disk/by-id/ path instead."
         );
     }
 
     let mut seen: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
-    for d in devices {
-        if let Some(s) = d.serial.as_deref() {
-            seen.entry(s).or_default().push(&d.name);
+    for d in &named {
+        if let Some(sn) = d.serial.as_deref() {
+            seen.entry(sn).or_default().push(&d.name);
         }
     }
     let collisions: Vec<String> = seen
@@ -355,7 +363,9 @@ pub fn render(devices: &[Device]) -> String {
         out.push_str(&format!(
             "  {:<10} {:>8}  serial: {}\n",
             "", "",
-            d.serial.as_deref().unwrap_or("(none reported)")
+            d.serial
+                .as_deref()
+                .unwrap_or("(none reported -- cannot be selected)")
         ));
         out.push_str(&format!(
             "  {:<10} {:>8}  {}\n",
@@ -536,11 +546,28 @@ lrwxrwxrwx 1 root root 13 Sep 17 10:00 nvme-Samsung_SSD_980_S5P2NG0N123456 -> ..
         check_serials_identify(&parse_lsblk(LSBLK).unwrap()).unwrap();
     }
 
+    /// A floppy, an empty optical drive or a card reader reports no
+    /// serial. Refusing the whole machine over one was found by the first
+    /// real CI run of the stage-2 test, on a QEMU guest whose `fd0` has
+    /// none -- it made the installer unusable on ordinary hardware.
     #[test]
-    fn a_missing_serial_is_refused_by_name() {
-        let devs = vec![disk("sda", Some("A1"), vec![]), disk("vda", None, vec![])];
+    fn a_device_with_no_serial_is_unselectable_not_disqualifying() {
+        let devs = vec![
+            disk("fd0", None, vec![]),
+            disk("sda", Some("A1"), vec![]),
+        ];
+        check_serials_identify(&devs).unwrap();
+        // ...and it still cannot be chosen, because nothing can name it.
+        assert!(devs.iter().filter(|d| d.serial.is_none()).count() == 1);
+    }
+
+    /// But a machine where NOTHING can be named is a real refusal: there
+    /// is no value the operator could type.
+    #[test]
+    fn a_machine_with_no_serials_at_all_is_refused() {
+        let devs = vec![disk("fd0", None, vec![]), disk("vda", None, vec![])];
         let err = check_serials_identify(&devs).unwrap_err().to_string();
-        assert!(err.contains("vda"), "{err}");
+        assert!(err.contains("nothing you could confirm"), "{err}");
         assert!(err.contains("by-id"), "the fix should be in the message: {err}");
     }
 
