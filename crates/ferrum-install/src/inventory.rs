@@ -158,6 +158,39 @@ fn is_unusable_alias(alias: &str) -> bool {
         || alias.starts_with("md-")
 }
 
+/// Validates a `/dev/disk/by-id/` path that did NOT come from
+/// `parse_by_id` in this process.
+///
+/// `parse_by_id` allowlists alias characters on the way in, so a value
+/// that came from a live inventory is already safe. A value recovered from
+/// `install-inventory.json` on a resume has not been through it -- that
+/// file sits in the operator's writable bind mount -- and it then flows
+/// into generated Nix and into disko, which interpolates the device
+/// UNQUOTED in one of its own loops.
+///
+/// Rather than re-derive an escaping argument at each of those sinks,
+/// validate once here so "the by-id path is allowlisted" is true on every
+/// path into the program. Three consecutive security findings on this
+/// surface all came from re-deriving safety per call site instead.
+///
+/// # Errors
+/// When the value is not `/dev/disk/by-id/<allowlisted alias>`.
+pub fn validate_by_id_path(path: &str) -> anyhow::Result<()> {
+    let Some(alias) = path.strip_prefix("/dev/disk/by-id/") else {
+        anyhow::bail!(
+            "{path:?} is not a /dev/disk/by-id/ path. Kernel names are not \
+             stable across boots and this value is re-read on every apply."
+        );
+    };
+    if alias.is_empty() || is_unusable_alias(alias) {
+        anyhow::bail!(
+            "{path:?} is not a usable /dev/disk/by-id/ alias. It may contain \
+             only letters, digits and . _ - :"
+        );
+    }
+    Ok(())
+}
+
 /// Parses `ls -l /dev/disk/by-id/` into alias -> kernel name.
 ///
 /// Reads the symlink target's basename rather than trusting the alias's own
@@ -472,6 +505,30 @@ lrwxrwxrwx 1 root root 13 Sep 17 10:00 nvme-Samsung_SSD_980_S5P2NG0N123456 -> ..
             d[0].by_id.as_deref(),
             Some("/dev/disk/by-id/ata-WDC_WD20EZAZ_WD-ABC123")
         );
+    }
+
+    /// The resume path deserializes this straight out of a file in the
+    /// operator's writable bind mount, and it reaches generated Nix and
+    /// disko's own unquoted `for dev in ...` loop.
+    #[test]
+    fn a_recovered_by_id_path_is_validated_like_a_parsed_one() {
+        validate_by_id_path("/dev/disk/by-id/ata-WDC_WD20EZAZ_WD-ABC123").unwrap();
+        validate_by_id_path("/dev/disk/by-id/nvme-Samsung_SSD_980_S5P2").unwrap();
+
+        for bad in [
+            "/dev/sda",
+            "/dev/disk/by-id/",
+            "/dev/disk/by-id/ata-X$(touch /tmp/p)",
+            "/dev/disk/by-id/ata-X;id",
+            "/dev/disk/by-id/ata-X`id`",
+            "/dev/disk/by-id/ata-X id",
+            "/dev/disk/by-id/ata-X\nid",
+            "/dev/disk/by-id/wwn-0x5000",
+            "/dev/disk/by-id/ata-X-part1",
+            "relative/ata-X",
+        ] {
+            assert!(validate_by_id_path(bad).is_err(), "accepted {bad:?}");
+        }
     }
 
     #[test]

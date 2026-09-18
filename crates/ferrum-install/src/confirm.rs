@@ -181,15 +181,16 @@ pub fn verify_still(approved: &Approved, current: &[Device]) -> anyhow::Result<(
         .find(|d| d.by_id.as_deref() == Some(expected_by_id))
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "after kexec, {expected_by_id} no longer exists on the target. \
-                 Refusing to partition anything."
+                "{expected_by_id} no longer exists on the target. Refusing to \
+                 continue; nothing has been written."
             )
         })?;
 
     if found.serial != approved.device.serial {
         anyhow::bail!(
-            "after kexec, {expected_by_id} reports serial {:?} but you approved \
-             {:?}. Device enumeration changed. Refusing to partition anything.",
+            "{expected_by_id} now reports serial {:?} but you approved {:?}. \
+             The device changed since you confirmed it. Refusing to continue; \
+             nothing has been written.",
             found.serial.as_deref().unwrap_or("(none)"),
             approved.device.serial.as_deref().unwrap_or("(none)")
         );
@@ -348,7 +349,7 @@ mod tests {
             None,
         )];
         let err = verify_still(&a, &after).unwrap_err().to_string();
-        assert!(err.contains("Refusing to partition"), "{err}");
+        assert!(err.contains("nothing has been written"), "{err}");
         assert!(err.contains("DATA-9") && err.contains("OS-123"), "{err}");
     }
 
@@ -360,7 +361,7 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("no longer exists"), "{err}");
-        assert!(err.contains("Refusing to partition"), "{err}");
+        assert!(err.contains("nothing has been written"), "{err}");
     }
 
     /// The approved inventory is what the post-install check reads to

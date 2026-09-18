@@ -397,6 +397,18 @@ fn recover_plan(
     let approved: confirm::Approved = serde_json::from_str(&std::fs::read_to_string(
         pre.host_dir.join("install-inventory.json"),
     )?)?;
+
+    // Re-validate everything recovered from the bind mount, exactly as a
+    // fresh run validates it. A deserialize is not a validation, and this
+    // file is as writable as anything else in host_dir -- the by-id path
+    // flows on into generated Nix and into disko's own unquoted device
+    // loop, so "it came from lsblk" has to be made true on this path too.
+    for device in std::iter::once(&approved.device).chain(approved.all_devices.iter()) {
+        if let Some(by_id) = device.by_id.as_deref() {
+            inventory::validate_by_id_path(by_id)?;
+        }
+    }
+
     let stage2 = std::fs::read_to_string(pre.host_dir.join("settings.stage2.json"))?;
     let hostname = read_hostname(&pre.host_dir)?;
     let answers = answers::from_stage2(&stage2, &hostname)?;

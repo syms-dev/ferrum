@@ -83,6 +83,11 @@ fn nix_str(value: &str) -> String {
         .replace('"', "\\\"")
         .replace("${", "\\${")
         .replace('\n', "\\n")
+        // \r matters even though it cannot terminate a Nix string: left
+        // raw, Nix turns it INTO a newline, so a value that contained no
+        // newline acquires one after evaluation. Anything downstream that
+        // assumes "newline-free in, newline-free out" is then wrong.
+        .replace('\r', "\\r")
 }
 
 /// A generated repository: relative path -> file contents.
@@ -690,6 +695,56 @@ mod tests {
     /// form appears in the output" -- which is true of text that is inert
     /// where it sits AND of text that is not. The only assertion that
     /// distinguishes them is running the thing.
+    /// Inverts `nix_str` the way Nix's own parser does, so a test can
+    /// exercise the text that ACTUALLY reaches the shell rather than the
+    /// text before escaping. Kept deliberately literal; the round-trip
+    /// property below is what makes it trustworthy.
+    #[cfg(test)]
+    fn nix_unescape(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        let mut chars = s.chars();
+        while let Some(c) = chars.next() {
+            if c != '\\' {
+                out.push(c);
+                continue;
+            }
+            match chars.next() {
+                Some('n') => out.push('\n'),
+                Some('r') => out.push('\r'),
+                Some('t') => out.push('\t'),
+                Some(other) => out.push(other),
+                None => out.push('\\'),
+            }
+        }
+        out
+    }
+
+    /// `nix_str` must be exactly invertible, or the string the installer
+    /// generates is not the string the host runs.
+    #[test]
+    fn nix_escaping_round_trips_byte_for_byte() {
+        for raw in [
+            "plain",
+            "a\"b",
+            "a\\b",
+            "a${b}",
+            "a\nb",
+            "a\rb",
+            "a\r\nb",
+            "trailing\\",
+            "a\\\"b",
+            "a'b'\\''c",
+            "$(id)`id`",
+            "''indented''",
+        ] {
+            assert_eq!(
+                nix_unescape(&nix_str(raw)),
+                raw,
+                "nix_str is not invertible for {raw:?}"
+            );
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn the_generated_guard_cannot_be_made_to_execute_anything() {
@@ -703,15 +758,22 @@ mod tests {
             (format!("/dev/disk/by-id/`touch {}`", marker.display()), "SER".into()),
             (format!("/dev/disk/by-id/ata-X'; touch {}; '", marker.display()), "SER".into()),
         ] {
-            let script = precreate_serial_guard(&disk, &serial);
-            // The guard is expected to FAIL (the serial will not match a
-            // device that does not exist); what must not happen is the
-            // payload running.
-            let _ = std::process::Command::new("sh").arg("-c").arg(&script).output();
-            assert!(
-                !marker.exists(),
-                "the guard executed an injected payload.\n  disk: {disk}\n  serial: {serial}\n\n{script}"
-            );
+            // Execute BOTH the raw guard and the text as it emerges from
+            // the Nix layer. Those are not always the same string, and the
+            // one the host actually runs is the second.
+            let raw = precreate_serial_guard(&disk, &serial);
+            let through_nix = nix_unescape(&nix_str(&raw));
+            for (label, script) in [("raw", &raw), ("post-nix", &through_nix)] {
+                // The guard is expected to FAIL (the serial will not match a
+                // device that does not exist); what must not happen is the
+                // payload running.
+                let _ = std::process::Command::new("sh").arg("-c").arg(script).output();
+                assert!(
+                    !marker.exists(),
+                    "the {label} guard executed an injected payload.\n  \
+                     disk: {disk}\n  serial: {serial}\n\n{script}"
+                );
+            }
         }
     }
 
