@@ -50,44 +50,45 @@ declares no TLS feature — so it looks unreachable, but it is a real advisory i
 Authorizes the rustls bump despite the dependency hard stop, FIXING the SEC-CRIT-002 residual
 rather than accepting it, and security cycles past the 2-cycle budget.
 
-## SECURITY BAR MET — cycle 5 PASS: 0 Critical / 0 High / 0 Medium
-Five cycles. Criticals in cycles 1-4, THREE of them in `precreate_serial_guard` alone. Cycle 5
-verified empirically: 28 payloads x 3 shells x 5 wrapping contexts through real Rust -> real Nix
--> real shells with a hostile `lsblk` on PATH, **mutation-proved** against the cycle-4 defect
-(restoring it pops 6 payloads). All five of its Low notes are now also fixed (`a281b29`).
+## ALL 14 STORIES IMPLEMENTED. `08e3817` pushed; S13's CI jobs are the proof.
+S13 = `tests/stage2/{run,resume}.sh` + CI jobs `stage2` and `stage2-resume` (KVM runner).
+Shell scripts driving a real QEMU guest, NOT `runNixOSTest` — forced, because the sandbox has no
+network and stage 2 exists so each `sopsFile` is created AT RUNTIME on the guest, ruling out the
+pre-built-closure trick every other VM test uses. Two jobs: each needs its own blank target.
+Closes R8 A2 (sonarr AND **sabnzbd** — `FERRUM_SABNZBD_STATE_DIR` is the var most likely to be got
+wrong), R8 A3 (rollback), R8 A4 (kill mid-install, resume fed **NO serial** so a re-ask hits EOF),
+**R2 A9b (the preCreateHook actually EXECUTES — pull it from the generated disko.nix, substitute a
+wrong serial, run it on the target, assert it refuses)**, R6 A3.
+**Still not proven: physical hardware.** A QEMU guest is a real kexec/disko/closure build, but the
+firmware, disks and timing are virtual.
 
-**THE DURABLE LESSONS — these are what actually stopped it:**
-1. **Shell-quoted is not shell-safe.** A `'...'` is INERT inside `"..."`, a here-doc, `eval`, or
-   another `'...'`. What matters is the context the quoted text lands in. Assign untrusted values
-   ONCE at a top-level assignment and reference via `"$var"`.
-2. **Escaped-for-the-inner-layer is not safe at the outer sink.** The value was correctly
-   `nix_str`-escaped for Nix and still landed unquoted in disko's own `for dev in ${toString …}`.
-3. **A test that asserts "the quoted form appears" is worthless** — equally true of text that is
-   inert and text that is not. **RENDER IT AND EXECUTE IT** against payloads
-   (`the_generated_guard_cannot_be_made_to_execute_anything`), and execute the POST-Nix text, not
-   the pre-escaping text.
-4. **Validate once at the boundary with an allowlist, on EVERY ingress.** Three injections all
-   came from re-deriving safety per call site. `inventory::validate_by_id_path` now runs on the
-   resume deserialize too. **A deserialize is not a validation.**
-5. **Confirm a mutation actually applied** before trusting a mutation test — mine silently failed
-   once and showed a false pass.
-6. `install-inventory.json` / `install-state.json` are ATTACKER-CONTROLLED on the resume path.
+## Code review cycle 2: all 6 prior findings RESOLVED; found 1 High **that my own fix caused**
+Regenerating on `asked_fresh` met the phase gate: resuming from exactly `PreflightPassed`
+regenerated the repo then **SKIPPED Tier 1** (`PreflightPassed < PreflightPassed` is false) while
+reporting `evaluated: true`. Reachable by the most ordinary sequence there is — interrupt right
+after the preflight line prints, before the erase warning, which is the natural place to pause.
+**Same shape as the resume that skipped the auth backstop — the FIFTH time a fix carried a defect.**
+Fixed: the rule now lives in **`state::effective_reached`** (unit-testable, mutation-proved) —
+*a phase recorded by a run whose content this run replaced is not evidence about this run.*
+Also fixed its Medium (render.rs had grown a SECOND copy of the shell quoter, in the one function
+that needed three Critical fixes) and a Low (consent is now a superset check, not exact equality).
 
-## VERIFIED for `a281b29` (real output)
-`cargo test --workspace` 8/8 binaries ok (191 in ferrum-install) · `clippy -p ferrum-install
---all-targets -D warnings` 0 · `nix build .#checks.aarch64-linux.workspace-tests` +
-`.#packages...ferrum-install` both built.
+## CI status
+**`a281b29`: CI success AND VM tests success** — including `cargo-audit` now that rustls is bumped.
+`08e3817` running: ci[flake-check, rust, cargo-audit, installer-image] + vm-tests[smoke, **stage2**,
+**stage2-resume**, vm-tests].
 
-## Unpushed commits (5): 646a365 d5e48aa 1b02cb7 f866983 a281b29
-Last PUSHED is `fc27b86`, whose CI was green except `cargo-audit` (the rustls advisory, fixed in
-`d5e48aa`).
+## VERIFIED for `08e3817` (real output)
+`cargo test --workspace` 8/8 binaries ok · `clippy -p ferrum-install --all-targets -D warnings` 0 ·
+`nix build .#checks.aarch64-linux.workspace-tests` green · both new scripts pass `bash -n`.
+**The S13 jobs themselves are unproven until CI runs them** — exactly as install-from-nothing was.
 
 ## Next Steps
-1. **Push** the five commits (per-push approval) and watch CI — `cargo-audit` should now pass.
-2. Close the `code-review` gate, then `build-green` — the ledger enforces that order and refused
-   an out-of-order attempt already. Record the security-clear evidence.
-3. S13 remains the one unimplemented story, and the ONLY thing that can prove the `preCreateHook`
-   actually executes on a real host. Its requirements are written into the spec.
+1. Watch `stage2` / `stage2-resume`. They are new and slow (90-min timeouts); expect iteration.
+2. Then close gates IN ORDER: `code-review` (re-check was CHANGES REQUESTED; its High is now fixed
+   — consider one more targeted pass), `build-green`, `contract-clear` (likely not-applicable,
+   needs the catalog condition), `test-coverage`, `security-clear` (evidence already written).
+3. Release blockers, not gate blockers: OQ4 ghcr publish credential, OQ5 pull image by digest.
 
 
 ## Blind-spot patterns (full text in the spec's revision logs)
