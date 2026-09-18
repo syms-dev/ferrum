@@ -82,6 +82,29 @@ pub const PLACEHOLDERS: &[&str] = &["CHANGE-ME", "example.invalid", "YOUR-USER",
 /// file now always exists. Only a CONTENT check can.
 pub const HARDWARE_CONFIG_SENTINEL: &str = "# PLACEHOLDER";
 
+/// The generated repository's `.gitignore`.
+///
+/// A constant rather than a literal inside `render`, because `write_repo`
+/// now guarantees it independently: `read_generated` reads only four
+/// files, so a resume against a host directory generated before this
+/// existed would otherwise run `git add -A` with no ignore file and commit
+/// the operator's own files right back into the history that ships to the
+/// host.
+pub const GITIGNORE: &str =
+        "# This installer's own working files. They are the OPERATOR's, not\n\
+         # the host's: install-state.json tracks this run's progress,\n\
+         # install-inventory.json holds every disk on the machine, and\n\
+         # known_hosts records which hosts you manage and their\n\
+         # fingerprints. install.rs excludes them from the copy; this stops\n\
+         # `git add -A` committing them, because .git itself ships to the\n\
+         # host and its history would carry them past that exclusion.\n\
+         install-state.json\n\
+         install-state.json.tmp\n\
+         install-inventory.json\n\
+         install-inventory.json.tmp\n\
+         known_hosts\n"
+        ;
+
 /// The disko revision generated hosts pin.
 ///
 /// disko's module is what partitions and formats the target, as root,
@@ -589,22 +612,7 @@ pub fn render(
     //
     // NOT fixed by excluding `.git` from copy_tree, which was suggested:
     // that would break evaluation on the host outright.
-    files.insert(
-        ".gitignore".into(),
-        "# This installer's own working files. They are the OPERATOR's, not\n\
-         # the host's: install-state.json tracks this run's progress,\n\
-         # install-inventory.json holds every disk on the machine, and\n\
-         # known_hosts records which hosts you manage and their\n\
-         # fingerprints. install.rs excludes them from the copy; this stops\n\
-         # `git add -A` committing them, because .git itself ships to the\n\
-         # host and its history would carry them past that exclusion.\n\
-         install-state.json\n\
-         install-state.json.tmp\n\
-         install-inventory.json\n\
-         install-inventory.json.tmp\n\
-         known_hosts\n"
-            .into(),
-    );
+    files.insert(".gitignore".into(), GITIGNORE.into());
 
     insert_hardware_config_placeholder(&mut files);
 
@@ -640,6 +648,16 @@ pub fn check_no_placeholders(files: &Files) -> anyhow::Result<()> {
 /// Any filesystem or git failure. `git` is on PATH because
 /// `nix/pkgs/ferrum-install/default.nix` wraps this binary with it.
 pub fn write_repo(dir: &Path, files: &Files) -> anyhow::Result<()> {
+    // Written unconditionally, BEFORE `git add -A` below and regardless of
+    // what the caller passed. `render()` includes it, but `read_generated`
+    // -- the resume path -- reads only four files, so a resume against a
+    // directory generated before this existed would commit the operator's
+    // known_hosts, disk inventory and consent record into the history that
+    // travels to the host. The control cannot depend on the caller
+    // remembering it.
+    std::fs::create_dir_all(dir)?;
+    std::fs::write(dir.join(".gitignore"), GITIGNORE)?;
+
     for (rel, body) in files {
         let path = dir.join(rel);
         if let Some(parent) = path.parent() {
@@ -686,6 +704,45 @@ pub fn write_repo(dir: &Path, files: &Files) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    /// SEC-L-N3. `render()` includes `.gitignore`, but the RESUME path
+    /// does not go through `render()` -- `read_generated` reads four files
+    /// and hands them straight to `write_repo`. So the guarantee has to
+    /// live in `write_repo`, not in its caller.
+    ///
+    /// Mutation check: delete the unconditional write in `write_repo` and
+    /// this fails. It survived the first time this was written, which is
+    /// why the test exists.
+    #[test]
+    fn write_repo_guarantees_the_gitignore_even_when_the_caller_omits_it() {
+        let dir = tempfile::tempdir().unwrap();
+        // Exactly what a resume passes: no .gitignore anywhere in it.
+        let mut files = Files::new();
+        files.insert("flake.nix".into(), "{ }\n".into());
+        assert!(!files.contains_key(".gitignore"), "the caller must not supply it");
+
+        write_repo(dir.path(), &files).unwrap();
+
+        let written = std::fs::read_to_string(dir.path().join(".gitignore"))
+            .expect("write_repo must write it regardless of the caller");
+        for name in ["install-state.json", "install-inventory.json", "known_hosts"] {
+            assert!(written.contains(name), "{name} not ignored:\n{written}");
+        }
+
+        // And it actually takes effect: a file created afterwards is not
+        // picked up by the `git add -A` of a second write_repo.
+        std::fs::write(dir.path().join("install-inventory.json"), "{}").unwrap();
+        write_repo(dir.path(), &files).unwrap();
+        let out = std::process::Command::new("git")
+            .current_dir(dir.path())
+            .args(["ls-files", "install-inventory.json"])
+            .output()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&out.stdout).trim().is_empty(),
+            "install-inventory.json was committed despite the .gitignore"
+        );
+    }
+
     /// SEC-M5 at the source. `install.rs`'s end-to-end test proves the
     /// history is clean, but it supplies its own `.gitignore` -- so on its
     /// own it would still pass if `render` stopped emitting one. That is
@@ -774,34 +831,7 @@ mod tests {
     #[test]
     fn the_placeholder_hardware_config_carries_the_sentinel_the_guards_look_for() {
         let mut files = Files::new();
-        // SEC-M5. `write_repo` runs `git add -A`, and `.git` travels to the
-    // host by design (Nix ignores untracked files, so the tree must be a
-    // real repository -- see install.rs). `copy_tree` excludes the
-    // operator's files from the COPY, but that control is defeated if they
-    // were committed before the copy: the history inside `.git` carries
-    // them anyway. So they must never enter the repository in the first
-    // place.
-    //
-    // NOT fixed by excluding `.git` from copy_tree, which was suggested:
-    // that would break evaluation on the host outright.
-    files.insert(
-        ".gitignore".into(),
-        "# This installer's own working files. They are the OPERATOR's, not\n\
-         # the host's: install-state.json tracks this run's progress,\n\
-         # install-inventory.json holds every disk on the machine, and\n\
-         # known_hosts records which hosts you manage and their\n\
-         # fingerprints. install.rs excludes them from the copy; this stops\n\
-         # `git add -A` committing them, because .git itself ships to the\n\
-         # host and its history would carry them past that exclusion.\n\
-         install-state.json\n\
-         install-state.json.tmp\n\
-         install-inventory.json\n\
-         install-inventory.json.tmp\n\
-         known_hosts\n"
-            .into(),
-    );
-
-    insert_hardware_config_placeholder(&mut files);
+        insert_hardware_config_placeholder(&mut files);
         let body = &files["hardware-configuration.nix"];
         assert!(
             body.contains(HARDWARE_CONFIG_SENTINEL),
@@ -821,34 +851,7 @@ mod tests {
     fn the_hardware_config_sentinel_is_not_in_the_placeholder_list() {
         assert!(!PLACEHOLDERS.contains(&HARDWARE_CONFIG_SENTINEL));
         let mut files = Files::new();
-        // SEC-M5. `write_repo` runs `git add -A`, and `.git` travels to the
-    // host by design (Nix ignores untracked files, so the tree must be a
-    // real repository -- see install.rs). `copy_tree` excludes the
-    // operator's files from the COPY, but that control is defeated if they
-    // were committed before the copy: the history inside `.git` carries
-    // them anyway. So they must never enter the repository in the first
-    // place.
-    //
-    // NOT fixed by excluding `.git` from copy_tree, which was suggested:
-    // that would break evaluation on the host outright.
-    files.insert(
-        ".gitignore".into(),
-        "# This installer's own working files. They are the OPERATOR's, not\n\
-         # the host's: install-state.json tracks this run's progress,\n\
-         # install-inventory.json holds every disk on the machine, and\n\
-         # known_hosts records which hosts you manage and their\n\
-         # fingerprints. install.rs excludes them from the copy; this stops\n\
-         # `git add -A` committing them, because .git itself ships to the\n\
-         # host and its history would carry them past that exclusion.\n\
-         install-state.json\n\
-         install-state.json.tmp\n\
-         install-inventory.json\n\
-         install-inventory.json.tmp\n\
-         known_hosts\n"
-            .into(),
-    );
-
-    insert_hardware_config_placeholder(&mut files);
+        insert_hardware_config_placeholder(&mut files);
         check_no_placeholders(&files)
             .expect("render must not reject its own placeholder file");
     }

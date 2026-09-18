@@ -116,8 +116,53 @@ struct LsblkDevice {
 /// # Returns
 /// `None` when absent, empty, or empty once cleaned; otherwise the cleaned
 /// value.
+/// The longest any lsblk-derived field may render.
+///
+/// Without a cap, one `model` rendered 200,161 bytes into the disk table.
+/// Only a few short lines separate that table from the "Type the SERIAL of
+/// the disk to erase" prompt, so a flood scrolls every real row off screen
+/// and leaves attacker-composed text sitting immediately above the prompt.
+/// That needs no control characters and no bidi -- it works on every
+/// terminal. 64 is comfortably wider than any real model or serial.
+const MAX_FIELD: usize = 64;
+
+/// Reduces one untrusted `lsblk` field to something that cannot lie about
+/// the line it is printed on.
+///
+/// **Allowlist, not denylist, and that distinction is the whole point.**
+/// This used to filter `char::is_control()`, which is Unicode category
+/// **Cc only**. Category **Cf** -- U+202E RIGHT-TO-LEFT OVERRIDE, the bidi
+/// isolates U+2066-2069, U+200E/U+200F, the soft hyphen U+00AD, the
+/// zero-width space U+200B -- is not `is_control()` and sailed straight
+/// through, reproducing the exact attack the filter was added to stop: the
+/// row shown as `sda` displaying a serial that genuinely belongs to `sdb`.
+///
+/// So this keeps only what it will vouch for: printable ASCII and the
+/// space. Every real device model, serial, size and kernel name is already
+/// within that set. A legitimate non-ASCII model loses characters, which
+/// is a cosmetic cost on a disk table, and the thing it buys is that no
+/// byte from the target can reposition the cursor, reverse the reading
+/// order, or hide itself.
+///
+/// Truncation happens here too, so no caller can forget it.
+///
+/// # Arguments
+/// * `s` - the raw field as reported by the target.
+///
+/// # Returns
+/// The allowlisted, trimmed, length-capped value; may be empty.
 fn strip_controls(s: &str) -> String {
-    s.chars().filter(|c| !c.is_control()).collect::<String>().trim().to_string()
+    let kept: String = s
+        .chars()
+        .filter(|c| c.is_ascii_graphic() || *c == ' ')
+        .collect();
+    let kept = kept.trim();
+    if kept.chars().count() > MAX_FIELD {
+        let head: String = kept.chars().take(MAX_FIELD - 3).collect();
+        format!("{head}...")
+    } else {
+        kept.to_string()
+    }
 }
 
 /// `clean` for a field that is always present, such as a device name.
@@ -132,6 +177,31 @@ fn strip_controls(s: &str) -> String {
 /// The value with control characters removed, or `"?"` if nothing is left
 /// -- never an empty cell, which would be indistinguishable from a
 /// rendering bug.
+/// Validates a kernel device name, which must survive cleaning unchanged.
+///
+/// `attach_by_id` looks a device up by this name, so a name that CHANGES
+/// under cleaning could be mapped onto a different disk's by-id path --
+/// another route to the wrong disk. Real kernel names (`sda`, `nvme0n1`,
+/// `vdb`, `mmcblk0`) are plain ASCII and never change here, so a name that
+/// does is not a kernel name and this refuses rather than guesses.
+///
+/// # Arguments
+/// * `name` - the raw `name` field from lsblk.
+///
+/// # Errors
+/// When the name is empty or contains anything outside `[A-Za-z0-9._-]`.
+fn check_device_name(name: &str) -> anyhow::Result<()> {
+    if name.is_empty() || name.chars().any(|c| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))) {
+        anyhow::bail!(
+            "the target reported a block device named {name:?}, which is not a \
+             kernel device name. Refusing: this name is used to match the \
+             device against its /dev/disk/by-id alias, so accepting a forged \
+             one risks resolving to a different disk than the table shows."
+        );
+    }
+    Ok(())
+}
+
 fn clean_required(v: String) -> String {
     let c = strip_controls(&v);
     if c.is_empty() { "?".to_string() } else { c }
@@ -155,7 +225,9 @@ pub fn parse_lsblk(json: &str) -> anyhow::Result<Vec<Device>> {
         .blockdevices
         .into_iter()
         .filter(|d| d.dev_type.as_deref() == Some("disk"))
-        .map(|d| Device {
+        .map(|d| -> anyhow::Result<Device> {
+            check_device_name(&d.name)?;
+            Ok(Device {
             name: clean_required(d.name),
             size: clean(d.size).unwrap_or_else(|| "?".to_string()),
             model: clean(d.model),
@@ -170,8 +242,9 @@ pub fn parse_lsblk(json: &str) -> anyhow::Result<Vec<Device>> {
                     mountpoint: clean(c.mountpoint),
                 })
                 .collect(),
+            })
         })
-        .collect())
+        .collect::<anyhow::Result<Vec<_>>>()?)
 }
 
 // ---------------------------------------------------------------------
@@ -447,6 +520,70 @@ mod tests {
     /// Mutation check: drop the `is_control` filter from `clean` and this
     /// fails.
     #[test]
+    fn a_device_whose_name_is_not_a_kernel_name_is_refused() {
+        // `attach_by_id` matches a device to its /dev/disk/by-id alias BY
+        // NAME, so a name that changed under cleaning could resolve to a
+        // different disk's stable path. Real kernel names are plain ASCII
+        // and never change, so anything else is refused rather than
+        // guessed at.
+        for bad in ["sda\u{1b}[2K\r", "sd a", "sda/../sdb", "\u{202e}adz", ""] {
+            let json = format!(
+                r#"{{"blockdevices":[{{"name":{},"type":"disk","size":"1T"}}]}}"#,
+                serde_json::to_string(bad).unwrap()
+            );
+            let err = super::parse_lsblk(&json)
+                .expect_err(&format!("{bad:?} is not a kernel device name"));
+            assert!(err.to_string().contains("kernel device name"), "{err}");
+        }
+        // Real names still parse.
+        for good in ["sda", "nvme0n1", "vdb", "mmcblk0", "dm-0"] {
+            let json = format!(
+                r#"{{"blockdevices":[{{"name":"{good}","type":"disk","size":"1T"}}]}}"#
+            );
+            assert_eq!(super::parse_lsblk(&json).unwrap()[0].name, good);
+        }
+    }
+
+    #[test]
+    fn the_rendered_table_survives_bidi_and_flooding() {
+        // The second half of SEC-C1, found only because the first fix was
+        // verified against the attack that had been DESCRIBED (ESC[2K)
+        // instead of the property it claimed. `is_control()` is Unicode
+        // category Cc; U+202E RIGHT-TO-LEFT OVERRIDE is category Cf and
+        // went straight through, reproducing the wrong-disk outcome with
+        // every guard agreeing.
+        let bidi = "\u{202e}321AIDEM";           // renders as MEDIA123 reversed
+        let others = [
+            "\u{200e}x", "\u{200f}x", "\u{2066}x", "\u{2067}x", "\u{2068}x",
+            "\u{2069}x", "\u{00ad}x", "\u{200b}x", "\u{feff}x",
+        ];
+        for payload in std::iter::once(bidi).chain(others) {
+            let got = super::clean(Some(payload.to_string())).unwrap_or_default();
+            for c in got.chars() {
+                assert!(
+                    c.is_ascii_graphic() || c == ' ',
+                    "{payload:?} left {c:?} ({:#x}) in the table", c as u32
+                );
+            }
+        }
+
+        // And the flood: no control characters, no bidi, works on every
+        // terminal. One field scrolled the real rows off screen and left
+        // attacker-composed text directly above the "type the SERIAL"
+        // prompt.
+        let flood = "A".repeat(200_000);
+        let capped = super::clean(Some(flood)).unwrap();
+        assert!(capped.chars().count() <= super::MAX_FIELD, "{}", capped.chars().count());
+        assert!(capped.ends_with("..."), "truncation must be visible: {capped:?}");
+
+        // A realistic value is untouched by the cap.
+        assert_eq!(
+            super::clean(Some("Samsung SSD 870 EVO 4TB".into())),
+            Some("Samsung SSD 870 EVO 4TB".into())
+        );
+    }
+
+    #[test]
     fn the_rendered_table_can_never_contain_a_control_character() {
         // SEC-C1, asserted where it actually matters: not on one helper,
         // but on the exact text the operator reads before naming a disk to
@@ -461,10 +598,14 @@ mod tests {
         // because nothing is malfunctioning. Every control behaves as
         // designed and the wrong disk is erased. No later guard can catch
         // it, which is why it has to be stopped here.
+        // A forged NAME is refused outright now -- see
+        // `a_device_whose_name_is_not_a_kernel_name_is_refused`. Here the
+        // name is real and every OTHER field is hostile, which is the case
+        // that must still render safely rather than refuse.
         let json = r#"{"blockdevices":[
-          {"name":"sda\u001b[2K\r","type":"disk","size":"1T\u001b[2K\r",
+          {"name":"sda","type":"disk","size":"1T\u001b[2K\r",
            "model":"EVIL\u001b[2K\rsda  8T  My Media Disk","serial":"S\u001b[2K\rDECOY",
-           "children":[{"name":"sda1\u001b[2K\r","fstype":"ext4\u001b[2K\r",
+           "children":[{"name":"sda1","fstype":"ext4\u001b[2K\r",
                         "mountpoint":"/mnt\u001b[2K\r"}]}
         ]}"#;
         let devices = super::parse_lsblk(json).expect("hostile lsblk must still parse");
