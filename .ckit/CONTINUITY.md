@@ -11,56 +11,49 @@ S13 deferral section). Story map: `.ckit/state/phase-1-6a-stories.md`.
 `crates/ferrum-install/` — 14 modules. Invariants are documented in the commit messages and
 module headers; the load-bearing ones are restated where the reviews touch them below.
 
-## Security cycle 2 found a CRITICAL IN MY OWN FIX. Fixed in `646a365` (local).
-`fc27b86` closed SEC-LOW-004 by recording consent as a **boolean** in install-state.json. That
-boolean was an authorization bypass: forgeable by hand in the operator's own bind mount, and —
-with no forgery at all — **unscoped**, so consent for `[sonarr]` covered a `qbittorrent` added to
-settings.stage2.json between an interrupted run and a resume. The same commit contradicted itself
-one file over: `answers.rs` refuses to recover consent from disk ("consent is a fact about what
-the operator was shown and typed"), while `main.rs` recovered the identical bit from a sibling
-file with the same write properties.
-**Now:** consent is the sorted app list actually shown; preflight recomputes and compares; this
-run's live answer wins whenever this run asked.
+## Security: BAR MET — cycle 5 PASS, 0 Critical/High/Medium
+Five cycles, four Criticals, THREE of them in `precreate_serial_guard`. Cycle 5 proved it
+empirically: 28 payloads x 3 shells x 5 contexts through real Rust -> real Nix -> real shells,
+mutation-proved against the cycle-4 defect. Full narrative + the six durable lessons:
+`.ckit/state/evidence/phase-1-6a-security-clear.md`. The ones that keep mattering:
+**shell-quoted is not shell-safe — context decides** · **escaped-for-the-inner-layer is not safe
+at the outer sink** · **a test asserting "the quoted form appears" is worthless — RENDER IT AND
+EXECUTE IT** · **validate once at the boundary on EVERY ingress; a deserialize is not a
+validation** · **confirm a mutation actually applied**.
 
-Also fixed in `646a365`: verify.rs's unquoted `findmnt --source {by_id}` (CRITICAL — the one sink
-I was asked to check and missed) + a by-id allowlist · pre-destructive resume now RE-RENDERS
-(HIGH — could install the previous run's settings while reporting the new ones) · `nix_str`
-escaping of device strings into generated Nix evaluated as root (HIGH) · missing
-settings.stage2.json now fails CLOSED (was fail-open) · **a test pins the backstop's call order**
-(deleting it used to leave the suite green — that is how SEC-CRIT-001 got in) · sh_quote shared ·
-install-inventory.json excluded from copy_tree · stale spec line removed.
-SEC-CRIT-002 was dispositioned **fixed as filed** (the false claims are gone); the reviewer
-explicitly declined to call the missing post-kexec check Critical and reclassified the residual
-**Medium**, which still blocks an ordinary PASS until the owner runs `accept-risk`.
-
-## VERIFIED for `646a365` (real output)
-`cargo test --workspace`: **8/8 binaries ok, 0 failed** (183 in ferrum-install).
-`cargo clippy -p ferrum-install --all-targets -- -D warnings`: **exit 0**.
-`nix build .#checks.aarch64-linux.workspace-tests` GREEN · `.#packages.aarch64-linux.ferrum-install` GREEN.
-**Mutation-tested**: deleting the backstop call, un-scoping consent, and removing Nix escaping
-each redden exactly their own test; restored 183 pass.
-
-## CI on `fc27b86` (pushed)
-`flake-check` `rust` `installer-image` **success**; **VM tests success**. `cargo-audit` **FAILED**
-— and correctly: **RUSTSEC-2026-0285, rustls 0.23.43, CVSS 5.3, fix = >=0.23.45.** Reached via
-`ureq` <- `ferrum-reconcile`, which only ever calls `http://` on loopback (`main.rs:53`) and
-declares no TLS feature — so it looks unreachable, but it is a real advisory in the tree.
+## Also fixed after review: rustls RUSTSEC-2026-0285 bumped 0.23.43 -> 0.23.45 (owner-authorized;
+one package, patch, 2 lines). `cargo audit` clean. `cargo-audit` CI job added and green.
 
 ## Owner bar: "keep going until it's fixed and no more medium or above"
 Authorizes the rustls bump despite the dependency hard stop, FIXING the SEC-CRIT-002 residual
 rather than accepting it, and security cycles past the 2-cycle budget.
 
-## All 14 stories implemented. S13 is ITERATING IN CI and finding real bugs.
-Each CI run of `tests/stage2/run.sh` has found a genuine product defect — which is the whole
-reason the story exists ("a test that never acts like a human never finds what a human hits"):
-1. **Run 1:** a plain QEMU virtio disk reports NO SERIAL, and R2 A8 refused the inventory. That
-   was the gate working — the serial is what the operator types to confirm destruction. Fixed by
-   giving the target disk one via `emptyDiskImages[].driveConfig.deviceExtraOpts.serial`.
-2. **Run 2:** `check_serials_identify` refused the WHOLE machine because **`fd0` (a floppy)** has
-   no serial. Real hardware does this too — empty optical drive, card reader. **The installer
-   would have refused those machines and nobody would have known until it happened to them.**
-   Fixed: a device with no serial is **unselectable** (`match_serial` can never return it), not
-   disqualifying. Still refused: a duplicate serial, or a machine where NOTHING can be named.
+## All 14 stories implemented. S13 is ITERATING IN CI and finding REAL BUGS.
+Each run of `tests/stage2/run.sh` has found a genuine defect — the whole reason the story exists.
+**Three of four would have hit real hardware, and NONE was visible to a unit test** (each piece
+individually correct; only the real-world ordering wrong):
+1. QEMU virtio disks report NO SERIAL → R2 A8 refused. *The gate working.* Fixed by giving the
+   target disk one (`emptyDiskImages[].driveConfig.deviceExtraOpts.serial`).
+2. **`check_serials_identify` refused the WHOLE machine because `fd0` (a floppy) has no serial.**
+   Real hardware: empty optical drive, card reader. Fixed — no serial = **unselectable**
+   (`match_serial` can never name it), not disqualifying. Still refused: duplicates, or a machine
+   where nothing can be named.
+3. **`custom/` was only created when there were data disks**, but the flake calls
+   `importDir ./custom` unconditionally (= `readDir`, a hard error). **Any single-disk install
+   produced an unevaluable config.** Fixed — always write `custom/.gitkeep`; a TRACKED file,
+   because git ignores empty dirs and Nix ignores untracked files.
+4. **`hardware-configuration.nix` does not exist at preflight time** — nixos-anywhere writes it
+   DURING the install. So **Tier 1 could never evaluate a fresh install**, i.e. the
+   pre-destructive check never ran. Fixed with a placeholder that nixos-anywhere overwrites.
+   *Same file and same root cause as the code review's Critical* (the single-invocation design
+   removed INSTALL.md's Step 3 without replacing what it provided).
+Also raised the resume test's `Installing`-phase wait 10min → 60min: Tier 1 is a real flake eval
+against the pinned rev and CI's nix cache is routinely throttled.
+
+**When reading these CI logs:** magic-nix-cache spam (`HTTP error 418`, `rate limit exceeded`)
+drowns everything and INTERLEAVES ONTO THE SAME LINE as real errors — my greps hid the real
+`FAILED at` twice. Dump the log to a file and `grep -oE "FAILED at \[[^]]*\]: .{0,120}"`.
+
 
 ## PROCESS FAILURE — three times now, same shape
 I trusted a command/edit instead of the result it produced:
