@@ -37,6 +37,10 @@ rustPlatform.buildRustPackage {
     filter = path: type:
       let rel = lib.removePrefix (toString ../../.. + "/") (toString path); in
       lib.hasPrefix "crates" rel || lib.hasPrefix "examples" rel
+      # flake.lock as well: render.rs include_str!s it in a test, so the
+      # checkPhase needs it. Kept in step with the identical filter in
+      # nix/modules/flake/checks.nix -- that pair has already drifted once.
+      || rel == "flake.lock"
       || (type == "directory" && (rel == "crates" || rel == "examples"));
   };
   cargoLock.lockFile = ../../../crates/Cargo.lock;
