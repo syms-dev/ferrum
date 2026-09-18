@@ -196,6 +196,11 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
 
     // --- The destructive step. ---
     if reached.unwrap_or(state::Phase::Generated) < state::Phase::Installed {
+        // Re-entering nixos-anywhere after it already started is the one
+        // case where it can loop forever instead of failing. Check first.
+        if reached == Some(state::Phase::Installing) {
+            check_target_still_reachable_before_reinstalling(&pre)?;
+        }
         let scratch = tempfile::tempdir()?;
         let extra = install::stage_extra_files(scratch.path(), &pre.host_dir)?;
 
@@ -604,6 +609,67 @@ fn transfer_hardware_config(pre: &preconditions::Preconditions) -> anyhow::Resul
 /// Polls the observable condition rather than sleeping a fixed time: a
 /// fixed wait is either too short on slow hardware or wastes minutes on
 /// fast hardware, and this runs on real machines with real POST times.
+/// Refuses to re-enter `nixos-anywhere` when the target can no longer be
+/// authenticated to.
+///
+/// Found by S13's resume test, and it is the defect that test exists for.
+/// After the first run kexecs the target, the machine in RAM accepts only
+/// the keys that run installed. A second `nixos-anywhere` invocation
+/// generates a FRESH keypair and calls `ssh-copy-id` to install it -- using
+/// the operator's credentials, which that environment no longer accepts.
+/// `ssh-copy-id` then fails with "Permission denied
+/// (publickey,keyboard-interactive)" and nixos-anywhere **retries it
+/// forever**. Observed: 150 minutes of silent looping, killed by a
+/// timeout, with no output of any kind for the operator to act on.
+///
+/// The retry loop is inside nixos-anywhere and not ours to remove, so this
+/// refuses to hand control to it in the state where it cannot succeed. A
+/// bounded window first, because a target mid-kexec or mid-reboot is
+/// legitimately unreachable for a while and that is not this failure.
+///
+/// # Arguments
+/// * `pre` - the target and credentials.
+///
+/// # Errors
+/// When the target cannot be authenticated to within the window, with the
+/// recovery an operator can actually carry out.
+fn check_target_still_reachable_before_reinstalling(
+    pre: &preconditions::Preconditions,
+) -> anyhow::Result<()> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+    while std::time::Instant::now() < deadline {
+        if collect::run(&pre.target, &pre.ssh_auth, "true").is_ok() {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_secs(5));
+    }
+    Err(cannot_reauthenticate(&pre.target.to_string()))
+}
+
+/// The error for a resume that can no longer reach its half-installed
+/// target. Split out so its guidance is pinned by a test rather than
+/// asserted by a comment.
+///
+/// # Arguments
+/// * `target` - the `root@host` this run was pointed at.
+fn cannot_reauthenticate(target: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "cannot authenticate to {target} to resume the install.\n\n\
+         A previous run recorded that it had STARTED installing, so this run \
+         would hand control back to nixos-anywhere -- but nixos-anywhere \
+         retries its key setup forever rather than failing, so continuing \
+         from here hangs silently instead of telling you anything. Refusing \
+         to do that.\n\n\
+         The usual cause is that the first run already kexec'd the target: \
+         the system now in its RAM accepts only the keys that run installed, \
+         and your credentials are not among them.\n\n\
+         To recover: power-cycle the target back into a normal Linux you can \
+         reach as root -- the kexec'd system lives only in RAM, so a reboot \
+         clears it -- then re-run with --fresh. The disk may already be \
+         partially written, which --fresh will redo from the start."
+    )
+}
+
 fn wait_for_ssh(pre: &preconditions::Preconditions) -> anyhow::Result<()> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
     while std::time::Instant::now() < deadline {
@@ -706,6 +772,27 @@ fn final_report(
 
 #[cfg(test)]
 mod tests {
+    /// S13's resume test found nixos-anywhere looping on `ssh-copy-id`
+    /// for 150 minutes with no output after a kill mid-install. The retry
+    /// is inside nixos-anywhere; what we control is refusing to hand it
+    /// control in the state where it cannot succeed -- and saying
+    /// something the operator can act on.
+    #[test]
+    fn the_resume_refusal_explains_the_hang_and_names_a_real_recovery() {
+        let msg = super::cannot_reauthenticate("root@saltbox").to_string();
+        assert!(msg.contains("root@saltbox"), "{msg}");
+        // Why it refuses rather than trying: the alternative is a silent
+        // hang, which is what an operator actually experienced.
+        assert!(msg.contains("forever"), "{msg}");
+        // The cause, so it is not mistaken for a network problem.
+        assert!(msg.contains("kexec"), "{msg}");
+        // A recovery that works, and both halves of it.
+        assert!(msg.contains("power-cycle"), "{msg}");
+        assert!(msg.contains("--fresh"), "{msg}");
+        // And the honest warning about what --fresh means here.
+        assert!(msg.contains("partially written"), "{msg}");
+    }
+
     use super::{check_hardware_config_body, needs_hardware_config_transfer};
     use crate::state::Phase;
 

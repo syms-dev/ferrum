@@ -472,11 +472,39 @@ same command does not wipe it again.
   to protect. The phase is written *before* the invocation starts.
 - A1c. Every phase transition is written **atomically** — temp file, fsync,
   rename — so there is never a real destructive action with no record of it.
-- A1d. Resuming from `installing` re-invokes `nixos-anywhere` **without** a
-  fresh typed confirmation (R2 A3): the named disk is already gone, so
-  re-confirming protects nothing and only trains the operator to retype.
-  Resuming from `preflight-passed` does require it, since nothing was
-  touched.
+- A1d. Resuming from `installing` does **not** ask for a fresh typed
+  confirmation (R2 A3): the named disk is already gone, so re-confirming
+  protects nothing and only trains the operator to retype. Resuming from
+  `preflight-passed` does require it, since nothing was touched.
+- A1e. **Resuming from `installing` re-invokes `nixos-anywhere` only while
+  the target can still be authenticated to. Otherwise it refuses, promptly
+  and with a recovery.**
+
+  *Added after S13 ran it.* A1d originally said the resume simply
+  re-invokes `nixos-anywhere`, and the test asserted it reached a working
+  host. **It cannot.** The first run kexecs the target, and the system then
+  in its RAM accepts only the keys *that* run installed. A second
+  invocation generates a fresh keypair and `ssh-copy-id`s it using the
+  operator's credentials, which that environment does not accept — and
+  nixos-anywhere **retries forever rather than failing**. Measured on CI
+  run 35354737401: **150 minutes of silent looping** on `Permission denied
+  (publickey,keyboard-interactive)`, killed by a timeout, with no output
+  the operator could act on.
+
+  The retry loop is inside nixos-anywhere and not ours to remove, so the
+  installer refuses to hand control to it in the state where it cannot
+  succeed. It probes for up to five minutes first, because a target
+  mid-kexec or mid-reboot is legitimately unreachable for a while and that
+  is not this failure. The refusal names the cause (the kexec), and the
+  recovery: power-cycle the target back into a reachable Linux — the
+  kexec'd system lives only in RAM — then re-run with `--fresh`, accepting
+  that the disk may already be partially written.
+
+  This narrows what R7 promises. "Re-running the same command does not wipe
+  it again" still holds. "Re-running the same command finishes the install"
+  does **not** hold once the target has been kexec'd, and no amount of
+  work on our side can make it, because the credentials to get back in
+  were destroyed with the first run's temporary directory.
 - A2. Re-running with an existing `/host` resumes at the first unreached
   phase and says so. It never repeats `nixos-anywhere`.
 - A3. Re-running past `installed` requires no disk confirmation, because no
@@ -727,7 +755,7 @@ stop. These were surfaced at planning time and authorized:
 | R4 | Steps 4 and 8 | `crates/ferrum-install/src/stages.rs` |
 | R5 | Steps 5 and 5b | `crates/ferrum-install/src/preflight.rs` |
 | R6 | Steps 3, 6 and 7 | `crates/ferrum-install/src/install.rs`, `verify.rs` |
-| R7 | "Recovering a failed install" | `crates/ferrum-install/src/state.rs` |
+| R7 | "Recovering a failed install" | `crates/ferrum-install/src/state.rs`; A1e's refusal in `main.rs` (`check_target_still_reachable_before_reinstalling`, `cannot_reauthenticate`), asserted by `tests/stage2/resume.sh` |
 | R8 | — (new test target) | `tests/install-from-nothing.nix` (pre-destructive refusals + the blank-disk invariant, sandboxed), `tests/stage2/run.sh` + `resume.sh` (the install itself and R6 A3, networked CI only) |
 | R9 | — (new; closes a defect the manual path also has) | `crates/ferrum-install/src/render.rs`, `preflight.rs`, `verify.rs` |
 
