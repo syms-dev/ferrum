@@ -36,11 +36,33 @@ dockerTools.buildLayeredImage {
   # for its own evaluation; /tmp must exist for both nix and ssh's control
   # sockets.
   extraCommands = ''
-    mkdir -p tmp etc
+    mkdir -p tmp etc root
     chmod 1777 tmp
     cat > etc/nix.conf <<EOF
     experimental-features = nix-command flakes
     EOF
+
+    # /etc/passwd and /etc/group are NOT optional, and their absence is not
+    # a cosmetic gap. OpenSSH refuses to start at all when it cannot resolve
+    # the uid it is running as -- it exits with "No user exists for uid 0"
+    # before it opens a connection. Since every single thing this installer
+    # does to a target goes over ssh, an image without these files cannot
+    # collect an inventory, let alone install: the very first command fails.
+    #
+    # dockerTools does not synthesise them, and nothing in the Rust test
+    # suite or the NixOS VM tests can catch it, because both run the binary
+    # outside this image. It was found by running the built image against a
+    # target, which is the only place it is observable.
+    cat > etc/passwd <<EOF
+    root:x:0:0:root:/root:/bin/bash
+    EOF
+    cat > etc/group <<EOF
+    root:x:0:
+    EOF
+
+    # ssh writes known_hosts relative to HOME. Without one it falls back to
+    # a path that does not exist in this image.
+    chmod 700 root
   '';
 
   config = {
@@ -49,6 +71,10 @@ dockerTools.buildLayeredImage {
       "NIX_CONFIG=experimental-features = nix-command flakes"
       "SSL_CERT_FILE=${cacert}/etc/ssl/certs/ca-bundle.crt"
       "PATH=/bin"
+      # ssh resolves ~ from HOME; the installer also points
+      # UserKnownHostsFile at the operator's mounted --ssh-dir, but ssh
+      # still wants a usable HOME for its own defaults.
+      "HOME=/root"
     ];
     # The host repository is written here and must outlive the container;
     # declaring it documents the mount the operator has to supply, and

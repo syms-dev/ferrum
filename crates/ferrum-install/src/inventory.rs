@@ -517,8 +517,16 @@ pub fn check_serials_identify(devices: &[Device]) -> anyhow::Result<()> {
     if named.is_empty() {
         anyhow::bail!(
             "no device on this machine reports a serial, so there is nothing \
-             you could confirm by typing one. Re-run naming the full \
-             /dev/disk/by-id/ path instead."
+             you could confirm by typing one, and the disk gate is the only \
+             thing standing between a typo and an erased disk.\n\n\
+             This is normal on virtual machines -- virtio disks report no \
+             serial -- and unusual on physical hardware. If this IS a VM, \
+             give the target disk a serial in the hypervisor (libvirt: \
+             <serial> on the disk; QEMU: -drive serial=...; Proxmox: the \
+             `serial=` option on the disk) and re-run. If it is physical, \
+             the disks are likely behind a controller that hides them -- \
+             check for an HBA in RAID mode.\n\n\
+             There is deliberately no flag to bypass this."
         );
     }
 
@@ -661,6 +669,36 @@ pub fn render(devices: &[Device]) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// Found by running the built image against a live SSH target: the
+    /// message told the operator to "re-run naming the full
+    /// /dev/disk/by-id/ path instead", and there is no flag that does
+    /// that. `--help` offers only --host-dir, --ssh-dir, --ssh-port and
+    /// --fresh. Same class as the post-wipe advice the security review
+    /// caught: an instruction the operator cannot carry out.
+    #[test]
+    fn the_no_serial_refusal_does_not_promise_a_flag_that_does_not_exist() {
+        let devices = vec![super::Device {
+            name: "nbd0".into(),
+            size: "0B".into(),
+            model: None,
+            serial: None,
+            by_id: None,
+            children: Vec::new(),
+        }];
+        let err = super::check_serials_identify(&devices)
+            .expect_err("a machine where nothing can be named must refuse");
+        let msg = format!("{err:#}");
+
+        // The impossible instruction, gone.
+        assert!(!msg.contains("Re-run naming"), "{msg}");
+        // Replaced by causes an operator can actually act on.
+        assert!(msg.contains("virtio"), "{msg}");
+        assert!(msg.contains("serial="), "{msg}");
+        // And it says plainly that there is no way around it, rather than
+        // implying one exists.
+        assert!(msg.contains("no flag to bypass"), "{msg}");
+    }
+
     fn dev(name: &str, serial: Option<&str>) -> super::Device {
         super::Device {
             name: name.into(),
@@ -1116,7 +1154,12 @@ lrwxrwxrwx 1 root root 13 Sep 17 10:00 nvme-Samsung_SSD_980_S5P2NG0N123456 -> ..
         let devs = vec![disk("fd0", None, vec![]), disk("vda", None, vec![])];
         let err = check_serials_identify(&devs).unwrap_err().to_string();
         assert!(err.contains("nothing you could confirm"), "{err}");
-        assert!(err.contains("by-id"), "the fix should be in the message: {err}");
+        // This used to assert the message contained "by-id", on the
+        // grounds that "the fix should be in the message" -- so the test
+        // was holding an IMPOSSIBLE instruction in place. There is no flag
+        // that takes a by-id path; see
+        // `the_no_serial_refusal_does_not_promise_a_flag_that_does_not_exist`.
+        assert!(err.contains("virtio"), "the real cause should be named: {err}");
     }
 
     /// Same-batch drives and USB bridges reporting the enclosure's serial.
