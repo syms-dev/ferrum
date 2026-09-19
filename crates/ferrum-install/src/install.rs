@@ -169,11 +169,11 @@ pub const HARDWARE_CONFIG: &str = "hardware-configuration.nix";
 /// (this binary is wrapped with it), and the resulting objects travel as a
 /// tar of `.git` plus the file itself. base64 because the payload is
 /// binary and the transport takes a string.
-pub fn hardware_config_extract_command() -> String {
+pub fn extract_into_etc_ferrum() -> String {
     "base64 -d | tar -C /etc/ferrum -xf -".to_string()
 }
 
-/// Commits the generated hardware configuration in the OPERATOR's copy.
+/// Commits everything currently in the OPERATOR's copy.
 ///
 /// # Arguments
 /// * `host_dir` - the operator's host repository.
@@ -181,7 +181,7 @@ pub fn hardware_config_extract_command() -> String {
 /// # Errors
 /// If git fails. Its output is included, because "git failed" on its own
 /// has wasted enough time in this feature already.
-pub fn commit_hardware_config(host_dir: &Path) -> anyhow::Result<()> {
+pub fn commit_all(host_dir: &Path, message: &str) -> anyhow::Result<()> {
     let git = |args: &[&str]| -> anyhow::Result<std::process::Output> {
         let out = std::process::Command::new("git")
             .current_dir(host_dir)
@@ -197,7 +197,7 @@ pub fn commit_hardware_config(host_dir: &Path) -> anyhow::Result<()> {
         }
         Ok(out)
     };
-    git(&["add", HARDWARE_CONFIG])?;
+    git(&["add", "-A"])?;
     // Nothing staged means it was already committed -- a resume, which is
     // not an error.
     if !git(&["diff", "--cached", "--quiet"]).is_ok() {
@@ -209,7 +209,7 @@ pub fn commit_hardware_config(host_dir: &Path) -> anyhow::Result<()> {
             "commit",
             "-q",
             "-m",
-            "ferrum-install: hardware configuration",
+            message,
         ])?;
     }
     Ok(())
@@ -223,18 +223,17 @@ pub fn commit_hardware_config(host_dir: &Path) -> anyhow::Result<()> {
 ///
 /// # Errors
 /// If tar or base64 fails.
-pub fn hardware_config_payload(host_dir: &Path) -> anyhow::Result<String> {
-    let out = std::process::Command::new("tar")
-        .arg("-C")
-        .arg(host_dir)
-        .arg("-cf")
-        .arg("-")
-        .arg(".git")
-        .arg(HARDWARE_CONFIG)
-        .output()?;
+pub fn tar_payload(host_dir: &Path, paths: &[&str]) -> anyhow::Result<String> {
+    let mut cmd = std::process::Command::new("tar");
+    cmd.arg("-C").arg(host_dir).arg("-cf").arg("-");
+    for path in paths {
+        cmd.arg(path);
+    }
+    let out = cmd.output()?;
     if !out.status.success() {
         anyhow::bail!(
-            "tar of .git and {HARDWARE_CONFIG} in {} failed: {}",
+            "tar of {:?} in {} failed: {}",
+            paths,
             host_dir.display(),
             String::from_utf8_lossy(&out.stderr).trim()
         );
@@ -475,7 +474,7 @@ mod tests {
     /// fails.
     #[test]
     fn the_transfer_does_not_require_git_on_the_target() {
-        let cmd = hardware_config_extract_command();
+        let cmd = extract_into_etc_ferrum();
         assert!(!cmd.contains("git"), "the target may not have git: {cmd}");
         assert!(cmd.contains("tar"), "{cmd}");
         assert!(cmd.contains("base64 -d"), "the payload is binary: {cmd}");
@@ -496,11 +495,11 @@ mod tests {
         )
         .unwrap();
 
-        commit_hardware_config(host.path()).expect("first commit");
-        commit_hardware_config(host.path()).expect("a resume must not fail here");
+        commit_all(host.path(), "test").expect("first commit");
+        commit_all(host.path(), "test").expect("a resume must not fail here");
 
         // And the payload really carries the objects plus the file.
-        let payload = hardware_config_payload(host.path()).unwrap();
+        let payload = tar_payload(host.path(), &[".git", HARDWARE_CONFIG]).unwrap();
         assert!(!payload.is_empty());
         assert!(
             payload.chars().all(|c| c.is_ascii_alphanumeric() || "+/=".contains(c)),

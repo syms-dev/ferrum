@@ -253,24 +253,13 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
             )?));
         }
 
-        println!("\nenabling apps and authentication ...");
-        for command in stage2::commands(&answers) {
-            if command.contains("put-secret") {
-                let token = answers.cloudflare_token.as_ref().map(answers::Secret::expose).unwrap_or_default();
-                collect::run_with_stdin(
-                    &pre.target,
-                    &pre.ssh_auth,
-                    &command,
-                    &stage2::acme_payload(token),
-                )?;
-            } else {
-                collect::run(&pre.target, &pre.ssh_auth, &command)?;
-            }
-        }
-        // R4 A5: the repository the operator keeps must end up holding the
-        // settings the host is actually running. Left at stage 1, a later
-        // reinstall from this same directory would silently produce an
-        // app-less machine.
+        // R4 A5, and now also a precondition of the transfer below: the
+        // repository the operator keeps must hold the settings the host is
+        // actually running. Left at stage 1, a later reinstall from this
+        // same directory would silently produce an app-less machine.
+        //
+        // Done BEFORE the remote commands, because the target no longer
+        // copies or commits anything itself -- it receives the result.
         let stage2_path = pre.host_dir.join("settings.stage2.json");
         let stage1_path = pre.host_dir.join("settings.stage1.json");
         let live = pre.host_dir.join("settings.json");
@@ -284,7 +273,26 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
             files.insert("settings.stage1.json".into(), std::fs::read_to_string(&stage1_path)?);
             render::write_repo(&pre.host_dir, &files)?;
         }
+        install::commit_all(&pre.host_dir, "stage 2: enable apps")?;
 
+        println!("\nenabling apps and authentication ...");
+        for command in stage2::commands(&answers) {
+            if command == install::extract_into_etc_ferrum() {
+                let payload =
+                    install::tar_payload(&pre.host_dir, &[".git", "settings.json"])?;
+                collect::run_with_stdin(&pre.target, &pre.ssh_auth, &command, &payload)?;
+            } else if command.contains("put-secret") {
+                let token = answers.cloudflare_token.as_ref().map(answers::Secret::expose).unwrap_or_default();
+                collect::run_with_stdin(
+                    &pre.target,
+                    &pre.ssh_auth,
+                    &command,
+                    &stage2::acme_payload(token),
+                )?;
+            } else {
+                collect::run(&pre.target, &pre.ssh_auth, &command)?;
+            }
+        }
         st.phase = state::Phase::Stage2Applied;
         state::write(&pre.host_dir, &st)?;
     }
@@ -601,19 +609,19 @@ fn transfer_hardware_config(pre: &preconditions::Preconditions) -> anyhow::Resul
     // R6 A2 first, and on THIS side: the repository the operator keeps is
     // the one that built the machine. Committing here rather than on the
     // target is also what removes the target's git dependency -- see
-    // install::hardware_config_extract_command.
+    // install::extract_into_etc_ferrum.
     let mut files = render::Files::new();
     files.insert(install::HARDWARE_CONFIG.to_string(), body);
     render::write_repo(&pre.host_dir, &files)?;
-    install::commit_hardware_config(&pre.host_dir)?;
+    install::commit_all(&pre.host_dir, "ferrum-install: hardware configuration")?;
 
     // Then ship the objects, so the file is TRACKED on the target too.
     // Untracked is not a lesser state for Nix -- it is invisible.
-    let payload = install::hardware_config_payload(&pre.host_dir)?;
+    let payload = install::tar_payload(&pre.host_dir, &[".git", install::HARDWARE_CONFIG])?;
     collect::run_with_stdin(
         &pre.target,
         &pre.ssh_auth,
-        &install::hardware_config_extract_command(),
+        &install::extract_into_etc_ferrum(),
         &payload,
     )?;
     println!("hardware configuration transferred and committed");
