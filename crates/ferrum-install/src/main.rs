@@ -210,7 +210,7 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
         println!("\ninstalling. THIS ERASES {}.", st.approved_disk);
         run_streaming(
             "nixos-anywhere",
-            &install::args(&cli.target, &answers.hostname, &extra, cli.ssh_port),
+            &install::args(&cli.target, &answers.hostname, &extra, cli.ssh_port, &pre.ssh_auth),
             &pre.host_dir,
         )?;
 
