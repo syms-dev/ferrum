@@ -89,6 +89,26 @@ in
     # module's, from the moment it first exists.
   ] ++ lib.optional haveSeed
     "C /etc/ferrum/settings.json 0664 root ${ferrumdGroup} - ${seedSettings}"
+
+  # ...and then FIX the ownership of whatever is there, seeded or not.
+  #
+  # `C` only acts when the path does not exist, so on any host whose
+  # settings.json arrived by another route it is a no-op -- and the file
+  # keeps the ownership that route gave it. That case was assumed rare
+  # ("a host provisioned before this module existed"), but it is now the
+  # NORMAL path: ferrum-install ships settings.json through
+  # nixos-anywhere's --extra-files, which extracts it as root:root 0644.
+  # So every single fresh install ended activation printing "ferrumd will
+  # not be able to save settings changes", and it was right -- the web UI
+  # could not write its own settings file on a brand-new host.
+  #
+  # `z` adjusts mode/ownership of an existing path WITHOUT creating it and
+  # without touching contents, which is exactly the missing half. It is
+  # deliberately not `Z`: recursion here would walk secrets/ and custom/,
+  # whose ownership is set separately and differently below.
+  ++ [
+    "z /etc/ferrum/settings.json 0664 root ${ferrumdGroup} - -"
+  ]
   ++ [
 
     # Owned by ferrum, not root: ferrumd CREATES files in here (one .sops
