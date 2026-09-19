@@ -134,14 +134,21 @@ pub fn commands(answers: &Answers) -> Vec<String> {
         cmds.push("ferrum-apply put-secret acme-dns".into());
     }
 
-    cmds.push("cp /etc/ferrum/settings.stage2.json /etc/ferrum/settings.json".into());
+    // Neither the copy nor the commit happens on the target any more.
+    //
+    // A ferrum host has no git -- a real install failed here with "bash:
+    // line 1: git: command not found", the SECOND site with that bug after
+    // the hardware-config transfer. Fixing one and not sweeping for the
+    // other cost an extra round trip on real hardware, which is the lesson
+    // worth keeping: fix the class, not the instance.
+    //
+    // So the operator's copy is updated first (which is where R4 A5 wanted
+    // it anyway), committed there, and the objects plus the new
+    // settings.json arrive as a tar. The ownership repair after it matters:
+    // tar restores the file as root:root, and ferrumd must be able to write
+    // its own settings.
+    cmds.push(crate::install::extract_into_etc_ferrum());
     cmds.push(ownership_repair().to_string());
-    cmds.push(
-        "cd /etc/ferrum && git add -A && \
-         (git diff --cached --quiet || git -c user.name=ferrum-install \
-          -c user.email=ferrum-install@localhost commit -q -m 'stage 2: enable apps')"
-            .into(),
-    );
     cmds.push(format!("{} ferrum-apply apply", env_prefix(answers)));
     cmds
 }
@@ -276,8 +283,13 @@ mod tests {
     /// file preserves ownership only if it truncates in place.
     #[test]
     fn ownership_is_repaired_on_both_sides_of_the_swap() {
+        // The swap itself moved to the operator's side, so the marker here
+        // is the delivery of the result rather than a remote `cp`.
         let c = commands(&answers(&["sonarr"], true));
-        let swap = c.iter().position(|x| x.contains("settings.stage2.json")).unwrap();
+        let swap = c
+            .iter()
+            .position(|x| *x == crate::install::extract_into_etc_ferrum())
+            .unwrap();
         assert!(c[..swap].iter().any(|x| x.contains("chown root:ferrum")));
         assert!(c[swap..].iter().any(|x| x.contains("chown root:ferrum")));
     }
@@ -314,20 +326,52 @@ mod tests {
     }
 
     /// Nix ignores untracked files inside a git tree, so the swapped
-    /// settings must be committed before the apply re-evaluates /etc/ferrum.
+    /// settings must reach the host TRACKED before the apply re-evaluates
+    /// /etc/ferrum -- which is what the tar of .git delivers.
     #[test]
-    fn the_swapped_settings_are_committed_before_the_apply() {
+    fn the_swapped_settings_arrive_tracked_before_the_apply() {
         let c = commands(&answers(&["sonarr"], true));
-        let commit = c.iter().position(|x| x.contains("git add -A")).unwrap();
+        let extract = c
+            .iter()
+            .position(|x| *x == crate::install::extract_into_etc_ferrum())
+            .expect("settings.json and .git must be delivered to the host");
         let apply = c.iter().position(|x| x.contains("ferrum-apply apply")).unwrap();
-        assert!(commit < apply);
+        assert!(extract < apply, "{c:?}");
     }
 
-    /// A resumed stage 2 must not fail because the first attempt committed.
+    /// Nothing stage 2 runs on the host may need git.
+    ///
+    /// A real install failed here with "git: command not found" -- the
+    /// second site of that bug, found only because the first fix did not
+    /// sweep for others.
+    ///
+    /// Mutation check: put any git command back into `commands` and this
+    /// fails.
     #[test]
-    fn the_commit_is_a_no_op_when_nothing_changed() {
+    fn no_command_stage_2_runs_on_the_host_needs_git() {
+        for c in commands(&answers(&["sonarr"], true)) {
+            assert!(
+                !c.contains("git "),
+                "a ferrum host has no git, and this would fail on it: {c}"
+            );
+        }
+    }
+
+    /// Ownership is repaired AFTER the tar, because tar restores
+    /// settings.json as root:root and ferrumd must be able to write it.
+    #[test]
+    fn ownership_is_repaired_after_the_settings_arrive() {
         let c = commands(&answers(&["sonarr"], true));
-        let git = c.iter().find(|x| x.contains("git add -A")).unwrap();
-        assert!(git.contains("git diff --cached --quiet ||"), "{git}");
+        let extract = c
+            .iter()
+            .position(|x| *x == crate::install::extract_into_etc_ferrum())
+            .unwrap();
+        let repair_after = c
+            .iter()
+            .skip(extract)
+            .position(|x| x == ownership_repair())
+            .expect("settings.json arrives root:root and must be fixed");
+        let apply = c.iter().position(|x| x.contains("ferrum-apply apply")).unwrap();
+        assert!(extract + repair_after < apply, "{c:?}");
     }
 }
