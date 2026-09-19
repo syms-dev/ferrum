@@ -22,7 +22,13 @@ use std::path::{Path, PathBuf};
 /// `--generate-hardware-config` is always used, so the target is not
 /// required to already run NixOS -- which removes `docs/INSTALL.md`'s
 /// Step 3 fork entirely.
-pub fn args(target: &str, hostname: &str, extra_files: &Path, port: u16) -> Vec<String> {
+pub fn args(
+    target: &str,
+    hostname: &str,
+    extra_files: &Path,
+    port: u16,
+    auth: &crate::preconditions::SshAuth,
+) -> Vec<String> {
     let mut a = vec![
         "--flake".into(),
         format!(".#{hostname}"),
@@ -38,6 +44,31 @@ pub fn args(target: &str, hostname: &str, extra_files: &Path, port: u16) -> Vec<
         a.push("--ssh-port".into());
         a.push(port.to_string());
     }
+
+    // THE credential, passed explicitly. Without it nixos-anywhere cannot
+    // authenticate to the target AT ALL, and it does not fail -- it retries
+    // ssh-copy-id forever.
+    //
+    // This is not a hypothetical. It burned two CI runs at three hours
+    // each and one real install: the inventory phase works, because
+    // collect.rs passes `-i` to its own ssh, so everything looks healthy
+    // right up to the destructive step. Then nixos-anywhere spawns ITS own
+    // ssh and ssh-copy-id, which know nothing about `--ssh-dir`, fall back
+    // to ~/.ssh inside the container -- which is empty, because the
+    // operator's keys are mounted at /ssh -- and loop on "Permission
+    // denied (publickey,keyboard-interactive)" with no timeout.
+    //
+    // The tell in the log is the line before the first denial:
+    // "Identity file /tmp/tmp.XXXX/nixos-anywhere not accessible".
+    //
+    // An agent is passed through the environment rather than argv, so
+    // there is nothing to add for that case -- SSH_AUTH_SOCK is already
+    // inherited by the child.
+    if let crate::preconditions::SshAuth::Key(path) = auth {
+        a.push("-i".into());
+        a.push(path.display().to_string());
+    }
+
     a.push(target.into());
     a
 }
@@ -135,6 +166,52 @@ pub fn hardware_config_commands() -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    use crate::preconditions::SshAuth;
+
+    /// The bug that hung two 3-hour CI runs and one real install.
+    ///
+    /// nixos-anywhere spawns its own ssh and ssh-copy-id. They do not know
+    /// about `--ssh-dir`, so without an explicit `-i` they look in ~/.ssh
+    /// inside the container -- empty -- and nixos-anywhere then retries
+    /// ssh-copy-id FOREVER rather than failing.
+    ///
+    /// The inventory phase passing proves nothing about this: collect.rs
+    /// passes `-i` to its own ssh, so the whole run looks healthy right up
+    /// to the destructive step.
+    ///
+    /// Mutation check: drop the `-i` push and this fails.
+    #[test]
+    fn the_operators_key_is_handed_to_nixos_anywhere() {
+        let key = std::path::PathBuf::from("/ssh/id_ed25519");
+        let a = args(
+            "root@saltbox",
+            "ferrum",
+            std::path::Path::new("/tmp/extra"),
+            22,
+            &SshAuth::Key(key.clone()),
+        );
+        let i = a.iter().position(|x| x == "-i").expect(
+            "without -i, nixos-anywhere cannot authenticate and loops on ssh-copy-id forever",
+        );
+        assert_eq!(a[i + 1], "/ssh/id_ed25519");
+        // The target stays last, where nixos-anywhere expects it.
+        assert_eq!(a.last().unwrap(), "root@saltbox");
+    }
+
+    /// An agent needs no argument: SSH_AUTH_SOCK is inherited by the child.
+    #[test]
+    fn an_agent_needs_no_identity_argument() {
+        let a = args(
+            "root@saltbox",
+            "ferrum",
+            std::path::Path::new("/tmp/extra"),
+            22,
+            &SshAuth::Agent(std::path::PathBuf::from("/tmp/agent.sock")),
+        );
+        assert!(!a.contains(&"-i".to_string()), "{a:?}");
+        assert_eq!(a.last().unwrap(), "root@saltbox");
+    }
+
     /// SEC-M5, asserted through the real git history rather than the file
     /// list.
     ///
@@ -195,7 +272,7 @@ mod tests {
 
     #[test]
     fn the_build_happens_on_the_target() {
-        let a = args("root@saltbox", "saltbox", Path::new("/tmp/x"), 22);
+        let a = args("root@saltbox", "saltbox", Path::new("/tmp/x"), 22, &SshAuth::Key(std::path::PathBuf::from("/ssh/id_ed25519")));
         let i = a.iter().position(|x| x == "--build-on").unwrap();
         assert_eq!(a[i + 1], "remote", "an aarch64 operator machine cannot build x86_64");
     }
@@ -203,14 +280,14 @@ mod tests {
     /// Always used, so the target need not already run NixOS.
     #[test]
     fn the_hardware_config_is_always_generated() {
-        let a = args("root@saltbox", "saltbox", Path::new("/tmp/x"), 22);
+        let a = args("root@saltbox", "saltbox", Path::new("/tmp/x"), 22, &SshAuth::Key(std::path::PathBuf::from("/ssh/id_ed25519")));
         assert!(a.contains(&"--generate-hardware-config".to_string()));
         assert!(a.contains(&"./hardware-configuration.nix".to_string()));
     }
 
     #[test]
     fn the_flake_attribute_is_the_hostname() {
-        let a = args("root@saltbox", "saltbox", Path::new("/tmp/x"), 22);
+        let a = args("root@saltbox", "saltbox", Path::new("/tmp/x"), 22, &SshAuth::Key(std::path::PathBuf::from("/ssh/id_ed25519")));
         assert!(a.contains(&".#saltbox".to_string()));
         assert_eq!(a.last().unwrap(), "root@saltbox");
     }
@@ -219,14 +296,14 @@ mod tests {
     /// cannot run.
     #[test]
     fn the_host_repository_is_transferred() {
-        let a = args("root@saltbox", "saltbox", Path::new("/tmp/extra"), 22);
+        let a = args("root@saltbox", "saltbox", Path::new("/tmp/extra"), 22, &SshAuth::Key(std::path::PathBuf::from("/ssh/id_ed25519")));
         let i = a.iter().position(|x| x == "--extra-files").unwrap();
         assert_eq!(a[i + 1], "/tmp/extra");
     }
 
     #[test]
     fn a_non_default_port_reaches_nixos_anywhere() {
-        let a = args("root@h", "h", Path::new("/x"), 2222);
+        let a = args("root@h", "h", Path::new("/x"), 2222, &SshAuth::Key(std::path::PathBuf::from("/ssh/id_ed25519")));
         let i = a.iter().position(|x| x == "--ssh-port").unwrap();
         assert_eq!(a[i + 1], "2222");
         assert_eq!(a.last().unwrap(), "root@h", "the target stays last");
@@ -235,7 +312,7 @@ mod tests {
     /// The common case must not grow a redundant flag.
     #[test]
     fn port_22_adds_no_flag() {
-        assert!(!args("root@h", "h", Path::new("/x"), 22).contains(&"--ssh-port".to_string()));
+        assert!(!args("root@h", "h", Path::new("/x"), 22, &SshAuth::Key(std::path::PathBuf::from("/ssh/id_ed25519"))).contains(&"--ssh-port".to_string()));
     }
 
     #[test]
