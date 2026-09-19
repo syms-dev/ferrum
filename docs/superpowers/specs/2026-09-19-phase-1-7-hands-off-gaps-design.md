@@ -78,7 +78,13 @@ issued. There is no broken API mechanism — there is no A/CNAME mechanism at al
     failure it prevents.
 
 **Open questions for the owner.**
-- OQ1. Is Cloudflare the only provider, as with ACME today, or is this the moment to abstract?
+- OQ1. **Recommendation: stay Cloudflare-only, but put the record operations behind one seam.**
+  ferrum already requires Cloudflare for ACME DNS-01, so record management adds no constraint an
+  operator does not already have, and it reuses the one credential they have already given. Adding
+  a provider abstraction now would be speculative generality for a second provider nobody has
+  asked for. The cheap insurance is to keep create/update/delete/list behind a single narrow
+  interface so a second implementation is additive rather than a refactor — which costs nothing
+  today. Owner to confirm.
 - OQ2. ~~Dynamic address tracking?~~ **Answered: static A record + optional DDNS updater.** See A8.
 
 ---
@@ -126,9 +132,24 @@ exactly the "bogged down and confused" experience this product exists to avoid.
 
 **Open questions.**
 - OQ3. ~~Is state preservation in scope?~~ **Answered: both paths.** See A6.
-- OQ6. Where does preserved state go while the OS disk is erased? A data disk is the obvious
-  staging area, but that assumes one exists and has room; over the network to the operator's
-  machine is slower but always available. This is the main unknown left in R2.
+- OQ6. **Recommendation: a data disk when there is one, the operator's machine otherwise, and
+  measure before promising.** Reasoning, with a real number: `/var/lib/ferrum/state` on the freshly
+  installed host is **230MB**, and that is with empty libraries. The bulk of a mature install is
+  Plex metadata and thumbnails, which reaches single-digit to low-tens of GB on a large library —
+  large enough that the choice matters, small enough that both options are viable.
+
+  So, in order:
+  1. **A data disk with room.** The install only erases the OS disk, so a data disk is untouched by
+     definition — this is the strongest property available, and it is fast and local. `btrfs send`
+     of the existing snapshot preserves the subvolume rather than copying a directory tree.
+  2. **The operator's machine**, over the same SSH the installer already uses, when there is no
+     data disk or not enough room. Slower, but it needs no assumption about the target at all.
+  3. **Neither** — then the installer must not claim preservation. It says so BEFORE the disk gate,
+     and takes R2's claim-token path instead.
+
+  Two properties this must have, both learned the hard way tonight: the staged copy is
+  **verified complete before anything is erased**, not after; and the size is **measured and shown
+  at the confirmation gate**, so "preserve my state" is never a promise made against an unknown.
 
 ---
 
@@ -181,10 +202,26 @@ ruled out by A6, not merely disfavoured.
 
 **Open questions.**
 - OQ4. ~~Write policy?~~ **Answered: `epmfs`.** See A7, and A8 for what that does not do.
-- OQ5. Is the pool path `/mnt/media`, matching the previous setup, or something ferrum-specific?
-- OQ7. Does ferrum offer an explicit "rebalance" action, or is that left to the operator with
-  mergerfs's own tooling? An automatic one is ruled out by A6; a manual one is a UI affordance and
-  a long-running job, which is a different shape of work from the rest of this requirement.
+- OQ5. ~~Pool path?~~ **Answered: ferrum decides, following TRaSH.** This turned out to be much
+  more than naming — see **R8**, which is a live defect: the pool is not what the apps are pointed
+  at, so the media is unreachable, and downloads sit on a different filesystem so imports cannot
+  hardlink. The remaining choice is only the root's name (OQ8).
+- OQ7. ~~Explicit rebalance?~~ **Answered: not needed; handle fullness instead.** See A9.
+
+- A9. **OWNER DECIDED (OQ7): a free-space floor, not rebalancing.** The question was what happens
+  when a show's disk is at 98% and three more seasons arrive. Two settings cover it:
+  - **`minfreespace`** — a branch below this is excluded from the candidate set, so the new seasons
+    land on another disk instead of failing. The show is then **split across disks**, which is the
+    honest trade: `epmfs` keeps a show together until keeping it together would mean not writing it
+    at all. Sized as a floor rather than a percentage, because mergerfs takes a size; ferrum picks
+    it from the disk's capacity rather than asking.
+  - **`moveonenospc`** — if a write runs out of space mid-file anyway, mergerfs relocates that file
+    to a branch with room rather than failing. Media files are large enough that a check at open
+    time is not sufficient on its own.
+
+  Together these mean a full disk degrades to "this show is now on two disks" rather than to a
+  failed import that an *arr reports badly or not at all. Rebalancing existing data stays out of
+  scope: it would move the operator's files (A6) and run for hours.
 
 ---
 
@@ -254,6 +291,53 @@ encrypted and shipped, surfacing much later as an ACME error that blamed DNS.
 - A2. The error names the offending character and its codepoint, because the character is usually
   invisible.
 - A3. Generic secrets keep working; this is a known-shape check, not a general schema.
+
+---
+
+## R8 — one filesystem root, laid out the way the *arr stack needs (TRaSH)
+
+**Found while answering OQ5, and it is live on the installed host right now.**
+
+`ferrum.storage.mediaDir` defaults to `/srv/media` and that is what every app is pointed at. The
+installer mounts data disks at `/mnt/media-0` and `/mnt/media-1`. **Nothing connects the two.** On
+the real host, `/srv/media` is an empty directory on the 500GB OS disk containing only
+`downloads/`, while 7TB of media sits at `/mnt/media-*` referenced by nothing. Adding a library in
+Plex cannot find the media because no app has ever been told where it is.
+
+**The hardlink constraint, which decides the layout.** The *arrs import by hardlinking from the
+download directory into the media library. A hardlink cannot cross a filesystem, so if downloads
+and media are separate mounts the import silently degrades to a **copy**: double the disk used
+during the copy, a long pause per import, and seeding broken if the original is moved rather than
+copied. This is the single most common misconfiguration the TRaSH guides exist to prevent, and
+ferrum currently has it by construction — `/srv/media/downloads` on the OS disk, media elsewhere.
+
+**Acceptance criteria.**
+- A1. Downloads and media live under **one filesystem root**, so imports hardlink. This is the
+  requirement everything else in R8 serves.
+- A2. That root is the pool from R3 when there is more than one data disk, and the single data disk
+  otherwise. `mediaDir` stops being an independent path that can disagree with where the disks
+  actually are.
+- A3. The layout follows the TRaSH recommendation in shape:
+
+      <root>/
+      ├── torrents/{movies,tv,music,books}
+      ├── usenet/{incomplete,complete/{movies,tv,music,books}}
+      └── media/{movies,tv,music,books}
+
+  ferrum is opinionated and picks this; it is not an operator choice.
+- A4. Every app's paths are derived from that root — qBittorrent and SABnzbd write into
+  `torrents/` and `usenet/`, the *arrs read from those and import into `media/`, Plex and Jellyfin
+  read `media/`. No app is configured with a path an operator typed.
+- A5. **A host with no data disk still works**, on the OS disk, with the same layout and the same
+  single-root property. Small installs must not be a different shape.
+- A6. Verification asserts hardlinking actually works between the download and media directories —
+  create, link, compare inode, remove. A layout that is correct on paper and split in practice is
+  the failure this requirement exists to prevent, and it is invisible until a library is large.
+
+**Open question.**
+- OQ8. What is `<root>`? `/data` is the TRaSH convention and the one most community guides assume.
+  `/srv/media` is ferrum's current default and would be a smaller change. The owner has said ferrum
+  should be opinionated and follow TRaSH where it has a recommendation, which points at `/data`.
 
 ---
 
