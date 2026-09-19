@@ -66,9 +66,20 @@ issued. There is no broken API mechanism — there is no A/CNAME mechanism at al
   bit the owner: every hostname returned `HTTP 000` from inside the LAN while working correctly.)*
 - A7. Dry-run output before any change: exactly which records will be created, modified or skipped.
 
+- A8. **OWNER DECIDED (OQ2): a static A record, plus optional dynamic tracking.** The address is
+  static today but is not guaranteed to stay so, and the failure mode of a silently stale A record
+  is that every app becomes unreachable from outside with no error anywhere — the host is healthy,
+  the certificates are valid, and the records point at someone else's address. So:
+  - the record is written from a public address detected at install time and shown for
+    confirmation, never guessed silently;
+  - an optional updater re-checks the real public address on a schedule and corrects the record
+    when it changes, touching only records ferrum owns (A4);
+  - the updater is opt-in but **recommended by default**, because the operator cannot observe the
+    failure it prevents.
+
 **Open questions for the owner.**
 - OQ1. Is Cloudflare the only provider, as with ACME today, or is this the moment to abstract?
-- OQ2. Should a dynamic public address be tracked (a ddns updater), or is a static address assumed?
+- OQ2. ~~Dynamic address tracking?~~ **Answered: static A record + optional DDNS updater.** See A8.
 
 ---
 
@@ -100,9 +111,24 @@ exactly the "bogged down and confused" experience this product exists to avoid.
 - A5. If an app still needs a human step after all of this, the installer says so **in its final
   report, per app, with the exact URL** — not in prose an operator has to infer.
 
+- A6. **OWNER DECIDED (OQ3): both paths must work, because both happen.** A given run is either a
+  first install or a reinstall, and the installer does not get to assume. So it detects which it
+  is (A1) and takes the matching path:
+  - **reinstall with state preserved** — identity survives, no claim token is needed, and the Plex
+    problem does not arise;
+  - **first install, or a reinstall where state cannot be preserved** — a claim token is collected
+    and applied automatically (A3, A4).
+
+  Note that a *first* install needs claiming too: a brand-new Plex server is reachable on the LAN
+  but answers "You do not have access to this server" to anything else until it is associated with
+  an account. Claiming is not a reinstall-only concern, which is why it cannot be handled purely by
+  preserving state.
+
 **Open questions.**
-- OQ3. Is preserving state across a reinstall in scope for 1.7, or is claim-token collection the
-  1.7 answer with preservation deferred? A2 is the better product and materially more work.
+- OQ3. ~~Is state preservation in scope?~~ **Answered: both paths.** See A6.
+- OQ6. Where does preserved state go while the OS disk is erased? A data disk is the obvious
+  staging area, but that assumes one exists and has room; over the network to the operator's
+  machine is slower but always available. This is the main unknown left in R2.
 
 ---
 
@@ -132,10 +158,33 @@ the presumptive choice; it is a union filesystem over existing mounts and satisf
 construction. The alternative — btrfs multi-device — would rewrite the disks and is therefore
 ruled out by A6, not merely disfavoured.
 
+- A7. **OWNER DECIDED (OQ4): `epmfs`.** Among the disks that already contain the target
+  directory, write to the one with most free space; fall back to the emptiest disk for a path that
+  exists nowhere yet. This keeps a show's seasons on one disk, which is what makes losing a single
+  disk lose whole shows rather than gaps in every show, and what lets idle disks spin down.
+
+- A8. **`epmfs` does not balance anything, and the spec must not pretend otherwise.** Neither does
+  `mfs`. The policy chooses where a NEW file goes; no policy moves a file that already exists. The
+  consequence to design for: once a show lives on disk A, every later season goes to disk A too,
+  even when A is nearly full and B is empty. That is the behaviour being asked for, and it is also
+  how a disk fills.
+
+  So `epmfs` is only safe with:
+  - **A minimum-free-space floor.** Below it, mergerfs skips that branch and places the write
+    elsewhere rather than failing it. Without this, a full disk turns into failed writes in an app
+    that reports them badly, if at all.
+  - **Visibility of per-disk fullness in the UI** (A4), since the operator cannot otherwise see a
+    pool that is 45% full overall and 98% full where it matters.
+  - **A stated position on rebalancing.** ferrum does not move data implicitly — that would violate
+    A6 and could run for hours. Whether it offers an explicit, operator-initiated rebalance is
+    OQ7 below.
+
 **Open questions.**
-- OQ4. Write policy: `mfs` (most free space) is the usual default. `epmfs` keeps a show's seasons
-  together on one disk, which matters for spin-down and for losing one disk gracefully.
+- OQ4. ~~Write policy?~~ **Answered: `epmfs`.** See A7, and A8 for what that does not do.
 - OQ5. Is the pool path `/mnt/media`, matching the previous setup, or something ferrum-specific?
+- OQ7. Does ferrum offer an explicit "rebalance" action, or is that left to the operator with
+  mergerfs's own tooling? An automatic one is ruled out by A6; a manual one is a UI affordance and
+  a long-running job, which is a different shape of work from the rest of this requirement.
 
 ---
 
