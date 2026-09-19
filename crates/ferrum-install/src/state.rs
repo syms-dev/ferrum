@@ -108,8 +108,13 @@ pub struct InstallState {
     pub unauthenticated_accepted_for: Vec<String>,
 }
 
+/// The installer's own progress record, inside the operator's host
+/// directory. Named in the conflict message, so operators are told the
+/// exact file to edit rather than a description of it.
+pub const STATE_FILE: &str = "install-state.json";
+
 fn path_in(dir: &Path) -> PathBuf {
-    dir.join("install-state.json")
+    dir.join(STATE_FILE)
 }
 
 /// Reads the recorded state, if any.
@@ -190,10 +195,41 @@ pub fn plan(prior: Option<&InstallState>, target: &str, fresh: bool) -> Resume {
         return Resume::Fresh;
     }
     if prior.target != target {
+        // A target that changed AFTER the disk was written is not an
+        // operator mistake -- it is the normal case, and the old advice
+        // here was actively destructive.
+        //
+        // The install sets the machine's hostname, so it requests a new
+        // DHCP lease and comes back on a different address. That happened
+        // on the very first real install: saltbox -> ferrum, .46 -> .50.
+        // The operator then names the new address, and this said "use
+        // --fresh to discard that record" -- which would re-run the
+        // destructive step and erase a host that had just installed
+        // correctly. The one suggestion offered was the one action that
+        // loses the work.
+        if prior.phase.is_destructive() {
+            return Resume::Conflict(format!(
+                "this directory holds an install of {} that reached '{}', and \
+                 you named {}.\n\n\
+                 If this is the SAME machine on a new address -- which is \
+                 normal, because the install changes the hostname and so the \
+                 DHCP lease -- update the \"target\" field in \
+                 {STATE_FILE} to {} and re-run WITHOUT --fresh. It will pick \
+                 up where it left off.\n\n\
+                 DO NOT use --fresh to get past this. {} is already \
+                 installed; --fresh would erase {} again and start over.",
+                prior.target,
+                prior.phase.describe(),
+                target,
+                target,
+                prior.target,
+                prior.approved_disk
+            ));
+        }
         return Resume::Conflict(format!(
             "this directory holds an install of {} that reached '{}', but you \
-             named {}. Use a different directory, or --fresh to discard that \
-             record.",
+             named {}. Nothing has been erased yet, so --fresh is safe here \
+             if you meant to start over; otherwise use a different directory.",
             prior.target,
             prior.phase.describe(),
             target
@@ -247,6 +283,45 @@ pub fn effective_reached(resume: &Resume) -> Option<Phase> {
 
 #[cfg(test)]
 mod tests {
+    /// The IP changing after an install is NORMAL -- the install sets the
+    /// hostname, so the machine requests a new DHCP lease and comes back
+    /// on a different address. It happened on the first real install
+    /// (saltbox -> ferrum, .46 -> .50).
+    ///
+    /// The advice for that situation must never be --fresh, which would
+    /// re-run the destructive step and erase a host that just installed
+    /// correctly.
+    ///
+    /// Mutation check: collapse the two branches back into one message
+    /// and this fails.
+    #[test]
+    fn a_target_that_moved_after_the_wipe_is_never_told_to_use_fresh() {
+        for phase in [Phase::Installing, Phase::Installed, Phase::HardwareConfigured, Phase::Stage2Applied] {
+            let r = plan(Some(&state(phase)), "root@192.168.2.50", false);
+            let Resume::Conflict(msg) = r else {
+                panic!("{phase:?}: a different target must not silently continue");
+            };
+            assert!(
+                msg.contains("DO NOT use --fresh"),
+                "{phase:?} is past the wipe, so --fresh would erase a live host: {msg}"
+            );
+            // It must name the file to edit and the safe route.
+            assert!(msg.contains(STATE_FILE), "{phase:?}: {msg}");
+            assert!(msg.contains("WITHOUT --fresh"), "{phase:?}: {msg}");
+            // ...and the new address, so it can be copied.
+            assert!(msg.contains("root@192.168.2.50"), "{phase:?}: {msg}");
+        }
+
+        // BEFORE the wipe there is nothing to lose, so --fresh is fine and
+        // the message may say so.
+        for phase in [Phase::Generated, Phase::PreflightPassed] {
+            let r = plan(Some(&state(phase)), "root@192.168.2.50", false);
+            let Resume::Conflict(msg) = r else { panic!("{phase:?}") };
+            assert!(!msg.contains("DO NOT use --fresh"), "{phase:?}: {msg}");
+            assert!(msg.contains("Nothing has been erased yet"), "{phase:?}: {msg}");
+        }
+    }
+
     use super::*;
 
     fn state(phase: Phase) -> InstallState {
