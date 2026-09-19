@@ -289,6 +289,14 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
                     &command,
                     &stage2::acme_payload(token),
                 )?;
+            } else if command.contains("ferrum-apply apply") {
+                // The long one: it builds the whole system on the target.
+                // Streamed, so the operator can see it working rather than
+                // watching one static line for twenty minutes and having to
+                // guess whether it has hung -- which, in this feature's
+                // history, it sometimes had.
+                println!("  (building on the host -- this is the long step)");
+                collect::run_streaming(&pre.target, &pre.ssh_auth, &command)?;
             } else {
                 collect::run(&pre.target, &pre.ssh_auth, &command)?;
             }

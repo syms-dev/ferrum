@@ -217,7 +217,8 @@ mod tests {
                         name: format!("{name}1"),
                         fstype: Some("ext4".into()),
                         mountpoint: Some(m.into()),
-                    }]
+                             by_id: None,
+                         }]
                 })
                 .unwrap_or_default(),
         }

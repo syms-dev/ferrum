@@ -265,7 +265,8 @@ mod tests {
                         name: "sdb1".into(),
                         fstype: Some(f.into()),
                         mountpoint: None,
-                    }]
+                             by_id: None,
+                         }]
                 })
                 .unwrap_or_default(),
         }
