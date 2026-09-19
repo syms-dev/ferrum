@@ -40,4 +40,150 @@ jobs:
           nix build --print-build-logs \
             .#checks.x86_64-linux.catalog-consistency \
             .#checks.x86_64-linux.schema-uniformity \
-            .#checks.x86_64-linux.sopsfile-are-paths
+            .#checks.x86_64-linux.sopsfile-are-paths \
+            .#checks.x86_64-linux.ui-renders-every-schema-type \
+            .#checks.x86_64-linux.installer-offers-every-catalog-app
+
+  # The Rust workspace: ~5,200 lines across four crates and 118 unit tests
+  # which, until 2026-09-15, CI never ran even once. The eval checks above
+  # do not build the Rust packages, and the VM tests (vm-tests.yml) had
+  # never completed, so nothing in CI had ever compiled this code.
+  #
+  # Building the four packages is what runs the tests: each is a
+  # rustPlatform.buildRustPackage whose checkPhase runs `cargo test`, with
+  # the real runtime tools (btrfs-progs, sops, ssh-to-age, authelia) supplied
+  # via nativeCheckInputs. That matters -- preflight::check_is_subvolume
+  # shells out to `btrfs`, and without it on PATH that test fails for an
+  # environment reason rather than a real one.
+  #
+  # Going through Nix rather than a separate rustup toolchain also means CI
+  # tests the exact compiler and dependency closure the real host builds
+  # with, instead of a second toolchain that could drift from it.
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: DeterminateSystems/nix-installer-action@main
+
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+
+      - name: build and test the Rust workspace
+        run: |
+          nix build --print-build-logs \
+            .#ferrum-apply \
+            .#ferrumd \
+            .#ferrum-reconcile \
+            .#ferrum-testapp \
+            .#ferrum-install \
+            .#checks.x86_64-linux.workspace-tests
+
+  # A mechanical CVE scan of the Rust dependency tree. Cheap, and the
+  # alternative is a knowledge-based review whose freshness silently decays
+  # -- which is what the Phase 1.6a security review had to fall back on.
+  cargo-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+      - name: audit the Rust dependency tree
+        run: nix run nixpkgs#cargo-audit -- audit --file crates/Cargo.lock
+
+  # The installer's delivery vehicle (Phase 1.6a, DEC-02: Docker is the only
+  # thing the operator's own machine must have). Built here because the
+  # image is the artifact a new user actually pulls, and a broken one is
+  # otherwise discovered by them rather than by us -- the same reasoning
+  # that put the Rust workspace in CI after five thousand lines had never
+  # been compiled by it.
+  #
+  # Its own job, not a step in `rust` above: a layered image build is the
+  # slowest thing in this file, and folding it in would mean a failed image
+  # and a failed unit test are the same red X.
+  installer-image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: DeterminateSystems/nix-installer-action@main
+
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+
+      - name: build the ferrum-install Docker image
+        run: |
+          nix build --print-build-logs .#ferrum-install-image
+
+          # Prove the artifact is a loadable image, not merely a tarball
+          # that built. `nix build` succeeding says nothing about whether
+          # Docker can read the result.
+          docker load < result
+          docker image inspect ferrum-install:latest > /dev/null
+
+          # R1 A3: no target argument means usage and a non-zero exit,
+          # without contacting anything. Asserted against the real image
+          # because this is the operator's very first interaction with it.
+          if docker run --rm ferrum-install:latest; then
+            echo "::error::running with no target should have failed"
+            exit 1
+          fi
+
+      # The step above exits before the installer opens a single SSH
+      # connection, which is why it did not catch the defect that made this
+      # step necessary: the image shipped with no /etc/passwd, OpenSSH
+      # refuses to start when it cannot resolve its own uid, and EVERY
+      # target interaction failed with "No user exists for uid 0". The
+      # image could not collect an inventory, let alone install. 394 unit
+      # tests and six security review cycles all passed with it broken,
+      # because every one of them runs the binary OUTSIDE the image.
+      #
+      # So this drives the real image against a real SSH server and
+      # asserts it gets far enough to have actually talked to it.
+      - name: the image can reach a target over SSH
+        run: |
+          set -euo pipefail
+          work="$(mktemp -d)"
+          mkdir -p "$work/ssh" "$work/host"
+          ssh-keygen -t ed25519 -N "" -f "$work/ssh/id_ed25519" -q
+
+          # A stand-in target: sshd with our key. It is NOT installable --
+          # it has no real disks -- and it does not need to be. What is
+          # being proved is that the image can authenticate, run a command
+          # and parse what comes back.
+          cat > "$work/Dockerfile" <<'DOCKERFILE'
+          FROM debian:bookworm-slim
+          RUN apt-get update -qq && apt-get install -y -qq openssh-server util-linux >/dev/null            && mkdir -p /run/sshd /root/.ssh
+          COPY id_ed25519.pub /root/.ssh/authorized_keys
+          RUN chmod 700 /root/.ssh && chmod 600 /root/.ssh/authorized_keys            && sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config            && ssh-keygen -A
+          CMD ["/usr/sbin/sshd","-D","-e"]
+          DOCKERFILE
+          cp "$work/ssh/id_ed25519.pub" "$work/"
+          docker build -q -t ferrum-fake-target "$work" > /dev/null
+          docker network create ferrum-ci-net > /dev/null
+          docker run -d --name ferrum-ci-target --network ferrum-ci-net ferrum-fake-target > /dev/null
+          sleep 5
+
+          set +e
+          out="$(printf 'ci-host\n\n\n' | docker run --rm -i --network ferrum-ci-net \
+                   -v "$work/host:/host" -v "$work/ssh:/ssh:ro" \
+                   ferrum-install:latest root@ferrum-ci-target 2>&1)"
+          set -e
+          echo "$out"
+
+          # The assertion that matters. "No user exists for uid 0" is the
+          # exact symptom of the shipped defect; anything mentioning a
+          # failure to RUN ssh means the image is broken regardless of the
+          # target.
+          if echo "$out" | grep -q "No user exists for uid"; then
+            echo "::error::the image cannot run ssh -- /etc/passwd is missing from it"
+            exit 1
+          fi
+
+          # Positive proof it really reached the target and read it, rather
+          # than failing early for some unrelated reason.
+          echo "$out" | grep -q "collecting inventory" || {
+            echo "::error::the image never got as far as collecting an inventory"; exit 1; }
+          echo "$out" | grep -q "architecture: x86_64" || {
+            echo "::error::the image did not read the target's architecture over SSH"; exit 1; }
+
+          docker rm -f ferrum-ci-target > /dev/null
+          docker network rm ferrum-ci-net > /dev/null

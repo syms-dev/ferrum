@@ -197,10 +197,32 @@ pkgs.testers.runNixOSTest {
     # own state, so root must keep it: directory write permission is
     # create/delete/rename permission on every name inside, whatever the
     # individual files' modes say. ferrumd gets a subdirectory instead.
+    #
+    # Asserted as the PROPERTY rather than a literal mode. This used to pin
+    # "root ferrum 750" exactly, and that literal was stricter than the
+    # reasoning above it: every catalog app's stateDir lives at
+    # ferrum.storage.stateDir/<app> under this directory and is owned by that
+    # app's own user, so an app must be able to TRAVERSE here to reach it. At
+    # 750 none could, and plexmediaserver failed its prestart mkdir on the
+    # first real hardware run of any catalog app. What actually protects the
+    # interlocks is the absence of the WRITE bit, which 751 keeps absent.
     parent = machine.succeed("stat -c '%U %G %a' /var/lib/ferrum").strip()
     print(f"/var/lib/ferrum: {parent}")
-    assert parent == "root ferrum 750", (
-        f"/var/lib/ferrum must be root-owned with only group traverse, got: {parent}"
+    powner, pgroup, pmode = parent.split()
+    assert (powner, pgroup) == ("root", "ferrum"), (
+        f"/var/lib/ferrum must be root-owned, group ferrum, got: {parent}"
+    )
+    pg, po = int(pmode[1]), int(pmode[2])
+    assert not (pg & 2) and not (po & 2), (
+        f"group/other must NOT be able to create or delete beside the "
+        f"root-trusted interlocks, got mode {pmode}"
+    )
+    assert not (po & 4), (
+        f"other must NOT be able to list this directory, got mode {pmode}"
+    )
+    assert po & 1, (
+        f"other MUST be able to traverse, or no catalog app can reach its "
+        f"own stateDir underneath, got mode {pmode}"
     )
     for sub in ("daemon", "jobs"):
         owned = machine.succeed(f"stat -c '%U %G %a' /var/lib/ferrum/{sub}").strip()
@@ -232,6 +254,20 @@ pkgs.testers.runNixOSTest {
     machine.succeed("test -e /var/lib/ferrum/state-restore-failed")
     machine.succeed("rm -f /var/lib/ferrum/state-restore-failed")
     print("PASS: ferrumd really cannot create or delete root-trusted files beside its own state")
+
+    # The traverse bit, proved behaviourally rather than inferred from the
+    # mode digits above, and as a user in NEITHER root nor the ferrum group --
+    # which is exactly what every catalog app's own user is. `nobody` stands
+    # in for one so this holds whether or not any app is enabled here.
+    #
+    # Traversal must work (an app has to reach stateDir/<app>) while listing
+    # and writing must not: one app must not be able to enumerate the others,
+    # and nothing outside root may touch the interlocks beside them.
+    for shared in ("/var/lib/ferrum", "/var/lib/ferrum/state"):
+        machine.succeed(f"su -s /bin/sh nobody -c 'test -x {shared}'")
+        machine.fail(f"su -s /bin/sh nobody -c 'ls {shared}'")
+        machine.fail(f"su -s /bin/sh nobody -c 'touch {shared}/.nope'")
+    print("PASS: an app-like unprivileged user can traverse to its stateDir but cannot list or write")
 
     print("=== real login with the real bootstrap password ===")
     password = machine.succeed("cat /var/lib/ferrum/daemon/ferrumd-setup-password").strip()
@@ -784,5 +820,96 @@ pkgs.testers.runNixOSTest {
     machine.succeed("systemctl start ferrumd.service")
     machine.wait_for_open_port(7788)
     print("PASS: and starts again for real once the path is back")
+
+    # --- the Phase 1.5b read-only APIs and the UI, on the real booted host ---
+    #
+    # Unit tests cover these handlers against temp directories. What they
+    # cannot cover is whether the real module tree wires the real env vars to
+    # the real packages -- exactly the class of bug that shipped three times
+    # here (ferrum-reconcile, ferrumd, ferrum-catalog: package builds fine,
+    # every host eval then fails with "attribute missing").
+    print("=== GET /api/catalog: the REAL built catalog ===")
+    catalog = json.loads(
+        machine.succeed("curl -s -b /tmp/cookies.txt http://127.0.0.1:7788/api/catalog")
+    )
+    assert set(catalog) >= {"apps", "schema", "schemaVersion"}, list(catalog)
+    assert catalog["apps"], "an empty catalog renders in the UI as 'this host has no apps'"
+    assert "plex" in catalog["apps"], sorted(catalog["apps"])
+    assert catalog["schema"].get("properties"), "the embedded schema is missing -- every form would be empty"
+    print(f"PASS: {len(catalog['apps'])} real apps with a real embedded schema")
+
+    print("=== GET /api/generations on a host with no system profile ===")
+    # This VM deliberately does NOT set virtualisation.useBootLoader, so it has
+    # no /nix/var/nix/profiles/system at all. That makes it the right place to
+    # prove the rule Task 3's DEC-03 established: a FAULT must never render as
+    # ABSENCE. An empty generation list here would tell an operator their
+    # rollback history was gone; a 500 naming the real path tells them what is
+    # actually wrong.
+    #
+    # The happy path -- a real current generation matching the real profile
+    # symlink -- is asserted in tests/daemon-apply-end-to-end.nix, which sets
+    # useBootLoader and performs a real generation switch. Asserting it here
+    # would have meant fabricating a profile the test does not otherwise need.
+    gen_code = machine.succeed(
+        "curl -s -o /tmp/gens -w '%{http_code}' -b /tmp/cookies.txt "
+        "http://127.0.0.1:7788/api/generations"
+    ).strip()
+    gen_body = machine.succeed("cat /tmp/gens")
+    assert gen_code == "500", (
+        f"a host with no system profile must report a fault, not an empty list; "
+        f"got {gen_code} with body {gen_body[:200]}"
+    )
+    assert "/nix/var/nix/profiles" in gen_body, (
+        f"the error must name the real path an operator has to go look at: {gen_body[:200]}"
+    )
+    assert gen_body.strip() not in ("", "[]", "{}"), gen_body
+    print("PASS: a missing system profile is a real 500 naming the real path, not an empty list")
+
+    print("=== GET /api/session: a token a real mutating request really accepts ===")
+    session = json.loads(
+        machine.succeed("curl -s -b /tmp/cookies.txt http://127.0.0.1:7788/api/session")
+    )
+    assert session["username"] == "admin", session
+    fresh = session["csrf_token"]
+    # Spend it. 401 = the CSRF gate PASSED and the handler ran, rejecting the
+    # deliberately wrong password. 403 would mean the token was refused.
+    # Asserting it is a non-empty string would prove nothing.
+    accepted = machine.succeed(
+        "curl -s -o /dev/null -w '%{http_code}' -b /tmp/cookies.txt "
+        "-X POST http://127.0.0.1:7788/api/password "
+        "-H 'Content-Type: application/json' -H 'X-CSRF-Token: " + fresh + "' "
+        """-d '{"current_password":"deliberately-wrong","new_password":"x"}'"""
+    ).strip()
+    assert accepted == "401", f"the session's own token must pass the CSRF gate, got {accepted}"
+    refused = machine.succeed(
+        "curl -s -o /dev/null -w '%{http_code}' -b /tmp/cookies.txt "
+        "-X POST http://127.0.0.1:7788/api/password "
+        "-H 'Content-Type: application/json' -H 'X-CSRF-Token: not-the-token' "
+        """-d '{"current_password":"deliberately-wrong","new_password":"x"}'"""
+    ).strip()
+    assert refused == "403", f"a wrong token must be refused, got {refused}"
+    print("PASS: the returned token really works, and a wrong one really does not")
+
+    print("=== GET /: the REAL packaged UI, unauthenticated ===")
+    index = machine.succeed("curl -s http://127.0.0.1:7788/")
+    assert "<title>ferrum</title>" in index, index[:200]
+    anon = machine.succeed("curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:7788/").strip()
+    assert anon == "200", f"the login page must load without a session, got {anon}"
+    print("PASS: the real ferrum-ui package is really served, without auth")
+
+    print("=== an unknown /api/ path is a real 404 and is NOT html ===")
+    for path in ["/api/nonexistent", "/api/", "/%61pi/nonexistent"]:
+        code = machine.succeed(
+            "curl -s -o /tmp/body -w '%{http_code}' 'http://127.0.0.1:7788" + path + "'"
+        ).strip()
+        body = machine.succeed("cat /tmp/body")
+        assert code == "404", f"{path} must be 404, got {code}"
+        assert "<!DOCTYPE" not in body and "<title>" not in body, (
+            f"{path} returned HTML to an API caller: {body[:120]}"
+        )
+    # The encoded form matters: axum matches routes literally without
+    # percent-decoding, so /%61pi/... bypasses every real /api/* route and
+    # reaches the SPA fallback. Testing the raw path there was a real bug.
+    print("PASS: unknown API paths 404 with no HTML, including percent-encoded")
   '';
 }

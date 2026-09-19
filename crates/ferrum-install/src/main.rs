@@ -1,0 +1,988 @@
+//! `ferrum-install` -- takes a machine you can SSH into as root and turns it
+//! into a working ferrum host.
+//!
+//! It replaces `docs/INSTALL.md`'s eight manual steps: identifying disks by
+//! `/dev/disk/by-id/`, determining the firmware mode, hand-editing twelve
+//! placeholders across the host template, generating a hardware
+//! configuration, installing once with no apps, keeping a second settings
+//! document alongside, and swapping it in afterwards.
+//!
+//! It ships as a Docker image so that Docker is the only thing the
+//! operator's own machine needs (see the Phase 1.6a spec, DEC-02), with the
+//! heavy x86_64 build happening on the target itself via nixos-anywhere's
+//! remote build rather than under emulation here.
+//!
+//! This binary is deliberately staged: the destructive step is not the last
+//! step, so its progress is recorded and it is resumable (spec R7). What is
+//! implemented so far is the part that runs before anything is contacted.
+
+mod answers;
+mod collect;
+mod confirm;
+mod install;
+mod inventory;
+mod preconditions;
+mod preflight;
+mod render;
+mod stage2;
+mod state;
+mod verify;
+mod prompt;
+mod sso;
+
+use clap::Parser;
+
+/// Install ferrum onto a target machine.
+#[derive(Parser, Debug)]
+#[command(name = "ferrum-install")]
+#[command(about = "Install ferrum onto a bare machine over SSH", long_about = None)]
+struct Cli {
+    /// The machine to install onto, as `root@host`. nixos-anywhere replaces
+    /// the entire OS, so this must be root.
+    target: String,
+
+    /// Directory holding the generated host repository. Bind-mounted from
+    /// the operator's machine so it outlives the container.
+    #[arg(long, default_value = preconditions::DEFAULT_HOST_DIR)]
+    host_dir: std::path::PathBuf,
+
+    /// Read-only mount holding the operator's SSH keys.
+    #[arg(long, default_value = preconditions::DEFAULT_SSH_DIR)]
+    ssh_dir: std::path::PathBuf,
+
+    /// SSH port on the target, when it is not 22.
+    #[arg(long, default_value_t = 22)]
+    ssh_port: u16,
+
+    /// Discard any existing install state and start over, re-running the
+    /// disk confirmation in full. Never implied by a stale directory: a
+    /// resume that silently restarted would re-run the destructive step.
+    #[arg(long)]
+    fresh: bool,
+}
+
+fn main() {
+    let cli = Cli::parse();
+    if let Err(e) = run(&cli) {
+        eprintln!("\nferrum-install: {e}");
+        std::process::exit(1);
+    }
+}
+
+/// The whole install, phase by phase.
+///
+/// Each phase records that it happened *before* the next begins, and the
+/// destructive one records that it has STARTED rather than that it
+/// finished -- the wipe happens inside `nixos-anywhere`, so a crash
+/// mid-invocation must never leave the disk gone with the record still
+/// saying nothing was touched.
+fn run(cli: &Cli) -> anyhow::Result<()> {
+    let agent = std::env::var("SSH_AUTH_SOCK").ok();
+    let pre = preconditions::check_in(
+        &cli.target,
+        cli.ssh_port,
+        &cli.host_dir,
+        &cli.ssh_dir,
+        agent.as_deref(),
+    )?;
+    report_preconditions(&pre, cli.fresh);
+
+    if cli.fresh {
+        state::clear(&pre.host_dir)?;
+    }
+    let prior = state::read(&pre.host_dir)?;
+    let resume = state::plan(prior.as_ref(), &cli.target, cli.fresh);
+    if let state::Resume::Conflict(message) = &resume {
+        anyhow::bail!("{message}");
+    }
+    if let state::Resume::ContinueAfter(p) = &resume {
+        println!("\nresuming: this directory already reached '{}'", p.describe());
+    }
+
+    // The disk gate is re-run only when nothing has been written yet.
+    // Past `Installing` the named disk is already gone, so re-confirming
+    // protects nothing and only trains the operator to retype a serial.
+    let asked_fresh = state::needs_disk_confirmation(&resume);
+
+    // **If this run collected answers, it also regenerates the repository,
+    // so nothing the PREVIOUS run validated applies any more.** Carrying
+    // its recorded phase forward would skip the checks that validate the
+    // content -- and resuming from exactly `PreflightPassed` did precisely
+    // that: it regenerated from new answers and then skipped Tier 1,
+    // because `PreflightPassed < PreflightPassed` is false. The evidence
+    // even claimed `evaluated: true`.
+    //
+    // Reachable by the most ordinary sequence there is: interrupt right
+    // after the preflight line prints and before the erase warning -- the
+    // natural place to pause and double-check -- then run it again.
+    //
+    // This is the same shape as the resume that skipped the authentication
+    // backstop. A phase recorded by a run whose content this run replaced
+    // is not evidence about this run. `state::effective_reached` owns that
+    // rule so it is unit-testable rather than implicit here.
+    let reached = state::effective_reached(&resume);
+    let (mut answers, approved) = if asked_fresh {
+        plan_install(&pre)?
+    } else {
+        recover_plan(&pre)?
+    };
+
+    let mut st = state::InstallState {
+        phase: state::Phase::Generated,
+        target: cli.target.clone(),
+        hostname: answers.hostname.clone(),
+        approved_disk: approved.device.by_id.clone().unwrap_or_default(),
+        // Consent from THIS run wins whenever this run actually asked.
+        // Preferring the stored value unconditionally -- as the first
+        // version did -- meant a resume that re-ran the interactive flow
+        // discarded the operator's live answer in favour of a boolean
+        // sitting in a writable file. The stored value is reused only on
+        // the path that deliberately does not re-prompt.
+        unauthenticated_accepted_for: if asked_fresh {
+            answers.sso.unauthenticated_accepted_for.clone()
+        } else {
+            prior
+                .as_ref()
+                .map(|p| p.unauthenticated_accepted_for.clone())
+                .unwrap_or_default()
+        },
+    };
+
+    // Regenerate whenever this run collected answers -- not only on a
+    // fresh run. A resume before the wipe re-runs the whole interactive
+    // flow, so skipping regeneration installed a host from the PREVIOUS
+    // run's settings while reporting the new ones. Both phases here are
+    // pre-destructive, so re-rendering costs nothing.
+    if asked_fresh {
+        let files = generate(&pre, cli, &answers, &approved)?;
+        println!("\ngenerated host repository in {}:", pre.host_dir.display());
+        for f in files.keys() {
+            println!("  {f}");
+        }
+        state::write(&pre.host_dir, &st)?;
+    }
+
+    // --- Tier 1 preflight. Target still untouched. ---
+    //
+    // The authentication backstop is re-checked on EVERY invocation,
+    // including resumes that skip the expensive evaluation. settings.
+    // stage2.json lives in the operator's bind mount and they are told the
+    // repository is theirs, so between an interrupted run and a resume it
+    // can legitimately have changed. Skipping this on resume meant the one
+    // guard against publishing an unauthenticated admin panel could be
+    // stepped around by the most ordinary sequence there is: get
+    // interrupted, run the same command again.
+    let files = read_generated(&pre.host_dir)?;
+    preflight::check_published_apps_are_authenticated(&files, &st.unauthenticated_accepted_for)?;
+
+    // ALWAYS evaluate, including on a resume. The old code skipped Tier 1
+    // once `PreflightPassed` had been reached and then hardcoded
+    // `Evidence { evaluated: true }`, so `describe()` printed "evaluation
+    // verified here" on a run that evaluated nothing -- the exact dishonesty
+    // Evidence's own doc comment says it exists to prevent. Tier 1 is
+    // eval-only and needs no builder, which is precisely what makes it
+    // cheap enough to re-run; and re-running is not just honesty, it also
+    // re-checks a host_dir the operator can legitimately have edited
+    // between an interrupted run and this one -- the same reasoning as the
+    // authenticated-apps check directly above.
+    println!("\npreflight: evaluating the generated configuration ...");
+    let evidence =
+        preflight::tier1(&pre.host_dir, &files, &answers.hostname, &st.unauthenticated_accepted_for)?;
+    if reached.unwrap_or(state::Phase::Generated) < state::Phase::PreflightPassed {
+        st.phase = state::Phase::PreflightPassed;
+        state::write(&pre.host_dir, &st)?;
+    }
+    println!("preflight: {}", evidence.describe());
+
+    // --- The destructive step. ---
+    if reached.unwrap_or(state::Phase::Generated) < state::Phase::Installed {
+        // EVERY invocation, not just resumes.
+        //
+        // nixos-anywhere's key upload is `until ssh-copy-id ...; do sleep
+        // 3; done` -- an unbounded retry, in its own source. If it cannot
+        // authenticate it does not fail, it loops silently forever. That
+        // burned two three-hour CI runs and one real install before the
+        // cause was found, and not one of them produced an error.
+        //
+        // We cannot fix that loop, but we can decline to enter it. The
+        // probe costs one SSH round-trip against a target we are about to
+        // erase anyway.
+        check_target_still_reachable_before_reinstalling(&pre)?;
+        let scratch = tempfile::tempdir()?;
+        let extra = install::stage_extra_files(scratch.path(), &pre.host_dir)?;
+
+        st.phase = state::Phase::Installing;
+        state::write(&pre.host_dir, &st)?;
+
+        println!("\ninstalling. THIS ERASES {}.", st.approved_disk);
+        run_streaming(
+            "nixos-anywhere",
+            &install::args(&cli.target, &answers.hostname, &extra, cli.ssh_port, &pre.ssh_auth),
+            &pre.host_dir,
+        )?;
+
+        // Recorded IMMEDIATELY, while still inside this block: from here
+        // the disk is written, and a resume must never repartition it.
+        st.phase = state::Phase::Installed;
+        state::write(&pre.host_dir, &st)?;
+    }
+
+    // Deliberately its OWN block, not the tail of the one above. Both steps
+    // are idempotent and neither touches the partition table, so a resume
+    // can safely repeat them -- whereas leaving them inside the destructive
+    // block meant an interruption in this window skipped them forever and
+    // left the placeholder hardware configuration installed for good.
+    if needs_hardware_config_transfer(reached) {
+        println!("installed. waiting for the host to come back ...");
+        wait_for_ssh(&pre)?;
+        transfer_hardware_config(&pre)?;
+        st.phase = state::Phase::HardwareConfigured;
+        state::write(&pre.host_dir, &st)?;
+    }
+
+    // --- Stage 2. The host exists now, so the things that could not exist
+    //     before it can be created. ---
+    if reached.unwrap_or(state::Phase::Generated) < state::Phase::Stage2Applied {
+        if answers.cloudflare_token.is_none()
+            && answers::token_still_needed(&answers, acme_secret_present(&pre)?)
+        {
+            let mut io = prompt::stdio();
+            answers.cloudflare_token = Some(answers::Secret::new(prompt::PromptIo::ask_secret(
+                &mut io,
+                "\nCloudflare API token (not recoverable from the generated files):",
+            )?));
+        }
+
+        // R4 A5, and now also a precondition of the transfer below: the
+        // repository the operator keeps must hold the settings the host is
+        // actually running. Left at stage 1, a later reinstall from this
+        // same directory would silently produce an app-less machine.
+        //
+        // Done BEFORE the remote commands, because the target no longer
+        // copies or commits anything itself -- it receives the result.
+        let stage2_path = pre.host_dir.join("settings.stage2.json");
+        let stage1_path = pre.host_dir.join("settings.stage1.json");
+        let live = pre.host_dir.join("settings.json");
+        if stage2_path.exists() {
+            if !stage1_path.exists() {
+                std::fs::rename(&live, &stage1_path)?;
+            }
+            std::fs::copy(&stage2_path, &live)?;
+            let mut files = render::Files::new();
+            files.insert("settings.json".into(), std::fs::read_to_string(&live)?);
+            files.insert("settings.stage1.json".into(), std::fs::read_to_string(&stage1_path)?);
+            render::write_repo(&pre.host_dir, &files)?;
+        }
+        install::commit_all(&pre.host_dir, "stage 2: enable apps")?;
+
+        println!("\nenabling apps and authentication ...");
+        for command in stage2::commands(&answers) {
+            if command == install::extract_into_etc_ferrum() {
+                let payload =
+                    install::tar_payload(&pre.host_dir, &[".git", "settings.json"])?;
+                collect::run_with_stdin(&pre.target, &pre.ssh_auth, &command, &payload)?;
+            } else if command.contains("put-secret") {
+                let token = answers.cloudflare_token.as_ref().map(answers::Secret::expose).unwrap_or_default();
+                collect::run_with_stdin(
+                    &pre.target,
+                    &pre.ssh_auth,
+                    &command,
+                    &stage2::acme_payload(token),
+                )?;
+            } else if command.contains("ferrum-apply apply") {
+                // The long one: it builds the whole system on the target.
+                // Streamed, so the operator can see it working rather than
+                // watching one static line for twenty minutes and having to
+                // guess whether it has hung -- which, in this feature's
+                // history, it sometimes had.
+                println!("  (building on the host -- this is the long step)");
+                collect::run_streaming(&pre.target, &pre.ssh_auth, &command)?;
+            } else {
+                collect::run(&pre.target, &pre.ssh_auth, &command)?;
+            }
+        }
+        st.phase = state::Phase::Stage2Applied;
+        state::write(&pre.host_dir, &st)?;
+    }
+
+    // --- Verification, then the report. ---
+    println!("\nverifying ...");
+    let failures = verify_host(&pre, &answers, &approved)?;
+    if !failures.is_empty() {
+        anyhow::bail!(
+            "the host is installed, but {} check(s) failed:\n  {}",
+            failures.len(),
+            failures.join("\n  ")
+        );
+    }
+    st.phase = state::Phase::Verified;
+    state::write(&pre.host_dir, &st)?;
+
+    final_report(&pre, &answers, &evidence)?;
+    Ok(())
+}
+
+/// The ferrum revision this installer was built from.
+///
+/// Injected by nix/pkgs/ferrum-install/default.nix. Absent means this
+/// binary was built outside Nix, and there is no honest revision to pin --
+/// R3 A5 requires a specific revision, never a branch, so a fallback like
+/// "main" would be worse than refusing.
+fn ferrum_revision() -> anyhow::Result<&'static str> {
+    option_env!("FERRUM_INSTALL_REV").ok_or_else(|| {
+        anyhow::anyhow!(
+            "this ferrum-install was built without FERRUM_INSTALL_REV, so it \
+             cannot pin the host to the revision it came from. Use the Docker \
+             image, which is built by Nix and always carries one."
+        )
+    })
+}
+
+/// Renders and commits the host repository.
+fn generate(
+    pre: &preconditions::Preconditions,
+    cli: &Cli,
+    answers: &answers::Answers,
+    approved: &confirm::Approved,
+) -> anyhow::Result<render::Files> {
+    let keys = preconditions::find_public_keys(&cli.ssh_dir)?;
+    let rev = ferrum_revision()?;
+    let files = render::render(answers, approved, &keys, rev)?;
+    render::write_repo(&pre.host_dir, &files)?;
+    Ok(files)
+}
+
+/// Re-reads the target and confirms the approved disk is still the disk.
+///
+/// Minutes pass between the inventory being printed and the serial being
+/// typed, and a USB disk can be unplugged in that window.
+///
+/// This is the pre-invocation half. The post-kexec half is generated into
+/// the host's `disko.nix` as a `preCreateHook` -- see
+/// `render::precreate_serial_guard` -- because nixos-anywhere exposes no
+/// hook back into this code.
+fn recheck(
+    pre: &preconditions::Preconditions,
+    approved: &confirm::Approved,
+) -> anyhow::Result<()> {
+    let raw = collect::collect(&pre.target, &pre.ssh_auth)?;
+    let mut devices = inventory::parse_lsblk(&raw.lsblk)?;
+    inventory::attach_by_id(&mut devices, &inventory::parse_by_id(&raw.by_id));
+    confirm::verify_still(approved, &devices)
+}
+
+/// Refuses a target whose architecture ferrum has no catalog for.
+///
+/// Every app in the catalog is built for `x86_64-linux`. Installing onto an
+/// aarch64 box would get as far as a flake evaluation that cannot produce a
+/// single service, so this refuses while the target is still untouched.
+///
+/// # Arguments
+/// * `arch` - the `uname -m` the target reported.
+///
+/// # Errors
+/// Returns an error naming the reported architecture when it is not `x86_64`.
+fn check_arch(arch: &str) -> anyhow::Result<()> {
+    if arch != "x86_64" {
+        anyhow::bail!(
+            "target reports architecture {:?}; ferrum's catalog is built for \
+             x86_64-linux only",
+            arch
+        );
+    }
+    Ok(())
+}
+
+/// Collects and reports the target's inventory. Read-only throughout.
+fn inventory_phase(
+    pre: &preconditions::Preconditions,
+) -> anyhow::Result<(Vec<inventory::Device>, bool)> {
+    println!("\ncollecting inventory from {} ...", pre.target);
+    let raw = collect::collect(&pre.target, &pre.ssh_auth)?;
+
+    check_arch(&raw.arch)?;
+
+    let mut devices = inventory::parse_lsblk(&raw.lsblk)?;
+    if devices.is_empty() {
+        anyhow::bail!("the target reports no whole block devices to install onto");
+    }
+    inventory::attach_by_id(&mut devices, &inventory::parse_by_id(&raw.by_id));
+
+    println!(
+        "\nfirmware: {}\narchitecture: {}\n\ndisks:\n{}",
+        if raw.efi_present { "EFI (/sys/firmware/efi present)" } else { "legacy BIOS" },
+        raw.arch,
+        inventory::render(&devices)
+    );
+
+    println!("if you install to ...");
+    for d in &devices {
+        match inventory::infer_firmware(raw.efi_present, d) {
+            Ok(fw) => println!("  {:<10} -> {fw:?} bootloader", d.name),
+            Err(e) => println!("  {:<10} -> REFUSED: {e}", d.name),
+        }
+        let mounts = d.mounted_at();
+        if !mounts.is_empty() {
+            println!("  {:<10}    currently mounted at {}", "", mounts.join(", "));
+        }
+    }
+
+    inventory::check_serials_identify(&devices)?;
+    Ok((devices, raw.efi_present))
+}
+
+fn report_preconditions(pre: &preconditions::Preconditions, fresh: bool) {
+    // Only the credential's KIND and LOCATION are ever printed; the key
+    // itself is never read by this process.
+    let auth = match &pre.ssh_auth {
+        preconditions::SshAuth::Agent(p) => format!("ssh agent at {}", p.display()),
+        preconditions::SshAuth::Key(p) => format!("key {}", p.display()),
+    };
+    println!("target:        {}", pre.target);
+    println!("host repo:     {}", pre.host_dir.display());
+    println!("credentials:   {auth}");
+    if fresh {
+        println!("mode:          --fresh (any existing install record is discarded)");
+    }
+}
+
+/// The interactive half: inventory, answers, and the disk gate.
+fn plan_install(
+    pre: &preconditions::Preconditions,
+) -> anyhow::Result<(answers::Answers, confirm::Approved)> {
+    let (devices, efi_present) = inventory_phase(pre)?;
+    let mut io = prompt::stdio();
+    let answers = answers::collect(&mut io)?;
+    let approved = confirm::confirm(&devices, efi_present, &mut io)?;
+
+    recheck(pre, &approved)?;
+    let path = pre.host_dir.join("install-inventory.json");
+    write_json(&path, &approved)?;
+    println!(
+        "\napproved for erasure: {} ({})\n  bootloader:  {:?}\n  recorded in: {}",
+        approved.device.name,
+        approved.device.by_id.as_deref().unwrap_or("?"),
+        approved.firmware,
+        path.display()
+    );
+    Ok((answers, approved))
+}
+
+/// The resume half: recover what was decided, never re-ask.
+fn recover_plan(
+    pre: &preconditions::Preconditions,
+) -> anyhow::Result<(answers::Answers, confirm::Approved)> {
+    let mut approved: confirm::Approved = serde_json::from_str(&std::fs::read_to_string(
+        pre.host_dir.join("install-inventory.json"),
+    )?)?;
+
+    // Re-validate everything recovered from the bind mount, exactly as a
+    // fresh run validates it. A deserialize is not a validation, and this
+    // file is as writable as anything else in host_dir -- the by-id path
+    // flows on into generated Nix and into disko's own unquoted device
+    // loop, so "it came from lsblk" has to be made true on this path too.
+    for device in std::iter::once(&mut approved.device).chain(approved.all_devices.iter_mut()) {
+        if let Some(by_id) = device.by_id.as_deref() {
+            inventory::validate_by_id_path(by_id)?;
+        }
+        // ...and the fields that RENDER, not just the one that reaches
+        // Nix. Only by_id was re-checked here, so a recovered record could
+        // still display as a different disk than it is -- the same
+        // property SEC-C1 was about, arriving by the other ingress.
+        // Refuses on name/serial, normalises the display-only fields; see
+        // that function for why the two are treated differently.
+        inventory::check_recovered_device(device)?;
+    }
+
+    let stage2 = std::fs::read_to_string(pre.host_dir.join("settings.stage2.json"))?;
+    let hostname = read_hostname(&pre.host_dir)?;
+    let answers = answers::from_stage2(&stage2, &hostname)?;
+    Ok((answers, approved))
+}
+
+fn read_hostname(dir: &std::path::Path) -> anyhow::Result<String> {
+    let flake = std::fs::read_to_string(dir.join("flake.nix"))?;
+    flake
+        .lines()
+        .find_map(|l| {
+            l.trim()
+                .strip_prefix("networking.hostName = \"")
+                .and_then(|r| r.split('"').next())
+                .map(str::to_string)
+        })
+        .ok_or_else(|| anyhow::anyhow!("could not read the hostname back from flake.nix"))
+}
+
+fn read_generated(dir: &std::path::Path) -> anyhow::Result<render::Files> {
+    let mut files = render::Files::new();
+    for rel in ["flake.nix", "disko.nix", "settings.json", "settings.stage2.json"] {
+        let p = dir.join(rel);
+        if p.exists() {
+            files.insert(rel.to_string(), std::fs::read_to_string(p)?);
+        }
+    }
+    Ok(files)
+}
+
+fn write_json<T: serde::Serialize>(path: &std::path::Path, value: &T) -> anyhow::Result<()> {
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, serde_json::to_string_pretty(value)?)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+/// Runs a long command with its output streaming through, so the operator
+/// sees nixos-anywhere working rather than a silent terminal.
+fn run_streaming(program: &str, args: &[String], cwd: &std::path::Path) -> anyhow::Result<()> {
+    let status = std::process::Command::new(program)
+        .current_dir(cwd)
+        .args(args)
+        .status()
+        .map_err(|e| anyhow::anyhow!("could not run {program}: {e}"))?;
+    if !status.success() {
+        anyhow::bail!("{program} failed ({status})");
+    }
+    Ok(())
+}
+
+/// Puts the generated hardware configuration onto the target and commits
+/// it, then commits it locally too (R6 A2).
+///
+/// Separate from `--extra-files` of necessity: see
+/// `install::hardware_config_commands`. Without this, `/etc/ferrum`'s
+/// flake imports a file that is not there and every later apply -- stage 2
+/// included -- fails to evaluate.
+/// Whether this run still owes the host its real `hardware-configuration.nix`.
+///
+/// Split out so the CONTROL FLOW is pinned by a test, not just the phase
+/// constants. A security re-scan showed that reverting the comparison here
+/// to `< Phase::Installed` -- which is exactly the SEC-H1 defect -- left
+/// all 205 tests passing, because the existing tests asserted the ordering
+/// of the enum rather than the decision made from it.
+///
+/// # Arguments
+/// * `reached` - the phase a previous run got to, or `None` for a fresh run
+///   (or a resume that re-asked and therefore regenerated).
+///
+/// # Returns
+/// `true` when the transfer must still run.
+fn needs_hardware_config_transfer(reached: Option<state::Phase>) -> bool {
+    reached.unwrap_or(state::Phase::Generated) < state::Phase::HardwareConfigured
+}
+
+/// Refuses a `hardware-configuration.nix` body that is still the stand-in.
+///
+/// Content, never existence: `render()` always writes this file now, so
+/// its presence proves nothing. `{ ... }: { }` evaluates and boots
+/// perfectly well, which is what makes shipping it silent.
+///
+/// # Arguments
+/// * `body` - the file's contents as read from the host directory.
+/// * `local` - the path, for the error message.
+///
+/// # Errors
+/// When `body` still carries [`render::HARDWARE_CONFIG_SENTINEL`].
+fn check_hardware_config_body(body: &str, local: &std::path::Path) -> anyhow::Result<()> {
+    if body.contains(render::HARDWARE_CONFIG_SENTINEL) {
+        anyhow::bail!(
+            "{} is still the placeholder this installer wrote -- \
+             `nixos-anywhere --generate-hardware-config` never replaced it. \
+             Transferring it would install a host with no hardware \
+             configuration: no initrd kernel modules, no microcode. Re-run \
+             the install rather than continuing from here.",
+            local.display()
+        );
+    }
+    Ok(())
+}
+
+fn transfer_hardware_config(pre: &preconditions::Preconditions) -> anyhow::Result<()> {
+    let local = pre.host_dir.join(install::HARDWARE_CONFIG);
+    let body = std::fs::read_to_string(&local).map_err(|e| {
+        anyhow::anyhow!(
+            "nixos-anywhere did not leave {} behind ({e}). The generated flake \
+             imports it unconditionally, so the host cannot evaluate its own \
+             configuration without it.",
+            local.display()
+        )
+    })?;
+
+    // The file always EXISTS now -- render() writes a placeholder so the
+    // preflight can evaluate. So existence proves nothing; only the content
+    // does. Shipping the placeholder to the host would install a machine
+    // with no hardware configuration at all, and it would boot and look
+    // fine.
+    check_hardware_config_body(&body, &local)?;
+
+    // R6 A2 first, and on THIS side: the repository the operator keeps is
+    // the one that built the machine. Committing here rather than on the
+    // target is also what removes the target's git dependency -- see
+    // install::extract_into_etc_ferrum.
+    let mut files = render::Files::new();
+    files.insert(install::HARDWARE_CONFIG.to_string(), body);
+    render::write_repo(&pre.host_dir, &files)?;
+    install::commit_all(&pre.host_dir, "ferrum-install: hardware configuration")?;
+
+    // Then ship the objects, so the file is TRACKED on the target too.
+    // Untracked is not a lesser state for Nix -- it is invisible.
+    let payload = install::tar_payload(&pre.host_dir, &[".git", install::HARDWARE_CONFIG])?;
+    collect::run_with_stdin(
+        &pre.target,
+        &pre.ssh_auth,
+        &install::extract_into_etc_ferrum(),
+        &payload,
+    )?;
+    println!("hardware configuration transferred and committed");
+    Ok(())
+}
+
+/// Polls for the host to answer SSH again.
+///
+/// Polls the observable condition rather than sleeping a fixed time: a
+/// fixed wait is either too short on slow hardware or wastes minutes on
+/// fast hardware, and this runs on real machines with real POST times.
+/// Refuses to re-enter `nixos-anywhere` when the target can no longer be
+/// authenticated to.
+///
+/// Found by S13's resume test, and it is the defect that test exists for.
+/// After the first run kexecs the target, the machine in RAM accepts only
+/// the keys that run installed. A second `nixos-anywhere` invocation
+/// generates a FRESH keypair and calls `ssh-copy-id` to install it -- using
+/// the operator's credentials, which that environment no longer accepts.
+/// `ssh-copy-id` then fails with "Permission denied
+/// (publickey,keyboard-interactive)" and nixos-anywhere **retries it
+/// forever**. Observed: 150 minutes of silent looping, killed by a
+/// timeout, with no output of any kind for the operator to act on.
+///
+/// The retry loop is inside nixos-anywhere and not ours to remove, so this
+/// refuses to hand control to it in the state where it cannot succeed. A
+/// bounded window first, because a target mid-kexec or mid-reboot is
+/// legitimately unreachable for a while and that is not this failure.
+///
+/// # Arguments
+/// * `pre` - the target and credentials.
+///
+/// # Errors
+/// When the target cannot be authenticated to within the window, with the
+/// recovery an operator can actually carry out.
+fn check_target_still_reachable_before_reinstalling(
+    pre: &preconditions::Preconditions,
+) -> anyhow::Result<()> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+    while std::time::Instant::now() < deadline {
+        if collect::run(&pre.target, &pre.ssh_auth, "true").is_ok() {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_secs(5));
+    }
+    Err(cannot_reauthenticate(&pre.target.to_string()))
+}
+
+/// The error for a resume that can no longer reach its half-installed
+/// target. Split out so its guidance is pinned by a test rather than
+/// asserted by a comment.
+///
+/// # Arguments
+/// * `target` - the `root@host` this run was pointed at.
+fn cannot_reauthenticate(target: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "cannot authenticate to {target}, so refusing to start the install.\n\n\
+         nixos-anywhere uploads its key with `until ssh-copy-id ...; do \
+         sleep 3; done` -- an unbounded retry, in its own source. If it \
+         cannot get in it does not fail, it loops silently forever. Handing \
+         it an unreachable target means a hang with no error at all, so \
+         this stops here instead.\n\n\
+         Worth checking, commonest first:\n\
+         - sshd may be rate-limiting you. OpenSSH 9.8+ penalises a source \
+         IP after repeated auth failures, so an earlier failed attempt can \
+         earn one. It expires by itself, usually within minutes.\n\
+         - the target must accept your key as ROOT: ssh -i <key> \
+         root@<target> true\n\
+         - if an earlier run already kexec'd the target, the system now in \
+         its RAM accepts only the keys THAT run installed. Power-cycle it \
+         (the kexec'd system lives only in RAM), then re-run with --fresh, \
+         accepting that the disk may already be partially written."
+    )
+}
+
+fn wait_for_ssh(pre: &preconditions::Preconditions) -> anyhow::Result<()> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
+    while std::time::Instant::now() < deadline {
+        if collect::run(&pre.target, &pre.ssh_auth, "true").is_ok() {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_secs(5));
+    }
+    anyhow::bail!(
+        "the host did not answer SSH within 10 minutes. It is installed; check \
+         it on the console before re-running -- a resume will not repartition."
+    )
+}
+
+fn acme_secret_present(pre: &preconditions::Preconditions) -> anyhow::Result<bool> {
+    Ok(collect::run(
+        &pre.target,
+        &pre.ssh_auth,
+        "test -f /etc/ferrum/secrets/acme-dns.sops && echo yes || echo no",
+    )
+    .map(|o| o.trim() == "yes")
+    .unwrap_or(false))
+}
+
+/// Runs every check and returns the ones that failed.
+fn verify_host(
+    pre: &preconditions::Preconditions,
+    answers: &answers::Answers,
+    approved: &confirm::Approved,
+) -> anyhow::Result<Vec<String>> {
+    let kept = render::data_disks(&approved.all_devices, &approved.device);
+    let mut checks = verify::ownership_checks();
+    checks.extend(verify::service_checks());
+    checks.extend(verify::data_disk_checks(&kept));
+    if let Some(domain) = &answers.base_domain {
+        if answers.sso.enabled {
+            checks.extend(verify::auth_checks(domain, &answers.apps, true));
+        } else {
+            // R9 A4: declining inverts the assertion rather than skipping it.
+            checks.extend(verify::unauthenticated_checks(domain, &answers.apps));
+        }
+    }
+
+    let mut failures = Vec::new();
+    for check in checks {
+        match collect::run(&pre.target, &pre.ssh_auth, &check.command) {
+            Ok(out) if out.contains(&check.expect) => println!("  ok: {}", check.what),
+            Ok(out) => failures.push(format!(
+                "{}: expected {:?}, got {:?}  [{}]",
+                check.what,
+                check.expect,
+                out.trim(),
+                check.command
+            )),
+            Err(e) => failures.push(format!("{}: {e}", check.what)),
+        }
+    }
+    Ok(failures)
+}
+
+/// Everything the operator needs to actually use the machine.
+fn final_report(
+    pre: &preconditions::Preconditions,
+    answers: &answers::Answers,
+    evidence: &preflight::Evidence,
+) -> anyhow::Result<()> {
+    println!("\n{}", "=".repeat(64));
+    println!("{} is installed.", answers.hostname);
+    println!("{}", "=".repeat(64));
+    println!("\nproof: {}", evidence.describe());
+
+    if let Some(domain) = &answers.base_domain {
+        println!("\nurls:");
+        println!("  ferrum        https://ferrum.{domain}");
+        if answers.sso.enabled {
+            println!("  sign-in       https://auth.{domain}");
+        }
+        for app in &answers.apps {
+            println!("  {app:<13} https://{app}.{domain}");
+        }
+    }
+
+    // Printed once, to the terminal, and written to no file.
+    println!("\nfirst-run credentials -- shown ONCE, stored nowhere by this installer:");
+    for (what, path) in verify::credential_paths(answers.sso.enabled) {
+        match collect::run(&pre.target, &pre.ssh_auth, &format!("cat {path}")) {
+            Ok(value) => println!("  {what:<15} {}", value.trim()),
+            Err(e) => println!("  {what:<15} (could not read {path}: {e})"),
+        }
+    }
+
+    println!(
+        "\nyour host repository is {}. It is yours: ferrum never rewrites it,\n\
+         and every later `ferrum-apply apply` on the host evaluates its copy\n\
+         at /etc/ferrum.",
+        pre.host_dir.display()
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    /// S13's resume test found nixos-anywhere looping on `ssh-copy-id`
+    /// for 150 minutes with no output after a kill mid-install. The retry
+    /// is inside nixos-anywhere; what we control is refusing to hand it
+    /// control in the state where it cannot succeed -- and saying
+    /// something the operator can act on.
+    #[test]
+    fn the_resume_refusal_explains_the_hang_and_names_a_real_recovery() {
+        let raw = super::cannot_reauthenticate("root@saltbox").to_string();
+        // Lowercased: these assertions are about the ADVICE being present,
+        // not about how a sentence happens to be capitalised.
+        let msg = raw.to_lowercase();
+        assert!(msg.contains("root@saltbox"), "{msg}");
+        // Why it refuses rather than trying: the alternative is a silent
+        // hang, which is what an operator actually experienced.
+        assert!(msg.contains("forever"), "{msg}");
+        // The rate-limit cause, which is what actually bit on the first
+        // real install: hundreds of failed ssh-copy-id attempts earned the
+        // operator's own IP an OpenSSH per-source penalty, and the next
+        // run then could not connect for reasons nothing explained.
+        assert!(msg.contains("rate-limiting"), "{msg}");
+        assert!(msg.contains("root@<target> true"), "{msg}");
+        // The cause, so it is not mistaken for a network problem.
+        assert!(msg.contains("kexec"), "{msg}");
+        // A recovery that works, and both halves of it.
+        assert!(msg.contains("power-cycle"), "{msg}");
+        assert!(msg.contains("--fresh"), "{msg}");
+        // And the honest warning about what --fresh means here.
+        assert!(msg.contains("partially written"), "{msg}");
+    }
+
+    use super::{check_hardware_config_body, needs_hardware_config_transfer};
+    use crate::state::Phase;
+
+    /// SEC-H1, pinned at the decision rather than the enum.
+    ///
+    /// Mutation check: revert the comparison in
+    /// `needs_hardware_config_transfer` to `< Phase::Installed` and this
+    /// fails. Before this test that mutation was silent.
+    #[test]
+    fn a_run_recorded_at_installed_still_owes_the_hardware_config_transfer() {
+        assert!(
+            needs_hardware_config_transfer(Some(Phase::Installed)),
+            "this is SEC-H1: a run interrupted between nixos-anywhere \
+             returning and the transfer records Installed, and must still \
+             transfer on the next run -- otherwise the placeholder becomes \
+             the host's permanent hardware configuration"
+        );
+        // Fresh runs and every earlier phase also owe it.
+        for p in [None, Some(Phase::Generated), Some(Phase::PreflightPassed), Some(Phase::Installing)] {
+            assert!(needs_hardware_config_transfer(p), "{p:?}");
+        }
+        // ...and once done, it is not repeated.
+        for p in [Phase::HardwareConfigured, Phase::Stage2Applied, Phase::Verified] {
+            assert!(!needs_hardware_config_transfer(Some(p)), "{p:?}");
+        }
+    }
+
+    /// Mutation check: replace the body of `check_hardware_config_body`
+    /// with `Ok(())` and this fails. Before this test that mutation was
+    /// silent.
+    #[test]
+    fn the_placeholder_hardware_config_is_refused_at_the_transfer() {
+        let path = std::path::Path::new("/etc/ferrum/hardware-configuration.nix");
+        let mut files = render::Files::new();
+        render::insert_hardware_config_placeholder(&mut files);
+        let err = check_hardware_config_body(&files["hardware-configuration.nix"], path)
+            .expect_err("the stand-in must never be transferred to the host");
+        let msg = err.to_string();
+        assert!(msg.contains("still the placeholder"), "{msg}");
+        assert!(msg.contains("no microcode"), "{msg}");
+
+        // A real generated config passes.
+        check_hardware_config_body(
+            "{ config, lib, modulesPath, ... }:\n{\n  boot.initrd.availableKernelModules = [ \"nvme\" ];\n}\n",
+            path,
+        )
+        .expect("a real hardware configuration must be accepted");
+    }
+
+    use super::check_arch;
+
+    #[test]
+    fn an_x86_64_target_is_accepted() {
+        assert!(check_arch("x86_64").is_ok());
+    }
+
+    #[test]
+    fn a_non_x86_64_target_is_refused_by_name() {
+        // Refused BEFORE the disk gate, so an operator who points the
+        // installer at an ARM box is told why rather than watching a flake
+        // evaluation fail after the disks are already partitioned.
+        let err = check_arch("aarch64").unwrap_err().to_string();
+        assert!(err.contains("aarch64"), "{err}");
+        assert!(err.contains("x86_64-linux"), "{err}");
+    }
+
+    use super::*;
+    use clap::CommandFactory;
+
+    /// R1 A3: no target argument means usage and a non-zero exit, with
+    /// nothing contacted. `try_parse_from` returning an error is what
+    /// produces both.
+    #[test]
+    fn no_target_is_a_usage_error() {
+        let err = Cli::try_parse_from(["ferrum-install"]).unwrap_err();
+        assert_eq!(
+            err.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument,
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn the_defaults_are_the_documented_mount_points() {
+        let cli = Cli::parse_from(["ferrum-install", "root@saltbox"]);
+        assert_eq!(cli.target, "root@saltbox");
+        assert_eq!(
+            cli.host_dir,
+            std::path::PathBuf::from(preconditions::DEFAULT_HOST_DIR)
+        );
+        assert_eq!(
+            cli.ssh_dir,
+            std::path::PathBuf::from(preconditions::DEFAULT_SSH_DIR)
+        );
+        assert!(!cli.fresh, "--fresh must never be the default");
+    }
+
+    #[test]
+    fn fresh_is_opt_in() {
+        let cli = Cli::parse_from(["ferrum-install", "root@saltbox", "--fresh"]);
+        assert!(cli.fresh);
+    }
+
+    #[test]
+    fn the_mounts_are_overridable_for_testing_outside_a_container() {
+        let cli = Cli::parse_from([
+            "ferrum-install",
+            "root@saltbox",
+            "--host-dir",
+            "/tmp/h",
+            "--ssh-dir",
+            "/tmp/s",
+        ]);
+        assert_eq!(cli.host_dir, std::path::PathBuf::from("/tmp/h"));
+        assert_eq!(cli.ssh_dir, std::path::PathBuf::from("/tmp/s"));
+    }
+
+    /// SEC-CRIT-001 was "the backstop is skipped on resume", and it was
+    /// reintroducible precisely because no test pinned the call. This reads
+    /// the source of `run()` and asserts the call happens before every
+    /// destructive branch -- crude, but it fails if someone deletes or
+    /// moves it, which is the property that was missing.
+    #[test]
+    fn the_authentication_backstop_runs_before_anything_destructive() {
+        let src = include_str!("main.rs");
+        let body = &src[src.find("fn run(cli: &Cli)").expect("run() exists")..];
+
+        let backstop = body
+            .find("check_published_apps_are_authenticated")
+            .expect("the authentication backstop call has been REMOVED from run()");
+        for destructive in ["stage_extra_files", "Phase::Installing", "nixos-anywhere"] {
+            let at = body.find(destructive).unwrap_or(usize::MAX);
+            assert!(
+                backstop < at,
+                "the backstop must run before {destructive:?}; SEC-CRIT-001 was \
+                 exactly this call being skipped"
+            );
+        }
+        // ...and it must not be inside the phase-gated block, or a resume
+        // skips it again.
+        let gated = body.find("< state::Phase::PreflightPassed").unwrap_or(usize::MAX);
+        assert!(backstop < gated, "the backstop must not be phase-gated");
+    }
+
+    #[test]
+    fn the_cli_definition_is_valid() {
+        Cli::command().debug_assert();
+    }
+}

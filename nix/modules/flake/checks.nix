@@ -203,6 +203,229 @@
           actualSchemaVersion = migratedHost.config.ferrum.schemaVersion;
         };
 
+      # Proof that modules/core/storage.nix's journalDir assertion is really
+      # wired into an evaluated host config, not merely written down -- and
+      # that the DEFAULT journalDir survives it. That second half is the part
+      # worth a check: the assertion rejects anything nesting inside stateDir
+      # (/var/lib/ferrum/state), and the default /var/lib/ferrum/journal sits
+      # one directory away from it, so an over-broad rewrite of the condition
+      # would brick every host rather than only the misconfigured ones.
+      #
+      # A false NixOS assertion becomes a hard error only when
+      # system.build.toplevel is forced, which is far too expensive to do here
+      # (eval-example-hosts below documents that cost). This inspects the same
+      # config.assertions list top-level reads, one step before NixOS turns a
+      # false entry into a throw. builtins.tryEval -- the throwCaught idiom
+      # from migrationMechanism above -- keeps a genuine evaluation error on a
+      # colliding value counting as "rejected" instead of taking the whole
+      # flake down with it.
+      journalDirCollision =
+        let
+          hostWith = journalDir: ferrumLib.mkHost {
+            inherit system;
+            settings = builtins.fromJSON (builtins.readFile ../../../examples/hosts/minimal/settings.json);
+            modules = [
+              ../../../examples/hosts/minimal/configuration.nix
+              { ferrum.secretsDir = toString ../../../examples/hosts/minimal/secrets; }
+            ] ++ lib.optional (journalDir != null) { ferrum.storage.journalDir = journalDir; };
+            revision = "ci";
+          };
+          # Scoped to the journalDir assertion's own message on purpose, and
+          # not negotiable: the example host carries OTHER failing assertions
+          # unrelated to this one (its committed placeholder secrets under
+          # examples/hosts/minimal/secrets/ have no *-apikey-raw.sops
+          # counterparts, which modules/ asserts on). Confirmed for real by
+          # running this check unscoped first. An unscoped version is not
+          # merely noisy, it is worthless in BOTH directions: it reports the
+          # legal default as rejected, and it reports every colliding value as
+          # rejected for a reason that has nothing to do with journalDir --
+          # so it would pass identically with this assertion deleted.
+          # null means "leave journalDir at its declared default".
+          failuresFor = journalDir:
+            let
+              probe = builtins.tryEval (
+                builtins.filter (m: lib.hasInfix "ferrum.storage.journalDir" m)
+                  (map (a: a.message)
+                    (builtins.filter (a: !a.assertion) (hostWith journalDir).config.assertions))
+              );
+            in
+            if probe.success then probe.value else [ "evaluation threw" ];
+
+          storage = (hostWith null).config.ferrum.storage;
+          colliding = [
+            "/var/lib/ferrum"
+            storage.stateDir
+            storage.snapshotDir
+            storage.mediaDir
+            "${storage.stateDir}/journal"
+            "${storage.mediaDir}/journal"
+          ];
+
+          defaultFailures = failuresFor null;
+          notRejected = builtins.filter (dir: failuresFor dir == [ ]) colliding;
+        in
+        {
+          ok = defaultFailures == [ ] && notRejected == [ ];
+          defaultJournalDir = storage.journalDir;
+          inherit defaultFailures notRejected;
+        };
+
+      # Every schema shape the real settings-schema.json contains must have a
+      # control in ui/forms.js.
+      #
+      # This is the mechanical guard on the phase's central claim -- that
+      # adding a directory under modules/apps/ makes an app appear with no UI
+      # change. Without it the claim decays silently: someone adds an option
+      # shape the renderer has never seen, nothing fails, and an operator
+      # eventually opens a form, saves it, and loses a field. forms.js's
+      # UNSUPPORTED branch stops the data loss; this stops the gap existing.
+      #
+      # It reads forms.js's single exported SUPPORTED_TYPES literal rather than
+      # parsing JavaScript. That is deliberate: one honest declaration a human
+      # maintains beats a parser that would quietly disagree with the code it
+      # claims to describe. The cost is that adding an entry there WITHOUT
+      # adding the matching branch in control() turns this into a rubber stamp
+      # -- a code-review discipline point, the same way schema-uniformity
+      # treats its own throw() messages.
+      # The installer offers the operator a list of apps to enable. That
+      # list lives in Rust, on the operator's machine, and the catalog it
+      # must match lives in Nix -- nothing connects them at compile time,
+      # so a new catalog app would silently be un-installable: present on
+      # a host that already has it, and absent from every new install.
+      # Same mechanism, and same one-line-literal constraint, as
+      # uiRendersEverySchemaType below.
+      installerOffersEveryCatalogApp =
+        let
+          answersSrc = builtins.readFile ../../../crates/ferrum-install/src/answers.rs;
+          declLine =
+            let hits = builtins.filter (l: lib.hasInfix "pub const CATALOG_APPS" l)
+                         (lib.splitString "\n" answersSrc);
+            in if hits == [ ] then
+                 throw "crates/ferrum-install/src/answers.rs no longer declares CATALOG_APPS on a single line that this check can read"
+               else builtins.head hits;
+          declared =
+            map builtins.head
+              (builtins.filter builtins.isList
+                (builtins.split "\"([a-z0-9-]+)\"" declLine));
+
+          catalogApps = builtins.attrNames (import ../../../modules/lib/catalog.nix { inherit lib; });
+          missing = builtins.filter (a: !(builtins.elem a declared)) catalogApps;
+          extra = builtins.filter (a: !(builtins.elem a catalogApps)) declared;
+        in
+        {
+          ok = missing == [ ] && extra == [ ];
+          message =
+            "crates/ferrum-install/src/answers.rs's CATALOG_APPS is out of step with "
+            + "modules/lib/catalog.nix."
+            + (lib.optionalString (missing != [ ])
+                " In the catalog but not offered by the installer: ${lib.concatStringsSep ", " missing}.")
+            + (lib.optionalString (extra != [ ])
+                " Offered by the installer but not in the catalog: ${lib.concatStringsSep ", " extra}.");
+        };
+
+      uiRendersEverySchemaType =
+        let
+          formsSrc = builtins.readFile ../../../ui/forms.js;
+          # Find the one line declaring the literal, then pull the quoted
+          # names out of it. Line-oriented rather than a multi-line regex:
+          # Nix's regex engine rejects the bracket-negation forms that would
+          # be needed, and a line lookup is clearer than working around it.
+          declLine =
+            let hits = builtins.filter (l: lib.hasInfix "SUPPORTED_TYPES = [" l)
+                         (lib.splitString "\n" formsSrc);
+            in if hits == [ ] then
+                 throw "ui/forms.js no longer declares SUPPORTED_TYPES on a single line that this check can read"
+               else builtins.head hits;
+          declared =
+            map builtins.head
+              (builtins.filter builtins.isList
+                (builtins.split "\"([a-z-]+)\"" declLine));
+
+          schema = builtins.fromJSON (builtins.readFile ../../../modules/lib/settings-schema.json);
+
+          # The shape vocabulary must match forms.js's control() branches
+          # exactly: an enum'd string and a plain string are different
+          # controls, and so is an array by its item type.
+          shapeOf = node:
+            let t = node.type or null; in
+            if t == "string" && node ? enum then [ "string-enum" ]
+            else if t == "array" then
+              [ ("array-of-" + (((node.items or { }).type or "unknown"))) ]
+            else if t != null && builtins.isString t then [ t ]
+            else [ ];
+
+          walk = node:
+            if !(builtins.isAttrs node) then [ ]
+            else
+              shapeOf node
+              ++ lib.concatMap walk (builtins.attrValues (node.properties or { }))
+              ++ lib.concatMap walk (builtins.attrValues (node.patternProperties or { }))
+              ++ (if builtins.isAttrs (node.items or null) then walk node.items else [ ])
+              ++ (if builtins.isAttrs (node.additionalProperties or null)
+                  then walk node.additionalProperties else [ ]);
+
+          present = lib.unique (walk schema);
+          missing = builtins.filter (t: !(builtins.elem t declared)) present;
+        in
+        {
+          ok = missing == [ ];
+          inherit missing declared;
+          schemaShapes = present;
+        };
+
+      # The auth model, asserted against the GENERATED nginx config rather
+      # than against the metadata that describes it.
+      #
+      # This exists because the metadata and the behaviour disagreed for
+      # three phases. Every app's meta.nix declared authBypassPaths, the
+      # app submodule exposed it as an option, the UI mentioned it -- and
+      # modules/proxy/nginx.nix put auth_request on locations."/" and
+      # generated nothing else. Reading any one of those files suggested
+      # the feature worked. Only the rendered vhost shows that it did not.
+      authModelEnforced =
+        let
+          host = ferrumLib.mkHost {
+            inherit system;
+            settings = {
+              schemaVersion = realMigrations.currentVersion;
+              proxy = { enable = true; baseDomain = "example.test"; acme.email = "a@example.test"; };
+              auth = { enable = true; adminEmail = "a@example.test"; };
+              apps = {
+                plex.enable = true;
+                sonarr.enable = true;
+              };
+            };
+            modules = [ ../../../examples/hosts/minimal/configuration.nix ];
+          };
+          vhosts = host.config.services.nginx.virtualHosts;
+          plexV = vhosts."plex.example.test" or null;
+          sonarrV = vhosts."sonarr.example.test" or null;
+          hasAuth = v: loc:
+            v != null && (v.locations.${loc} or null) != null
+            && lib.hasInfix "auth_request /authelia" (v.locations.${loc}.extraConfig or "");
+          problems =
+            lib.optional (plexV == null) "no vhost generated for plex"
+            ++ lib.optional (sonarrV == null) "no vhost generated for sonarr"
+            # Plex authenticates itself; forward-auth in front of it breaks
+            # every native client.
+            ++ lib.optional (hasAuth plexV "/")
+                 "plex's / is behind forward-auth, which breaks Roku/TV/mobile clients"
+            # Sonarr has no real login of its own, so its UI must be gated.
+            ++ lib.optional (!(hasAuth sonarrV "/"))
+                 "sonarr's / is NOT behind forward-auth, so it is published unauthenticated"
+            # ...but its API must not be, or Prowlarr, mobile clients and
+            # ferrum's own reconciler all break.
+            ++ lib.optional (sonarrV != null && (sonarrV.locations."/api" or null) == null)
+                 "sonarr has no /api location, so its API is behind forward-auth"
+            ++ lib.optional (hasAuth sonarrV "/api")
+                 "sonarr's /api is behind forward-auth, which breaks Prowlarr and ferrum-reconcile";
+        in
+        {
+          ok = problems == [ ];
+          message = "the generated nginx config does not match the declared auth model";
+          inherit problems;
+        };
+
       mkAssertionCheck = name: result:
         pkgs.runCommand "ferrum-check-${name}" { } (
           if result.ok then
@@ -213,10 +436,16 @@
     in
     {
       checks = {
+        auth-model-enforced = mkAssertionCheck "auth-model-enforced" authModelEnforced;
         catalog-consistency = mkAssertionCheck "catalog-consistency" catalogConsistency;
         schema-uniformity = mkAssertionCheck "schema-uniformity" schemaUniformity;
+        ui-renders-every-schema-type =
+          mkAssertionCheck "ui-renders-every-schema-type" uiRendersEverySchemaType;
+        installer-offers-every-catalog-app =
+          mkAssertionCheck "installer-offers-every-catalog-app" installerOffersEveryCatalogApp;
         sopsfile-are-paths = mkAssertionCheck "sopsfile-are-paths" sopsFilesArePaths;
         migration-mechanism = mkAssertionCheck "migration-mechanism" migrationMechanism;
+        journaldir-collision = mkAssertionCheck "journaldir-collision" journalDirCollision;
         mkhost-applies-migration = mkAssertionCheck "mkhost-applies-migration" mkHostAppliesMigration;
 
         # Forces .drvPath for each example host so an option-type mistake
@@ -253,7 +482,82 @@
           }
           "echo $drvPaths > $out";
 
+        # ferrum-secrets is a LIBRARY crate with no package of its own, and
+        # every package that depends on it sets buildAndTestSubdir to its own
+        # crate -- so `cargo test` never reaches ferrum-secrets' own five
+        # tests, even though its code compiles into both ferrum-apply and
+        # ferrumd. Without this check the shared encrypt-and-write path that
+        # BOTH the privileged applier and the unprivileged daemon rely on is
+        # the one part of the workspace CI does not test.
+        #
+        # Deliberately a real buildRustPackage over the whole workspace
+        # rather than a bare `cargo test` in a runCommand: that is what puts
+        # the pinned toolchain and the vendored Cargo.lock closure in play,
+        # matching how every other Rust artifact here is built. The runtime
+        # tools are the union of what the workspace's tests shell out to --
+        # btrfs (preflight::check_is_subvolume), sops/ssh-to-age (secrets),
+        # authelia (argon2id hashing). Confirmed real, by really running the
+        # suite in a container on 2026-09-15: without btrfs on PATH,
+        # is_subvolume_check_fails_on_a_plain_directory fails on the spawn
+        # error rather than the assertion it means to make.
+        workspace-tests = pkgs.rustPlatform.buildRustPackage {
+          pname = "ferrum-workspace-tests";
+          version = "0.1.0";
+
+          # The source root is the REPOSITORY, not crates/, and must stay
+          # in step with nix/pkgs/ferrum-install/default.nix: render.rs
+          # does include_str! on examples/hosts/template/disko.nix so that
+          # a drift between the generated btrfs subvolume layout and the
+          # template is a compile error rather than a silent host that
+          # cannot roll back. That path escapes crates/.
+          #
+          # This derivation compiles the same crate as that package and was
+          # missed when the package's root was changed -- CI caught it,
+          # because `cargo test` run by hand does not reproduce a Nix
+          # sandbox's view of the tree.
+          src = lib.cleanSourceWith {
+            src = ../../..;
+            filter = path: type:
+              let rel = lib.removePrefix (toString ../../.. + "/") (toString path); in
+              lib.hasPrefix "crates" rel || lib.hasPrefix "examples" rel
+              # flake.lock too: render.rs include_str!s it so the disko
+              # revision generated hosts pin cannot drift from the one this
+              # repository tests against. disko partitions the target as
+              # root, so an unpinned or untested revision there is remote
+              # code execution on the destructive path. Same class of
+              # escape-from-crates/ as the template above -- and, again,
+              # invisible to `cargo test` run by hand.
+              || rel == "flake.lock"
+              || (type == "directory" && (rel == "crates" || rel == "examples"));
+          };
+          cargoLock.lockFile = ../../../crates/Cargo.lock;
+          cargoRoot = "crates";
+          buildAndTestSubdir = "crates";
+          nativeCheckInputs = [ pkgs.btrfs-progs pkgs.sops pkgs.ssh-to-age pkgs.authelia pkgs.git ];
+          # The point of this derivation is the checkPhase; nothing consumes
+          # its binaries, so skip the install entirely.
+          installPhase = "touch $out";
+        };
+
         smoke-vm = import ../../../tests/smoke.nix { inherit pkgs; };
+
+        # Phase 1.6a: the first test that starts from NOTHING. Two nodes --
+        # an operator machine running the real ferrum-install binary, and a
+        # target whose disk is blank. Every other VM test in this file
+        # builds a host from an expression and then drives it, which is
+        # exactly the gap the design doc's install postmortem names: six of
+        # that install's ten defects were invisible to a suite shaped that
+        # way.
+        #
+        # Stage 2 is deliberately NOT here and cannot be: the sandbox has
+        # no network and no in-guest nixpkgs evaluation, and stage 2 exists
+        # precisely so each app's sopsFile is created at runtime on the
+        # guest, which rules out the pre-built-closure trick that makes the
+        # other tests possible. It lives in the networked CI job instead.
+        install-from-nothing = import ../../../tests/install-from-nothing.nix {
+          inherit pkgs;
+          ferrumInstall = self'.packages.ferrum-install;
+        };
 
         # tests/rollback.nix is the plan's terminal proof: a real rollback
         # reverts application STATE. rollback-proves-necessity.nix is its
@@ -261,13 +565,13 @@
         # prevent is real in the first place. apply-generation-switch.nix
         # (below) proves the other half of the pair: the CLOSURE reverts
         # too, against a genuinely different generation.
-        rollback = import ../../../tests/rollback.nix { inherit pkgs; };
+        rollback = import ../../../tests/rollback.nix { inherit pkgs; sopsNix = inputs.sops-nix; };
         rollback-proves-necessity = import ../../../tests/rollback-proves-necessity.nix { inherit pkgs; };
 
         # Closes the one gap tests/rollback.nix's own header discloses: a
         # real generation switch between two genuinely different closures,
         # not just application state, actually reverts on rollback.
-        apply-generation-switch = import ../../../tests/apply-generation-switch.nix { inherit pkgs; };
+        apply-generation-switch = import ../../../tests/apply-generation-switch.nix { inherit pkgs; sopsNix = inputs.sops-nix; };
 
         # Proves systemd itself honors ConditionPathExists and holds
         # ferrum-managed apps down when the (durable, per Fix 1) failure
@@ -309,6 +613,42 @@
           nativeBuildInputs = [ pkgs.clippy ];
           buildPhase = "true";
           checkPhase = "cargo clippy --offline -- -D warnings";
+          installPhase = "mkdir -p $out";
+        };
+
+        # ferrum-install had NO lint gate at all -- the three derivations
+        # around it scope to ferrum-apply, ferrum-reconcile and ferrumd via
+        # buildAndTestSubdir, and none covered it. That made the one crate
+        # holding every Critical in this feature the one crate nothing
+        # linted, and two real clippy errors had accumulated unnoticed.
+        #
+        # Unlike its siblings this cannot use `src = cleanSource ../crates`:
+        # render.rs include_str!s examples/hosts/template/disko.nix and
+        # flake.lock, both of which escape crates/. Same root and filter as
+        # workspace-tests above -- keep the three in step.
+        #
+        # --all-targets, so test code is linted too. One of the two errors
+        # this found was in a test.
+        clippy-ferrum-install = pkgs.rustPlatform.buildRustPackage {
+          pname = "ferrum-install-clippy";
+          version = "0.1.0";
+          src = lib.cleanSourceWith {
+            src = ../../..;
+            filter = path: type:
+              let rel = lib.removePrefix (toString ../../.. + "/") (toString path); in
+              lib.hasPrefix "crates" rel || lib.hasPrefix "examples" rel
+              || rel == "flake.lock"
+              || (type == "directory" && (rel == "crates" || rel == "examples"));
+          };
+          cargoLock.lockFile = ../../../crates/Cargo.lock;
+          cargoRoot = "crates";
+          buildAndTestSubdir = "crates";
+          nativeBuildInputs = [ pkgs.clippy ];
+          buildPhase = "true";
+          # cd explicitly: the custom buildPhase above skips the step that
+          # would otherwise honour cargoRoot, so cargo runs at the source
+          # root where there is no Cargo.toml.
+          checkPhase = "cd crates && cargo clippy --offline -p ferrum-install --all-targets -- -D warnings";
           installPhase = "mkdir -p $out";
         };
 

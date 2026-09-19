@@ -10,7 +10,7 @@
 // privileged surface is the closed five-variant request enum below, which
 // mirrors crates/ferrum-apply/src/request.rs exactly.
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::{
         sse::{Event, KeepAlive, Sse},
@@ -18,7 +18,7 @@ use axum::{
     },
     Json,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
@@ -240,9 +240,501 @@ pub async fn stream_job(Path(id): Path<String>) -> impl IntoResponse {
         .into_response()
 }
 
+/// One job, as `GET /api/jobs` reports it.
+///
+/// `status` is lifecycle, `result` is outcome, and they are deliberately
+/// separate fields: a job that finished is `status: "complete"` with a
+/// `result` of `succeeded`/`degraded`/`failed`, so a caller can render "is
+/// it still going?" without having to know the outcome vocabulary, and the
+/// outcome vocabulary can grow without changing what "still running" means.
+#[derive(Serialize, Debug, PartialEq)]
+pub struct JobSummary {
+    pub id: String,
+    /// `None` for a job dispatched before `ferrum-apply` learned to write a
+    /// `started` line. Reported as null rather than guessed: the request
+    /// file that would have said is deleted once the unit stops.
+    pub kind: Option<String>,
+    /// `running` (no terminal line yet), `complete`, or `unknown` (the file
+    /// exists but nothing in it parses).
+    pub status: &'static str,
+    pub result: Option<String>,
+    pub detail: Option<String>,
+    pub started_at: Option<u64>,
+    pub finished_at: Option<u64>,
+}
+
+/// One parsed progress line, echoed verbatim by `GET /api/jobs/:id`.
+#[derive(Serialize, Debug)]
+pub struct JobEvent {
+    pub ts: Option<u64>,
+    pub event: Option<String>,
+    pub detail: Option<String>,
+}
+
+#[derive(Serialize, Debug)]
+pub struct JobDetail {
+    #[serde(flatten)]
+    pub summary: JobSummary,
+    pub events: Vec<JobEvent>,
+}
+
+fn parse_line(line: &str) -> Option<serde_json::Value> {
+    serde_json::from_str::<serde_json::Value>(line).ok()
+}
+
+fn str_field(v: &serde_json::Value, key: &str) -> Option<String> {
+    v.get(key).and_then(|x| x.as_str()).map(str::to_string)
+}
+
+/// Reads one job's JSONL file into a summary.
+///
+/// Returns `None` only when the file cannot be read at all; a file that is
+/// present but unparseable is a summary with `status: "unknown"`, not an
+/// omission. That distinction matters: the file's existence is real evidence
+/// that a real privileged run happened, and hiding it because we cannot read
+/// it would be strictly worse than showing it plainly.
+pub fn summarize(id: &str, path: &std::path::Path) -> std::io::Result<Option<JobSummary>> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        // Genuinely absent is `Ok(None)` -- the caller turns that into a 404,
+        // or skips it in a listing. Any OTHER error is a real fault and is
+        // propagated: a permission regression on the jobs directory must not
+        // be indistinguishable from "this job does not exist". Same rule
+        // ferrum_state::journal::list already applies (journal.rs:35-38), and
+        // the same rationale Task 3 recorded for the generations endpoint --
+        // an operator who cannot tell a fault from an empty result will
+        // conclude their history was lost.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
+
+    let first = lines.first().and_then(|l| parse_line(l));
+    let last = lines.last().and_then(|l| parse_line(l));
+
+    let Some(first) = first else {
+        return Ok(Some(JobSummary {
+            id: id.to_string(),
+            kind: None,
+            status: "unknown",
+            result: None,
+            detail: None,
+            started_at: None,
+            finished_at: None,
+        }));
+    };
+
+    let started_at = first.get("ts").and_then(|t| t.as_u64());
+    // Only a genuine `started` line names the kind. Any other first event
+    // means this job predates that line, so the kind is unknown rather than
+    // whatever the first step happened to be called.
+    let kind = match str_field(&first, "event").as_deref() {
+        Some("started") => str_field(&first, "detail"),
+        _ => None,
+    };
+
+    let terminal = last.filter(|l| str_field(l, "event").as_deref() == Some("complete"));
+    let (status, result, detail, finished_at) = match terminal {
+        Some(l) => {
+            // `Progress::complete` writes the detail as "<result>: <detail>".
+            // Split once, so a detail containing its own ": " stays intact.
+            let payload = str_field(&l, "detail").unwrap_or_default();
+            let (result, detail) = match payload.split_once(": ") {
+                Some((r, d)) => (Some(r.to_string()), Some(d.to_string())),
+                None => (Some(payload.clone()), None),
+            };
+            ("complete", result, detail, l.get("ts").and_then(|t| t.as_u64()))
+        }
+        None => ("running", None, None, None),
+    };
+
+    Ok(Some(JobSummary { id: id.to_string(), kind, status, result, detail, started_at, finished_at }))
+}
+
+/// Newest first, via the same `Reverse` idiom gc.rs already uses.
+///
+/// A job with no parseable `started_at` sorts LAST rather than disappearing
+/// (see `summarize`'s note on not hiding real runs): `None < Some(_)`, so
+/// `Reverse(None)` is the greatest key and lands at the end. Extracted from
+/// the handler so that ordering -- including the None-last part, which is a
+/// deliberate choice a refactor could silently invert -- is directly testable
+/// without standing up a router or mutating process-wide environment.
+fn sort_newest_first(summaries: &mut [JobSummary]) {
+    summaries.sort_by_key(|s| std::cmp::Reverse(s.started_at));
+}
+
+#[derive(Deserialize)]
+pub struct ListJobsQuery {
+    limit: Option<usize>,
+}
+
+/// `GET /api/jobs?limit=N`
+///
+/// A missing jobs directory is an empty list, not a 500: a host that has
+/// never dispatched a job is a real, valid state, and the UI's "no jobs yet"
+/// is the correct rendering of it.
+pub async fn list_jobs(Query(q): Query<ListJobsQuery>) -> impl IntoResponse {
+    list_jobs_in(&jobs_dir(), q.limit)
+}
+
+/// The body of `list_jobs`, with the directory passed in so the tests below
+/// exercise the real handler against a real temp directory without mutating
+/// process-wide environment that the other tests in this module read
+/// concurrently -- the same reason `remove_request_file_in` exists.
+fn list_jobs_in(dir: &std::path::Path, limit: Option<usize>) -> axum::response::Response {
+    let limit = limit.unwrap_or(25).clamp(1, 100);
+
+    // Absent is an empty list; anything else is a fault and must say so.
+    // `journal::list` (crates/ferrum-state/src/journal.rs:35-38) sets this
+    // precedent, and Task 3 recorded the rationale: a fault rendered as an
+    // empty list is indistinguishable from "this host has never run a job",
+    // so an operator with real history concludes it was lost.
+    if !dir.exists() {
+        return Json(serde_json::json!({ "jobs": [] })).into_response();
+    }
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("could not read the jobs directory {}: {e}", dir.display()),
+            )
+                .into_response()
+        }
+    };
+
+    let mut summaries: Vec<JobSummary> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        // The stem becomes the reported id, so it is re-parsed as a UUID for
+        // the same reason `stream_job` re-parses its own path parameter:
+        // anything that is not literally a UUID has no business being echoed
+        // back as a job id.
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if Uuid::parse_str(stem).is_err() {
+            continue;
+        }
+        match summarize(stem, &path) {
+            Ok(Some(summary)) => summaries.push(summary),
+            // Vanished between read_dir and read -- a benign race, not a fault.
+            Ok(None) => continue,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("could not read the job file {}: {e}", path.display()),
+                )
+                    .into_response()
+            }
+        }
+    }
+
+    sort_newest_first(&mut summaries);
+    summaries.truncate(limit);
+
+    Json(serde_json::json!({ "jobs": summaries })).into_response()
+}
+
+/// `GET /api/jobs/:id`
+pub async fn get_job(Path(id): Path<String>) -> impl IntoResponse {
+    get_job_in(&jobs_dir(), &id)
+}
+
+/// The body of `get_job`; see `list_jobs_in` for why the directory is a
+/// parameter rather than read from the environment here.
+fn get_job_in(dir: &std::path::Path, id: &str) -> axum::response::Response {
+    // Rejected before touching the filesystem, identical to `stream_job`'s
+    // guard and for the identical reason: the id becomes a path component.
+    if Uuid::parse_str(id).is_err() {
+        return (StatusCode::BAD_REQUEST, "job id must be a UUID").into_response();
+    }
+    let path = dir.join(format!("{id}.jsonl"));
+    let summary = match summarize(id, &path) {
+        Ok(Some(s)) => s,
+        Ok(None) => return (StatusCode::NOT_FOUND, "no such job").into_response(),
+        // A permission regression on an existing job file is a fault, not a
+        // 404: reporting "no such job" would send an operator hunting for a
+        // job that is right there on disk.
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("could not read the job file {}: {e}", path.display()),
+            )
+                .into_response()
+        }
+    };
+
+    let events = std::fs::read_to_string(&path)
+        .map(|c| {
+            c.lines()
+                .filter(|l| !l.trim().is_empty())
+                .filter_map(parse_line)
+                .map(|v| JobEvent {
+                    ts: v.get("ts").and_then(|t| t.as_u64()),
+                    event: str_field(&v, "event"),
+                    detail: str_field(&v, "detail"),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    Json(JobDetail { summary, events }).into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Writes a job file whose lines are the given `(event, detail)` pairs,
+    /// each with an explicit `ts`, and returns its path.
+    fn job_file(dir: &std::path::Path, id: &str, lines: &[(u64, &str, &str)]) -> std::path::PathBuf {
+        let path = dir.join(format!("{id}.jsonl"));
+        let body: String = lines
+            .iter()
+            .map(|(ts, event, detail)| {
+                format!("{}\n", serde_json::json!({"ts": ts, "event": event, "detail": detail}))
+            })
+            .collect();
+        std::fs::write(&path, body).unwrap();
+        path
+    }
+
+    const ID: &str = "3f1b8a7e-0c2d-4e5f-9a1b-2c3d4e5f6a7b";
+
+    #[test]
+    fn a_finished_job_reports_its_kind_result_detail_and_both_timestamps() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = job_file(
+            dir.path(),
+            ID,
+            &[
+                (100, "started", "apply"),
+                (101, "build", "building the new generation"),
+                (102, "complete", "succeeded: switched to generation 7"),
+            ],
+        );
+        let s = summarize(ID, &path).unwrap().unwrap();
+        assert_eq!(s.kind.as_deref(), Some("apply"));
+        assert_eq!(s.status, "complete");
+        assert_eq!(s.result.as_deref(), Some("succeeded"));
+        assert_eq!(s.detail.as_deref(), Some("switched to generation 7"));
+        assert_eq!(s.started_at, Some(100));
+        assert_eq!(s.finished_at, Some(102));
+    }
+
+    #[test]
+    fn a_job_with_no_terminal_line_is_running_and_has_no_finished_at() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = job_file(dir.path(), ID, &[(100, "started", "rollback"), (101, "snapshot", "taken")]);
+        let s = summarize(ID, &path).unwrap().unwrap();
+        assert_eq!(s.status, "running");
+        assert_eq!(s.kind.as_deref(), Some("rollback"));
+        assert_eq!(s.result, None);
+        assert_eq!(s.finished_at, None);
+    }
+
+    /// A job dispatched before `ferrum-apply` learned to write a `started`
+    /// line. Its kind is genuinely unknown -- the request file that would
+    /// have said is deleted once the unit stops -- so it must be reported as
+    /// null rather than guessed from whatever the first step happened to be.
+    #[test]
+    fn a_job_predating_the_started_line_reports_a_null_kind_not_the_first_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = job_file(
+            dir.path(),
+            ID,
+            &[(100, "preflight", "checking free space"), (101, "complete", "succeeded: ok")],
+        );
+        let s = summarize(ID, &path).unwrap().unwrap();
+        assert_eq!(s.kind, None, "the first event is not a `started` line, so the kind is unknown");
+        assert_eq!(s.started_at, Some(100), "but its ts is still the job's start");
+        assert_eq!(s.status, "complete");
+    }
+
+    /// `Progress::complete` writes "<result>: <detail>", and a real detail can
+    /// itself contain ": " -- a health-check message, a path with a port, a
+    /// nested error. Splitting on the FIRST separator keeps the rest intact;
+    /// splitting on the last, or on every occurrence, would truncate it.
+    #[test]
+    fn a_detail_containing_its_own_separator_survives_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = job_file(
+            dir.path(),
+            ID,
+            &[(1, "complete", "failed: unit sonarr.service is down: exit code 3")],
+        );
+        let s = summarize(ID, &path).unwrap().unwrap();
+        assert_eq!(s.result.as_deref(), Some("failed"));
+        assert_eq!(s.detail.as_deref(), Some("unit sonarr.service is down: exit code 3"));
+    }
+
+    /// Real evidence that a real privileged run happened must not be hidden
+    /// just because it cannot be parsed.
+    #[test]
+    fn an_unparseable_job_file_is_reported_as_unknown_rather_than_omitted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(format!("{ID}.jsonl"));
+        std::fs::write(&path, "this is not json at all\n").unwrap();
+        let s = summarize(ID, &path).unwrap().unwrap();
+        assert_eq!(s.status, "unknown");
+        assert_eq!(s.kind, None);
+        assert_eq!(s.started_at, None);
+    }
+
+    /// Newest first, and an unparseable job (no `started_at`) must land at
+    /// the END rather than the front. Inverting this is a one-character
+    /// mistake that would push every broken job to the top of the operator's
+    /// list, so it is asserted rather than left to the comment.
+    #[test]
+    fn jobs_sort_newest_first_with_unknown_start_times_last() {
+        let mk = |id: &str, started_at: Option<u64>| JobSummary {
+            id: id.to_string(),
+            kind: None,
+            status: "complete",
+            result: None,
+            detail: None,
+            started_at,
+            finished_at: None,
+        };
+        let mut v = vec![mk("old", Some(10)), mk("broken", None), mk("new", Some(30)), mk("mid", Some(20))];
+        sort_newest_first(&mut v);
+        let order: Vec<&str> = v.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(order, vec!["new", "mid", "old", "broken"]);
+    }
+
+    /// The three handler-level cases Task 4 Step 4 names: a non-UUID filename
+    /// that must be skipped, `limit` clamped at both ends, and a `..`-bearing
+    /// id rejected with 400.
+    ///
+    /// Driven through the real handlers rather than the helpers, because the
+    /// UUID guards are the security-relevant part of this task and a test of
+    /// `summarize` alone cannot exercise them. Serialized into ONE test that
+    /// sets `FERRUM_JOBS_DIR`, matching this module's existing note about
+    /// process-wide environment: the other tests here read it concurrently.
+    /// The three handler-level cases Task 4 Step 4 names: a non-UUID filename
+    /// that must be skipped, `limit` clamped at both ends, and a `..`-bearing
+    /// id rejected with 400.
+    ///
+    /// Driven through the real handler bodies rather than the helpers,
+    /// because the UUID guards are the security-relevant part of this task
+    /// and a test of `summarize` alone cannot exercise them. Uses the `_in`
+    /// variants so it touches NO process-wide environment: an earlier version
+    /// set `FERRUM_JOBS_DIR` and was genuinely flaky, because this module's
+    /// own `jobs_dir()` default test calls `remove_var` concurrently.
+    #[tokio::test]
+    async fn handlers_skip_non_uuid_files_clamp_limit_and_reject_traversal_ids() {
+        use axum::body::to_bytes;
+
+        let dir = tempfile::tempdir().unwrap();
+        job_file(dir.path(), ID, &[(10, "started", "apply"), (11, "complete", "succeeded: ok")]);
+        std::fs::write(dir.path().join("not-a-uuid.jsonl"), "{\"ts\":1,\"event\":\"started\"}\n").unwrap();
+
+        async fn read(r: axum::response::Response) -> (StatusCode, String) {
+            let (parts, body) = r.into_parts();
+            let bytes = to_bytes(body, usize::MAX).await.unwrap();
+            (parts.status, String::from_utf8(bytes.to_vec()).unwrap())
+        }
+
+        // 1. The non-UUID filename is skipped; only the real job is listed.
+        let (status, text) = read(list_jobs_in(dir.path(), None)).await;
+        assert_eq!(status, StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let jobs = v["jobs"].as_array().unwrap();
+        assert_eq!(jobs.len(), 1, "only the UUID-named file is a job: {text}");
+        assert_eq!(jobs[0]["id"], ID);
+        assert!(!text.contains("not-a-uuid"), "a non-UUID stem must never be echoed as an id");
+
+        // 2. limit clamps at both ends: 0 -> 1, and a huge value -> 100.
+        for (requested, at_most) in [(Some(0usize), 1usize), (Some(10_000), 100)] {
+            let (status, text) = read(list_jobs_in(dir.path(), requested)).await;
+            assert_eq!(status, StatusCode::OK);
+            let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert!(
+                v["jobs"].as_array().unwrap().len() <= at_most,
+                "limit {requested:?} should clamp to at most {at_most}"
+            );
+        }
+
+        // 3. A traversal id is rejected BEFORE any filesystem access.
+        for bad in ["../../etc/shadow", "..", "not-a-uuid", ""] {
+            let (status, _) = read(get_job_in(dir.path(), bad)).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "id {bad:?} must be rejected as a non-UUID");
+        }
+
+        // A real UUID with no file is a 404 -- not a 400, and not a 500.
+        let (status, _) = read(get_job_in(dir.path(), "11111111-2222-3333-4444-555555555555")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // And the real job is retrievable, with its events.
+        let (status, text) = read(get_job_in(dir.path(), ID)).await;
+        assert_eq!(status, StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["kind"], "apply");
+        assert_eq!(v["events"].as_array().unwrap().len(), 2);
+    }
+
+    /// A fault must never be reported as absence. `summarize` returns
+    /// `Ok(None)` ONLY for a genuinely missing file; any other IO error
+    /// propagates, so `get_job` can answer 500 instead of a misleading 404
+    /// and `list_jobs` can answer 500 instead of a silently empty list.
+    ///
+    /// Provoked with a directory where a file is expected, which yields a
+    /// non-`NotFound` error deterministically. A permissions test would not
+    /// work here: the test container runs as root and bypasses DAC, so a
+    /// mode-000 file is still readable and the test would pass vacuously.
+    #[test]
+    fn a_read_error_that_is_not_absence_propagates_rather_than_reading_as_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let as_dir = dir.path().join(format!("{ID}.jsonl"));
+        std::fs::create_dir(&as_dir).unwrap();
+
+        let err = summarize(ID, &as_dir).expect_err("a directory is not an absent job");
+        assert_ne!(
+            err.kind(),
+            std::io::ErrorKind::NotFound,
+            "this must not be mistaken for a missing job"
+        );
+
+        // And the genuinely-absent case still reads as absent, not an error.
+        assert!(summarize(ID, &dir.path().join("absent.jsonl")).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_missing_job_file_summarizes_to_none() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(summarize(ID, &dir.path().join("nope.jsonl")).unwrap().is_none());
+    }
+
+    /// A `complete` line that is not the LAST line leaves the job running --
+    /// otherwise a job whose terminal line is followed by a stray write would
+    /// be reported finished while its unit is still going.
+    #[test]
+    fn only_the_last_line_can_terminate_a_job() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = job_file(
+            dir.path(),
+            ID,
+            &[(1, "started", "gc"), (2, "complete", "succeeded: done"), (3, "extra", "still writing")],
+        );
+        assert_eq!(summarize(ID, &path).unwrap().unwrap().status, "running");
+    }
+
+    #[test]
+    fn blank_lines_do_not_confuse_the_first_or_last_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(format!("{ID}.jsonl"));
+        std::fs::write(
+            &path,
+            "\n{\"ts\":5,\"event\":\"started\",\"detail\":\"gc\"}\n\n\
+             {\"ts\":6,\"event\":\"complete\",\"detail\":\"succeeded: pruned 2\"}\n\n",
+        )
+        .unwrap();
+        let s = summarize(ID, &path).unwrap().unwrap();
+        assert_eq!(s.kind.as_deref(), Some("gc"));
+        assert_eq!(s.started_at, Some(5));
+        assert_eq!(s.finished_at, Some(6));
+    }
 
     #[test]
     fn every_request_kind_serializes_to_what_ferrum_apply_parses() {

@@ -1,0 +1,216 @@
+# ferrum — Claude Code SDLC config
+
+This repository has a **claude-kit** autonomous-SDLC configuration installed. Claude Code reads it
+automatically when you open the project; nothing here is application code.
+
+- **Stack:** stack-agnostic (no stack lanes selected)
+- **SDLC profile:** Standard — full SDLC, parallel lanes, security gate
+- **MCP integrations:** chrome-devtools, github
+- **Installed:** ~29 agents · 43 skills · stack overlay rules
+  (none)
+
+## What got installed
+
+```
+CLAUDE.md                  entry point — rules + your stack's commands ("Project-specific rules")
+README.claude-sdlc.md      this file
+.claude/
+  settings.json            hooks (working memory, learnings, guardrails, quality checks)
+  rules/                   the engineering rule set + your stack's overlay rules
+  agents/                  the SDLC agents for the chosen profile (+ stack specialists)
+  skills/                  on-demand skills, including sdlc/ — the pipeline entry point
+  hooks/                   the hook scripts referenced by settings.json
+  templates/               artifact templates (feature-spec, adr, test-plan, …)
+  config/                  init-options.json (selection + checksums) + the catalog snapshot
+  state/  tmp/             runtime scratch (gitignored)
+.mcp.json                  the MCP servers you selected (fill in the ${ENV} placeholders)
+```
+
+How Claude Code discovers it: `CLAUDE.md` is loaded as project context; `.claude/agents/*.md`,
+`.claude/skills/*/SKILL.md`, and the hooks in `.claude/settings.json` are auto-discovered;
+`.mcp.json` (if present) registers MCP servers.
+
+## Privacy — learning capture
+
+Learning capture is **ON for this install** (`session-end-catchup`, chosen at init): a background Claude
+job reads your session transcript and changed files to record durable learnings under
+`.claude/agent-memory/` (a committed store). It skips secret-bearing files (`.env`, `*.pem`/`*.key`,
+`credentials.*`) and redacts secret-shaped values, but transcripts can still hold sensitive context —
+**review new `agent-memory/` entries before committing them**. Controls:
+
+- `CKIT_NO_AUTOCAPTURE=1` — disable capture entirely.
+- `CKIT_CAPTURE_MAX_LINES` / `CKIT_CAPTURE_MAX_BYTES` — bound what each run feeds the job.
+- `claude-kit privacy-report` — audit every installed hook: what it reads/writes, whether a
+  background job spawns, and how to disable it.
+
+
+## Start the workflow
+
+Open the project in Claude Code and run the pipeline entry point:
+
+```
+/sdlc Build JWT authentication for the backend
+```
+
+The orchestrator asks a few ordered questions, classifies the work, then delegates to specialist
+agents through the pipeline phases — enforcing a quality gate between each. With this profile the
+active gates are: **Standard — full SDLC, parallel lanes, security gate**.
+
+You can also invoke any single skill directly (e.g. `/spec-driven-development`, `/code-review-and-quality`)
+or ask Claude to use a specific agent.
+
+The versioned headless-loop interface ships at `.claude/scripts/sdlc-loop.sh`, but new unattended
+iterations currently fail closed before a host process starts. Portable process groups cannot prove
+containment of deliberately detached descendants, so the kit does not mint an automated gate-
+transition token. Use the interactive lifecycle; the script can still strictly validate an already-
+completed run. See the autonomous-operation guide before relying on a future promotion.
+
+## Core rules (non-negotiable)
+
+- Never read or print secrets. Never run destructive commands without confirmation.
+- Plan before large edits; write a spec before implementing a feature.
+- Run the project's validation (lint, type-check, tests) before declaring work complete.
+
+See `CLAUDE.md` and `.claude/rules/` for the full set.
+
+## Extending the config
+
+- **Add a stack** (frontend framework, backend language/framework, or database): add an entry to the
+  claude-kit catalog and a `templates/stacks/<stack_dir>/` folder with overlay rules — then re-run
+  `claude-kit init`. It's a data change, not code.
+- **Add a skill / agent:** drop a `.claude/skills/<name>/SKILL.md` or `.claude/agents/<name>.md`.
+- **Enable MCP later:** add servers to `.mcp.json` (see `claude-kit list-options` for the catalog).
+- **Upgrade safely:** `claude-kit diff` to preview, then `claude-kit upgrade` (your edits are backed
+  up, never silently overwritten). `claude-kit doctor` checks config health.
+
+## Organization-wide vibe-coding capabilities
+
+claude-kit isn't just for one developer. Engineers, PMs, designers, QA, DevOps, security, data,
+support, and founders can all drive work in natural language — creating features, fixing bugs, writing
+tests, reviewing code, generating docs, shipping releases, and maintaining systems — through a shared,
+safe, consistent set of **skills · agents · rules · hooks · workflows · MCP**.
+
+- **This project's scope:** `individual`
+- **The vocabulary:** *Skills* are reusable playbooks (slash commands). *Agents* are specialized
+  workers with isolated context and tool limits. *Rules* are always-on (or path-scoped) conventions.
+  *Hooks* are deterministic checks at lifecycle events. *Workflows* orchestrate agents+skills.
+  *MCP* connects Claude to GitHub, Jira, Linear, databases, browsers, and docs.
+
+### 1. Skills for org-wide reusable workflows
+`/sdlc` (the pipeline), `/spec-driven-development`, `/planning-and-task-breakdown`,
+`/code-review-and-quality`, `/test-driven-development`, `/security-and-hardening`, `/threat-model`,
+`/accessibility-review`, `/performance-optimization`, `/shipping-and-launch`, `/refresh-docs` (organization scope adds the five non-engineer
+playbooks: feature-from-idea, prompt-to-safe-task, prototype-to-production, customer-issue-to-fix,
+repo-onboarding).
+
+### 2. Agents by role/team
+Orchestration/quality: `orchestrator`, `risk-classifier`, `sdlc-code-reviewer`, `acceptance-reviewer`,
+`merge-reviewer`, `devils-advocate`. Product: `spec-doc-writer`, `story-planner`,
+`ui-designer`. Planning review: `senior-backend-reviewer`, `senior-frontend-reviewer`,
+`technical-architect`, `em-reviewer`. Engineering: `developer`, `senior-backend-dev`,
+`senior-frontend-dev` (+ DB specialists). Quality: `tester`, `unit-tester`, `e2e-tester`,
+`senior-tester`. Security/reliability: `security-reviewer`, `owasp-reviewer`, `secret-scanner`,
+`dependency-scanner`, `policy-validator`, `devops-engineer`, `observability-engineer`,
+`incident-responder`.
+
+### 3. Rules to share across repositories
+`mandatory-workflow`, `quality-gates`, `autonomy-levels`, `risk-classification`, `human-in-the-loop`,
+`agent-guardrails`, plus the policy set `secrets-policy`, `pii-policy`, `production-data-policy`,
+`branch-and-pr-policy`, `compliance-policy`, and the vibe-coding set `prompt-to-task-conversion`,
+`non-engineer-safe-coding`, `prototype-boundaries`, `ambiguity-resolution`.
+
+### 4. Hooks to enforce for safety & quality
+`guard-rm-rf` (dangerous shell), `protect-secrets` + `guard-commit-secrets` (secrets),
+`warn-sensitive-files` (auth/payments/migrations/infra), `validate-frontmatter` + `validate-settings`,
+`warn-large-edits`, `warn-missing-tests`, `audit-log` (local, org mode), `lint-fix`, `type-check`.
+Conservative by default; higher autonomy levels enable more. Disable any per-repo in
+`.claude/settings.local.json`.
+
+### 5. Optional MCP integrations
+GitHub (issues/PRs), Jira/Linear (tickets), the project database (read), Playwright (browser/E2E),
+and Context7 (live library docs). Select at init; they land in `.mcp.json` with `${ENV}` placeholders.
+
+### 6. Distributing capabilities across projects
+| Layer | Lives in | Use for |
+|-------|----------|---------|
+| **Project** | `.claude/`, `CLAUDE.md`, `.mcp.json` (committed) | what this repo needs — the per-repo source of truth |
+| **User** | `~/.claude/` (per developer, not committed) | personal preferences, personal skills, local overrides |
+| **Organization** | reusable packs / plugins, versioned + changelogged in an approved registry | shared, governed capabilities adopted across repos |
+
+**Never commit:** local secrets, `.env`, personal tokens, personal `settings.local.json`.
+(Planned: `claude-sdlc package-org-pack` / `install-org-pack` to package + install approved packs.)
+
+## Capability matrix
+
+| Capability area | Skills | Agents | Rules | Hooks | Example |
+|---|---|---|---|---|---|
+| Feature development | `/sdlc`, `/spec-driven-development`, `/incremental-implementation` | `orchestrator`, `developer`, `sdlc-code-reviewer` | `mandatory-workflow`, `quality-gates` | `lint-fix`, `type-check` | `/sdlc Add team invites` |
+| Bug fixing | `/debugging-and-error-recovery`, `/triage` | `developer`, `tester`, `sdlc-code-reviewer` | `testing`, `rarv-cycle` | `warn-missing-tests` | `/sdlc Fix 500 on empty title` |
+| Refactoring | `/code-simplification` | `developer`, `sdlc-code-reviewer` | `code-organization`, `design-patterns` | `warn-large-edits` | `/code-simplification the billing service` |
+| Test generation | `/test-driven-development`, `/unit-test` | `tester`, `unit-tester`, `e2e-tester`, `senior-tester` | `testing` | `warn-missing-tests` | `/test-driven-development password-reset links` |
+| PR review | `/code-review-and-quality` | `sdlc-code-reviewer`, `merge-reviewer`, `devils-advocate` | `quality-gates`, `branch-and-pr-policy` | `guard-push-main` | `/code-review-and-quality` |
+| Product discovery | `/idea-refine`, `/interview-me` | `story-planner` | `ambiguity-resolution` | — | `/idea-refine team invites` |
+| Requirements clarification | `/interview-me`, `/scope` | `spec-doc-writer`, `risk-classifier` | `prompt-to-task-conversion`, `ambiguity-resolution` | — | `/scope make dashboard faster` |
+| Architecture decisions | `/spec-driven-development`, `/decision`, `/documentation-and-adrs` | `technical-architect` | `design-patterns` | — | ADR for a new module |
+| API design | `/api-and-interface-design` | `technical-architect`, `senior-backend-dev` | `design-patterns`, `documentation` | — | `/api-and-interface-design` for invites |
+| Database design | `/spec-driven-development` | `postgres-specialist`/`mongodb-specialist`, `migration-specialist` | (stack overlay db rules) | `warn-sensitive-files` | schema + migration for invites |
+| Frontend implementation | `/frontend-ui-engineering`, `/component-design`, `/ui-ux-design` | `senior-frontend-dev`, `ui-designer`, `developer` | `frontend-best-practices`, `responsive-and-accessibility` | `lint-fix` | `/component-design` the invite modal |
+| Backend implementation | `/incremental-implementation`, `/api-and-interface-design` | `senior-backend-dev`, `developer` | `code-organization` | `lint-fix`, `type-check` | implement the invites endpoint |
+| Security review | `/security-and-hardening`, `/security-verification`, `/threat-model` | `security-reviewer`, `owasp-reviewer`, `secret-scanner`, `dependency-scanner`, `policy-validator` | `secrets-policy`, `agent-guardrails` | `protect-secrets`, `guard-commit-secrets`, `warn-sensitive-files` | `/security-verification` the auth change |
+| Performance review | `/performance-optimization`, `/load-testing` | `db-performance-reviewer` (PostgreSQL) | `risk-classification` | — | `/performance-optimization` the list endpoint |
+| Accessibility review | `/accessibility-review` | `ui-designer` | `responsive-and-accessibility` | — | `/accessibility-review` the modal |
+| DevOps / release | `/deploy`, `/shipping-and-launch`, `/ci-cd-and-automation` | `devops-engineer`, `pr-raiser`, `observability-engineer` | `devops-observability`, `branch-and-pr-policy` | `guard-push-main` | `/deploy loop` until the release verifies clean |
+| Incident response | `/incident-postmortem` | `incident-responder` | `devops-observability` | `audit-log` | `/incident-postmortem` after a SEV1 |
+| Documentation | `/documentation-and-adrs`, `/refresh-docs` | `technical-architect` | `documentation` | — | `/refresh-docs` after an API change |
+
+## Autonomy model
+
+How much Claude may do before a human acts (set per repo; default `assisted`). Full detail in
+`.claude/rules/autonomy-levels.md`.
+
+| Level | May do | Must not, without a human |
+|-------|--------|----------------------------|
+| advisory | inspect · explain · plan · review | edit files unless asked |
+| assisted *(default)* | edit after explaining the plan | broad/cross-cutting changes without asking |
+| autonomous-local | implement locally + run validation | push, open PRs, leave the repo |
+| autonomous-pr | create branches + PR-ready changes | **merge** (human review required) |
+| enterprise-controlled | work through strict gates + audit | edit sensitive files / complete without security + review |
+
+## Risk classification
+
+Every task is classified **low · medium · high · restricted** before work starts
+(`.claude/rules/risk-classification.md`). High-risk areas — authentication, authorization, payments,
+secrets, production data, database migrations, infrastructure, security controls, compliance, destructive
+operations, dependency upgrades, many-file changes — require: a plan · explicit approval · security
+review · test review · rollback notes · a residual-risk summary. Restricted work cannot start without
+written human authorization.
+
+## Governance & adoption
+
+- **Add a skill/agent:** create it in the kit's `templates/org/…`, list it in the pack's `pack.yaml`,
+  document it in the pack README. **Reuse before creating** — never add a competing duplicate.
+- **Retire duplicates:** prefer one canonical component; deprecate aliases via `/deprecation-and-migration`.
+- **Approve hooks & sensitive rules:** security/DevOps review before rollout; keep hooks conservative.
+- **Version & roll out:** version packs, keep a changelog, roll out repo-by-repo with `claude-kit diff`
+  then `claude-kit upgrade` (edits are backed up).
+- **Different teams, different autonomy:** choose the level per repo (a regulated service vs an internal tool).
+- **Collect feedback:** capture recurring prompts (→ new skills) and recurring mistakes (→ new rules)
+  via the `remember` skill.
+
+### Metrics worth tracking
+tasks completed through `/sdlc` · PRs created with Claude assistance · test-coverage change · escaped
+defects · review comments per PR · idea→PR time · security findings caught pre-merge · rollback
+frequency · docs updated with code · unsafe actions blocked by hooks · repeated prompts that should
+become skills · repeated mistakes that should become rules.
+
+## Examples
+
+```text
+# Engineer — behavior-preserving refactor (reads files, classifies risk, plans, proposes tests,
+#            small changes, invokes code + test review)
+/code-simplification Simplify the billing service without changing behavior
+
+# QA — regression coverage (finds modules, proposes unit/integration/e2e tests, writes + validates,
+#      summarizes coverage gaps)
+/test-driven-development Add regression coverage for failed password-reset links
+```

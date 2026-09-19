@@ -18,6 +18,28 @@ pub enum Request {
     Gc,
 }
 
+impl Request {
+    /// The request's own kind string, exactly as it appears in the request
+    /// file's `kind` field.
+    ///
+    /// Derived from the parsed variant rather than re-read out of the raw
+    /// JSON text: the file has already been through serde by the time
+    /// anything wants this, so re-parsing it would introduce a second,
+    /// weaker reader of the same bytes that could disagree with the first.
+    /// These strings must stay in lockstep with the `rename_all =
+    /// "snake_case"` tag above -- they are what `GET /api/jobs` reports as a
+    /// job's `kind`, and the UI renders them.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Request::Preflight => "preflight",
+            Request::Apply => "apply",
+            Request::Rollback { .. } => "rollback",
+            Request::RestoreState => "restore_state",
+            Request::Gc => "gc",
+        }
+    }
+}
+
 pub fn read_request(path: &Path) -> anyhow::Result<Request> {
     let raw = std::fs::read_to_string(path)
         .map_err(|e| anyhow::anyhow!("failed to read request file {}: {e}", path.display()))?;
@@ -28,6 +50,32 @@ pub fn read_request(path: &Path) -> anyhow::Result<Request> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// These strings are what `GET /api/jobs` reports as a job's `kind` and
+    /// what the UI renders, so they must match the `rename_all =
+    /// "snake_case"` tag exactly. Asserted against the real serde round-trip
+    /// rather than hand-written literals, so renaming a variant without
+    /// updating `kind()` fails here instead of silently changing the API.
+    #[test]
+    fn kind_matches_the_tag_serde_actually_parses() {
+        let dir = tempfile::tempdir().unwrap();
+        for (json, expected) in [
+            (r#"{"kind":"preflight"}"#, "preflight"),
+            (r#"{"kind":"apply"}"#, "apply"),
+            (r#"{"kind":"rollback","to":3}"#, "rollback"),
+            (r#"{"kind":"restore_state"}"#, "restore_state"),
+            (r#"{"kind":"gc"}"#, "gc"),
+        ] {
+            let path = dir.path().join("req.json");
+            std::fs::write(&path, json).unwrap();
+            let req = read_request(&path).unwrap();
+            assert_eq!(req.kind(), expected, "kind() disagrees with the parsed tag for {json}");
+            // And the reported kind really is the tag from the file, not a
+            // label invented alongside it.
+            let tag: serde_json::Value = serde_json::from_str(json).unwrap();
+            assert_eq!(req.kind(), tag["kind"].as_str().unwrap());
+        }
+    }
 
     #[test]
     fn parses_apply_request() {

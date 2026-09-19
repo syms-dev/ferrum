@@ -7,7 +7,7 @@
 # enforces that every option reachable here stays JSON-expressible -- no
 # `path`, `package`, or function-typed option is allowed to sneak in, because
 # the UI can only ever write JSON scalars back into settings.json.
-{ lib, catalog, stateRoot }:
+{ lib, catalog, stateRoot, proxyEnabled ? false }:
 let
   inherit (lib) mkOption mkEnableOption types;
 in
@@ -32,9 +32,30 @@ types.attrsOf (types.submodule ({ name, ... }:
         description = "Hostname label under ferrum.proxy.baseDomain.";
       };
 
+      # Defaults to "public" once the proxy is on, because a published app is
+      # what this product is for -- the comparison point is Saltbox, where
+      # enabling a role puts it on your domain. An app reachable only from the
+      # machine itself is a half-finished deployment, not a target state.
+      #
+      # This default used to be "local" unconditionally, and that caused a real
+      # incident on a real host: Jellyfin was enabled, silently got no nginx
+      # vhost, and jellyfin.<domain> was then served by whichever vhost nginx
+      # treated as default -- Plex's. The operator read that as ferrum routing
+      # one app to another. modules/proxy/nginx.nix now also has a catch-all so
+      # an unmatched hostname is refused rather than misrouted, but the honest
+      # fix is that enabling an app on a host with a proxy should publish it.
+      #
+      # "local" remains available and meaningful (an app reached only through
+      # ferrum's own UI proxying, or a host with no domain); it just is not
+      # what an operator gets by accident.
+      #
+      # Note for whoever enables many apps at once: each "public" app requests
+      # its own certificate, and Let's Encrypt rate-limits per registered
+      # domain. Staging first is the cheap way to find that out.
       exposure = mkOption {
         type = types.enum [ "local" "lan" "public" ];
-        default = "local";
+        default = if proxyEnabled then "public" else "local";
+        defaultText = lib.literalExpression ''if ferrum.proxy.enable then "public" else "local"'';
         description = ''
           local  -- loopback only, reached through the ferrum UI's own proxying.
           lan    -- an nginx vhost restricted to ferrum.proxy.trustedNetworks.

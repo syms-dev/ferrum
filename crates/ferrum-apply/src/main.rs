@@ -1,10 +1,10 @@
 use clap::{Parser, Subcommand};
 
 mod apply;
-mod generations;
-mod journal;
+mod gc;
 mod preflight;
 mod progress;
+mod put_secret;
 mod request;
 mod restore_state;
 mod rollback;
@@ -39,10 +39,54 @@ enum Command {
     RunRequest {
         path: std::path::PathBuf,
     },
+    /// Encrypt an OPERATOR-SUPPLIED secret value, read from stdin, to this
+    /// host's own age recipient and write <secretsDir>/<name>.sops.
+    ///
+    /// Every other secret this binary handles is one it generates itself.
+    /// This is the path for a value only a human has -- today, the
+    /// Cloudflare DNS-01 token, without which a host with any `public` app
+    /// cannot even evaluate (modules/proxy/acme.nix asserts the .sops file
+    /// exists at Nix eval time).
+    ///
+    /// The value comes from stdin, never argv, so it stays out of `ps` and
+    /// shell history. Existing files are left alone unless --replace is
+    /// given, which keeps a resumed install idempotent.
+    PutSecret {
+        /// Secret name, e.g. `acme-dns`. Must match the name declared in
+        /// settings.json's `secrets` map.
+        name: String,
+        /// Overwrite an existing value (use when rotating a credential).
+        #[arg(long)]
+        replace: bool,
+    },
     /// Show what a settings.json schema migration would do, without
     /// writing anything. Read-only: evaluates the real flake via `nix
     /// eval`, never runs `nix build` or touches settings.json on disk.
     PreviewMigration,
+}
+
+/// Writes the job's `started` line, then runs it.
+///
+/// Extracted from the `RunRequest` arm -- the way this file already extracts
+/// `handle_apply_result` and `restore_state_outcome` -- so that the ORDERING
+/// is testable: the `started` line must be the first line of a dispatched
+/// job's file, before any subcommand writes progress of its own. `GET
+/// /api/jobs` reads that first line to answer "what was this job?", and by
+/// then ferrumd has already deleted the request file that would otherwise
+/// have said.
+///
+/// The kind comes from the parsed `Request`, never re-derived from the raw
+/// file text. `Progress` is passed in rather than opened here so the test
+/// below needs no process-wide environment; in production it is
+/// `Progress::open()`, which is a total no-op when `FERRUM_JOB_ID` is unset,
+/// so a bare `ferrum-apply run-request` over SSH still writes nothing.
+fn run_request(
+    req: request::Request,
+    progress: &mut progress::Progress,
+    run: impl FnOnce(request::Request) -> i32,
+) -> i32 {
+    progress.event("started", req.kind());
+    run(req)
 }
 
 /// Maps an `apply::run` outcome to a process exit code, printing context to
@@ -363,6 +407,103 @@ fn run_preview_migration() -> i32 {
     0
 }
 
+/// A real GC pass: prunes state snapshots beyond `ferrum.storage.keepGenerations`.
+///
+/// Was a stub returning exit 1 until 2026-09-15, while
+/// `ferrum.storage.keepGenerations` sat in options.nix and
+/// settings-schema.json with no consumer anywhere -- so an operator could
+/// set a retention policy that nothing enforced, and snapshots accumulated
+/// for the life of the host. See gc.rs's own header for why that matters
+/// more than it sounds.
+/// Encrypts an operator-supplied secret read from stdin.
+///
+/// Deliberately does NOT go through `progress::Progress`: that file is the
+/// job stream ferrumd renders, and this subcommand is invoked directly over
+/// SSH by the installer, never dispatched as a ferrumd job (it is absent
+/// from `request::Request` for the same reason). Writing a job file here
+/// would fabricate an entry for work the daemon never asked for.
+///
+/// Returns 0 on success -- including the idempotent "already exists" path,
+/// so a resumed install does not fail at this step.
+fn run_put_secret(name: &str, replace: bool) -> i32 {
+    let secrets_dir: std::path::PathBuf = std::env::var("FERRUM_SECRETS_DIR")
+        .unwrap_or_else(|_| "/etc/ferrum/secrets".to_string())
+        .into();
+    let host_key_pub: std::path::PathBuf = std::env::var("FERRUM_HOST_KEY_PUB")
+        .unwrap_or_else(|_| ferrum_secrets::DEFAULT_HOST_KEY_PUB.to_string())
+        .into();
+
+    match put_secret::run(&secrets_dir, &host_key_pub, name, replace) {
+        Ok(put_secret::Outcome::Wrote) => {
+            println!("put-secret: wrote {}", secrets_dir.join(format!("{name}.sops")).display());
+            0
+        }
+        Ok(put_secret::Outcome::Replaced) => {
+            println!("put-secret: replaced {}", secrets_dir.join(format!("{name}.sops")).display());
+            0
+        }
+        Ok(put_secret::Outcome::Unchanged) => {
+            println!(
+                "put-secret: {} already exists, left unchanged (pass --replace to overwrite)",
+                secrets_dir.join(format!("{name}.sops")).display()
+            );
+            0
+        }
+        Err(e) => {
+            eprintln!("put-secret: {e}");
+            1
+        }
+    }
+}
+
+fn run_gc() -> i32 {
+    let mut progress = progress::Progress::open();
+    match run_gc_inner(&mut progress) {
+        Ok(pruned) => {
+            let detail = format!("pruned {pruned} snapshot(s)");
+            println!("gc: {detail}");
+            progress.complete("succeeded", &detail);
+            0
+        }
+        Err(e) => {
+            eprintln!("gc failed: {e}");
+            progress.complete("failed", &e.to_string());
+            1
+        }
+    }
+}
+
+fn run_gc_inner(progress: &mut progress::Progress) -> anyhow::Result<usize> {
+    let snapshot_dir = std::env::var("FERRUM_SNAPSHOT_DIR")
+        .unwrap_or_else(|_| "/var/lib/ferrum/snapshots".to_string());
+    let journal_dir = std::env::var("FERRUM_JOURNAL_DIR")
+        .unwrap_or_else(|_| "/var/lib/ferrum/journal".to_string());
+    // Matches ferrum.storage.keepGenerations' own default in
+    // modules/core/options.nix. The module wires the real value through
+    // modules/core/overlays.nix, so this fallback only applies to a
+    // ferrum-apply invoked outside a ferrum host.
+    let keep_generations: usize = std::env::var("FERRUM_KEEP_GENERATIONS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10);
+
+    // Read from the live system, not from the journal: the running
+    // generation is what rule 2 in gc::plan protects, and it is only
+    // knowable from /run/current-system. A failure here must abort the
+    // whole run rather than defaulting to "no generation is current" --
+    // that would drop the protection and let the running generation's own
+    // snapshot be pruned.
+    let (current, _) = apply::current_generation()?;
+
+    gc::run(
+        std::path::Path::new(&snapshot_dir),
+        std::path::Path::new(&journal_dir),
+        keep_generations,
+        current,
+        progress,
+    )
+}
+
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let exit_code = match cli.command {
@@ -370,24 +511,17 @@ fn main() -> anyhow::Result<()> {
         Command::Apply => run_apply(),
         Command::Rollback { to } => run_rollback(to),
         Command::RestoreState => run_restore_state(),
-        Command::Gc => {
-            eprintln!("gc: not yet implemented");
-            1
-        }
+        Command::Gc => run_gc(),
         Command::PreviewMigration => run_preview_migration(),
+        Command::PutSecret { name, replace } => run_put_secret(&name, replace),
         Command::RunRequest { path } => match request::read_request(&path) {
-            Ok(request::Request::Preflight) => run_preflight(),
-            Ok(request::Request::Apply) => run_apply(),
-            Ok(request::Request::Rollback { to }) => run_rollback(to),
-            Ok(request::Request::RestoreState) => run_restore_state(),
-            Ok(request::Request::Gc) => {
-                eprintln!("gc: not yet implemented via run-request");
-                // Still writes a terminal progress line: a job ferrumd
-                // dispatched must always end its own stream, even when the
-                // answer is "this kind isn't implemented yet".
-                progress::Progress::open().complete("failed", "gc is not yet implemented");
-                1
-            }
+            Ok(req) => run_request(req, &mut progress::Progress::open(), |req| match req {
+                request::Request::Preflight => run_preflight(),
+                request::Request::Apply => run_apply(),
+                request::Request::Rollback { to } => run_rollback(to),
+                request::Request::RestoreState => run_restore_state(),
+                request::Request::Gc => run_gc(),
+            }),
             Err(e) => {
                 eprintln!("run-request: {e}");
                 progress::Progress::open().complete("failed", &e.to_string());
@@ -402,6 +536,48 @@ fn main() -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    /// The `started` line must be the FIRST line of a dispatched job's file.
+    /// `GET /api/jobs` reads only the first line to recover a job's kind, so
+    /// if a subcommand's own progress landed ahead of it the kind would be
+    /// reported as null for every job.
+    ///
+    /// Uses `Progress::to_path` rather than `FERRUM_JOB_ID`/`FERRUM_JOBS_DIR`:
+    /// those are process-wide, and progress.rs's own env test runs in this
+    /// same test binary, so racing it would make this flaky.
+    #[test]
+    fn a_dispatched_jobs_started_line_comes_before_the_subcommands_own_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("job.jsonl");
+        let mut progress = progress::Progress::to_path(&path);
+
+        let code = run_request(request::Request::Gc, &mut progress, |req| {
+            // Stand-in for a real subcommand writing its own progress.
+            progress::Progress::to_path(&path).event("pruning", &format!("ran {}", req.kind()));
+            0
+        });
+        assert_eq!(code, 0, "the runner's exit code must pass through unchanged");
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(lines.len(), 2, "expected exactly the started line then the subcommand's: {content}");
+
+        let first: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(first["event"], "started", "the FIRST line must be the started event");
+        assert_eq!(first["detail"], "gc", "and it must name the request's own kind");
+
+        let second: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(second["event"], "pruning", "the subcommand's progress follows it");
+    }
+
+    /// The exit code is the runner's, not something `run_request` invents --
+    /// a dispatched apply that degrades must still surface its own 3.
+    #[test]
+    fn run_request_returns_the_runners_exit_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut progress = progress::Progress::to_path(&dir.path().join("j.jsonl"));
+        assert_eq!(run_request(request::Request::Apply, &mut progress, |_| 3), 3);
+    }
 
     #[test]
     fn parses_preflight() {
@@ -435,6 +611,26 @@ mod tests {
     fn parses_preview_migration_subcommand() {
         let cli = Cli::parse_from(["ferrum-apply", "preview-migration"]);
         assert!(matches!(cli.command, Command::PreviewMigration));
+    }
+
+    /// The secret VALUE must never be an argument -- it would land in `ps`
+    /// and in shell history. Only the name and the flag are.
+    #[test]
+    fn put_secret_takes_a_name_and_an_optional_replace_flag() {
+        let cli = Cli::parse_from(["ferrum-apply", "put-secret", "acme-dns"]);
+        match cli.command {
+            Command::PutSecret { ref name, replace } => {
+                assert_eq!(name, "acme-dns");
+                assert!(!replace);
+            }
+            _ => panic!("expected PutSecret, got {:?}", cli.command),
+        }
+
+        let cli = Cli::parse_from(["ferrum-apply", "put-secret", "acme-dns", "--replace"]);
+        match cli.command {
+            Command::PutSecret { replace, .. } => assert!(replace),
+            _ => panic!("expected PutSecret"),
+        }
     }
 
     #[test]

@@ -52,12 +52,26 @@ in
     users.groups.${cfg.mediaGroup} = { };
 
     systemd.tmpfiles.rules = [
-      "d ${cfg.stateDir} 0750 root root - -"
+      # 0751, not 0750, on both of these: every catalog app's stateDir is
+      # ${cfg.stateDir}/<app>, owned by that app's own user, and the app must
+      # be able to TRAVERSE down to it. At 0750 root:root nothing but root
+      # could, so plexmediaserver's prestart `mkdir -p` failed on the first
+      # component with "cannot create directory '/var/lib/ferrum'" and the
+      # unit hit its restart limit -- found on the first real hardware run of
+      # any catalog app, 2026-09-16. /var/lib/ferrum needs it too: app users
+      # are not in the ferrum group, so its group r-x does not help them.
+      #
+      # The extra bit is `x` WITHOUT `r` deliberately. Traversal into a known
+      # path is all an app needs; it cannot list this directory, so one app
+      # still cannot enumerate the others. daemon/ and jobs/ keep their own
+      # 0750 root:ferrum and are unaffected.
+      "d ${cfg.stateDir} 0751 root root - -"
       "d ${cfg.snapshotDir} 0750 root root - -"
-      "d /var/lib/ferrum 0750 root ${ferrumdGroup} - -"
+      "d /var/lib/ferrum 0751 root ${ferrumdGroup} - -"
       "d ${cfg.mediaDir} 0775 root ${cfg.mediaGroup} - -"
       "d ${cfg.mediaDir}/downloads 0775 root ${cfg.mediaGroup} - -"
       "d ${cfg.mediaDir}/library 0775 root ${cfg.mediaGroup} - -"
+      "d ${cfg.journalDir} 0750 root ${ferrumdGroup} - -"
     ];
 
     assertions = [
@@ -72,6 +86,33 @@ in
       {
         assertion = !(lib.hasInfix cfg.stateDir cfg.snapshotDir);
         message = "ferrum.storage.snapshotDir must not nest inside ferrum.storage.stateDir.";
+      }
+      {
+        assertion =
+          cfg.journalDir != "/var/lib/ferrum"
+          && !(lib.any (dir: lib.hasInfix dir cfg.journalDir) [
+            cfg.stateDir
+            cfg.snapshotDir
+            cfg.mediaDir
+          ]);
+        message = ''
+          ferrum.storage.journalDir must not be /var/lib/ferrum itself, and
+          must be neither equal to nor nested inside stateDir, snapshotDir or
+          mediaDir. It is operator-settable and otherwise unconstrained, and
+          this module declares a systemd.tmpfiles rule for whatever it is set
+          to -- and as the note above says, two rules for one path with
+          different arguments is a real conflict, not a merge. NixOS
+          re-processes tmpfiles rules on every switch-to-configuration, not
+          only at boot (see modules/proxy/authelia.nix:102-104), so a
+          colliding value is not a one-time boot failure: it is re-applied in
+          the middle of every apply, forever. journalDir = mediaDir would flip
+          the media tree from 0775 root:${cfg.mediaGroup} to 0750
+          root:${ferrumdGroup} and break every app; journalDir = stateDir
+          would regroup the state subvolume root; journalDir =
+          /var/lib/ferrum collides with the rule declared above. The default
+          /var/lib/ferrum/journal lives under /var/lib/ferrum without being
+          equal to it and nests inside none of the three, so it stays legal.
+        '';
       }
       {
         assertion = cfg.minFreeGiB > 0;

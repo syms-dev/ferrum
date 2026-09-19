@@ -165,6 +165,13 @@ lib.mkIf ferrum.daemon.enable {
       FERRUM_JOBS_DIR = "/var/lib/ferrum/jobs";
       FERRUM_REQUESTS_DIR = "/run/ferrum/requests";
       FERRUM_SETTINGS_SCHEMA = "${pkgs.ferrum-settings-schema}/share/ferrum/settings-schema.json";
+      # The per-app metadata GET /api/catalog serves. Built since Phase 1.1
+      # and, until now, consumed by nothing -- nix/modules/flake/packages.nix
+      # said so in its own header comment.
+      FERRUM_CATALOG = "${pkgs.ferrum-catalog}/share/ferrum/catalog.json";
+      FERRUM_PROFILES_DIR = "/nix/var/nix/profiles";
+      FERRUM_JOURNAL_DIR = ferrum.storage.journalDir;
+      FERRUM_UI_DIR = "${pkgs.ferrum-ui}/share/ferrum/ui";
     };
     serviceConfig = {
       Type = "simple";

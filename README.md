@@ -2,7 +2,17 @@
 
 A NixOS-based, rollback-safe alternative to [Saltbox](https://github.com/saltyorg/Saltbox) for self-hosted media and automation servers.
 
-**Status: early scaffolding.** The design is written; the rollback engine described below is not built yet. Nothing here should be pointed at a real server.
+**Status: pre-alpha — running on real hardware, no install path, no update mechanism.**
+
+Built and tested: the rollback engine, the seven-app catalog, the reverse proxy with TLS and SSO, sops secrets, the cross-app reconciler, `ferrumd` (the unprivileged daemon with its polkit privilege boundary), and the schema-driven web UI. 166 Rust unit tests and eight NixOS VM tests cover them.
+
+Proven on a real machine, not just in CI: a rollback that reverted both the system closure and application state together; Plex reachable on a real domain with a real Let's Encrypt certificate, served through ferrum's own nginx vhost from a typed `settings.json` with no hand-written Nix.
+
+Not built: the install path, and **any way to update an app**. App versions come from the nixpkgs revision ferrum's own flake pins, so updating means hand-editing pins across two repositories and re-applying; see [the Phase 1.6 spec](docs/superpowers/specs/2026-09-16-phase-1-6-updates-design.md), whose planning gate is currently open.
+
+`ferrum-apply gc` **is** implemented (it was a stub until 2026-09-15) and prunes to `ferrum.storage.keepGenerations`, default 10. No timer runs it, so it is operator-triggered. Note that it protects only the *currently-running* generation's snapshot, so an older generation's snapshot can be pruned and that generation then becomes unrollbackable.
+
+It has now been installed on a real machine end to end, and rollback has been exercised there for real. That is one machine, run by its author, over one evening — **still do not point this at a server holding data you care about.**
 
 ## Why
 
@@ -28,8 +38,10 @@ modules/             the NixOS module tree — the product
   lib/               ferrum.lib.mkHost, the app catalog, the uniform app submodule
   core/              cross-cutting ferrum.* options, storage, generations
   apps/<name>/       one directory per catalog app: meta.nix + service.nix
-crates/              Rust workspace (ferrumd, ferrum-apply, ferrum-reconcile) — not yet started
-ui/                  the web UI — not yet started
+crates/              Rust workspace: ferrum-apply (the rollback engine), ferrumd (the
+                     daemon), ferrum-install (the installer), ferrum-reconcile
+                     (cross-app registration), ferrum-secrets, ferrum-state
+ui/                  the web UI — hand-written HTML/CSS/ES modules, no build step
 tests/               NixOS VM tests
 examples/hosts/      example settings.json + host config used by the guard checks
 docs/design/         the approved design spec
@@ -38,6 +50,23 @@ docs/design/         the approved design spec
 ## Secrets
 
 Every secret on a ferrum host is a [sops](https://github.com/getsops/sops)-encrypted file under `ferrum.secretsDir` (default `/etc/ferrum/secrets`), decrypted at boot into a runtime-only path by [sops-nix](https://github.com/Mic92/sops-nix). The box's age decryption identity is derived from its own SSH host key — nothing to provision or lose track of separately.
+
+**Installing a host takes one command.** `ferrum-install` ships as a Docker
+image, so Docker is the only thing your own machine needs. It inventories the
+target, makes you type the serial of the disk it will erase, generates the
+whole host repository, installs, enables the apps behind single sign-on, and
+prints the URLs and both first-run passwords. See `docs/INSTALL.md`; the manual
+path is still documented there for anyone modifying ferrum itself.
+
+```bash
+docker run --rm -it -v ~/.ssh:/ssh:ro -v ~/ferrum-host:/host \
+  ghcr.io/syms-dev/ferrum-install root@YOUR-TARGET
+```
+
+**Operator-supplied secrets go in with `ferrum-apply put-secret <name>`**, which
+reads the value from stdin (never argv, so it stays out of `ps` and shell
+history) and encrypts it to the host's own age recipient. The Cloudflare DNS-01
+token is the one you will need; the installer handles it for you.
 
 **Sonarr, Radarr and Prowlarr's API keys are fully automatic.** `ferrum-apply` generates and encrypts a random key for each enabled app on first apply; there is nothing an operator needs to do.
 
@@ -94,7 +123,18 @@ Log in at `https://auth.<ferrum.proxy.baseDomain>/`, then change the password fr
 
 ## Development
 
-There is no local nix install in this environment yet, so nothing here has been evaluated locally — `nix flake check` in CI is the first real test of any of it. See the design doc's "Dev loop" section for the intended setup (an aarch64 dev VM plus a real x86_64 test target provisioned via `nixos-anywhere`).
+See the design doc's "Dev loop" section for the intended setup (an aarch64 dev VM plus a real x86_64 test target provisioned via `nixos-anywhere`).
+
+The Rust workspace can be built and tested without a Nix install, which is useful on a machine that has neither Nix nor a Rust toolchain:
+
+```bash
+docker run --rm -v "$PWD:/src:ro" -w /work rust:1-bookworm bash -c '
+  apt-get update -qq && apt-get install -y -qq btrfs-progs &&
+  cp -r /src/crates /work/crates && cd /work/crates &&
+  cargo test --workspace --locked'
+```
+
+`btrfs-progs` is required: `preflight::check_is_subvolume` shells out to `btrfs`, and without it one test fails on the spawn error rather than the assertion it means to make. The Nix build supplies it via `nativeCheckInputs`.
 
 ```bash
 nix flake check
