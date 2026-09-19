@@ -196,11 +196,18 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
 
     // --- The destructive step. ---
     if reached.unwrap_or(state::Phase::Generated) < state::Phase::Installed {
-        // Re-entering nixos-anywhere after it already started is the one
-        // case where it can loop forever instead of failing. Check first.
-        if reached == Some(state::Phase::Installing) {
-            check_target_still_reachable_before_reinstalling(&pre)?;
-        }
+        // EVERY invocation, not just resumes.
+        //
+        // nixos-anywhere's key upload is `until ssh-copy-id ...; do sleep
+        // 3; done` -- an unbounded retry, in its own source. If it cannot
+        // authenticate it does not fail, it loops silently forever. That
+        // burned two three-hour CI runs and one real install before the
+        // cause was found, and not one of them produced an error.
+        //
+        // We cannot fix that loop, but we can decline to enter it. The
+        // probe costs one SSH round-trip against a target we are about to
+        // erase anyway.
+        check_target_still_reachable_before_reinstalling(&pre)?;
         let scratch = tempfile::tempdir()?;
         let extra = install::stage_extra_files(scratch.path(), &pre.host_dir)?;
 
@@ -654,19 +661,22 @@ fn check_target_still_reachable_before_reinstalling(
 /// * `target` - the `root@host` this run was pointed at.
 fn cannot_reauthenticate(target: &str) -> anyhow::Error {
     anyhow::anyhow!(
-        "cannot authenticate to {target} to resume the install.\n\n\
-         A previous run recorded that it had STARTED installing, so this run \
-         would hand control back to nixos-anywhere -- but nixos-anywhere \
-         retries its key setup forever rather than failing, so continuing \
-         from here hangs silently instead of telling you anything. Refusing \
-         to do that.\n\n\
-         The usual cause is that the first run already kexec'd the target: \
-         the system now in its RAM accepts only the keys that run installed, \
-         and your credentials are not among them.\n\n\
-         To recover: power-cycle the target back into a normal Linux you can \
-         reach as root -- the kexec'd system lives only in RAM, so a reboot \
-         clears it -- then re-run with --fresh. The disk may already be \
-         partially written, which --fresh will redo from the start."
+        "cannot authenticate to {target}, so refusing to start the install.\n\n\
+         nixos-anywhere uploads its key with `until ssh-copy-id ...; do \
+         sleep 3; done` -- an unbounded retry, in its own source. If it \
+         cannot get in it does not fail, it loops silently forever. Handing \
+         it an unreachable target means a hang with no error at all, so \
+         this stops here instead.\n\n\
+         Worth checking, commonest first:\n\
+         - sshd may be rate-limiting you. OpenSSH 9.8+ penalises a source \
+         IP after repeated auth failures, so an earlier failed attempt can \
+         earn one. It expires by itself, usually within minutes.\n\
+         - the target must accept your key as ROOT: ssh -i <key> \
+         root@<target> true\n\
+         - if an earlier run already kexec'd the target, the system now in \
+         its RAM accepts only the keys THAT run installed. Power-cycle it \
+         (the kexec'd system lives only in RAM), then re-run with --fresh, \
+         accepting that the disk may already be partially written."
     )
 }
 
@@ -779,11 +789,20 @@ mod tests {
     /// something the operator can act on.
     #[test]
     fn the_resume_refusal_explains_the_hang_and_names_a_real_recovery() {
-        let msg = super::cannot_reauthenticate("root@saltbox").to_string();
+        let raw = super::cannot_reauthenticate("root@saltbox").to_string();
+        // Lowercased: these assertions are about the ADVICE being present,
+        // not about how a sentence happens to be capitalised.
+        let msg = raw.to_lowercase();
         assert!(msg.contains("root@saltbox"), "{msg}");
         // Why it refuses rather than trying: the alternative is a silent
         // hang, which is what an operator actually experienced.
         assert!(msg.contains("forever"), "{msg}");
+        // The rate-limit cause, which is what actually bit on the first
+        // real install: hundreds of failed ssh-copy-id attempts earned the
+        // operator's own IP an OpenSSH per-source penalty, and the next
+        // run then could not connect for reasons nothing explained.
+        assert!(msg.contains("rate-limiting"), "{msg}");
+        assert!(msg.contains("root@<target> true"), "{msg}");
         // The cause, so it is not mistaken for a network problem.
         assert!(msg.contains("kexec"), "{msg}");
         // A recovery that works, and both halves of it.
