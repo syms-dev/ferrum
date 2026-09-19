@@ -598,15 +598,24 @@ fn transfer_hardware_config(pre: &preconditions::Preconditions) -> anyhow::Resul
     // fine.
     check_hardware_config_body(&body, &local)?;
 
-    let cmds = install::hardware_config_commands();
-    collect::run_with_stdin(&pre.target, &pre.ssh_auth, &cmds[0], &body)?;
-    collect::run(&pre.target, &pre.ssh_auth, &cmds[1])?;
-
-    // R6 A2: the repository the operator keeps is the one that built the
-    // machine, so the generated file belongs in it too.
+    // R6 A2 first, and on THIS side: the repository the operator keeps is
+    // the one that built the machine. Committing here rather than on the
+    // target is also what removes the target's git dependency -- see
+    // install::hardware_config_extract_command.
     let mut files = render::Files::new();
     files.insert(install::HARDWARE_CONFIG.to_string(), body);
     render::write_repo(&pre.host_dir, &files)?;
+    install::commit_hardware_config(&pre.host_dir)?;
+
+    // Then ship the objects, so the file is TRACKED on the target too.
+    // Untracked is not a lesser state for Nix -- it is invisible.
+    let payload = install::hardware_config_payload(&pre.host_dir)?;
+    collect::run_with_stdin(
+        &pre.target,
+        &pre.ssh_auth,
+        &install::hardware_config_extract_command(),
+        &payload,
+    )?;
     println!("hardware configuration transferred and committed");
     Ok(())
 }

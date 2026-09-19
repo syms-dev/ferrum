@@ -17,6 +17,7 @@
 , openssh
 , git
 , coreutils
+, gnutar
   # The ferrum revision this installer pins generated hosts to (R3 A5).
   # Passed from nix/modules/flake/packages.nix, which is the only place
   # that can see the flake's own `self`.
@@ -77,7 +78,7 @@ rustPlatform.buildRustPackage {
   #                      the install with a message naming the wrong cause.
   postFixup = ''
     wrapProgram $out/bin/ferrum-install \
-      --prefix PATH : ${lib.makeBinPath [ nix nixos-anywhere openssh git coreutils ]}
+      --prefix PATH : ${lib.makeBinPath [ nix nixos-anywhere openssh git coreutils gnutar ]}
   '';
 
   meta = {

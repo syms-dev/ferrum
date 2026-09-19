@@ -152,16 +152,109 @@ pub const HARDWARE_CONFIG: &str = "hardware-configuration.nix";
 /// the file in a step of its own before building the extra-files tree; the
 /// single-invocation design removed that ordering without replacing what
 /// it provided.
-pub fn hardware_config_commands() -> Vec<String> {
-    vec![
-        format!("cat > /etc/ferrum/{HARDWARE_CONFIG}"),
-        format!(
-            "cd /etc/ferrum && git add {HARDWARE_CONFIG} && \
-             (git diff --cached --quiet || git -c user.name=ferrum-install \
-              -c user.email=ferrum-install@localhost commit -q -m \
-              'ferrum-install: hardware configuration')"
-        ),
-    ]
+/// **The target does not need git, and must not be assumed to have it.**
+///
+/// This used to run `git add && git commit` over SSH on the target. A real
+/// install failed there with "bash: line 1: git: command not found" --
+/// nothing in the module tree put git on a ferrum host. Worse, the failure
+/// left the REAL hardware-configuration.nix written into /etc/ferrum but
+/// UNTRACKED, which for Nix means it does not exist: the host kept a flake
+/// importing a file Nix could not see.
+///
+/// git is being added to the host for other reasons (an operator editing
+/// custom/ needs it), but this step must not DEPEND on that, because it is
+/// the step that has to work before the host can be rebuilt to gain it.
+///
+/// So the commit happens on the OPERATOR's side, where git is guaranteed
+/// (this binary is wrapped with it), and the resulting objects travel as a
+/// tar of `.git` plus the file itself. base64 because the payload is
+/// binary and the transport takes a string.
+pub fn hardware_config_extract_command() -> String {
+    "base64 -d | tar -C /etc/ferrum -xf -".to_string()
+}
+
+/// Commits the generated hardware configuration in the OPERATOR's copy.
+///
+/// # Arguments
+/// * `host_dir` - the operator's host repository.
+///
+/// # Errors
+/// If git fails. Its output is included, because "git failed" on its own
+/// has wasted enough time in this feature already.
+pub fn commit_hardware_config(host_dir: &Path) -> anyhow::Result<()> {
+    let git = |args: &[&str]| -> anyhow::Result<std::process::Output> {
+        let out = std::process::Command::new("git")
+            .current_dir(host_dir)
+            .args(args)
+            .output()?;
+        if !out.status.success() {
+            anyhow::bail!(
+                "git {} failed in {}: {}",
+                args.join(" "),
+                host_dir.display(),
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        Ok(out)
+    };
+    git(&["add", HARDWARE_CONFIG])?;
+    // Nothing staged means it was already committed -- a resume, which is
+    // not an error.
+    if !git(&["diff", "--cached", "--quiet"]).is_ok() {
+        git(&[
+            "-c",
+            "user.name=ferrum-install",
+            "-c",
+            "user.email=ferrum-install@localhost",
+            "commit",
+            "-q",
+            "-m",
+            "ferrum-install: hardware configuration",
+        ])?;
+    }
+    Ok(())
+}
+
+/// Tars `.git` and the hardware configuration, base64-encoded for a
+/// string transport.
+///
+/// # Arguments
+/// * `host_dir` - the operator's host repository, already committed.
+///
+/// # Errors
+/// If tar or base64 fails.
+pub fn hardware_config_payload(host_dir: &Path) -> anyhow::Result<String> {
+    let out = std::process::Command::new("tar")
+        .arg("-C")
+        .arg(host_dir)
+        .arg("-cf")
+        .arg("-")
+        .arg(".git")
+        .arg(HARDWARE_CONFIG)
+        .output()?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "tar of .git and {HARDWARE_CONFIG} in {} failed: {}",
+            host_dir.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(base64_encode(&out.stdout))
+}
+
+/// Minimal base64, so this does not pull a dependency for one call.
+fn base64_encode(bytes: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
+        out.push(T[(n >> 18) as usize & 63] as char);
+        out.push(T[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 { T[(n >> 6) as usize & 63] as char } else { '=' });
+        out.push(if chunk.len() > 2 { T[n as usize & 63] as char } else { '=' });
+    }
+    out
 }
 
 #[cfg(test)]
@@ -373,13 +466,46 @@ mod tests {
         assert!(flake.contains("hardware-configuration.nix"));
     }
 
+    /// The target must not be assumed to have git. A real install failed
+    /// with "bash: line 1: git: command not found" and left the real
+    /// hardware configuration UNTRACKED -- which, for Nix, is the same as
+    /// absent.
+    ///
+    /// Mutation check: put `git` back in the remote command and this
+    /// fails.
     #[test]
-    fn the_hardware_config_is_written_then_committed_on_the_target() {
-        let c = hardware_config_commands();
-        assert!(c[0].contains("cat > /etc/ferrum/hardware-configuration.nix"));
-        assert!(c[1].contains("git add hardware-configuration.nix"));
-        // A resumed run must not fail because the first attempt committed.
-        assert!(c[1].contains("git diff --cached --quiet ||"));
+    fn the_transfer_does_not_require_git_on_the_target() {
+        let cmd = hardware_config_extract_command();
+        assert!(!cmd.contains("git"), "the target may not have git: {cmd}");
+        assert!(cmd.contains("tar"), "{cmd}");
+        assert!(cmd.contains("base64 -d"), "the payload is binary: {cmd}");
+        assert!(cmd.contains("-C /etc/ferrum"), "{cmd}");
+    }
+
+    /// The commit happens on the operator's side, and a resume must not
+    /// fail because the first attempt already committed.
+    #[test]
+    fn committing_the_hardware_config_is_idempotent() {
+        let host = tempfile::tempdir().unwrap();
+        let mut files = crate::render::Files::new();
+        files.insert("flake.nix".into(), "{ }\n".into());
+        crate::render::write_repo(host.path(), &files).unwrap();
+        std::fs::write(
+            host.path().join(HARDWARE_CONFIG),
+            "{ ... }: { boot.initrd.availableKernelModules = [ \"ahci\" ]; }\n",
+        )
+        .unwrap();
+
+        commit_hardware_config(host.path()).expect("first commit");
+        commit_hardware_config(host.path()).expect("a resume must not fail here");
+
+        // And the payload really carries the objects plus the file.
+        let payload = hardware_config_payload(host.path()).unwrap();
+        assert!(!payload.is_empty());
+        assert!(
+            payload.chars().all(|c| c.is_ascii_alphanumeric() || "+/=".contains(c)),
+            "payload must be transport-safe base64"
+        );
     }
 
     #[cfg(unix)]
