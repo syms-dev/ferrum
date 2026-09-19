@@ -23,6 +23,18 @@ pub struct Filesystem {
     pub name: String,
     pub fstype: Option<String>,
     pub mountpoint: Option<String>,
+    /// The PARTITION's own stable `/dev/disk/by-id/` path.
+    ///
+    /// Distinct from the containing disk's, and that distinction is the
+    /// whole point: the filesystem lives on the partition. Mounting the
+    /// disk instead fails with "wrong fs type, bad superblock", which is
+    /// exactly what happened on the first real install -- both data disks
+    /// silently failed to mount because `custom/media.nix` named the disk.
+    ///
+    /// `#[serde(default)]` so an inventory written before this field
+    /// existed still deserializes on a resume.
+    #[serde(default)]
+    pub by_id: Option<String>,
 }
 
 /// A whole block device, as the operator needs to see it to identify one.
@@ -373,7 +385,8 @@ pub fn parse_lsblk(json: &str) -> anyhow::Result<Vec<Device>> {
                     name: clean_required(c.name),
                     fstype: clean(c.fstype),
                     mountpoint: clean(c.mountpoint),
-                })
+                             by_id: None,
+                         })
                 .collect(),
             })
         })
@@ -477,10 +490,20 @@ pub fn parse_by_id(listing: &str) -> BTreeMap<String, String> {
 
 /// Attaches the stable `by-id` path to each device.
 pub fn attach_by_id(devices: &mut [Device], by_id: &BTreeMap<String, String>) {
+    let path_for = |name: &str| {
+        by_id
+            .get(name)
+            .map(|alias| format!("/dev/disk/by-id/{alias}"))
+    };
     for dev in devices.iter_mut() {
-        dev.by_id = by_id
-            .get(&dev.name)
-            .map(|alias| format!("/dev/disk/by-id/{alias}"));
+        dev.by_id = path_for(&dev.name);
+        // Partitions too. The disk's path is what the operator confirms
+        // and what disko is told to erase; the PARTITION's path is what a
+        // data disk is mounted from, because that is where the filesystem
+        // is. Conflating them mounts /dev/sdb instead of /dev/sdb1.
+        for fs in dev.children.iter_mut() {
+            fs.by_id = path_for(&fs.name);
+        }
     }
 }
 
@@ -776,7 +799,8 @@ mod tests {
             name: "sda1".into(),
             fstype: Some("ext4\u{202e}".into()),
             mountpoint: Some("/mnt\u{1b}[2K\r".into()),
-        });
+                                   by_id: None,
+                               });
         super::check_recovered_device(&mut d).unwrap();
         for v in [
             d.model.as_deref().unwrap(),
@@ -999,6 +1023,7 @@ mod tests {
             name: name.into(),
             fstype: fstype.map(str::to_string),
             mountpoint: None,
+            by_id: None,
         }
     }
 

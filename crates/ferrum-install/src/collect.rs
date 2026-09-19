@@ -113,6 +113,41 @@ pub fn run(target: &Target, auth: &SshAuth, command: &str) -> anyhow::Result<Str
 /// # Errors
 /// Returns an error carrying ssh's own stderr. The payload is never
 /// included in an error message.
+/// Runs a command on the target with its output going STRAIGHT to the
+/// operator's terminal.
+///
+/// `run` captures output and returns it, which is right for the short
+/// commands whose result is inspected. It is wrong for the stage-2 apply:
+/// that builds an entire NixOS system on the target and can run for tens
+/// of minutes, during which a captured-output runner shows the operator a
+/// single static line and no evidence anything is alive.
+///
+/// That is not a cosmetic difference. Every long silence in this
+/// feature's history turned out to be either a real hang or a build, and
+/// nothing on screen distinguished them -- a three-hour CI timeout and a
+/// working install looked identical until the logs were dug out
+/// afterwards.
+///
+/// # Arguments
+/// * `target` - the machine to run on.
+/// * `auth` - the operator's credential.
+/// * `command` - the remote command.
+///
+/// # Errors
+/// If ssh cannot start, or the remote command exits non-zero.
+pub fn run_streaming(target: &Target, auth: &SshAuth, command: &str) -> anyhow::Result<()> {
+    let status = Command::new("ssh")
+        .args(base_args_in(auth, target.port, target.known_hosts_dir.as_deref()))
+        .arg(target.to_string())
+        .arg(command)
+        .status()
+        .map_err(|e| anyhow::anyhow!("could not run ssh: {e}"))?;
+    if !status.success() {
+        anyhow::bail!("ssh {target} failed running {command:?} ({status})");
+    }
+    Ok(())
+}
+
 pub fn run_with_stdin(
     target: &Target,
     auth: &SshAuth,
