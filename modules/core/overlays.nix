@@ -207,5 +207,26 @@ in
   # this host. An operator running it by hand gets exactly the same
   # environment a ferrumd-dispatched run gets, which is what makes the two
   # paths genuinely equivalent rather than superficially similar.
-  environment.systemPackages = [ pkgs.ferrum-apply ];
+  environment.systemPackages = [
+    pkgs.ferrum-apply
+
+    # git is NOT optional on a ferrum host, and its absence is not a
+    # convenience gap.
+    #
+    # /etc/ferrum is a git repository by design, because Nix SILENTLY
+    # IGNORES untracked files inside a git tree -- an untracked
+    # custom/whatever.nix is not "added but broken", it simply does not
+    # exist as far as evaluation is concerned. So every documented
+    # operator action there ends in `git add`, and ferrum-apply evaluates
+    # that repo on every run.
+    #
+    # Without git the host cannot perform the actions its own design
+    # requires. Found on the first real install: the installer's own R6 A2
+    # commit of the generated hardware-configuration.nix failed with
+    # "bash: line 1: git: command not found", leaving the real hardware
+    # configuration present in the working tree but UNTRACKED -- i.e.
+    # invisible to Nix, on the one file the host cannot boot correctly
+    # without.
+    pkgs.git
+  ];
 }
