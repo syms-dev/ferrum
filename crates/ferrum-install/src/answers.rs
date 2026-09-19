@@ -222,13 +222,7 @@ pub fn collect(io: &mut impl PromptIo) -> anyhow::Result<Answers> {
              It is held in memory, written to no file\nhere, and encrypted to the \
              host's own key once the host exists.",
         );
-        let token = io.ask_secret("Cloudflare API token:")?;
-        if token.is_empty() {
-            anyhow::bail!(
-                "a Cloudflare DNS-01 token is required to publish an app: \
-                 modules/proxy/acme.nix refuses to build without it"
-            );
-        }
+        let token = validate_cloudflare_token(&io.ask_secret("Cloudflare API token:")?)?;
         Some(Secret::new(token))
     } else {
         None
@@ -255,6 +249,70 @@ pub fn collect(io: &mut impl PromptIo) -> anyhow::Result<Answers> {
 ///
 /// # Errors
 /// Malformed JSON, or a document with no hostname to recover.
+/// Validates a Cloudflare API token before it can reach ACME.
+///
+/// The token becomes the value of an HTTP `Authorization` header. Any
+/// character that cannot appear in a header field makes every certificate
+/// order fail, and the failure surfaces far away from its cause: on the
+/// first real install it appeared as
+///
+///   acme: error presenting token: cloudflare: failed to find zone
+///   thesyms.ca.: ... net/http: invalid header field value for
+///   "Authorization"
+///
+/// which reads like a DNS or zone problem rather than a bad paste. The
+/// actual cause was a trailing `%` -- zsh's marker for output with no
+/// final newline, copied along with the token out of a terminal.
+///
+/// Validated here, at the one place a human types it, rather than
+/// anywhere further in: by the time it is a sops file on the host it has
+/// been encrypted, shipped and referenced by a systemd unit, and the
+/// error no longer names it.
+///
+/// # Arguments
+/// * `raw` - what the operator typed or pasted.
+///
+/// # Returns
+/// The trimmed token.
+///
+/// # Errors
+/// When it is empty, or contains anything outside the character set
+/// Cloudflare issues -- naming the offending character, since it is
+/// usually invisible.
+pub fn validate_cloudflare_token(raw: &str) -> anyhow::Result<String> {
+    let token = raw.trim();
+    if token.is_empty() {
+        anyhow::bail!(
+            "a Cloudflare DNS-01 token is required to publish an app: \
+             modules/proxy/acme.nix refuses to build without it"
+        );
+    }
+    // An allowlist. Cloudflare issues tokens from exactly this set, and
+    // this value ends up in an HTTP header where anything else is fatal.
+    if let Some(bad) = token.chars().find(|c| !(c.is_ascii_alphanumeric() || *c == '_' || *c == '-')) {
+        anyhow::bail!(
+            "that Cloudflare token contains {bad:?} ({:#06x}), which cannot \
+             appear in an HTTP Authorization header -- every certificate \
+             order would fail with \"invalid header field value\", and the \
+             error would name DNS rather than the token.\n\n\
+             If you copied it from a terminal, check for a trailing \"%\" \
+             (zsh's marker for output with no final newline) or a stray \
+             space. A Cloudflare API token is letters, digits, underscores \
+             and hyphens only.",
+            bad as u32
+        );
+    }
+    if token.len() < 20 {
+        anyhow::bail!(
+            "that Cloudflare token is only {} characters, which is too short \
+             to be one. Tokens are issued from the Cloudflare dashboard \
+             under My Profile -> API Tokens, scoped Zone:Read + DNS:Edit.",
+            token.len()
+        );
+    }
+    Ok(token.to_string())
+}
+
 pub fn from_stage2(body: &str, hostname: &str) -> anyhow::Result<Answers> {
     let doc: serde_json::Value = serde_json::from_str(body)?;
     let sso_enabled = doc
@@ -344,6 +402,41 @@ pub fn token_still_needed(a: &Answers, already_on_host: bool) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// The real failure: a token pasted out of a zsh terminal carried the
+    /// shell's trailing "%" -- its marker for output with no final
+    /// newline. It encrypted, shipped and installed fine, then every
+    /// certificate order failed with "invalid header field value for
+    /// Authorization", reported as a DNS zone problem.
+    ///
+    /// Mutation check: drop the charset check and this fails.
+    #[test]
+    fn a_token_carrying_a_shell_artifact_is_refused_with_the_reason() {
+        let err = super::validate_cloudflare_token("abcdefghij1234567890abcdefghij1234567890%")
+            .expect_err("a trailing % cannot go in an HTTP header");
+        let msg = err.to_string();
+        assert!(msg.contains("Authorization"), "{msg}");
+        // It must name the likely cause, because the character is invisible.
+        assert!(msg.contains("zsh"), "{msg}");
+
+        // Whitespace is trimmed rather than refused -- a stray newline or
+        // space around a paste is not the operator's mistake to fix twice.
+        assert_eq!(
+            super::validate_cloudflare_token("  abcdefghij1234567890abcdefghij1234567890 \n").unwrap(),
+            "abcdefghij1234567890abcdefghij1234567890"
+        );
+
+        // Interior whitespace is a real problem and is refused.
+        assert!(super::validate_cloudflare_token("abcdefghij12345 67890abcdefghij12345678").is_err());
+
+        // Too short to be a token at all.
+        let short = super::validate_cloudflare_token("abc").unwrap_err().to_string();
+        assert!(short.contains("too short"), "{short}");
+
+        // A real one passes untouched.
+        let good = "aBcD_eFgH-1234567890aBcDeFgH1234567890xy";
+        assert_eq!(super::validate_cloudflare_token(good).unwrap(), good);
+    }
+
     use super::*;
     use crate::prompt::testing::Scripted;
 
@@ -397,14 +490,14 @@ mod tests {
             "sonarr, plex",
             "",               // SSO: default yes
             "admin@thesyms.ca",
-            "cf-token-value",
+            "cftokenvalue1234567890abcdefghijklmnopqr",
         ]);
         let a = collect(&mut io).unwrap();
         assert_eq!(a.hostname, "saltbox");
         assert_eq!(a.base_domain.as_deref(), Some("thesyms.ca"));
         assert_eq!(a.apps, vec!["plex", "sonarr"]);
         assert!(a.sso.enabled);
-        assert_eq!(a.cloudflare_token.as_ref().map(Secret::expose), Some("cf-token-value"));
+        assert_eq!(a.cloudflare_token.as_ref().map(Secret::expose), Some("cftokenvalue1234567890abcdefghijklmnopqr"));
     }
 
     /// No domain means nothing is published, so neither ACME nor the token
@@ -446,15 +539,15 @@ mod tests {
     #[test]
     fn the_token_is_only_ever_held_in_memory() {
         let mut io = Scripted::new(&[
-            "saltbox", "thesyms.ca", "me@thesyms.ca", "sonarr", "", "a@b.co", "secret-token",
+            "saltbox", "thesyms.ca", "me@thesyms.ca", "sonarr", "", "a@b.co", "secrettoken1234567890abcdefghijklmnopqrs",
         ]);
         let a = collect(&mut io).unwrap();
         assert!(
-            !io.transcript().contains("secret-token"),
+            !io.transcript().contains("secrettoken1234567890abcdefghijklmnopqrs"),
             "the token must never be echoed back: {}",
             io.transcript()
         );
-        assert_eq!(a.cloudflare_token.as_ref().map(Secret::expose), Some("secret-token"));
+        assert_eq!(a.cloudflare_token.as_ref().map(Secret::expose), Some("secrettoken1234567890abcdefghijklmnopqrs"));
     }
 
     /// A resume must never re-prompt: the operator answered before
@@ -514,7 +607,8 @@ mod tests {
     #[test]
     fn the_token_is_asked_for_without_echo() {
         let mut io = Scripted::new(&[
-            "saltbox", "thesyms.ca", "me@thesyms.ca", "sonarr", "", "a@b.co", "tok",
+            "saltbox", "thesyms.ca", "me@thesyms.ca", "sonarr", "", "a@b.co",
+            "tokentokentoken1234567890abcdefghijklmno",
         ]);
         collect(&mut io).unwrap();
         assert_eq!(io.secret_asks.len(), 1, "the token must use the non-echoing prompt");
@@ -524,14 +618,14 @@ mod tests {
     #[test]
     fn the_token_cannot_be_printed_by_debug() {
         let mut io = Scripted::new(&[
-            "saltbox", "thesyms.ca", "me@thesyms.ca", "sonarr", "", "a@b.co", "super-secret",
+            "saltbox", "thesyms.ca", "me@thesyms.ca", "sonarr", "", "a@b.co", "supersecret1234567890abcdefghijklmnopqrs",
         ]);
         let a = collect(&mut io).unwrap();
         let rendered = format!("{a:?}");
-        assert!(!rendered.contains("super-secret"), "Debug leaked the token: {rendered}");
+        assert!(!rendered.contains("supersecret1234567890abcdefghijklmnopqrs"), "Debug leaked the token: {rendered}");
         assert!(rendered.contains("<redacted>"), "{rendered}");
         // ...and it is still retrievable where it is genuinely needed.
-        assert_eq!(a.cloudflare_token.as_ref().map(Secret::expose), Some("super-secret"));
+        assert_eq!(a.cloudflare_token.as_ref().map(Secret::expose), Some("supersecret1234567890abcdefghijklmnopqrs"));
     }
 
     #[test]
