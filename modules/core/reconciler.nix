@@ -109,10 +109,32 @@ let
       }))
     enabledApps);
 
-  reconcileConfigFile = pkgs.writeText "ferrum-reconcile-config.json" (builtins.toJSON {
+  # Plex, which does not fit the app/pair model: no API key, claimed to a
+  # plex.tv account rather than configured, and unusable until it is.
+  #
+  # The claim token is a ferrum SECRET rather than a settings value. It
+  # grants association of a server with an account, and settings.json is
+  # world-readable by design (the UI renders it); plex/meta.nix's
+  # settingsSchema.claimToken is the wrong home for it for that reason.
+  plexApp = config.ferrum.apps.plex or { enable = false; };
+  plexClaimDeclared = config.ferrum.secrets ? "plex-claim";
+  plexConfig = lib.optionalAttrs (plexApp.enable or false) {
+    plex = {
+      baseUrl = "http://127.0.0.1:${toString plexApp.port}";
+      preferencesPath =
+        "${plexApp.stateDir}/Plex Media Server/Preferences.xml";
+      claimTokenPath = if plexClaimDeclared then "/run/secrets/plex-claim" else null;
+      libraries = [
+        { kind = "movie"; name = "Movies"; path = "${config.ferrum.storage.mediaDir}/media/movies"; }
+        { kind = "show"; name = "TV Shows"; path = "${config.ferrum.storage.mediaDir}/media/tv"; }
+      ];
+    };
+  };
+
+  reconcileConfigFile = pkgs.writeText "ferrum-reconcile-config.json" (builtins.toJSON ({
     apps = lib.mapAttrs appConnInfo enabledApps;
     inherit pairs rootFolders downloadPaths;
-  });
+  } // plexConfig));
 in
 {
   assertions = map (msg: { assertion = false; message = msg; }) realSymmetryErrors;
@@ -120,7 +142,7 @@ in
   # Runs when there is EITHER a registration or a root folder to set. A
   # single *arr with no peers still needs its root folder, and gating only
   # on pairs meant it silently got nothing.
-  systemd.services.ferrum-reconcile = lib.mkIf (pairs != [ ] || rootFolders != [ ] || downloadPaths != [ ]) {
+  systemd.services.ferrum-reconcile = lib.mkIf (pairs != [ ] || rootFolders != [ ] || downloadPaths != [ ] || plexConfig != { }) {
     description = "Register download clients and indexer applications across the catalog";
     after = [ "ferrum-apps.target" ];
     wantedBy = [ "ferrum-apps.target" ];

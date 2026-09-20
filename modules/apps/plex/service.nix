@@ -10,6 +10,20 @@ let
   claimToken = app.settings.claimToken or "";
 in
 lib.mkIf app.enable {
+  # The plex.tv claim token, when the operator supplied one.
+  #
+  # A secret rather than a settings value: it associates this server with
+  # a Plex account, and settings.json is world-readable by design. Read
+  # once by ferrum-reconcile, which claims the server if it is unclaimed;
+  # inert afterwards. Claim tokens expire four minutes after issue, so a
+  # stale one here is normal and is reported rather than fatal.
+  sops.secrets = lib.mkIf (ferrum.secrets ? "plex-claim") {
+    "plex-claim" = {
+      sopsFile = /. + "${ferrum.secretsDir}/plex-claim.sops";
+      format = "binary";
+    };
+  };
+
   # Unfree-package allowance for plexmediaserver lives centrally in
   # modules/core/overlays.nix (aggregated from every catalog app's
   # meta.nix `unfreePackages`), not here -- see that file's comment.

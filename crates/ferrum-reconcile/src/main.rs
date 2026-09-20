@@ -50,6 +50,45 @@ struct ReconcileConfig {
     /// disk) makes every import a COPY, silently.
     #[serde(default)]
     download_paths: Vec<DownloadPath>,
+    /// Plex, which is shaped differently from everything else here.
+    ///
+    /// It has no API key: it is claimed to a plex.tv account, and until it
+    /// is, it answers "You do not have access to this server" to anything
+    /// that is not localhost. On a ferrum host the usual escape hatch --
+    /// claim it from the LAN at :32400 -- does not exist either, because
+    /// apps are published through nginx and the port is not open.
+    #[serde(default)]
+    plex: Option<PlexConfig>,
+}
+
+/// What Plex needs to become a usable server rather than a running one.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PlexConfig {
+    /// `host:port` of the local Plex.
+    base_url: String,
+    /// sops path holding a plex.tv claim token, when one was supplied.
+    /// Claim tokens expire four minutes after they are issued, so this is
+    /// frequently a token that no longer works -- which is not an error,
+    /// it just means the operator has to supply a fresh one.
+    #[serde(default)]
+    claim_token_path: Option<String>,
+    /// Plex's own Preferences.xml, which holds the account token once the
+    /// server is claimed. That token is what library calls authenticate
+    /// with.
+    preferences_path: String,
+    /// Libraries to create if absent: (type, name, path).
+    #[serde(default)]
+    libraries: Vec<PlexLibrary>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PlexLibrary {
+    /// Plex's own vocabulary: "movie" or "show".
+    kind: String,
+    name: String,
+    path: String,
 }
 
 /// Where one download client should write.
@@ -151,6 +190,20 @@ fn main() -> anyhow::Result<()> {
             ),
             Err(e) => {
                 eprintln!("ferrum-reconcile: {} downloads -> {} FAILED: {e}", dp.app, dp.path);
+                had_error = true;
+            }
+        }
+    }
+
+    if let Some(plex) = &config.plex {
+        match reconcile_plex(plex) {
+            Ok(msgs) => {
+                for m in msgs {
+                    println!("ferrum-reconcile: plex {m}");
+                }
+            }
+            Err(e) => {
+                eprintln!("ferrum-reconcile: plex FAILED: {e}");
                 had_error = true;
             }
         }
@@ -340,6 +393,147 @@ fn set_download_path(config: &ReconcileConfig, dp: &DownloadPath) -> anyhow::Res
         }
         other => anyhow::bail!("no download-path support for '{other}'"),
     }
+}
+
+/// Claims Plex if it is unclaimed, then creates any missing libraries.
+///
+/// Both steps are skipped when already done, because this runs after
+/// every apply and must be a no-op on a host that is already set up.
+///
+/// # Arguments
+/// * `plex` - connection details, the claim token path, and the wanted
+///   libraries.
+///
+/// # Returns
+/// One line per thing it did or deliberately did not do, so the operator
+/// can see why nothing happened as easily as why something did.
+///
+/// # Errors
+/// Only for failures that are not the operator's to fix by supplying a
+/// fresh token -- an expired or rejected claim is reported, not fatal,
+/// because failing the whole unit over it would also block the libraries
+/// and every other app's reconciliation.
+fn reconcile_plex(plex: &PlexConfig) -> anyhow::Result<Vec<String>> {
+    let mut out = Vec::new();
+
+    let mut token = plex_account_token(&plex.preferences_path);
+
+    if token.is_none() {
+        match &plex.claim_token_path {
+            None => {
+                out.push(
+                    "is NOT claimed and no claim token was supplied -- it will answer \
+                     \"You do not have access to this server\" to anything but localhost. \
+                     Get one from https://plex.tv/claim (valid 4 minutes) and put it in \
+                     the plex-claim secret."
+                        .to_string(),
+                );
+            }
+            Some(path) => match claim_plex(&plex.base_url, path) {
+                Ok(()) => {
+                    out.push("claimed".to_string());
+                    token = plex_account_token(&plex.preferences_path);
+                }
+                Err(e) => out.push(format!(
+                    "could not be claimed: {e}. Claim tokens expire four minutes after \
+                     they are issued, so this is usually a stale one -- get a fresh \
+                     token from https://plex.tv/claim and replace the plex-claim secret."
+                )),
+            },
+        }
+    }
+
+    let Some(token) = token else {
+        out.push("libraries skipped: the server must be claimed first".to_string());
+        return Ok(out);
+    };
+
+    let existing = plex_existing_library_paths(&plex.base_url, &token)?;
+    for lib in &plex.libraries {
+        if existing.iter().any(|p| p == &lib.path) {
+            continue;
+        }
+        if !std::path::Path::new(&lib.path).is_dir() {
+            out.push(format!("library {:?} skipped: {} does not exist", lib.name, lib.path));
+            continue;
+        }
+        create_plex_library(&plex.base_url, &token, lib)?;
+        out.push(format!("library {:?} created at {}", lib.name, lib.path));
+    }
+    Ok(out)
+}
+
+/// Reads the account token Plex writes into Preferences.xml once claimed.
+///
+/// Its absence IS the definition of unclaimed, which is why this is the
+/// check rather than asking the server: a running unclaimed Plex answers
+/// perfectly well on localhost, so reachability proves nothing.
+fn plex_account_token(preferences_path: &str) -> Option<String> {
+    let xml = fs::read_to_string(preferences_path).ok()?;
+    let needle = "PlexOnlineToken=\"";
+    let start = xml.find(needle)? + needle.len();
+    let rest = &xml[start..];
+    let end = rest.find('"')?;
+    let token = &rest[..end];
+    if token.is_empty() {
+        None
+    } else {
+        Some(token.to_string())
+    }
+}
+
+fn claim_plex(base_url: &str, claim_token_path: &str) -> anyhow::Result<()> {
+    let claim = fs::read_to_string(claim_token_path)
+        .map_err(|e| anyhow::anyhow!("could not read the claim token at {claim_token_path}: {e}"))?
+        .trim()
+        .to_string();
+    if claim.is_empty() {
+        anyhow::bail!("the claim token is empty");
+    }
+    ureq::post(&format!("{base_url}/myplex/claim"))
+        .query("token", &claim)
+        .call()
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(())
+}
+
+fn plex_existing_library_paths(base_url: &str, token: &str) -> anyhow::Result<Vec<String>> {
+    let xml = ureq::get(&format!("{base_url}/library/sections"))
+        .set("X-Plex-Token", token)
+        .call()
+        .map_err(|e| anyhow::anyhow!("listing Plex libraries failed: {e}"))?
+        .into_string()
+        .map_err(|e| anyhow::anyhow!("Plex returned unreadable library XML: {e}"))?;
+    // Deliberately a substring scan rather than an XML parse: the only
+    // thing needed is whether a path is already used, and pulling in an
+    // XML dependency for one attribute is not worth it.
+    Ok(xml
+        .split("path=\"")
+        .skip(1)
+        .filter_map(|rest| rest.split('"').next().map(str::to_string))
+        .collect())
+}
+
+fn create_plex_library(base_url: &str, token: &str, lib: &PlexLibrary) -> anyhow::Result<()> {
+    // The agent/scanner pair is Plex's own default for each type; naming
+    // them explicitly avoids depending on whatever the server's current
+    // default happens to be.
+    let (agent, scanner) = match lib.kind.as_str() {
+        "movie" => ("tv.plex.agents.movie", "Plex Movie"),
+        "show" => ("tv.plex.agents.series", "Plex TV Series"),
+        other => anyhow::bail!("unsupported Plex library type {other:?}"),
+    };
+    ureq::post(&format!("{base_url}/library/sections"))
+        .set("X-Plex-Token", token)
+        .query("name", &lib.name)
+        .query("type", &lib.kind)
+        .query("agent", agent)
+        .query("scanner", scanner)
+        .query("language", "en-US")
+        .query("location", &lib.path)
+        .call()
+        .map_err(|e| anyhow::anyhow!("creating Plex library {:?} failed: {e}", lib.name))?;
+    Ok(())
 }
 
 /// Looks up an existing entry by `name` at `GET {base}{path}` -- both
