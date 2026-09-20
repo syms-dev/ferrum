@@ -31,6 +31,24 @@ struct Pair {
 struct ReconcileConfig {
     apps: HashMap<String, AppConnInfo>,
     pairs: Vec<Pair>,
+    /// Root folders each *arr must know about before it can accept a
+    /// single show or film.
+    ///
+    /// Registering apps to each other is not enough to make the stack
+    /// usable: Sonarr with no root folder refuses to add a series at all,
+    /// and the operator has to go and type a path that ferrum already
+    /// knows. That is precisely the "log in and everything is pre-setup"
+    /// gap this product exists to close.
+    #[serde(default)]
+    root_folders: Vec<RootFolder>,
+}
+
+/// One `app -> path` root folder registration.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RootFolder {
+    app: String,
+    path: String,
 }
 
 /// Reads a sops-nix decrypted secret's bare content, trimmed of the
@@ -83,6 +101,27 @@ fn main() -> anyhow::Result<()> {
             }
         }
     }
+    // Root folders after the pairs, and independently: a failed pair must
+    // not stop the *arrs learning where their media lives, and a failed
+    // root folder must not undo a registration that worked.
+    for rf in &config.root_folders {
+        match ensure_root_folder(&config, rf) {
+            Ok(changed) => println!(
+                "ferrum-reconcile: {} root folder {} {}",
+                rf.app,
+                rf.path,
+                if changed { "ADDED" } else { "already present" }
+            ),
+            Err(e) => {
+                eprintln!(
+                    "ferrum-reconcile: {} root folder {} FAILED: {e}",
+                    rf.app, rf.path
+                );
+                had_error = true;
+            }
+        }
+    }
+
     if had_error {
         anyhow::bail!("one or more pairs failed to reconcile -- see errors above");
     }
@@ -120,6 +159,68 @@ fn reconcile_pair(config: &ReconcileConfig, pair: &Pair) -> anyhow::Result<()> {
             pair.provider
         ),
     }
+}
+
+/// Ensures an *arr knows about a root folder, adding it if absent.
+///
+/// Idempotent by PATH rather than by name, because that is the identity
+/// the *arr APIs use for a root folder -- `GET /api/v3/rootfolder` returns
+/// objects whose `path` is the natural key, and adding a duplicate path is
+/// rejected by the app rather than silently merged.
+///
+/// # Arguments
+/// * `config` - the whole config, for the app's connection details.
+/// * `rf` - the app and the path it should hold.
+///
+/// # Returns
+/// `true` when a folder was added, `false` when it was already there.
+///
+/// # Errors
+/// When the app is unknown, has no API key, or its API refuses the call.
+fn ensure_root_folder(config: &ReconcileConfig, rf: &RootFolder) -> anyhow::Result<bool> {
+    let app = config
+        .apps
+        .get(&rf.app)
+        .ok_or_else(|| anyhow::anyhow!("unknown app '{}' in rootFolders", rf.app))?;
+    let key = read_api_key(&app.api_key_secret_path)?.ok_or_else(|| {
+        anyhow::anyhow!("no API key for '{}' -- required to set its root folder", rf.app)
+    })?;
+
+    let existing: Vec<serde_json::Value> = ureq::get(&format!("{}/api/v3/rootfolder", base_url(app)))
+        .set("X-Api-Key", &key)
+        .call()
+        .map_err(|e| anyhow::anyhow!("GET rootfolder failed: {e}"))?
+        .into_json()
+        .map_err(|e| anyhow::anyhow!("GET rootfolder returned invalid JSON: {e}"))?;
+    if existing
+        .iter()
+        .any(|f| f.get("path").and_then(|p| p.as_str()) == Some(rf.path.as_str()))
+    {
+        return Ok(false);
+    }
+
+    // The directory must exist before the app will accept it; the *arrs
+    // validate the path and reject one they cannot see. storage.nix
+    // creates the whole tree, so this is a guard against a mismatch
+    // between what ferrum thinks the layout is and what is on disk --
+    // exactly the disconnect that left the apps pointed at an empty
+    // /srv/media while the media sat unmounted elsewhere.
+    if !std::path::Path::new(&rf.path).is_dir() {
+        anyhow::bail!(
+            "{} does not exist on this host, so {} would reject it. The \
+             media tree is created by modules/core/storage.nix from \
+             ferrum.storage.mediaDir -- if that path is wrong, the apps and \
+             the disks disagree about where media lives.",
+            rf.path,
+            rf.app
+        );
+    }
+
+    ureq::post(&format!("{}/api/v3/rootfolder", base_url(app)))
+        .set("X-Api-Key", &key)
+        .send_json(serde_json::json!({ "path": rf.path }))
+        .map_err(|e| anyhow::anyhow!("POST rootfolder {} failed: {e}", rf.path))?;
+    Ok(true)
 }
 
 /// Looks up an existing entry by `name` at `GET {base}{path}` -- both

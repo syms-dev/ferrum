@@ -77,15 +77,34 @@ let
         (builtins.filter (p: enabledApps ? ${p}) (catalog.${id}.integrations.consumes or [ ])))
     enabledApps);
 
+  # One root folder per enabled app that manages a library, derived from
+  # the catalog rather than listed here -- same reasoning as `pairs`.
+  #
+  # The path is built from ferrum.storage.mediaDir, so the apps are told
+  # about exactly the tree modules/core/storage.nix created. Those two
+  # disagreeing is what left every app pointed at an empty /srv/media
+  # while the media sat on unmounted disks.
+  rootFolders = lib.flatten (lib.mapAttrsToList
+    (id: _:
+      let cat = catalog.${id}.mediaCategory or null; in
+      lib.optional (cat != null) {
+        app = id;
+        path = "${config.ferrum.storage.mediaDir}/media/${cat}";
+      })
+    enabledApps);
+
   reconcileConfigFile = pkgs.writeText "ferrum-reconcile-config.json" (builtins.toJSON {
     apps = lib.mapAttrs appConnInfo enabledApps;
-    inherit pairs;
+    inherit pairs rootFolders;
   });
 in
 {
   assertions = map (msg: { assertion = false; message = msg; }) realSymmetryErrors;
 
-  systemd.services.ferrum-reconcile = lib.mkIf (pairs != [ ]) {
+  # Runs when there is EITHER a registration or a root folder to set. A
+  # single *arr with no peers still needs its root folder, and gating only
+  # on pairs meant it silently got nothing.
+  systemd.services.ferrum-reconcile = lib.mkIf (pairs != [ ] || rootFolders != [ ]) {
     description = "Register download clients and indexer applications across the catalog";
     after = [ "ferrum-apps.target" ];
     wantedBy = [ "ferrum-apps.target" ];

@@ -11,6 +11,18 @@
   defaultPort = 8989;
   defaultSubdomain = "sonarr";
   defaultMediaAccess = "readwrite";
+
+  # Which directory under <mediaDir>/media this app manages.
+  #
+  # Declared here rather than in the reconciler so that adding an app
+  # stays "add a directory under modules/apps", which is the property
+  # catalog-consistency exists to protect. An app with no library of its
+  # own simply omits this.
+  #
+  # Without a root folder an *arr will not accept a single show or film --
+  # it refuses the add outright and the operator has to type a path ferrum
+  # already knows. That is the "log in and everything is pre-setup" gap.
+  mediaCategory = "tv";
   # one_factor, not two_factor. Enforcing 2FA locked the operator out of
   # their own host on the first real install: Authelia demands TOTP
   # enrolment before the first login, and ferrum configures the FILESYSTEM

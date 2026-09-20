@@ -434,6 +434,53 @@
           inherit problems;
         };
 
+      # The apps are told where media lives, and told the SAME place the
+      # storage module created.
+      #
+      # This reads the config the reconciler will actually receive, not the
+      # metadata that produces it. The whole class of bug it guards against
+      # is the two disagreeing: on the first real install every app was
+      # pointed at /srv/media while the disks were mounted at /mnt/media-N,
+      # so 7TB was present, mounted, and invisible.
+      rootFoldersReachTheApps =
+        let
+          host = ferrumLib.mkHost {
+            inherit system;
+            settings = {
+              schemaVersion = realMigrations.currentVersion;
+              apps = { sonarr.enable = true; radarr.enable = true; };
+            };
+            modules = [ ../../../examples/hosts/minimal/configuration.nix ];
+          };
+          cfgPath = host.config.systemd.services.ferrum-reconcile.environment.FERRUM_RECONCILE_CONFIG;
+          mediaDir = host.config.ferrum.storage.mediaDir;
+        in
+        pkgs.runCommand "ferrum-check-root-folders" { } ''
+          set -eu
+          cfg=${cfgPath}
+          fail() { echo "root-folder check: $1" >&2; echo "--- config ---" >&2; cat "$cfg" >&2; exit 1; }
+
+          ${pkgs.jq}/bin/jq -e '.rootFolders | length == 2' "$cfg" > /dev/null \
+            || fail "expected one root folder each for sonarr and radarr"
+
+          ${pkgs.jq}/bin/jq -e --arg p "${mediaDir}/media/tv" \
+            '.rootFolders[] | select(.app == "sonarr") | select(.path == $p)' "$cfg" > /dev/null \
+            || fail "sonarr's root folder is not ${mediaDir}/media/tv"
+
+          ${pkgs.jq}/bin/jq -e --arg p "${mediaDir}/media/movies" \
+            '.rootFolders[] | select(.app == "radarr") | select(.path == $p)' "$cfg" > /dev/null \
+            || fail "radarr's root folder is not ${mediaDir}/media/movies"
+
+          # And the path must be under the root the storage module builds,
+          # which is the half that actually failed before.
+          case "${mediaDir}" in
+            /data) ;;
+            *) fail "mediaDir is ${mediaDir}, not the /data root the TRaSH layout assumes" ;;
+          esac
+
+          echo ok > $out
+        '';
+
       mkAssertionCheck = name: result:
         pkgs.runCommand "ferrum-check-${name}" { } (
           if result.ok then
@@ -445,6 +492,7 @@
     {
       checks = {
         auth-model-enforced = mkAssertionCheck "auth-model-enforced" authModelEnforced;
+        root-folders-reach-the-apps = rootFoldersReachTheApps;
         catalog-consistency = mkAssertionCheck "catalog-consistency" catalogConsistency;
         schema-uniformity = mkAssertionCheck "schema-uniformity" schemaUniformity;
         ui-renders-every-schema-type =
