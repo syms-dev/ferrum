@@ -41,6 +41,7 @@
     ./core/nix-settings.nix
     ./core/bootstrap.nix
     ./core/storage.nix
+    ./core/pool.nix
     ./core/overlays.nix
     ./core/generations.nix
     ./core/state-restore.nix

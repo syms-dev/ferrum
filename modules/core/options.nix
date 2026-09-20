@@ -46,7 +46,91 @@ in
       };
       mediaDir = mkOption {
         type = types.str;
-        default = "/srv/media";
+        default = "/data";
+        description = ''
+          The single root under which downloads AND media both live.
+
+          One root is not a stylistic choice. The *arr apps import by
+          HARDLINKING from the download directory into the library, and a
+          hardlink cannot cross a filesystem -- so if downloads and media
+          sit on different mounts the import silently degrades to a copy:
+          double the space while it runs, a long pause per import, and
+          broken seeding when the original is moved rather than copied.
+          That is the single most common misconfiguration the TRaSH guides
+          exist to prevent, and ferrum had it by construction until this
+          default changed: media on the data disks, downloads at
+          /srv/media/downloads on the OS disk.
+
+          `/data` follows the TRaSH convention, so an operator reading any
+          *arr guide finds the paths where the guide says they are.
+
+          On a host with data disks this is where they are mounted (or
+          where their pool is presented); on a host without, it is a plain
+          directory on the OS disk. The layout beneath it is the same
+          either way, so a small install is not a different shape.
+        '';
+      };
+
+      pool = {
+        enable = mkOption {
+          type = types.bool;
+          default = false;
+          description = ''
+            Present several data disks as one filesystem at mediaDir, so
+            apps see a single library rather than one per disk.
+
+            Set by the installer when it finds more than one data disk. A
+            single disk needs no pool -- it is mounted at mediaDir
+            directly.
+          '';
+        };
+
+        branches = mkOption {
+          type = types.listOf types.str;
+          default = [ ];
+          example = [ "/mnt/ferrum-disk-0" "/mnt/ferrum-disk-1" ];
+          description = ''
+            The individual disk mount points the pool unions, in order.
+            Their mounts are declared in /etc/ferrum/custom/, which is the
+            operator's to edit; this list is what the pool is built from.
+          '';
+        };
+
+        minFreeGiB = mkOption {
+          type = types.int;
+          default = 50;
+          description = ''
+            A branch with less than this free is skipped when placing a NEW
+            file.
+
+            This is what stops `epmfs` filling a disk. Without it, once a
+            show lives on a disk every later season goes to that disk too,
+            full or not, and the write fails inside an app that reports it
+            badly or not at all. With it, the new seasons land elsewhere --
+            the show is then split across disks, which is the honest trade:
+            keeping a show together matters right up to the point where it
+            would mean not writing it at all.
+          '';
+        };
+
+        policy = mkOption {
+          type = types.enum [ "epmfs" "mfs" ];
+          default = "epmfs";
+          description = ''
+            Where a new file goes.
+
+            epmfs -- existing path, most free space. Among the disks that
+            already hold the target directory, pick the emptiest. Keeps a
+            show's seasons on one disk, so losing a disk loses whole shows
+            rather than gaps in every show, and idle disks can spin down.
+
+            mfs -- most free space, ignoring what is already where.
+            Balances new writes more evenly and scatters a series.
+
+            NEITHER MOVES EXISTING DATA. This chooses where the next file
+            is written; nothing rebalances what is already on the disks.
+          '';
+        };
       };
       mediaGroup = mkOption {
         type = types.str;

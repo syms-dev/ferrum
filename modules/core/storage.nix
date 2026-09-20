@@ -68,9 +68,34 @@ in
       "d ${cfg.stateDir} 0751 root root - -"
       "d ${cfg.snapshotDir} 0750 root root - -"
       "d /var/lib/ferrum 0751 root ${ferrumdGroup} - -"
+      # The TRaSH layout, under ONE root.
+      #
+      # downloads and media are siblings inside mediaDir rather than
+      # separate mounts, and that is the whole point: the *arrs import by
+      # hardlinking, a hardlink cannot cross a filesystem, and the old
+      # layout put downloads on the OS disk while media lived on the data
+      # disks. Imports degraded to copies -- silently, and invisibly until
+      # a library is large enough to notice the duplication.
+      #
+      # The category directories are created rather than left to the apps
+      # so that an operator pointing Plex at a library finds it already
+      # there, and so every app agrees on where things go without anyone
+      # configuring a path by hand.
       "d ${cfg.mediaDir} 0775 root ${cfg.mediaGroup} - -"
-      "d ${cfg.mediaDir}/downloads 0775 root ${cfg.mediaGroup} - -"
-      "d ${cfg.mediaDir}/library 0775 root ${cfg.mediaGroup} - -"
+    ]
+    ++ lib.concatMap
+      (sub: [ "d ${cfg.mediaDir}/${sub} 0775 root ${cfg.mediaGroup} - -" ])
+      ([
+        "torrents"
+        "usenet"
+        "usenet/incomplete"
+        "usenet/complete"
+        "media"
+      ]
+      ++ lib.concatMap
+        (cat: [ "torrents/${cat}" "usenet/complete/${cat}" "media/${cat}" ])
+        [ "movies" "tv" "music" "books" ])
+    ++ [
       "d ${cfg.journalDir} 0750 root ${ferrumdGroup} - -"
     ];
 

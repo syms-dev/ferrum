@@ -427,7 +427,20 @@ fn flake(hostname: &str, ferrum_rev: &str, ssh_keys: &[String], firmware: Firmwa
     )
 }
 
+/// The one root downloads and media share, so imports can hardlink.
+///
+/// Must match `ferrum.storage.mediaDir`'s default in
+/// modules/core/options.nix. They are two halves of one decision: this
+/// side mounts the disks there, that side builds the TRaSH tree inside.
+pub const MEDIA_ROOT: &str = "/data";
+
+/// Where a pool branch is mounted when there is more than one data disk.
+fn branch_path(i: usize) -> String {
+    format!("/mnt/ferrum-disk-{i}")
+}
+
 fn media(disks: &[&Device]) -> anyhow::Result<String> {
+    let single = disks.len() == 1;
     let mounts = disks
         .iter()
         .enumerate()
@@ -469,9 +482,21 @@ fn media(disks: &[&Device]) -> anyhow::Result<String> {
                 )
             })?;
             let fstype = nix_str(part.fstype.as_deref().unwrap_or("ext4"));
+            // ONE disk mounts straight at /data; SEVERAL mount as pool
+            // branches and modules/core/pool.nix unions them at /data.
+            //
+            // The mount point is never /mnt/media-N any more. That path
+            // was disconnected from everything: ferrum.storage.mediaDir
+            // was /srv/media, which is what the apps were pointed at, so
+            // the data disks were mounted somewhere no app ever looked.
+            let mount = if single {
+                MEDIA_ROOT.to_string()
+            } else {
+                format!("/mnt/ferrum-disk-{i}")
+            };
             Ok(format!(
                 r#"  # {model}, {size} -- partition {part_name}
-  fileSystems."/mnt/media-{i}" = {{
+  fileSystems."{mount}" = {{
     device = "{by_id}";
     fsType = "{fstype}";
     # nofail is load-bearing: without it a disk that is unplugged, asleep
@@ -484,6 +509,7 @@ fn media(disks: &[&Device]) -> anyhow::Result<String> {
                 size = nix_str(&d.size),
                 part_name = nix_str(&part.name),
                 by_id = nix_str(by_id),
+                mount = nix_str(&mount),
             ))
         })
         .collect::<anyhow::Result<Vec<_>>>()?
@@ -503,9 +529,29 @@ fn media(disks: &[&Device]) -> anyhow::Result<String> {
     ))
 }
 
-fn settings(answers: &Answers, stage: Stage) -> serde_json::Value {
+fn settings(answers: &Answers, stage: Stage, data_disks: usize) -> serde_json::Value {
     let mut root = serde_json::Map::new();
     root.insert("schemaVersion".into(), serde_json::json!(1));
+
+    // More than one data disk means a pool, so the apps see one library
+    // instead of one per disk. A single disk is mounted at mediaDir
+    // directly and needs nothing here.
+    //
+    // Only the BRANCH LIST is written: policy and free-space floor keep
+    // their module defaults, so an operator who wants to change them
+    // changes one value rather than having the installer's opinion baked
+    // into their settings.json forever.
+    if data_disks > 1 {
+        root.insert(
+            "storage".into(),
+            serde_json::json!({
+                "pool": {
+                    "enable": true,
+                    "branches": (0..data_disks).map(branch_path).collect::<Vec<_>>(),
+                }
+            }),
+        );
+    }
 
     if let Some(domain) = &answers.base_domain {
         let mut proxy = serde_json::Map::new();
@@ -592,16 +638,19 @@ pub fn render(
         "flake.nix".into(),
         flake(&answers.hostname, ferrum_rev, ssh_keys, approved.firmware),
     );
+    // Computed BEFORE the settings, which now depend on how many there
+    // are: more than one means a pool.
+    let disks = data_disks(&approved.all_devices, &approved.device);
+
     files.insert(
         "settings.json".into(),
-        format!("{}\n", serde_json::to_string_pretty(&settings(answers, Stage::One))?),
+        format!("{}\n", serde_json::to_string_pretty(&settings(answers, Stage::One, disks.len()))?),
     );
     files.insert(
         "settings.stage2.json".into(),
-        format!("{}\n", serde_json::to_string_pretty(&settings(answers, Stage::Two))?),
+        format!("{}\n", serde_json::to_string_pretty(&settings(answers, Stage::Two, disks.len()))?),
     );
 
-    let disks = data_disks(&approved.all_devices, &approved.device);
     if !disks.is_empty() {
         files.insert("custom/media.nix".into(), media(&disks)?);
     }
@@ -736,6 +785,56 @@ pub fn write_repo(dir: &Path, files: &Files) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    /// One data disk mounts AT the media root, not beside it.
+    ///
+    /// The old layout mounted data disks at /mnt/media-N while
+    /// ferrum.storage.mediaDir was /srv/media -- so the apps were pointed
+    /// at an empty directory on the OS disk and the media was mounted
+    /// somewhere nothing looked. On the first real install that meant 7TB
+    /// present, mounted, and invisible to every app.
+    #[test]
+    fn a_single_data_disk_is_mounted_at_the_media_root() {
+        let mut a = approved(Firmware::Uefi);
+        a.all_devices.retain(|d| d.name != "sdc"); // leave one data disk
+        let f = render(&answers(), &a, &keys(), "9656ab2").unwrap();
+        let m = &f["custom/media.nix"];
+        assert!(m.contains(&format!("fileSystems.\"{MEDIA_ROOT}\"")), "{m}");
+        assert!(!m.contains("/mnt/media-"), "the disconnected path must be gone:\n{m}");
+
+        // One disk needs no pool.
+        let st: serde_json::Value = serde_json::from_str(&f["settings.json"]).unwrap();
+        assert!(st.get("storage").is_none(), "a single disk is not a pool: {st}");
+    }
+
+    /// Several disks become pool branches, and the pool is turned on.
+    #[test]
+    fn several_data_disks_become_pool_branches() {
+        let mut a = approved(Firmware::Uefi);
+        // Give the second data disk a filesystem so it counts.
+        a.all_devices = vec![
+            dev("sda", "/dev/disk/by-id/ata-OS_1", None),
+            dev("sdb", "/dev/disk/by-id/ata-DATA_1", Some("ext4")),
+            dev("sdc", "/dev/disk/by-id/ata-DATA_2", Some("ext4")),
+        ];
+        a.device = a.all_devices[0].clone();
+        let f = render(&answers(), &a, &keys(), "9656ab2").unwrap();
+        let m = &f["custom/media.nix"];
+        assert!(m.contains("/mnt/ferrum-disk-0"), "{m}");
+        assert!(m.contains("/mnt/ferrum-disk-1"), "{m}");
+        // The pool is mounted at the root by the module, so media.nix must
+        // NOT also mount a disk there -- that would mount over the pool.
+        assert!(!m.contains(&format!("fileSystems.\"{MEDIA_ROOT}\"")), "{m}");
+
+        let st: serde_json::Value = serde_json::from_str(&f["settings.json"]).unwrap();
+        let pool = &st["storage"]["pool"];
+        assert_eq!(pool["enable"], serde_json::json!(true), "{st}");
+        assert_eq!(
+            pool["branches"],
+            serde_json::json!(["/mnt/ferrum-disk-0", "/mnt/ferrum-disk-1"]),
+            "{st}"
+        );
+    }
+
     /// A data disk is mounted from its PARTITION, never from the disk.
     ///
     /// The first real install generated
