@@ -41,6 +41,27 @@ struct ReconcileConfig {
     /// gap this product exists to close.
     #[serde(default)]
     root_folders: Vec<RootFolder>,
+    /// Where each download client writes.
+    ///
+    /// This is where hardlinking is won or lost. The *arrs import by
+    /// hardlinking out of the download directory into the library, and a
+    /// hardlink cannot cross a filesystem -- so a download client left on
+    /// its own default (somewhere under its state directory on the OS
+    /// disk) makes every import a COPY, silently.
+    #[serde(default)]
+    download_paths: Vec<DownloadPath>,
+}
+
+/// Where one download client should write.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DownloadPath {
+    app: String,
+    /// Finished downloads. Must be under the same root as the library.
+    path: String,
+    /// In-progress downloads, where the client supports a separate one.
+    #[serde(default)]
+    incomplete_path: Option<String>,
 }
 
 /// One `app -> path` root folder registration.
@@ -117,6 +138,19 @@ fn main() -> anyhow::Result<()> {
                     "ferrum-reconcile: {} root folder {} FAILED: {e}",
                     rf.app, rf.path
                 );
+                had_error = true;
+            }
+        }
+    }
+
+    for dp in &config.download_paths {
+        match set_download_path(&config, dp) {
+            Ok(()) => println!(
+                "ferrum-reconcile: {} downloads -> {} OK",
+                dp.app, dp.path
+            ),
+            Err(e) => {
+                eprintln!("ferrum-reconcile: {} downloads -> {} FAILED: {e}", dp.app, dp.path);
                 had_error = true;
             }
         }
@@ -221,6 +255,91 @@ fn ensure_root_folder(config: &ReconcileConfig, rf: &RootFolder) -> anyhow::Resu
         .send_json(serde_json::json!({ "path": rf.path }))
         .map_err(|e| anyhow::anyhow!("POST rootfolder {} failed: {e}", rf.path))?;
     Ok(true)
+}
+
+/// Points a download client at the shared media root.
+///
+/// Both clients are driven through their own APIs rather than by writing
+/// their config files. SABnzbd owns `sabnzbd.ini` and rewrites it on
+/// exit, so seeding it is fragile; qBittorrent's config is worse still.
+/// Setting it through the API is also what makes the value visible in the
+/// app's own UI, which matters when an operator goes looking.
+///
+/// Idempotent because both APIs take a desired value rather than an
+/// append -- setting the same path twice is a no-op.
+///
+/// # Arguments
+/// * `config` - the whole config, for connection details.
+/// * `dp` - the app and the paths it should write to.
+///
+/// # Errors
+/// When the app is unknown, the directory is missing, or its API refuses.
+fn set_download_path(config: &ReconcileConfig, dp: &DownloadPath) -> anyhow::Result<()> {
+    let app = config
+        .apps
+        .get(&dp.app)
+        .ok_or_else(|| anyhow::anyhow!("unknown app '{}' in downloadPaths", dp.app))?;
+    let base = base_url(app);
+
+    for path in std::iter::once(&dp.path).chain(dp.incomplete_path.iter()) {
+        if !std::path::Path::new(path).is_dir() {
+            anyhow::bail!(
+                "{path} does not exist, so {} would reject it. The download \
+                 tree is created by modules/core/storage.nix from \
+                 ferrum.storage.mediaDir.",
+                dp.app
+            );
+        }
+    }
+
+    match dp.app.as_str() {
+        // qBittorrent: LocalHostAuth is off, so no credential is needed
+        // from localhost. setPreferences takes a JSON blob as a form
+        // field, which is its own peculiar shape rather than a JSON body.
+        "qbittorrent" => {
+            let mut prefs = serde_json::json!({ "save_path": dp.path });
+            if let Some(inc) = &dp.incomplete_path {
+                prefs["temp_path"] = serde_json::json!(inc);
+                prefs["temp_path_enabled"] = serde_json::json!(true);
+            }
+            ureq::post(&format!("{base}/api/v2/app/setPreferences"))
+                .send_form(&[("json", &prefs.to_string())])
+                .map_err(|e| anyhow::anyhow!("qBittorrent setPreferences failed: {e}"))?;
+            Ok(())
+        }
+        // SABnzbd: one key per call, and the api key goes in the query.
+        "sabnzbd" => {
+            let key = read_api_key(&app.api_key_secret_path)?.ok_or_else(|| {
+                anyhow::anyhow!("no API key for sabnzbd -- required to set its directories")
+            })?;
+            let mut settings = vec![("complete_dir", dp.path.as_str())];
+            if let Some(inc) = &dp.incomplete_path {
+                settings.push(("download_dir", inc.as_str()));
+            }
+            for (keyword, value) in settings {
+                ureq::get(&format!("{base}/api"))
+                    .query("mode", "set_config")
+                    .query("section", "misc")
+                    .query("keyword", keyword)
+                    .query("value", value)
+                    .query("apikey", &key)
+                    .query("output", "json")
+                    .call()
+                    .map_err(|e| anyhow::anyhow!("SABnzbd set_config {keyword} failed: {e}"))?;
+            }
+            // set_config alone updates the running config; saving persists
+            // it to sabnzbd.ini so it survives a restart.
+            ureq::get(&format!("{base}/api"))
+                .query("mode", "config")
+                .query("name", "save")
+                .query("apikey", &key)
+                .query("output", "json")
+                .call()
+                .map_err(|e| anyhow::anyhow!("SABnzbd config save failed: {e}"))?;
+            Ok(())
+        }
+        other => anyhow::bail!("no download-path support for '{other}'"),
+    }
 }
 
 /// Looks up an existing entry by `name` at `GET {base}{path}` -- both

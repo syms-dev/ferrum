@@ -12,6 +12,16 @@
   defaultPort = 8080;
   defaultSubdomain = "sabnzbd";
   defaultMediaAccess = "readwrite";
+
+  # Where this client writes, under <mediaDir>. Declared here for the same
+  # reason mediaCategory is: adding an app stays "add a directory".
+  #
+  # It must be under the SAME root as the library. The *arrs import by
+  # hardlinking and a hardlink cannot cross a filesystem, so a client
+  # left on its own default -- somewhere under its state directory on the
+  # OS disk -- turns every import into a silent copy.
+  downloadSubdir = "usenet/complete";
+  downloadIncompleteSubdir = "usenet/incomplete";
   # one_factor, not two_factor. Enforcing 2FA locked the operator out of
   # their own host on the first real install: Authelia demands TOTP
   # enrolment before the first login, and ferrum configures the FILESYSTEM

@@ -448,7 +448,12 @@
             inherit system;
             settings = {
               schemaVersion = realMigrations.currentVersion;
-              apps = { sonarr.enable = true; radarr.enable = true; };
+              apps = {
+                sonarr.enable = true;
+                radarr.enable = true;
+                qbittorrent.enable = true;
+                sabnzbd.enable = true;
+              };
             };
             modules = [ ../../../examples/hosts/minimal/configuration.nix ];
           };
@@ -477,6 +482,27 @@
             /data) ;;
             *) fail "mediaDir is ${mediaDir}, not the /data root the TRaSH layout assumes" ;;
           esac
+
+          # THE HARDLINK INVARIANT, which is the reason any of this is
+          # shaped the way it is. Every download path and every root
+          # folder must sit under ONE root: the *arrs import by
+          # hardlinking, a hardlink cannot cross a filesystem, and a
+          # download client left elsewhere turns every import into a
+          # silent copy. Asserting the paths individually would not catch
+          # a layout where each is internally sensible and they are on
+          # different mounts.
+          ${pkgs.jq}/bin/jq -e --arg r "${mediaDir}/" \
+            '[.rootFolders[].path, .downloadPaths[].path, (.downloadPaths[].incompletePath // empty)]
+             | length > 0 and all(startswith($r))' "$cfg" > /dev/null \
+            || fail "a download or library path is outside ${mediaDir}, so imports would copy instead of hardlink"
+
+          ${pkgs.jq}/bin/jq -e --arg p "${mediaDir}/torrents" \
+            '.downloadPaths[] | select(.app == "qbittorrent") | select(.path == $p)' "$cfg" > /dev/null \
+            || fail "qbittorrent does not write to ${mediaDir}/torrents"
+
+          ${pkgs.jq}/bin/jq -e --arg p "${mediaDir}/usenet/complete" --arg i "${mediaDir}/usenet/incomplete" \
+            '.downloadPaths[] | select(.app == "sabnzbd") | select(.path == $p) | select(.incompletePath == $i)' "$cfg" > /dev/null \
+            || fail "sabnzbd's complete/incomplete directories are wrong"
 
           echo ok > $out
         '';

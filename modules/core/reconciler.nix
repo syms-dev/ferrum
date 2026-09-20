@@ -93,9 +93,25 @@ let
       })
     enabledApps);
 
+  # Same shape as rootFolders: derived from the catalog, built from
+  # mediaDir, so the download tree and the library tree are the same tree.
+  downloadPaths = lib.flatten (lib.mapAttrsToList
+    (id: _:
+      let
+        sub = catalog.${id}.downloadSubdir or null;
+        inc = catalog.${id}.downloadIncompleteSubdir or null;
+      in
+      lib.optional (sub != null) ({
+        app = id;
+        path = "${config.ferrum.storage.mediaDir}/${sub}";
+      } // lib.optionalAttrs (inc != null) {
+        incompletePath = "${config.ferrum.storage.mediaDir}/${inc}";
+      }))
+    enabledApps);
+
   reconcileConfigFile = pkgs.writeText "ferrum-reconcile-config.json" (builtins.toJSON {
     apps = lib.mapAttrs appConnInfo enabledApps;
-    inherit pairs rootFolders;
+    inherit pairs rootFolders downloadPaths;
   });
 in
 {
@@ -104,7 +120,7 @@ in
   # Runs when there is EITHER a registration or a root folder to set. A
   # single *arr with no peers still needs its root folder, and gating only
   # on pairs meant it silently got nothing.
-  systemd.services.ferrum-reconcile = lib.mkIf (pairs != [ ] || rootFolders != [ ]) {
+  systemd.services.ferrum-reconcile = lib.mkIf (pairs != [ ] || rootFolders != [ ] || downloadPaths != [ ]) {
     description = "Register download clients and indexer applications across the catalog";
     after = [ "ferrum-apps.target" ];
     wantedBy = [ "ferrum-apps.target" ];
