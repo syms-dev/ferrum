@@ -418,7 +418,15 @@
             ++ lib.optional (sonarrV != null && (sonarrV.locations."/api" or null) == null)
                  "sonarr has no /api location, so its API is behind forward-auth"
             ++ lib.optional (hasAuth sonarrV "/api")
-                 "sonarr's /api is behind forward-auth, which breaks Prowlarr and ferrum-reconcile";
+                 "sonarr's /api is behind forward-auth, which breaks Prowlarr and ferrum-reconcile"
+            # No app may DEFAULT to two_factor. Authelia demands TOTP
+            # enrolment before a first login and ferrum's notifier writes
+            # the enrolment link to a file on the host, so a two_factor
+            # default locks the operator out of a working system. Caught
+            # only by an operator failing to log in, on real hardware.
+            ++ map (a: "${a} defaults to two_factor, which locks the operator out: the TOTP enrolment link goes to a file on the host")
+                 (lib.filter (a: (catalog.${a}.defaultAuthPolicy or "") == "two_factor")
+                   (builtins.attrNames catalog));
         in
         {
           ok = problems == [ ];

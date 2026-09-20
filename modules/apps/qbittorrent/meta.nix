@@ -12,7 +12,21 @@
   defaultPort = 8090;
   defaultSubdomain = "qbittorrent";
   defaultMediaAccess = "readwrite";
-  defaultAuthPolicy = "two_factor";
+  # one_factor, not two_factor. Enforcing 2FA locked the operator out of
+  # their own host on the first real install: Authelia demands TOTP
+  # enrolment before the first login, and ferrum configures the FILESYSTEM
+  # notifier, so the enrolment link is written to
+  # /var/lib/authelia-main/notifications.txt -- a file nobody would think
+  # to look in. SSO was therefore unusable out of the box on a correctly
+  # installed, fully working system.
+  #
+  # Requiring SMTP instead would make a mail server a prerequisite for a
+  # media box, which is worse. So the default is a password behind SSO,
+  # which is what the gate is actually for: these apps ship with no real
+  # authentication of their own, and one_factor closes that. An operator
+  # who wants 2FA can set it per app, and that path should enrol them
+  # during install rather than leaving a link in a file.
+  defaultAuthPolicy = "one_factor";
 
   # /api/v2 (qBittorrent's actual versioned API prefix, matching
   # healthCheck.path below) must reach it without a forward-auth redirect
