@@ -14,15 +14,42 @@ pub enum ApplyResult {
 /// summary into a classification. See Global Constraints in the plan for
 /// what each exit code means: 0 = ok, 2 = activation script failed,
 /// 4 = one or more units failed to start/restart.
+/// Turns the switch's exit code and the post-settle health into a verdict.
+///
+/// Exit 4 means "a unit failed to start or restart" AT THE MOMENT THE
+/// SWITCH FINISHED, which is not the same as a unit that is broken. A
+/// service with Restart=on-failure that exits non-zero once and succeeds
+/// on its next attempt is reported as failed by switch-to-configuration
+/// and is perfectly healthy thirty seconds later.
+///
+/// ferrum-reconcile does exactly that on every apply: it races the apps it
+/// registers, exits 1 when they are not listening yet, and succeeds on the
+/// retry. Five consecutive applies on a working host reported
+/// "apply degraded" about a service that had already fixed itself -- and a
+/// warning that is usually wrong is how a real one gets ignored.
+///
+/// So exit 4 defers to the health check, which polls until the units
+/// settle. A unit that is still not active when that times out is a real
+/// failure and is still reported.
+///
+/// # Arguments
+/// * `switch_exit_code` - what switch-to-configuration returned.
+/// * `all_units_active` - whether the managed units are active AFTER the
+///   settle window, not at the instant the switch returned.
 fn classify(switch_exit_code: i32, all_units_active: bool) -> ApplyResult {
     match switch_exit_code {
         0 if all_units_active => ApplyResult::Succeeded,
         0 => ApplyResult::Degraded(
             "one or more managed units failed to become active".to_string(),
         ),
+        // The activation SCRIPT failing is not a restart race -- nothing
+        // retries it, so this stays immediate.
         2 => ApplyResult::Degraded("activation script failed (exit 2)".to_string()),
+        4 if all_units_active => ApplyResult::Succeeded,
         4 => ApplyResult::Degraded(
-            "one or more units failed to start or restart (exit 4)".to_string(),
+            "one or more units failed to start or restart, and were still not \
+             active after the health-check window (exit 4)"
+                .to_string(),
         ),
         other => ApplyResult::Degraded(format!("switch-to-configuration exited {other}")),
     }
@@ -370,11 +397,39 @@ mod tests {
     }
 
     #[test]
-    fn exit_4_is_degraded_units() {
-        assert_eq!(
-            classify(4, true),
-            ApplyResult::Degraded("one or more units failed to start or restart (exit 4)".to_string())
-        );
+    /// Exit 4 with everything healthy AFTER the settle window is a
+    /// success, not a degradation.
+    ///
+    /// switch-to-configuration reports exit 4 for a unit that failed at
+    /// the instant it finished. ferrum-reconcile does that on every apply
+    /// -- it races the apps it registers, exits 1, and succeeds on the
+    /// retry seconds later. Five consecutive applies on a healthy host
+    /// said "apply degraded" about a service that had already fixed
+    /// itself.
+    ///
+    /// Mutation check: return Degraded for exit 4 regardless and this
+    /// fails.
+    #[test]
+    fn exit_4_that_settles_is_not_degraded() {
+        assert_eq!(classify(4, true), ApplyResult::Succeeded);
+    }
+
+    /// ...but a unit still down after the window is a real failure, and
+    /// the message says the window was given.
+    #[test]
+    fn exit_4_that_does_not_settle_is_still_degraded() {
+        let ApplyResult::Degraded(reason) = classify(4, false) else {
+            panic!("a unit that never came up must be reported");
+        };
+        assert!(reason.contains("still not active"), "{reason}");
+        assert!(reason.contains("exit 4"), "{reason}");
+    }
+
+    /// An activation SCRIPT failure is not a restart race -- nothing
+    /// retries it -- so it must not be softened by the same rule.
+    #[test]
+    fn exit_2_is_never_softened_by_the_settle_check() {
+        assert!(matches!(classify(2, true), ApplyResult::Degraded(_)));
     }
 
     #[test]
