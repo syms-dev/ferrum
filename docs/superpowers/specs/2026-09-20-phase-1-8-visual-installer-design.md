@@ -48,8 +48,14 @@ casually-exposed local web server that does those things is worse than the termi
 **Acceptance criteria.**
 - A1. Bound to loopback by default. Publishing it on a LAN interface is an explicit flag with a
   stated reason, never the default.
-- A2. The printed URL carries a single-use, high-entropy token; requests without it are refused.
-  This is what stops another process on the same machine driving an install.
+- A2. **AMENDED by design finding F5.** The printed URL carries a single-use, high-entropy token;
+  requests without it are refused. This is what stops another process on the same machine driving
+  an install.
+
+  The token goes in the URL **fragment**, not the query string, and is exchanged once for a
+  session cookie. A query string lands in browser history and in the `Referer` of any outbound
+  navigation — and the done screen links out to `plex.tv/claim`, so that is a real path, not a
+  theoretical one. Every external link additionally carries `rel="noopener noreferrer"`.
 - A3. Secrets are write-only across the boundary: the Cloudflare token and the Plex claim token go
   in and are never rendered back, not even masked, and never appear in a GET response or a log.
 - A4. No destructive action is reachable by GET, and none happens without the explicit
@@ -77,8 +83,12 @@ a resume resumes to.
 6. **Done** — see R6.
 
 - A1. The operator can go back to any earlier screen before the confirmation, and cannot after it.
-- A2. Every screen states what has and has not happened to the target yet. "Nothing has been
-  written" is load-bearing information right up until it stops being true.
+- A2. **AMENDED by design finding F1.** Originally "every screen states what has and has not
+  happened to the target yet", which the design spec points out becomes repeated prose that
+  operators stop reading. Instead: ONE persistent ribbon, bound to `Phase`, always visible, saying
+  exactly what has happened to the target. "Nothing has been written" is load-bearing right up
+  until it stops being true, and it should be in one place that changes rather than a sentence on
+  each screen.
 
 ## R4 — the destructive step is unmistakable, and typed
 
@@ -86,9 +96,16 @@ a resume resumes to.
 - A1. Erasure requires typing the disk's **serial**, as the terminal does. Not a checkbox, not a
   held button. The serial is the one thing that cannot be got right by reflex, and it is already
   proven: the terminal gate is what stopped a wrong-disk install during testing.
-- A2. The screen names, unambiguously and without scrolling: the disk to be erased, its size and
-  serial, and **every disk that will be left alone**. The second list matters as much as the
-  first — an operator with 7TB of media needs to see it is not in scope.
+- A2. **AMENDED by design finding F4.** The screen names, unambiguously: the disk to be erased,
+  its size and serial, and **every disk that will be left alone**. The second list matters as much
+  as the first — an operator with 7TB of media needs to see it is not in scope.
+
+  The original "without scrolling" is unsatisfiable on a short window with many disks, and the
+  only ways to satisfy it literally are to truncate or collapse the kept list, which is precisely
+  what this criterion forbids. So the requirement becomes an ORDERING one instead: the gate sits
+  **below** the complete list, so reaching the thing that erases a disk requires scrolling past
+  every disk that survives. That is strictly better than fitting on one screen — it makes the safe
+  list unavoidable rather than merely present.
 - A3. Existing data on the target disk is stated. "This disk currently holds a ferrum install" or
   "this disk has an ext4 filesystem mounted at /mnt/media" changes the decision.
 - A4. After this point the UI says plainly that the disk is gone and a resume will not repartition.
@@ -108,6 +125,16 @@ Two CI runs and one real install sat silent for hours. The terminal showed one s
   waiting for a timeout the operator cannot see.
 - A5. The build runs on the target (`--build-on remote`, load-bearing for an aarch64 operator
   installing an x86_64 host), so its progress comes over SSH. The UI must not imply local work.
+- A6. **ADDED by design finding F2, the most valuable of the nine.** Liveness state, the
+  quiet/overdue thresholds, the plausible window per step, and the **retry count** all live in
+  `ferrum-install` **the library**, on the event stream both front-ends consume. They must not be
+  browser-side logic.
+
+  R1 A3 keeps the terminal a supported path. If only the browser can tell that a step is overdue,
+  the CLI keeps the exact failure mode this entire phase exists to remove — and the CLI is what CI
+  runs, so the regression would be invisible to CI too. The retry count is the specific payload
+  that matters: "47 attempts and none has succeeded" separates looping from slow, where elapsed
+  time alone does not.
 
 ## R6 — it ends with a working system and the keys to it
 
@@ -118,6 +145,10 @@ Two CI runs and one real install sat silent for hours. The terminal showed one s
 - A2. Credentials are shown **as soon as they exist**, not only at the end.
 - A3. Each app is listed with its URL and whether it answered. "Installed" and "reachable on its
   own hostname with a real certificate" are different claims and the UI makes the distinction.
+  **Per design finding F6**, these come from `verify.rs`'s own `Check` results rendered directly,
+  not reinterpreted into a separate UI vocabulary: a second interpretation layer is somewhere for
+  the two to drift, and the design spec shows Service / Reachable / Certificate as three separate
+  columns because merging them into one tick IS this criterion's failure mode.
 - A4. A self-signed fallback certificate is reported as a problem, never as success.
 - A5. Anything still needing a human — a Plex claim token, a DNS record the operator must add — is
   named here with the exact action, per app. This is the list the product exists to keep empty, so
@@ -145,7 +176,19 @@ Two CI runs and one real install sat silent for hours. The terminal showed one s
   structure, and how the disk table and progress view actually look. Those are the subject of the
   companion design work and deliberately not pre-empted here.
 
-## Open questions
+## Open questions — all three answered by the design spec (F7/F8/F9), owner to confirm
+
+- OQ1. **Yes.** Collect the Plex claim token at the point of use, with a link to fetch one and a
+  re-prompt on expiry. The four-minute window makes any earlier collection point wrong, and this
+  is markedly better than the terminal equivalent.
+- OQ2. **Yes.** Surface the 1.7 DNS work: which records will be created, and which already exist
+  pointing elsewhere. The second list is the one that matters — silently overwriting a record
+  someone set deliberately is the failure 1.7 R1 A3 forbids.
+- OQ3. **Yes.** A dry-run mode that walks every screen and stops at the gate. Nearly free, and it
+  is the only practical way to exercise the many-disks-on-a-short-window layouts without that many
+  disks — this feature's own testing needs it.
+
+### Original wording
 
 - OQ1. Does the browser installer collect the Plex claim token (four-minute expiry) at the point of
   use, with a "get one" link and a re-prompt on expiry? That is the natural place for it and is

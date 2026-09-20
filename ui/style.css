@@ -8,13 +8,38 @@
   --text: #e6e8ec;
   --muted: #9aa3b2;
   --accent: #5aa9e6;
-  --danger: #e2574c;
+  /* #e2574c measured 4.48:1 on --panel, a hair under AA. Nudged up
+   * while fixing the light-mode block rather than left as a near-miss,
+   * since danger is the colour the installer uses to say a disk is
+   * about to be erased. 4.96 on --panel, 5.45 on --bg. */
+  --danger: #e86257;
   --ok: #56b96b;
 }
 @media (prefers-color-scheme: light) {
   :root {
     --bg: #f6f7f9; --panel: #fff; --line: #dfe3e8;
     --text: #1b1f27; --muted: #5c6673;
+
+    /* The semantic colours MUST be overridden here too.
+     *
+     * This block used to redefine only the surface and text tokens, so
+     * --accent, --ok and --danger kept the values chosen for the dark
+     * panel (#1c1f26, where they measure 6.5 / 6.7 / 4.5) and landed on
+     * white instead. Measured there: accent 2.54:1, ok 2.46:1, danger
+     * 3.68:1 -- all three fail WCAG AA for text, and two fail even the
+     * 3:1 floor for UI components and graphical objects.
+     *
+     * That is already wrong on the dashboard. It becomes dangerous in the
+     * installer, which uses red and green to say which disk is about to
+     * be erased and which are safe -- a 2.46:1 green is not a signal, and
+     * the operator reading it is about to destroy something.
+     *
+     * Values below are darkened until they clear 4.5:1 against BOTH
+     * surfaces in this block (--panel #fff and --bg #f6f7f9), since these
+     * tokens are used on both. Worst case is ok at 4.74:1 on --bg. */
+    --accent: #15639f;  /* 6.33 on #fff, 5.91 on #f6f7f9 */
+    --ok: #1a7f37;      /* 5.08 on #fff, 4.74 on #f6f7f9 */
+    --danger: #b3261e;  /* 6.54 on #fff, 6.10 on #f6f7f9 */
   }
 }
 * { box-sizing: border-box; }
