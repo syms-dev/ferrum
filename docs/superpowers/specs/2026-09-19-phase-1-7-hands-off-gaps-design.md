@@ -1,6 +1,7 @@
 # Phase 1.7 — the gaps between "installed" and "hands off"
 
-**Status:** draft for owner review. No implementation until approved.
+**Status:** requirements settled -- every open question OQ1-OQ8 is answered inline. Not yet
+through the planning review gate; no implementation until that runs.
 
 ## Why this exists
 
@@ -317,14 +318,17 @@ ferrum currently has it by construction — `/srv/media/downloads` on the OS dis
 - A2. That root is the pool from R3 when there is more than one data disk, and the single data disk
   otherwise. `mediaDir` stops being an independent path that can disagree with where the disks
   actually are.
-- A3. The layout follows the TRaSH recommendation in shape:
+- A3. **The root is `/data`** (OQ8, owner decided), with the TRaSH layout beneath it:
 
-      <root>/
+      /data/
       ├── torrents/{movies,tv,music,books}
       ├── usenet/{incomplete,complete/{movies,tv,music,books}}
       └── media/{movies,tv,music,books}
 
-  ferrum is opinionated and picks this; it is not an operator choice.
+  ferrum is opinionated and picks this; it is not an operator choice. `/data` is the TRaSH
+  convention and what community guides assume, so an operator following any *arr tutorial finds
+  the paths where the tutorial says they will be -- which is itself part of not getting bogged
+  down.
 - A4. Every app's paths are derived from that root — qBittorrent and SABnzbd write into
   `torrents/` and `usenet/`, the *arrs read from those and import into `media/`, Plex and Jellyfin
   read `media/`. No app is configured with a path an operator typed.
@@ -335,9 +339,13 @@ ferrum currently has it by construction — `/srv/media/downloads` on the OS dis
   the failure this requirement exists to prevent, and it is invisible until a library is large.
 
 **Open question.**
-- OQ8. What is `<root>`? `/data` is the TRaSH convention and the one most community guides assume.
-  `/srv/media` is ferrum's current default and would be a smaller change. The owner has said ferrum
-  should be opinionated and follow TRaSH where it has a recommendation, which points at `/data`.
+- OQ8. ~~What is the root?~~ **Answered: `/data`.** See A3.
+
+**Migration note.** `ferrum.storage.mediaDir` currently defaults to `/srv/media`, and the running
+host has an empty `/srv/media/downloads` on the OS disk. Moving to `/data` changes the meaning of
+an existing option, so it needs a schema migration (`modules/lib/migrations.nix`) rather than a
+silent default change: a host already running with files under `/srv/media` must not have them
+quietly become invisible on an update.
 
 ---
 
