@@ -1,6 +1,6 @@
 # Phase 1.7d — R16: ferrum notices when the box stops matching its configuration
 
-**Status:** drafted 2026-09-21. Open questions OQ1–OQ3 block the planning gate. No implementation
+**Status:** drafted 2026-09-21. **OQ1 answered by the owner (report only).** OQ2–OQ3 carry recommendations and do not block. No implementation
 until that runs, and not until the Phase 1.7 R1 pipeline run finishes (one run per checkout).
 
 ## Why this exists
@@ -69,7 +69,9 @@ by noticing an app behaving oddly three weeks later.
 
 ## Open questions for the owner
 
-- **OQ1. Does ferrum ever repair drift automatically, or only report it?** A3 above says report
+- **OQ1 — ANSWERED: report only.** ferrum never repairs drift by itself; A3 stands as written. The owner's call, matching the recommendation. Original reasoning kept below because it is the reopen trigger: if "self-healing" is later taken to mean automatic repair, it returns as an opt-in, per-class, default-off setting and never as a default.
+
+  Original question. **Does ferrum ever repair drift automatically, or only report it?** A3 above says report
   only, and that is the recommendation: automatic repair on a schedule would silently revert a
   change an operator made deliberately at 2am to get something working. But "self-healing" was the
   owner's own word for the product, so this is their call, not mine. A middle option exists —

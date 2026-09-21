@@ -129,12 +129,15 @@ options, not `settingsSchema`. That deferral is now the thing blocking the owner
 - **R20 (from F5):** per-app settings pages render the app submodule's options; `apps` gains real
   schema instead of the deferral.
 
-## Open questions
+## Open questions — answered 2026-09-21
 
-- **OQ1.** For F3's lock-you-out group, is "editable with a confirmation naming the consequence"
-  enough, or should they be read-only in the UI entirely? Recommendation: confirmation, except
-  `schemaVersion`, which should never be editable by anyone.
-- **OQ2.** Should F1's fix generate the schema from Nix at build time (correct by construction,
-  more machinery) or add a check that fails when the two disagree (cheaper, still allows a
-  deliberate omission)? Recommendation: the check first, because it is small and closes the live
-  hole today; generation later if the schema keeps drifting.
+- **OQ1 — ANSWERED: editable, with a confirmation that names the consequence.** The
+  lock-you-out group (`daemon.port`, `daemon.listenAddress`, `daemon.subdomain`, `proxy.enable`,
+  `auth.enable`) stays changeable, but the UI states what will happen before it happens — e.g.
+  "this makes the dashboard unreachable until you change it back over SSH". **`schemaVersion` is
+  read-only regardless**: it is migration state, and no confirmation makes editing it meaningful.
+- **OQ2 — ANSWERED: add the check now, consider generation later.** A build check that fails when
+  an option exists in `modules/core/options.nix` and not in the schema. It is small, it closes the
+  live hole today, and it matches the three checks `checks.nix` already carries for the identical
+  problem. Generating the schema from the option tree stays the better end state and is the reopen
+  trigger: if the two drift again after the check exists, generate it.
