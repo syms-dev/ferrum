@@ -55,6 +55,37 @@ fn classify(switch_exit_code: i32, all_units_active: bool) -> ApplyResult {
     }
 }
 
+/// Folds the DNS reconcile step's outcome into the switch's own verdict
+/// (decision D-08).
+///
+/// DNS runs as a step inside this binary rather than as its own systemd unit
+/// precisely so its failures arrive here with a per-record breakdown intact,
+/// instead of being absorbed by `all_managed_units_active()`'s single
+/// boolean. A record that could not be created is a published app that
+/// nobody can reach, which is the failure R1 exists to fix -- so it degrades
+/// the apply even when the switch and the health check were both clean.
+///
+/// # Arguments
+/// * `base` - the verdict `classify` produced from the switch.
+/// * `dns` - `None` when there is nothing to report, or the breakdown.
+///
+/// # Returns
+/// `base` unchanged when DNS is clean. Otherwise `Degraded`, with the DNS
+/// reason appended to any reason `base` already carried -- a failing switch
+/// and a failing DNS reconcile are two facts and the operator needs both.
+/// `Failed` is left alone: an apply that never got as far as switching is
+/// not degraded *by DNS*, and relabelling it would hide the real cause.
+fn fold_dns_outcome(base: ApplyResult, dns: Option<String>) -> ApplyResult {
+    let Some(reason) = dns else {
+        return base;
+    };
+    match base {
+        ApplyResult::Succeeded => ApplyResult::Degraded(reason),
+        ApplyResult::Degraded(existing) => ApplyResult::Degraded(format!("{existing}; {reason}")),
+        ApplyResult::Failed(existing) => ApplyResult::Failed(existing),
+    }
+}
+
 fn run_ok(cmd: &mut Command) -> anyhow::Result<()> {
     let status = cmd.status()?;
     if !status.success() {
@@ -280,7 +311,15 @@ fn run_inner(
         // degraded (e.g. an app crashed after activation) -- report real
         // health instead of a bare, potentially-false "succeeded".
         progress.event("health-check", "already on the target closure; checking health only");
-        return Ok(classify(0, wait_for_healthy(storage.health_check_timeout)?));
+        let healthy = classify(0, wait_for_healthy(storage.health_check_timeout)?);
+        // DNS is reconciled here too, and that is load-bearing rather than
+        // symmetric: an apply whose records failed (a refused token, an
+        // unreachable API) leaves the closure unchanged, so the operator's
+        // retry after fixing the credential lands on exactly this path. If
+        // it skipped reconciliation there would be no way to converge
+        // without an unrelated configuration change.
+        let dns = crate::dns_reconcile::reconcile_for_apply(&toplevel, progress);
+        return Ok(fold_dns_outcome(healthy, dns));
     }
 
     // 2. Preflight, before touching anything.
@@ -360,7 +399,15 @@ fn run_inner(
 
     progress.event("health-check", "waiting for every managed unit to become active");
     let healthy = wait_for_healthy(storage.health_check_timeout)?;
-    Ok(classify(switch_exit_code, healthy))
+
+    // 8. Reconcile the DNS records the new closure publishes (R1, D-08).
+    // After the switch, so the document read is the one this generation
+    // activated; after the health check, so a host that cannot serve its
+    // apps is not also told its records are wrong. Deliberately not `?`:
+    // Cloudflare being unreachable must degrade the verdict, never turn a
+    // completed switch into an apply error.
+    let dns = crate::dns_reconcile::reconcile_for_apply(&toplevel, progress);
+    Ok(fold_dns_outcome(classify(switch_exit_code, healthy), dns))
 }
 
 /// Unix-seconds-as-a-string, e.g. "1770000000". Not RFC3339 -- deliberately
@@ -436,6 +483,65 @@ mod tests {
         assert_eq!(
             classify(-1, true),
             ApplyResult::Degraded("switch-to-configuration exited -1".to_string())
+        );
+    }
+
+    /// D-08. A switch and a health check that both passed do not make the
+    /// apply a success if the records nobody can reach were never created --
+    /// that is precisely the shape of the incident R1 exists to fix.
+    ///
+    /// Mutation check: return `base` unchanged whatever `dns` says and this
+    /// fails.
+    #[test]
+    fn a_clean_switch_with_a_failed_record_is_degraded_not_succeeded() {
+        assert_eq!(
+            fold_dns_outcome(
+                ApplyResult::Succeeded,
+                Some("1 of 2 DNS record(s) could not be reconciled: auth.example.com (create): refused".to_string()),
+            ),
+            ApplyResult::Degraded(
+                "1 of 2 DNS record(s) could not be reconciled: auth.example.com (create): refused"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn a_clean_reconcile_leaves_the_switchs_own_verdict_alone() {
+        assert_eq!(
+            fold_dns_outcome(ApplyResult::Succeeded, None),
+            ApplyResult::Succeeded
+        );
+        assert_eq!(
+            fold_dns_outcome(ApplyResult::Degraded("a unit is down".to_string()), None),
+            ApplyResult::Degraded("a unit is down".to_string())
+        );
+    }
+
+    /// Two failures are two facts. Collapsing them would leave whichever one
+    /// the operator did not see unfixed.
+    #[test]
+    fn a_degraded_switch_and_a_failed_record_report_both_causes() {
+        let ApplyResult::Degraded(reason) = fold_dns_outcome(
+            ApplyResult::Degraded("a unit is down".to_string()),
+            Some("auth.example.com (create): refused".to_string()),
+        ) else {
+            panic!("two failures must still be a degradation");
+        };
+        assert!(reason.contains("a unit is down"), "{reason}");
+        assert!(reason.contains("auth.example.com"), "{reason}");
+    }
+
+    /// A build that never switched is not degraded *by DNS*; relabelling it
+    /// would bury the real cause.
+    #[test]
+    fn a_failed_apply_keeps_its_own_cause() {
+        assert_eq!(
+            fold_dns_outcome(
+                ApplyResult::Failed("nix build failed".to_string()),
+                Some("auth.example.com (create): refused".to_string()),
+            ),
+            ApplyResult::Failed("nix build failed".to_string())
         );
     }
 

@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 
 mod apply;
+mod dns_reconcile;
 mod gc;
 mod preflight;
 mod progress;
@@ -58,6 +59,22 @@ enum Command {
         /// Overwrite an existing value (use when rotating a credential).
         #[arg(long)]
         replace: bool,
+    },
+    /// Reconcile the DNS records this host publishes against Cloudflare.
+    ///
+    /// Invoked on a schedule by `ferrum-dns-updater.service`
+    /// (`modules/proxy/dns.nix`) to correct the A records ferrum owns when
+    /// this host's public address moves. `ferrum-apply apply` does the same
+    /// work in-process after every switch; this is that reconciliation
+    /// *between* applies, and it is safe to run by hand at any time.
+    ///
+    /// Takes a path, never a credential: the token is read from the file the
+    /// document names, so it never appears in argv and never reaches `ps`.
+    ReconcileDns {
+        /// The desired-record document, normally
+        /// `/etc/ferrum-dns-config.json`.
+        #[arg(long)]
+        config: std::path::PathBuf,
     },
     /// Show what a settings.json schema migration would do, without
     /// writing anything. Read-only: evaluates the real flake via `nix
@@ -456,6 +473,88 @@ fn run_put_secret(name: &str, replace: bool) -> i32 {
     }
 }
 
+/// Reconciles this host's DNS records against Cloudflare, then records that
+/// it did (A8).
+///
+/// Reads only the state directory from the environment, the same way every
+/// other subcommand here does. The credential is never read here: it comes
+/// from the path the document names, inside `dns_reconcile`, so nothing
+/// about it passes through argv or this function.
+fn run_reconcile_dns(config: &std::path::Path) -> i32 {
+    let marker = std::path::PathBuf::from(
+        std::env::var("FERRUM_STATE_DIR").unwrap_or_else(|_| "/var/lib/ferrum/state".to_string()),
+    )
+    .join("dns-updater-last-success");
+    let outcome = dns_reconcile::run(
+        config,
+        &dns_reconcile::cloudflare_client,
+        &dns_reconcile::authoritative_verifier,
+    );
+    reconcile_dns_exit(outcome, &marker, std::time::SystemTime::now())
+}
+
+/// Turns a reconcile outcome into output and an exit code.
+///
+/// Exit codes follow `handle_apply_result`'s convention so a unit or future
+/// automation can tell the cases apart without parsing text: **0** clean,
+/// **3** reconciled but something is wrong, **1** could not reconcile at
+/// all.
+///
+/// The last-success marker is written only on a clean cycle, and a cycle
+/// with nothing to do counts as clean. Its *age* is the signal A8 asks for:
+/// a timer that has been erroring for six weeks is, from outside,
+/// indistinguishable from one that has never had anything to do -- unless
+/// something records the difference. `ferrum-apply apply`'s in-process
+/// reconcile deliberately does not write it, so the file keeps meaning "the
+/// scheduled updater ran and was happy" rather than "something, at some
+/// point, looked".
+///
+/// # Arguments
+/// * `outcome` - what `dns_reconcile::run` returned.
+/// * `marker` - where the last-success timestamp lives.
+/// * `now` - the timestamp to record.
+fn reconcile_dns_exit(
+    outcome: Result<Option<dns_reconcile::ReconcileReport>, dns_reconcile::ReconcileError>,
+    marker: &std::path::Path,
+    now: std::time::SystemTime,
+) -> i32 {
+    let report = match outcome {
+        Ok(Some(report)) => report,
+        Ok(None) => {
+            println!("reconcile-dns: DNS record management is disabled on this host");
+            return 0;
+        }
+        Err(e) => {
+            eprintln!("reconcile-dns: {e}");
+            return 1;
+        }
+    };
+
+    println!("{}", report.full_summary());
+    if let Some(failures) = report.failure_summary() {
+        eprintln!("reconcile-dns: {failures}");
+        return 3;
+    }
+    // Reconciliation itself succeeded, so this is not a failed cycle -- but
+    // an unwritten marker means the next observer cannot tell a working
+    // updater from a silent one, which is the entire point of the file. Say
+    // so rather than exiting 0 in silence.
+    if let Err(e) = dns_reconcile::record_last_success(marker, now) {
+        eprintln!(
+            "reconcile-dns: records are correct, but the last-success marker at {} could not be written: {e}",
+            marker.display()
+        );
+        return 3;
+    }
+    if !report.scheduled {
+        println!(
+            "reconcile-dns: scheduled re-checks are off -- these records will not be corrected \
+             automatically if this host's public address changes"
+        );
+    }
+    0
+}
+
 fn run_gc() -> i32 {
     let mut progress = progress::Progress::open();
     match run_gc_inner(&mut progress) {
@@ -513,6 +612,7 @@ fn main() -> anyhow::Result<()> {
         Command::RestoreState => run_restore_state(),
         Command::Gc => run_gc(),
         Command::PreviewMigration => run_preview_migration(),
+        Command::ReconcileDns { config } => run_reconcile_dns(&config),
         Command::PutSecret { name, replace } => run_put_secret(&name, replace),
         Command::RunRequest { path } => match request::read_request(&path) {
             Ok(req) => run_request(req, &mut progress::Progress::open(), |req| match req {
@@ -535,6 +635,115 @@ fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod reconcile_dns {
+        use super::*;
+        use crate::dns_reconcile::{Operation, ReconcileError, ReconcileReport, RecordReport};
+
+        fn report(records: Vec<RecordReport>, scheduled: bool) -> ReconcileReport {
+            ReconcileReport { records, scheduled }
+        }
+
+        fn clean_record() -> RecordReport {
+            RecordReport {
+                name: "auth.example.com".to_string(),
+                operation: Operation::Create,
+                failure: None,
+                note: None,
+            }
+        }
+
+        fn failed_record() -> RecordReport {
+            RecordReport {
+                name: "plex.example.com".to_string(),
+                operation: Operation::Create,
+                failure: Some("Cloudflare refused the request".to_string()),
+                note: None,
+            }
+        }
+
+        #[test]
+        fn a_clean_cycle_exits_zero_and_leaves_a_timestamp_behind() {
+            let dir = tempfile::tempdir().unwrap();
+            let marker = dir.path().join("state").join("dns-updater-last-success");
+            let code = reconcile_dns_exit(
+                Ok(Some(report(vec![clean_record()], true))),
+                &marker,
+                std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_770_000_000),
+            );
+            assert_eq!(code, 0);
+            assert_eq!(std::fs::read_to_string(&marker).unwrap(), "1770000000\n");
+        }
+
+        /// A cycle with nothing to do is still a cycle that proved the
+        /// records are right, so it must refresh the marker -- otherwise the
+        /// file ages out on a host where nothing is wrong.
+        #[test]
+        fn a_no_op_cycle_still_refreshes_the_marker() {
+            let dir = tempfile::tempdir().unwrap();
+            let marker = dir.path().join("dns-updater-last-success");
+            assert_eq!(
+                reconcile_dns_exit(
+                    Ok(Some(report(Vec::new(), true))),
+                    &marker,
+                    std::time::SystemTime::now()
+                ),
+                0
+            );
+            assert!(marker.exists());
+        }
+
+        /// The marker must not claim a healthy cycle that did not happen: a
+        /// failed record is exactly when a stale timestamp would be read as
+        /// "the updater is fine".
+        ///
+        /// Mutation check: write the marker before checking
+        /// `failure_summary()` and this fails.
+        #[test]
+        fn a_failed_record_exits_three_and_writes_no_timestamp() {
+            let dir = tempfile::tempdir().unwrap();
+            let marker = dir.path().join("dns-updater-last-success");
+            let code = reconcile_dns_exit(
+                Ok(Some(report(vec![clean_record(), failed_record()], true))),
+                &marker,
+                std::time::SystemTime::now(),
+            );
+            assert_eq!(code, 3, "a partial result is a reported failure");
+            assert!(
+                !marker.exists(),
+                "a failed cycle must not leave a marker claiming success"
+            );
+        }
+
+        /// A run that could not start at all is distinct from one that ran
+        /// and found problems, so the exit code distinguishes them.
+        #[test]
+        fn a_run_that_could_not_start_exits_one_and_writes_no_timestamp() {
+            let dir = tempfile::tempdir().unwrap();
+            let marker = dir.path().join("dns-updater-last-success");
+            let code = reconcile_dns_exit(
+                Err(ReconcileError::NoCredentialConfigured),
+                &marker,
+                std::time::SystemTime::now(),
+            );
+            assert_eq!(code, 1);
+            assert!(!marker.exists());
+        }
+
+        #[test]
+        fn a_host_that_does_not_manage_dns_exits_zero_without_a_timestamp() {
+            let dir = tempfile::tempdir().unwrap();
+            let marker = dir.path().join("dns-updater-last-success");
+            assert_eq!(
+                reconcile_dns_exit(Ok(None), &marker, std::time::SystemTime::now()),
+                0
+            );
+            assert!(
+                !marker.exists(),
+                "a host that reconciles nothing has not proved anything about its records"
+            );
+        }
+    }
     use clap::Parser;
 
     /// The `started` line must be the FIRST line of a dispatched job's file.

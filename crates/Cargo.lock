@@ -635,6 +635,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "ferrum-dns",
  "ferrum-secrets",
  "ferrum-state",
  "rustix 0.38.44",
