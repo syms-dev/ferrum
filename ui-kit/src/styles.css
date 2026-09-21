@@ -25,3 +25,6 @@
 @import "./components/RollbackConfirm.css";
 @import "./components/Copyable.css";
 @import "./components/ConfirmErase.css";
+@import "./components/DriftPanel.css";
+@import "./components/UpdateList.css";
+@import "./components/VpnStatus.css";

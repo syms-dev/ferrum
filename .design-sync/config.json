@@ -12,6 +12,12 @@
     "ConfirmErase": {
       "cardMode": "single",
       "viewport": "760x560"
+    },
+    "UpdateList": {
+      "cardMode": "column"
+    },
+    "DriftPanel": {
+      "cardMode": "column"
     }
   },
   "readmeHeader": ".design-sync/conventions.md"
