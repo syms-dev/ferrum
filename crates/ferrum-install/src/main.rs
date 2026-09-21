@@ -19,6 +19,7 @@
 mod answers;
 mod collect;
 mod confirm;
+mod dns;
 mod install;
 mod inventory;
 mod preconditions;
@@ -124,7 +125,12 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
     // is not evidence about this run. `state::effective_reached` owns that
     // rule so it is unit-testable rather than implicit here.
     let reached = state::effective_reached(&resume);
-    let (mut answers, approved) = if asked_fresh {
+    // `adoption` carries R1 A3's decision from the pre-erase gate all the
+    // way to the final report. A resume never re-runs that gate -- it never
+    // re-asks anything -- so it carries an empty outcome, and the report
+    // then says nothing about names it did not ask about rather than
+    // inventing a state it cannot know.
+    let (mut answers, approved, adoption) = if asked_fresh {
         plan_install(&pre)?
     } else {
         recover_plan(&pre)?
@@ -334,7 +340,7 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
     st.phase = state::Phase::Verified;
     state::write(&pre.host_dir, &st)?;
 
-    final_report(&pre, &answers, &evidence)?;
+    final_report(&pre, &answers, &evidence, &adoption)?;
     Ok(())
 }
 
@@ -463,14 +469,33 @@ fn report_preconditions(pre: &preconditions::Preconditions, fresh: bool) {
     }
 }
 
-/// The interactive half: inventory, answers, and the disk gate.
+/// The interactive half: inventory, answers, the disk gate, and the DNS
+/// gate.
+///
+/// **The DNS gate's position is a requirement, not a detail** (R1 A7/A3).
+/// It runs here, after the disk has been named and before anything has
+/// been erased, because that is the last moment an answer about the
+/// operator's zone can still change the outcome. Discovering after the
+/// install that `plex.<domain>` points at the operator's old box means
+/// ferrum publishes Plex, the name still answers from the old machine, and
+/// the operator is handed a manual step -- reported, unreachable, and
+/// exactly the hands-off failure R1 exists to remove. R2/A4 learned the
+/// same lesson about the same window.
+///
+/// # Returns
+/// The answers, the approved disk, and what the operator decided about the
+/// DNS names ferrum does not own.
 fn plan_install(
     pre: &preconditions::Preconditions,
-) -> anyhow::Result<(answers::Answers, confirm::Approved)> {
+) -> anyhow::Result<(answers::Answers, confirm::Approved, dns::Adoption)> {
     let (devices, efi_present) = inventory_phase(pre)?;
     let mut io = prompt::stdio();
     let answers = answers::collect(&mut io, &answers::cloudflare_client)?;
     let approved = confirm::confirm(&devices, efi_present, &mut io)?;
+
+    // Still pre-destructive: a refusal here costs a re-run, and every later
+    // moment is a worse one to learn that ferrum cannot publish a record.
+    let adoption = dns::gate(&answers, &answers::cloudflare_client, &mut io)?;
 
     recheck(pre, &approved)?;
     let path = pre.host_dir.join("install-inventory.json");
@@ -482,13 +507,20 @@ fn plan_install(
         approved.firmware,
         path.display()
     );
-    Ok((answers, approved))
+    Ok((answers, approved, adoption))
 }
 
 /// The resume half: recover what was decided, never re-ask.
+///
+/// The DNS gate is deliberately absent here. It is a pre-erase decision and
+/// a resume runs after the erase, so re-asking would invite a different
+/// answer against a half-installed machine -- the same reason the disk
+/// question is not re-asked. The returned [`dns::Adoption`] is therefore
+/// empty, and the final report stays silent about names this run never put
+/// to the operator rather than asserting a state it cannot know.
 fn recover_plan(
     pre: &preconditions::Preconditions,
-) -> anyhow::Result<(answers::Answers, confirm::Approved)> {
+) -> anyhow::Result<(answers::Answers, confirm::Approved, dns::Adoption)> {
     let mut approved: confirm::Approved = serde_json::from_str(&std::fs::read_to_string(
         pre.host_dir.join("install-inventory.json"),
     )?)?;
@@ -514,7 +546,7 @@ fn recover_plan(
     let stage2 = std::fs::read_to_string(pre.host_dir.join("settings.stage2.json"))?;
     let hostname = read_hostname(&pre.host_dir)?;
     let answers = answers::from_stage2(&stage2, &hostname)?;
-    Ok((answers, approved))
+    Ok((answers, approved, dns::Adoption::none()))
 }
 
 fn read_hostname(dir: &std::path::Path) -> anyhow::Result<String> {
@@ -845,26 +877,84 @@ fn verify_host(
     Ok(failures)
 }
 
+/// The report's URL block and everything that qualifies it.
+///
+/// A pure function rather than a run of `println!` inside [`final_report`]
+/// for one reason: the two caveats it emits are the only warning an
+/// operator gets about hostnames that resolve and then do not answer, and a
+/// warning nothing can assert is a warning a later edit deletes silently.
+/// Returning lines makes both emissions testable without a host.
+///
+/// # Arguments
+/// * `answers` - for the base domain, the SSO choice and the app list.
+/// * `adoption` - R1 A3's outcome, appended as named unreachable apps.
+///
+/// # Returns
+/// The lines to print, or none at all for a host with no base domain --
+/// which publishes nothing, so there is no URL and no caveat to qualify.
+fn url_report(answers: &answers::Answers, adoption: &dns::Adoption) -> Vec<String> {
+    let Some(domain) = answers.base_domain.as_deref() else {
+        return Vec::new();
+    };
+
+    let mut lines = vec![
+        "\nurls:".to_string(),
+        format!("  ferrum        https://{}.{domain}", dns::DAEMON_SUBDOMAIN),
+    ];
+    if answers.sso.enabled {
+        lines.push(format!("  sign-in       https://auth.{domain}"));
+    }
+    for app in &answers.apps {
+        lines.push(format!("  {app:<13} https://{app}.{domain}"));
+    }
+
+    // A6, immediately after the urls block. The owner spent real time
+    // concluding an install had failed because every one of these returned
+    // HTTP 000 from inside the LAN while working perfectly from outside.
+    lines.push(format!("\nnote: {}", dns::SPLIT_HORIZON_CAVEAT));
+    // H-01 option C: the first url above is the one an operator visits
+    // first, and it is the one that resolves into a closed connection.
+    lines.push(format!("note: {}", dns::daemon_record_caveat(domain)));
+
+    let contested = dns::report_lines(adoption);
+    if !contested.is_empty() {
+        lines.push(String::new());
+        lines.extend(contested);
+    }
+    lines
+}
+
 /// Everything the operator needs to actually use the machine.
+///
+/// **Two caveats are printed here as well as in the pre-erase dry run**
+/// (R1 A6 and the owner's H-01 option-C ruling), and the duplication is the
+/// point. The dry run is read before the install and is far up the
+/// scrollback by the time a hostname does not answer; this report is what
+/// is still on screen. Both are fixed strings so a test can assert them
+/// and a regression cannot quietly reword one out of existence.
+///
+/// # Arguments
+/// * `pre` - the checked-in preconditions, for reading the credentials off
+///   the host.
+/// * `answers` - the operator's answers, for the hostname and URL list.
+/// * `evidence` - what the preflight actually proved.
+/// * `adoption` - R1 A3's outcome. A declined name is reported here as a
+///   **named unreachable app**, because the alternative -- a line in a log
+///   the operator scrolled past before the install began -- is how that
+///   fact turns into an unexplained failure hours later.
 fn final_report(
     pre: &preconditions::Preconditions,
     answers: &answers::Answers,
     evidence: &preflight::Evidence,
+    adoption: &dns::Adoption,
 ) -> anyhow::Result<()> {
     println!("\n{}", "=".repeat(64));
     println!("{} is installed.", answers.hostname);
     println!("{}", "=".repeat(64));
     println!("\nproof: {}", evidence.describe());
 
-    if let Some(domain) = &answers.base_domain {
-        println!("\nurls:");
-        println!("  ferrum        https://ferrum.{domain}");
-        if answers.sso.enabled {
-            println!("  sign-in       https://auth.{domain}");
-        }
-        for app in &answers.apps {
-            println!("  {app:<13} https://{app}.{domain}");
-        }
+    for line in url_report(answers, adoption) {
+        println!("{line}");
     }
 
     // Printed once, to the terminal, and written to no file.
@@ -919,6 +1009,7 @@ mod tests {
 
     use super::{
         check_hardware_config_body, ensure_cloudflare_token, needs_hardware_config_transfer,
+        url_report,
     };
     use crate::prompt::testing::Scripted;
     use crate::state::Phase;
@@ -1123,10 +1214,12 @@ mod tests {
         let production_factory = format!("&{}::{}", "answers", "cloudflare_client");
         assert_eq!(
             source.matches(production_factory.as_str()).count(),
-            2,
-            "both token-collection sites -- the first interactive run via \
+            3,
+            "the two token-collection sites -- the first interactive run via \
              answers::collect, and the stage-2 resume via ensure_cloudflare_token -- \
-             must hand the real Cloudflare client to the verification"
+             must hand the real Cloudflare client to the verification; the third is \
+             R1 A7's pre-erase dry run in plan_install, which reads the zone with the \
+             same credential and mints no Secret of its own"
         );
     }
 
@@ -1285,5 +1378,92 @@ mod tests {
     #[test]
     fn the_cli_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    /// Answers for a host that publishes something, so the report has a
+    /// url block to qualify.
+    fn published_answers() -> answers::Answers {
+        answers::from_stage2(
+            &serde_json::json!({
+                "proxy": { "enable": true, "baseDomain": "thesyms.ca" },
+                "auth": { "enable": true, "adminEmail": "me@thesyms.ca" },
+                "apps": { "sonarr": { "enable": true } },
+            })
+            .to_string(),
+            "saltbox",
+        )
+        .expect("the stage-2 document is well formed")
+    }
+
+    /// R1 A6, at the **second** of its two required emission sites.
+    ///
+    /// The dry run carries it too, and the duplication is deliberate: by
+    /// the time a hostname does not answer, the dry run is far up the
+    /// scrollback and this report is what is on screen. The owner spent
+    /// real time concluding an install had failed because every hostname
+    /// returned HTTP 000 from inside the LAN while working from outside.
+    ///
+    /// Mutation check: delete the `SPLIT_HORIZON_CAVEAT` push in
+    /// `url_report` and this test fails; delete the one in `dns::render`
+    /// and `dns::tests::the_dry_run_carries_the_split_horizon_caveat_verbatim`
+    /// fails. Neither covers the other.
+    #[test]
+    fn the_final_report_carries_the_split_horizon_caveat_verbatim() {
+        let report = url_report(&published_answers(), &dns::Adoption::none()).join("\n");
+        assert!(report.contains(dns::SPLIT_HORIZON_CAVEAT), "{report}");
+        // Immediately after the urls block, where A6 places it.
+        let urls = report.find("urls:").expect("the url block is present");
+        let caveat = report
+            .find(dns::SPLIT_HORIZON_CAVEAT)
+            .expect("the caveat is present");
+        assert!(urls < caveat, "{report}");
+    }
+
+    /// H-01 option C, at the second of its two emission sites. Without it
+    /// the one hostname an operator visits first resolves and then dies
+    /// with no explanation -- `ferrum.daemon.subdomain` has no vhost and
+    /// nginx's catch-all answers it with a closed connection.
+    ///
+    /// Mutation check: delete the `daemon_record_caveat` push in
+    /// `url_report` and this fails.
+    #[test]
+    fn the_final_report_discloses_that_the_daemon_hostname_closes_the_connection() {
+        let report = url_report(&published_answers(), &dns::Adoption::none()).join("\n");
+        assert!(
+            report.contains("https://ferrum.thesyms.ca"),
+            "the url is offered: {report}"
+        );
+        assert!(
+            report.contains(&dns::daemon_record_caveat("thesyms.ca")),
+            "and it is qualified: {report}"
+        );
+    }
+
+    /// A3's decline, surfaced where the operator will actually see it
+    /// rather than in a log line from before the disk was erased.
+    #[test]
+    fn a_declined_name_is_reported_as_a_named_unreachable_app() {
+        let adoption = dns::Adoption {
+            adopted: Vec::new(),
+            declined: vec![dns::ForeignName {
+                name: "plex.thesyms.ca".to_string(),
+                current: "198.51.100.9".to_string(),
+                wanted: "203.0.113.7".to_string(),
+            }],
+        };
+        let report = url_report(&published_answers(), &adoption).join("\n");
+        assert!(report.contains("NOT reachable"), "{report}");
+        assert!(report.contains("plex.thesyms.ca"), "{report}");
+        assert!(report.contains("198.51.100.9"), "{report}");
+    }
+
+    /// A host with no base domain publishes nothing, so there is no url
+    /// block and nothing to qualify.
+    #[test]
+    fn a_host_with_no_base_domain_gets_no_url_block_and_no_caveats() {
+        let answers =
+            answers::from_stage2(&serde_json::json!({ "apps": {} }).to_string(), "saltbox")
+                .expect("the stage-2 document is well formed");
+        assert!(url_report(&answers, &dns::Adoption::none()).is_empty());
     }
 }
