@@ -44,3 +44,5 @@ export { UpdateList } from "./components/UpdateList";
 export type { AvailableUpdate, UpdateListProps } from "./components/UpdateList";
 export { VpnStatus } from "./components/VpnStatus";
 export type { VpnStatusProps } from "./components/VpnStatus";
+export { VpnSettings } from "./components/VpnSettings";
+export type { VpnProvider, VpnSettingsProps } from "./components/VpnSettings";

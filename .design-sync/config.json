@@ -18,6 +18,9 @@
     },
     "DriftPanel": {
       "cardMode": "column"
+    },
+    "VpnSettings": {
+      "cardMode": "column"
     }
   },
   "readmeHeader": ".design-sync/conventions.md"
