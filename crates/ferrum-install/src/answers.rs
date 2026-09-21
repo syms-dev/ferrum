@@ -4,6 +4,7 @@
 //! so that a run which is going to fail on a missing answer fails while it
 //! still costs nothing.
 
+use crate::address::{self, Detected};
 use crate::prompt::PromptIo;
 use crate::sso::{self, SsoDecision};
 
@@ -320,19 +321,13 @@ fn validate_public_ipv4(raw: &str) -> anyhow::Result<std::net::Ipv4Addr> {
 /// always" is not "always", and an installer that refused it would be
 /// substituting its own judgement for the operator's about their own
 /// network. So it is said out loud and the answer stays theirs.
+///
+/// Delegates to [`address::routability`] rather than repeating the ranges:
+/// A8's detection classifies the *same* question about an address it found
+/// on the target, and two copies of this judgement would eventually disagree
+/// about which of a typed and a detected address is publishable.
 fn is_reachable_from_outside(addr: &std::net::Ipv4Addr) -> bool {
-    let [first, second, ..] = addr.octets();
-    // 100.64.0.0/10, carrier-grade NAT: what a residential connection looks
-    // like when the ISP has not given the customer a real address, and the
-    // one case where a correct-looking address genuinely cannot work.
-    let carrier_grade_nat = first == 100 && (64..=127).contains(&second);
-    !(addr.is_private()
-        || addr.is_loopback()
-        || addr.is_link_local()
-        || addr.is_unspecified()
-        || addr.is_broadcast()
-        || addr.is_multicast()
-        || carrier_grade_nat)
+    address::routability(addr) == address::Routability::Public
 }
 
 /// Validates the hostname every CNAME will follow.
@@ -364,6 +359,119 @@ fn validate_cname_target(raw: &str) -> anyhow::Result<String> {
     validate_domain(raw)
 }
 
+/// How the A record's address was arrived at.
+///
+/// A8's failure mode is a confidently wrong address nobody looked at, so
+/// every address this installer uses is printed back with its provenance
+/// attached. "203.0.113.10" alone does not tell an operator whether ferrum
+/// found that or they typed it, and those two mistakes have different fixes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AddressSource {
+    /// Found on the target by [`crate::address::detect`].
+    Detected,
+    /// Typed at the prompt, whether or not detection offered something.
+    Entered,
+}
+
+impl AddressSource {
+    /// The parenthetical shown beside the address.
+    fn label(self) -> &'static str {
+        match self {
+            AddressSource::Detected => "detected on the target",
+            AddressSource::Entered => "you entered this",
+        }
+    }
+}
+
+/// How `decide_dns` obtains a candidate address for A8.
+///
+/// A seam rather than a direct call to [`crate::address::detect`] for two
+/// reasons. Production needs the target and the SSH credential, which live
+/// in `preconditions` and have no business reaching this module; and the
+/// tests must never open a socket, because the Nix sandbox that runs the
+/// workspace suite has no network at all.
+///
+/// `FnMut` rather than `Fn`: the prompt offers a re-detect, so it is called
+/// more than once in a single run.
+pub type Detector<'a> = &'a mut dyn FnMut() -> Detected;
+
+/// A8's address question: detect on the target, then confirm.
+///
+/// The order is the requirement. Detection runs first and its result is
+/// always printed, because an address written from a silent guess is exactly
+/// what A8 forbids; only a **public** detected address is then offered as a
+/// default, so an operator pressing enter can never accept a CGNAT, private
+/// or IPv6 answer without having read a paragraph explaining it. Anything
+/// else -- unreachable, unparseable, missing, failed -- falls back to asking,
+/// with the reason stated. Nothing here aborts the install: a detection that
+/// cannot run costs one typed answer, not a re-run.
+///
+/// An overridden value goes through the same [`validate_public_ipv4`] a
+/// detection-free run would use; there is no second, weaker path.
+///
+/// # Arguments
+/// * `io` - the question-and-answer channel with the operator.
+/// * `detect` - the seam described on [`Detector`].
+///
+/// # Returns
+/// The address and where it came from.
+///
+/// # Errors
+/// An input failure, or an answer that fails validation three times.
+fn ask_a_record_address(
+    io: &mut impl PromptIo,
+    detect: Detector<'_>,
+) -> anyhow::Result<(std::net::Ipv4Addr, AddressSource)> {
+    // Bounded like `ask_valid`, and for the same reason: a scripted or
+    // confused session asking to look again forever is a hang, not a retry.
+    for attempt in 0..3 {
+        io.say(
+            "\nLooking for this server's public address -- asking the server \
+             itself, over the\nSSH connection, rather than asking this machine. \
+             A VPN, a corporate network or\nsimply a different connection here \
+             would answer with an address that is not the\nserver's, and that \
+             mistake looks exactly like a correct answer.",
+        );
+        let found = detect();
+        io.say(&found.summary());
+        let Some(candidate) = found.candidate() else {
+            // Reported, not used. The plain prompt below is the fallback.
+            break;
+        };
+        let raw = io.ask(&format!(
+            "Public IPv4 address for the A records ('r' to look again) [{candidate}]:"
+        ))?;
+        let answer = raw.trim();
+        if answer.is_empty() {
+            return Ok((candidate, AddressSource::Detected));
+        }
+        if answer.eq_ignore_ascii_case("r") {
+            if attempt < 2 {
+                continue;
+            }
+            break;
+        }
+        match validate_public_ipv4(answer) {
+            Ok(addr) => return Ok((addr, AddressSource::Entered)),
+            // Not fatal: fall through to the plain prompt, which gives the
+            // operator the same three tries every other answer gets.
+            Err(e) => {
+                io.say(&format!("  {e}"));
+                break;
+            }
+        }
+    }
+
+    Ok((
+        ask_valid(
+            io,
+            "This server's public IPv4 address:",
+            validate_public_ipv4,
+        )?,
+        AddressSource::Entered,
+    ))
+}
+
 /// Asks A2's record-target question and A8's updater question.
 ///
 /// Both are asked, never inferred. A2 exists because ferrum cannot know
@@ -377,13 +485,20 @@ fn validate_cname_target(raw: &str) -> anyhow::Result<String> {
 /// * `domain` - `ferrum.proxy.baseDomain`, used only to make the question
 ///   concrete about which names are at stake.
 /// * `io` - the question-and-answer channel with the operator.
+/// * `detect` - A8's address detection, described on [`Detector`]. Used
+///   only in `A` mode: a CNAME follows a name, so there is no address to
+///   find.
 ///
 /// # Returns
 /// The decision, ready to be rendered into `ferrum.proxy.dns`.
 ///
 /// # Errors
 /// An input failure, or an answer that fails validation three times.
-pub fn decide_dns(domain: &str, io: &mut impl PromptIo) -> anyhow::Result<DnsDecision> {
+pub fn decide_dns(
+    domain: &str,
+    io: &mut impl PromptIo,
+    detect: Detector<'_>,
+) -> anyhow::Result<DnsDecision> {
     io.say(&format!(
         "\nferrum also creates the DNS record for every hostname it publishes, so \
          <app>.{domain}\nresolves without you opening a DNS console. It needs to know \
@@ -402,11 +517,15 @@ pub fn decide_dns(domain: &str, io: &mut impl PromptIo) -> anyhow::Result<DnsDec
 
     let target = match mode {
         RecordMode::A => {
-            let address = ask_valid(
-                io,
-                "This server's public IPv4 address:",
-                validate_public_ipv4,
-            )?;
+            let (address, source) = ask_a_record_address(io, detect)?;
+            // A8: shown before it is used, every time, with its provenance.
+            // This is the last line between a wrong address and every app
+            // published at someone else's server.
+            io.say(&format!(
+                "\n  A records for every app under {domain} will point at {address} \
+                 ({}).",
+                source.label()
+            ));
             if !is_reachable_from_outside(&address) {
                 io.say(&format!(
                     "  Note: {address} is not an address anything outside this network \
@@ -456,12 +575,19 @@ pub fn decide_dns(domain: &str, io: &mut impl PromptIo) -> anyhow::Result<DnsDec
 ///   entered. Production passes [`cloudflare_client`]; tests pass a factory
 ///   pointed at `ferrum_dns::testing::FakeCloudflare`, because the sandbox
 ///   that runs the suite has no network and must never reach the real API.
+/// * `detect` - R1 A8's address detection, described on [`Detector`].
+///   Production runs it on the target over SSH; tests pass a fake, for the
+///   same no-network reason.
 ///
 /// # Errors
 /// An input failure, an answer that fails validation three times, a
 /// declined SSO confirmation (see `sso::decide`), or a Cloudflare token
 /// that cannot manage records for the base domain.
-pub fn collect(io: &mut impl PromptIo, make_client: ClientFactory<'_>) -> anyhow::Result<Answers> {
+pub fn collect(
+    io: &mut impl PromptIo,
+    make_client: ClientFactory<'_>,
+    detect: Detector<'_>,
+) -> anyhow::Result<Answers> {
     let hostname = ask_valid(io, "Hostname for this machine:", validate_hostname)?;
 
     io.say(
@@ -522,7 +648,7 @@ pub fn collect(io: &mut impl PromptIo, make_client: ClientFactory<'_>) -> anyhow
     // declared, so asking for a record target on a run whose token has just
     // been refused would be collecting an answer that cannot be used.
     let dns = match (&base_domain, &cloudflare_token) {
-        (Some(domain), Some(_)) => Some(decide_dns(domain, io)?),
+        (Some(domain), Some(_)) => Some(decide_dns(domain, io, detect)?),
         _ => None,
     };
 
@@ -1020,6 +1146,27 @@ mod tests {
         move |token| ferrum_dns::client::Client::with_base_url(token, base_url.clone())
     }
 
+    /// The detector for every test whose subject is NOT detection.
+    ///
+    /// Reports a failure, so the prompt falls back to asking and each test's
+    /// scripted answers line up with a detection-free run -- which is also
+    /// the real behaviour on a target detection cannot reach. Nothing here
+    /// opens a socket: the sandbox running this suite has no network.
+    fn no_detection() -> impl FnMut() -> Detected {
+        || Detected::Failed {
+            reason: "no target in this test".into(),
+        }
+    }
+
+    /// A detector returning whatever a target would have printed.
+    ///
+    /// Goes through `address::detect` and its classifier rather than
+    /// hand-building a `Detected`, so these tests exercise the same parse
+    /// the real SSH path does.
+    fn detecting(raw: &'static str) -> impl FnMut() -> Detected {
+        move || address::detect(|_command| Ok(raw.to_string()))
+    }
+
     #[test]
     fn hostnames_must_be_dns_labels() {
         assert_eq!(validate_hostname(" Saltbox ").unwrap(), "saltbox");
@@ -1097,7 +1244,7 @@ mod tests {
             "",             // updater: default yes
         ]);
         let fake = healthy_cloudflare();
-        let a = collect(&mut io, &verifying_against(&fake)).unwrap();
+        let a = collect(&mut io, &verifying_against(&fake), &mut no_detection()).unwrap();
         assert_eq!(a.hostname, "saltbox");
         assert_eq!(a.base_domain.as_deref(), Some("thesyms.ca"));
         assert_eq!(a.apps, vec!["plex", "sonarr"]);
@@ -1122,7 +1269,7 @@ mod tests {
     fn no_domain_skips_acme_and_the_token() {
         let mut io = Scripted::new(&["saltbox", "", "plex"]);
         let fake = FakeCloudflare::start();
-        let a = collect(&mut io, &verifying_against(&fake)).unwrap();
+        let a = collect(&mut io, &verifying_against(&fake), &mut no_detection()).unwrap();
         assert_eq!(a.base_domain, None);
         assert_eq!(a.acme_email, None);
         assert_eq!(a.cloudflare_token, None);
@@ -1137,7 +1284,7 @@ mod tests {
     fn a_domain_with_no_apps_does_not_require_the_token() {
         let mut io = Scripted::new(&["saltbox", "thesyms.ca", "me@thesyms.ca", "", "", "a@b.co"]);
         let fake = FakeCloudflare::start();
-        let a = collect(&mut io, &verifying_against(&fake)).unwrap();
+        let a = collect(&mut io, &verifying_against(&fake), &mut no_detection()).unwrap();
         assert!(a.apps.is_empty());
         assert_eq!(a.cloudflare_token, None);
         assert!(
@@ -1172,7 +1319,7 @@ mod tests {
                 "a@b.co",
                 blank,
             ]);
-            let err = collect(&mut io, &verifying_against(&fake))
+            let err = collect(&mut io, &verifying_against(&fake), &mut no_detection())
                 .unwrap_err()
                 .to_string();
             assert!(err.contains("acme.nix"), "{blank:?}: {err}");
@@ -1202,7 +1349,7 @@ mod tests {
             "n",
         ]);
         let fake = healthy_cloudflare();
-        let a = collect(&mut io, &verifying_against(&fake)).unwrap();
+        let a = collect(&mut io, &verifying_against(&fake), &mut no_detection()).unwrap();
         assert!(
             !io.transcript()
                 .contains("secrettoken1234567890abcdefghijklmnopqrs"),
@@ -1234,7 +1381,7 @@ mod tests {
         let mut script = upto_token(GOOD_TOKEN);
         script.extend_from_slice(extra);
         let mut io = Scripted::new(&script);
-        collect(&mut io, &verifying_against(fake))
+        collect(&mut io, &verifying_against(fake), &mut no_detection())
     }
 
     /// R1 A2. Both shapes are supported and the choice is the operator's.
@@ -1273,7 +1420,7 @@ mod tests {
         let mut script = upto_token(GOOD_TOKEN);
         script.extend_from_slice(&["a", "203.0.113.10", ""]);
         let mut io = Scripted::new(&script);
-        let a = collect(&mut io, &verifying_against(&fake)).unwrap();
+        let a = collect(&mut io, &verifying_against(&fake), &mut no_detection()).unwrap();
         assert_eq!(
             a.dns.as_ref().map(|d| d.ddns_updater),
             Some(true),
@@ -1304,7 +1451,7 @@ mod tests {
         let mut script = upto_token(GOOD_TOKEN);
         script.extend_from_slice(&["cname", "dyn.example.net"]);
         let mut io = Scripted::new(&script);
-        let a = collect(&mut io, &verifying_against(&fake)).unwrap();
+        let a = collect(&mut io, &verifying_against(&fake), &mut no_detection()).unwrap();
         assert_eq!(a.dns.map(|d| d.ddns_updater), Some(false));
         let t = io.transcript();
         assert!(
@@ -1366,7 +1513,7 @@ mod tests {
         // hits when the ISP hands out no real address.
         script.extend_from_slice(&["a", "100.64.1.5", "n"]);
         let mut io = Scripted::new(&script);
-        let a = collect(&mut io, &verifying_against(&fake)).unwrap();
+        let a = collect(&mut io, &verifying_against(&fake), &mut no_detection()).unwrap();
         assert_eq!(
             a.dns.map(|d| d.target),
             Some(RecordTarget::A("100.64.1.5".parse().unwrap())),
@@ -1385,6 +1532,273 @@ mod tests {
             assert!(
                 !is_reachable_from_outside(&unreachable.parse().unwrap()),
                 "{unreachable} should have been flagged"
+            );
+        }
+    }
+
+    /// Runs a full collect with a detector, returning the answers and the io
+    /// so a test can assert on what the operator actually saw.
+    fn collect_detecting(
+        fake: &FakeCloudflare,
+        detected: &'static str,
+        extra: &[&'static str],
+    ) -> (Answers, Scripted) {
+        let mut script = upto_token(GOOD_TOKEN);
+        script.extend_from_slice(extra);
+        let mut io = Scripted::new(&script);
+        let a = collect(&mut io, &verifying_against(fake), &mut detecting(detected)).unwrap();
+        (a, io)
+    }
+
+    /// R1 A8, the happy path: found on the target, shown, accepted by
+    /// pressing enter -- and recorded as detected, not entered.
+    ///
+    /// Mutation check: have `ask_a_record_address` return the candidate
+    /// without ever printing it, and the "shown for confirmation" assertion
+    /// fails; drop the default and the script runs an answer short.
+    #[test]
+    fn a_detected_public_address_is_shown_then_taken_by_pressing_enter() {
+        let fake = healthy_cloudflare();
+        let (a, io) = collect_detecting(&fake, "203.0.113.10\n", &["a", "", "n"]);
+        assert_eq!(
+            a.dns.map(|d| d.target),
+            Some(RecordTarget::A("203.0.113.10".parse().unwrap()))
+        );
+        let t = io.transcript();
+        assert!(
+            t.contains("Detected on the target: 203.0.113.10"),
+            "A8 requires it shown before it is used: {t}"
+        );
+        assert!(
+            t.contains("asking the server itself, over the"),
+            "the operator must be told WHERE it was detected, because an \
+             address found on this machine would be the wrong one: {t}"
+        );
+        assert!(
+            t.contains("point at 203.0.113.10 (detected on the target)"),
+            "the source must be stated with the value: {t}"
+        );
+    }
+
+    /// The operator overrides the detected value, and it goes through the
+    /// same validation a detection-free run uses.
+    ///
+    /// Mutation check: accept the typed value without `validate_public_ipv4`
+    /// and the rejected-garbage half fails.
+    #[test]
+    fn an_override_is_honoured_labelled_and_still_validated() {
+        let fake = healthy_cloudflare();
+        let (a, io) = collect_detecting(&fake, "203.0.113.10", &["a", "198.51.100.7", "n"]);
+        assert_eq!(
+            a.dns.map(|d| d.target),
+            Some(RecordTarget::A("198.51.100.7".parse().unwrap())),
+            "the operator's answer wins over the detected one"
+        );
+        assert!(
+            io.transcript()
+                .contains("point at 198.51.100.7 (you entered this)"),
+            "an entered address must not be reported as detected: {}",
+            io.transcript()
+        );
+
+        // A rejected override falls back to the plain prompt, which gives
+        // the same three tries every other answer gets.
+        script_healthy_zone(&fake);
+        let (b, _) = collect_detecting(
+            &fake,
+            "203.0.113.10",
+            &["a", "not-an-address", "198.51.100.8", "n"],
+        );
+        assert_eq!(
+            b.dns.map(|d| d.target),
+            Some(RecordTarget::A("198.51.100.8".parse().unwrap()))
+        );
+    }
+
+    /// 'r' looks again rather than being read as an address.
+    #[test]
+    fn the_operator_can_ask_it_to_look_again() {
+        let fake = healthy_cloudflare();
+        let mut script = upto_token(GOOD_TOKEN);
+        script.extend_from_slice(&["a", "r", "", "n"]);
+        let mut io = Scripted::new(&script);
+        let mut looks = 0usize;
+        let a = collect(&mut io, &verifying_against(&fake), &mut || {
+            looks += 1;
+            address::detect(|_| Ok("203.0.113.10".to_string()))
+        })
+        .unwrap();
+        assert_eq!(looks, 2, "'r' must run detection again, not parse as input");
+        assert_eq!(
+            a.dns.map(|d| d.target),
+            Some(RecordTarget::A("203.0.113.10".parse().unwrap()))
+        );
+    }
+
+    /// R1 A8 / D-11(b). A CGNAT answer is reported and NOT offered as a
+    /// default: the whole point is that pressing enter cannot accept it.
+    ///
+    /// Mutation check: offer any parsed IPv4 as the default and the script
+    /// runs an answer long -- `collect` then fails with "scripted input
+    /// exhausted", which is this test dying.
+    #[test]
+    fn a_detected_cgnat_address_is_reported_never_offered() {
+        let fake = healthy_cloudflare();
+        let (a, io) = collect_detecting(&fake, "100.64.1.5", &["a", "203.0.113.10", "n"]);
+        assert_eq!(
+            a.dns.map(|d| d.target),
+            Some(RecordTarget::A("203.0.113.10".parse().unwrap())),
+            "the CGNAT address must not have become the record's value"
+        );
+        let t = io.transcript();
+        assert!(t.contains("carrier-grade NAT"), "{t}");
+        assert!(
+            !t.contains("[100.64.1.5]"),
+            "it must never appear as a default an operator can accept by \
+             pressing enter: {t}"
+        );
+        assert!(
+            t.contains("point at 203.0.113.10 (you entered this)"),
+            "{t}"
+        );
+        assert!(
+            !io.asked.iter().any(|q| q.contains("'r' to look again")),
+            "the candidate prompt must not be used at all for a CGNAT \
+             answer -- there is nothing to accept: {t}"
+        );
+    }
+
+    /// UF-18. A detected IPv6 address never reaches an A record.
+    ///
+    /// Mutation check: let `Detected::candidate` return something for the
+    /// IPv6 arm and the script runs an answer long, killing this test.
+    #[test]
+    fn a_detected_ipv6_address_never_becomes_an_a_record() {
+        let fake = healthy_cloudflare();
+        let (a, io) = collect_detecting(&fake, "2001:db8::1", &["a", "203.0.113.10", "n"]);
+        assert_eq!(
+            a.dns.map(|d| d.target),
+            Some(RecordTarget::A("203.0.113.10".parse().unwrap()))
+        );
+        let t = io.transcript();
+        assert!(t.contains("2001:db8::1"), "it must be shown: {t}");
+        assert!(
+            t.contains("UF-18"),
+            "and named as a scope decision rather than a parse failure: {t}"
+        );
+        assert!(!t.contains("[2001:db8::1]"), "never a default: {t}");
+        assert!(
+            !io.asked.iter().any(|q| q.contains("'r' to look again")),
+            "the candidate prompt must not be used at all: an IPv6 detection \
+             offers NO default, not a substituted one: {t}"
+        );
+        assert!(
+            io.asked
+                .iter()
+                .any(|q| q == "This server's public IPv4 address:"),
+            "it falls back to the plain prompt: {t}"
+        );
+    }
+
+    /// D-11(b), the case the owner actually lost an attempt to: detection
+    /// produced nothing. That must be a stated failure and a fallback to
+    /// asking -- never a blank or defaulted address, and never an abort.
+    ///
+    /// Mutation check: return `Detected::Public(Ipv4Addr::UNSPECIFIED)` for
+    /// empty output and the address assertion fails; propagate the failure
+    /// as an error and `collect` returns `Err`, also failing here.
+    #[test]
+    fn detection_that_finds_nothing_states_it_and_asks() {
+        let fake = healthy_cloudflare();
+        let (a, io) = collect_detecting(&fake, "", &["a", "203.0.113.10", "n"]);
+        assert_eq!(
+            a.dns.map(|d| d.target),
+            Some(RecordTarget::A("203.0.113.10".parse().unwrap())),
+            "an empty detection must not degrade into a default address"
+        );
+        let t = io.transcript();
+        assert!(t.contains("neither curl nor wget"), "{t}");
+        assert!(
+            t.contains("This server's public IPv4 address:"),
+            "the fallback is asking, with the reason stated first: {t}"
+        );
+
+        // And a detection that could not run at all behaves the same way.
+        script_healthy_zone(&fake);
+        let mut script = upto_token(GOOD_TOKEN);
+        script.extend_from_slice(&["a", "203.0.113.10", "n"]);
+        let mut io = Scripted::new(&script);
+        let b = collect(&mut io, &verifying_against(&fake), &mut || {
+            address::detect(|_| anyhow::bail!("ssh target failed: no route to host"))
+        })
+        .unwrap();
+        assert_eq!(
+            b.dns.map(|d| d.target),
+            Some(RecordTarget::A("203.0.113.10".parse().unwrap()))
+        );
+        assert!(
+            io.transcript().contains("no route to host"),
+            "the reason is stated rather than swallowed: {}",
+            io.transcript()
+        );
+    }
+
+    /// Detection is not run at all for a CNAME: there is no address to find,
+    /// and running it would print a paragraph about something the operator
+    /// has just said they do not want.
+    #[test]
+    fn a_cname_run_never_looks_for_an_address() {
+        let fake = healthy_cloudflare();
+        let mut script = upto_token(GOOD_TOKEN);
+        script.extend_from_slice(&["cname", "dyn.example.net"]);
+        let mut io = Scripted::new(&script);
+        let mut looks = 0usize;
+        collect(&mut io, &verifying_against(&fake), &mut || {
+            looks += 1;
+            address::detect(|_| Ok("203.0.113.10".to_string()))
+        })
+        .unwrap();
+        assert_eq!(looks, 0, "a CNAME follows a name, not an address");
+    }
+
+    /// The operator-facing text for all four A8 outcomes, printed so it can
+    /// be reviewed as prose rather than as format strings.
+    ///
+    /// Run with `cargo test -p ferrum-install a8_prompts -- --nocapture`.
+    /// The assertions are the test; the printing is what makes the wording
+    /// reviewable, which for a feature whose entire value is "the operator
+    /// looked at it" is the part worth checking.
+    #[test]
+    fn a8_prompts_read_correctly_to_an_operator() {
+        for (case, detected, extra) in [
+            ("detected and usable", "203.0.113.10", &["a", "", "n"][..]),
+            (
+                "detected but CGNAT",
+                "100.64.1.5",
+                &["a", "203.0.113.10", "n"][..],
+            ),
+            (
+                "detected IPv6",
+                "2001:db8::1",
+                &["a", "203.0.113.10", "n"][..],
+            ),
+            ("detection failed", "", &["a", "203.0.113.10", "n"][..]),
+        ] {
+            let fake = healthy_cloudflare();
+            let (_, io) = collect_detecting(&fake, detected, extra);
+            println!("\n===== {case} =====");
+            for line in &io.said {
+                println!("{line}");
+            }
+            println!("--- questions asked ---");
+            for line in &io.asked {
+                println!("{line}");
+            }
+            assert!(
+                io.said
+                    .iter()
+                    .any(|s| s.contains("Looking for this server")),
+                "{case}: detection must announce itself"
             );
         }
     }
@@ -1426,7 +1840,7 @@ mod tests {
     fn no_token_means_the_dns_questions_are_never_asked() {
         let mut io = Scripted::new(&["saltbox", "", "plex"]);
         let fake = FakeCloudflare::start();
-        let a = collect(&mut io, &verifying_against(&fake)).unwrap();
+        let a = collect(&mut io, &verifying_against(&fake), &mut no_detection()).unwrap();
         assert_eq!(a.dns, None);
         let t = io.transcript();
         assert!(!t.contains("Record target"), "should not have asked: {t}");
@@ -1574,7 +1988,7 @@ mod tests {
             "n",
         ]);
         let fake = healthy_cloudflare();
-        collect(&mut io, &verifying_against(&fake)).unwrap();
+        collect(&mut io, &verifying_against(&fake), &mut no_detection()).unwrap();
         assert_eq!(
             io.secret_asks.len(),
             1,
@@ -1598,7 +2012,7 @@ mod tests {
             "n",
         ]);
         let fake = healthy_cloudflare();
-        let a = collect(&mut io, &verifying_against(&fake)).unwrap();
+        let a = collect(&mut io, &verifying_against(&fake), &mut no_detection()).unwrap();
         let rendered = format!("{a:?}");
         assert!(
             !rendered.contains("supersecret1234567890abcdefghijklmnopqrs"),
@@ -1677,7 +2091,7 @@ mod tests {
             GOOD_TOKEN,
         ]);
 
-        let err = collect(&mut io, &verifying_against(&fake))
+        let err = collect(&mut io, &verifying_against(&fake), &mut no_detection())
             .unwrap_err()
             .to_string();
 

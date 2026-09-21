@@ -16,6 +16,7 @@
 //! step, so its progress is recorded and it is resumable (spec R7). What is
 //! implemented so far is the part that runs before anything is contacted.
 
+mod address;
 mod answers;
 mod collect;
 mod confirm;
@@ -490,7 +491,12 @@ fn plan_install(
 ) -> anyhow::Result<(answers::Answers, confirm::Approved, dns::Adoption)> {
     let (devices, efi_present) = inventory_phase(pre)?;
     let mut io = prompt::stdio();
-    let answers = answers::collect(&mut io, &answers::cloudflare_client)?;
+    // R1 A8: the address is found ON THE TARGET, over the same SSH path
+    // every other remote check uses. Detecting it from this process would
+    // report the operator's own machine's address -- correct-looking,
+    // wrong, and indistinguishable from the right answer afterwards.
+    let mut detect = || address::detect(|cmd| collect::run(&pre.target, &pre.ssh_auth, cmd));
+    let answers = answers::collect(&mut io, &answers::cloudflare_client, &mut detect)?;
     let approved = confirm::confirm(&devices, efi_present, &mut io)?;
 
     // Still pre-destructive: a refusal here costs a re-run, and every later
