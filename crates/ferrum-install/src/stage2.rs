@@ -177,6 +177,9 @@ mod tests {
             },
             apps: apps.iter().map(|s| s.to_string()).collect(),
             cloudflare_token: Some(crate::answers::Secret::new("tok".into())),
+            // Nothing in this module reads the DNS decision; it reaches the
+            // host through settings.json, which render.rs owns and tests.
+            dns: None,
         }
     }
 

@@ -24,7 +24,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use crate::answers::Answers;
+use crate::answers::{Answers, DnsDecision, RecordTarget};
 use crate::confirm::Approved;
 use crate::inventory::{Device, Firmware};
 
@@ -527,6 +527,51 @@ fn media(disks: &[&Device]) -> anyhow::Result<String> {
     ))
 }
 
+/// Renders R1 A2/A8's decision as `ferrum.proxy.dns`.
+///
+/// `enable` is written as `true` because that is the whole point of
+/// collecting the answer: `modules/core/options.nix` defaults the option to
+/// `false` only because no address can be guessed safely, and the installer
+/// is what supplies the one thing that was missing. A host whose operator
+/// answered these questions and still had to open a DNS console would have
+/// gained nothing.
+///
+/// Only the fields the decision actually determines are written. The mode's
+/// unused sibling (`cnameTarget` in A mode, `staticAddress` in CNAME mode)
+/// and `ddnsUpdater.intervalMinutes` keep their module defaults, so an
+/// operator changing their mind later edits one value rather than working
+/// around this installer's opinion frozen into their settings.json.
+///
+/// # Arguments
+/// * `decision` - what the operator chose at the prompt.
+///
+/// # Returns
+/// The `ferrum.proxy.dns` object.
+fn dns_settings(decision: &DnsDecision) -> serde_json::Value {
+    let mut dns = serde_json::Map::new();
+    dns.insert("enable".into(), serde_json::json!(true));
+    match &decision.target {
+        RecordTarget::A(address) => {
+            dns.insert("recordMode".into(), serde_json::json!("a"));
+            dns.insert(
+                "staticAddress".into(),
+                serde_json::json!(address.to_string()),
+            );
+        }
+        RecordTarget::Cname(hostname) => {
+            dns.insert("recordMode".into(), serde_json::json!("cname"));
+            dns.insert("cnameTarget".into(), serde_json::json!(hostname));
+        }
+    }
+    // Written only when it is on. `answers::decide_dns` never offers the
+    // updater in CNAME mode, so this cannot produce the combination
+    // modules/proxy/dns.nix asserts against.
+    if decision.ddns_updater {
+        dns.insert("ddnsUpdater".into(), serde_json::json!({ "enable": true }));
+    }
+    serde_json::Value::Object(dns)
+}
+
 fn settings(answers: &Answers, stage: Stage, data_disks: usize) -> serde_json::Value {
     let mut root = serde_json::Map::new();
     root.insert("schemaVersion".into(), serde_json::json!(1));
@@ -557,6 +602,16 @@ fn settings(answers: &Answers, stage: Stage, data_disks: usize) -> serde_json::V
         proxy.insert("baseDomain".into(), serde_json::json!(domain));
         if let Some(email) = &answers.acme_email {
             proxy.insert("acme".into(), serde_json::json!({ "email": email }));
+        }
+        // R1 A2/A8, and stage 2 only. modules/proxy/dns.nix asserts that
+        // ferrum.proxy.dns.enable implies a declared credential, and stage 1
+        // deliberately declares no secrets at all -- so writing this block
+        // into stage 1 would make the first evaluation fail on an assertion
+        // about a credential that cannot exist yet.
+        if stage == Stage::Two {
+            if let Some(decision) = &answers.dns {
+                proxy.insert("dns".into(), dns_settings(decision));
+            }
         }
         root.insert("proxy".into(), serde_json::Value::Object(proxy));
     }
@@ -1108,6 +1163,10 @@ mod tests {
             },
             apps: vec!["sonarr".into(), "plex".into()],
             cloudflare_token: Some(crate::answers::Secret::new("tok".into())),
+            dns: Some(DnsDecision {
+                target: RecordTarget::A("203.0.113.10".parse().expect("a literal address")),
+                ddns_updater: true,
+            }),
         }
     }
 
@@ -1548,6 +1607,79 @@ mod tests {
         // acme.nix checks `ferrum.secrets ? acme-dns` as well as the file,
         // so the token alone is not enough.
         assert!(s["secrets"]["acme-dns"].is_object(), "{s}");
+    }
+
+    /// R1 A2. The record target the operator chose has to arrive in the
+    /// settings under the names modules/core/options.nix declares, and
+    /// `enable` has to be flipped on -- it defaults to false there only
+    /// because no address can be guessed, and this installer is what
+    /// supplies the missing answer. A host whose operator answered the
+    /// question and still had to open a DNS console gained nothing.
+    #[test]
+    fn a_mode_renders_the_address_and_nothing_of_the_other_mode() {
+        let f = render(&answers(), &approved(Firmware::Uefi), &keys(), "abc1234").unwrap();
+        let s: serde_json::Value = serde_json::from_str(&f["settings.stage2.json"]).unwrap();
+        let dns = &s["proxy"]["dns"];
+        assert_eq!(dns["enable"], true, "{s}");
+        assert_eq!(dns["recordMode"], "a", "{s}");
+        assert_eq!(dns["staticAddress"], "203.0.113.10", "{s}");
+        assert!(
+            dns.get("cnameTarget").is_none(),
+            "the other mode's target must not be written: {s}"
+        );
+        assert_eq!(dns["ddnsUpdater"]["enable"], true, "{s}");
+        // The interval keeps its module default rather than freezing
+        // today's value into this host forever.
+        assert!(dns.pointer("/ddnsUpdater/intervalMinutes").is_none(), "{s}");
+    }
+
+    /// R1 A2 and A8. CNAME mode is the mirror image, and the updater must
+    /// be absent entirely: modules/proxy/dns.nix asserts the combination is
+    /// invalid, so rendering it would produce a host that cannot evaluate.
+    #[test]
+    fn cname_mode_renders_the_hostname_and_never_the_updater() {
+        let mut a = answers();
+        a.dns = Some(DnsDecision {
+            target: RecordTarget::Cname("saltbox.dynamic-dns.example.net".into()),
+            ddns_updater: false,
+        });
+        let f = render(&a, &approved(Firmware::Uefi), &keys(), "abc1234").unwrap();
+        let s: serde_json::Value = serde_json::from_str(&f["settings.stage2.json"]).unwrap();
+        let dns = &s["proxy"]["dns"];
+        assert_eq!(dns["enable"], true, "{s}");
+        assert_eq!(dns["recordMode"], "cname", "{s}");
+        assert_eq!(dns["cnameTarget"], "saltbox.dynamic-dns.example.net", "{s}");
+        assert!(dns.get("staticAddress").is_none(), "{s}");
+        assert!(
+            dns.get("ddnsUpdater").is_none(),
+            "the updater is meaningless for a CNAME and dns.nix asserts \
+             against it: {s}"
+        );
+    }
+
+    /// Stage 1 declares no secrets at all, and modules/proxy/dns.nix
+    /// asserts that dns.enable implies a declared credential. Writing the
+    /// block into stage 1 would fail the FIRST evaluation -- the one that
+    /// happens before the disk is erased -- on an assertion about a
+    /// credential that cannot exist yet.
+    #[test]
+    fn stage_one_carries_no_dns_block() {
+        let f = render(&answers(), &approved(Firmware::Uefi), &keys(), "abc1234").unwrap();
+        let s: serde_json::Value = serde_json::from_str(&f["settings.json"]).unwrap();
+        assert!(s["proxy"].get("dns").is_none(), "{s}");
+        // ... while the rest of the proxy is configured as before.
+        assert_eq!(s["proxy"]["baseDomain"], "thesyms.ca");
+    }
+
+    /// A host with no domain publishes nothing, so there is no record to
+    /// create and no block to write.
+    #[test]
+    fn no_dns_decision_means_no_dns_block() {
+        let mut a = answers();
+        a.dns = None;
+        let f = render(&a, &approved(Firmware::Uefi), &keys(), "abc1234").unwrap();
+        let s: serde_json::Value = serde_json::from_str(&f["settings.stage2.json"]).unwrap();
+        assert!(s["proxy"].get("dns").is_none(), "{s}");
     }
 
     /// Writing a value that still equals its default freezes today's

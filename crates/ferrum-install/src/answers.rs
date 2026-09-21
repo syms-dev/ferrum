@@ -56,6 +56,53 @@ impl std::fmt::Debug for Secret {
     }
 }
 
+/// What the DNS records ferrum owns point at (spec R1 A2).
+///
+/// A2 calls this "a decision, not an assumption", and an enum is how that
+/// is enforced rather than merely documented: there are exactly two shapes
+/// and no absent one. A server on a static public address wants `A`; one
+/// behind an address that changes wants `Cname` onto a name something else
+/// already keeps current. Guessing wrong publishes every app at a server
+/// that is not this one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecordTarget {
+    /// `A` records to a stated public IPv4 address.
+    ///
+    /// Held as an [`std::net::Ipv4Addr`] rather than a `String` so that a
+    /// value which got this far cannot be anything else: it is parsed once,
+    /// at the prompt where a human can fix it, and no later reader has to
+    /// ask the question again.
+    A(std::net::Ipv4Addr),
+    /// `CNAME` records following a stated hostname -- typically a
+    /// dynamic-DNS name maintained outside ferrum.
+    Cname(String),
+}
+
+/// The operator's DNS answers: where the records point (R1 A2), and
+/// whether a timer keeps them current (R1 A8).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DnsDecision {
+    /// A2's choice, made once and applied to every record.
+    pub target: RecordTarget,
+    /// A8's updater. Offered with the recommended answer as the default in
+    /// `A` mode, and not offered at all in `Cname` mode: a CNAME already
+    /// delegates address tracking to whatever owns the target name, and
+    /// `modules/proxy/dns.nix` asserts that combination is invalid rather
+    /// than running a timer with nothing to do.
+    pub ddns_updater: bool,
+}
+
+/// Which of A2's two shapes the operator picked.
+///
+/// Separate from [`RecordTarget`] because the mode is known one question
+/// before its value is: the prompt asks "a or cname", and only then asks
+/// for the address or the hostname that mode needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecordMode {
+    A,
+    Cname,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub struct Answers {
     pub hostname: String,
@@ -67,6 +114,14 @@ pub struct Answers {
     /// a file on the operator's machine and never logged; it reaches the
     /// host through `ferrum-apply put-secret` during stage 2.
     pub cloudflare_token: Option<Secret>,
+    /// R1 A2/A8: what ferrum's own DNS records point at, and whether the
+    /// updater runs.
+    ///
+    /// `None` on a host that publishes nothing or has no credential to
+    /// manage records with -- `modules/proxy/dns.nix` asserts that
+    /// `ferrum.proxy.dns.enable` implies a base domain and a declared
+    /// credential, so there is nothing to ask about without both.
+    pub dns: Option<DnsDecision>,
 }
 
 /// A hostname must be a DNS label: it becomes `networking.hostName` and
@@ -185,6 +240,214 @@ fn ask_valid<T>(
     unreachable!("the loop returns or errors on its last iteration")
 }
 
+/// Parses A2's record-mode answer.
+///
+/// Strict: an empty string is NOT a mode here. The prompt supplies its own
+/// default before calling this, so that a `recordMode` recovered from a
+/// hand-edited settings document cannot quietly become "a" because someone
+/// blanked it.
+///
+/// # Arguments
+/// * `raw` - the operator's answer, or a document's `recordMode`.
+///
+/// # Errors
+/// When the value is neither mode, naming both and what each is for.
+fn parse_record_mode(raw: &str) -> anyhow::Result<RecordMode> {
+    match raw.trim().to_lowercase().as_str() {
+        "a" => Ok(RecordMode::A),
+        "cname" => Ok(RecordMode::Cname),
+        other => anyhow::bail!(
+            "{other:?} is not a record mode. Answer 'a' for A records \
+             pointing at this server's own public IPv4 address, or 'cname' \
+             for records that follow a hostname something else already \
+             keeps current."
+        ),
+    }
+}
+
+/// Validates the address every A record will point at.
+///
+/// Parsed here, at the one place a human types it, because the alternative
+/// is `modules/proxy/dns.nix`'s assertion firing during an evaluation that
+/// happens long after the operator has walked away -- and because a value
+/// that is not an address at all would otherwise reach Cloudflare and be
+/// rejected there, far from its cause.
+///
+/// # Arguments
+/// * `raw` - what the operator typed.
+///
+/// # Returns
+/// The parsed address.
+///
+/// # Errors
+/// When it is empty, when it is IPv6, or when it is not an IPv4 address.
+/// Each says a different thing, because each has a different fix.
+fn validate_public_ipv4(raw: &str) -> anyhow::Result<std::net::Ipv4Addr> {
+    let value = raw.trim();
+    if value.is_empty() {
+        anyhow::bail!(
+            "an address is required. modules/proxy/dns.nix refuses to \
+             evaluate with an empty ferrum.proxy.dns.staticAddress rather \
+             than publish every app at somewhere that is not this server -- \
+             so an empty answer here costs the whole install, thirty minutes \
+             from now, with the error naming Nix instead of this question. \
+             Give this server's public IPv4 address, e.g. 203.0.113.10."
+        );
+    }
+    if let Ok(v6) = value.parse::<std::net::Ipv6Addr>() {
+        anyhow::bail!(
+            "{v6} is an IPv6 address. ferrum publishes A and CNAME records \
+             and no AAAA record at all: that is a deliberate scope decision \
+             (finding UF-18), not a bug or a gap in this check. Give this \
+             server's public IPv4 address, or answer 'cname' and point at a \
+             hostname that already carries whatever records you want."
+        );
+    }
+    value.parse::<std::net::Ipv4Addr>().map_err(|_| {
+        anyhow::anyhow!(
+            "{value:?} is not an IPv4 address. It must be four decimal \
+             octets, e.g. 203.0.113.10 -- and it must be the address the \
+             internet reaches this server at, not its address on your LAN."
+        )
+    })
+}
+
+/// Whether an address can be reached from outside this network at all.
+///
+/// Report-only, never a refusal. A private, loopback, link-local or CGNAT
+/// address in a public A record is almost always a mistake -- it publishes a
+/// name that resolves somewhere nobody outside can reach -- but "almost
+/// always" is not "always", and an installer that refused it would be
+/// substituting its own judgement for the operator's about their own
+/// network. So it is said out loud and the answer stays theirs.
+fn is_reachable_from_outside(addr: &std::net::Ipv4Addr) -> bool {
+    let [first, second, ..] = addr.octets();
+    // 100.64.0.0/10, carrier-grade NAT: what a residential connection looks
+    // like when the ISP has not given the customer a real address, and the
+    // one case where a correct-looking address genuinely cannot work.
+    let carrier_grade_nat = first == 100 && (64..=127).contains(&second);
+    !(addr.is_private()
+        || addr.is_loopback()
+        || addr.is_link_local()
+        || addr.is_unspecified()
+        || addr.is_broadcast()
+        || addr.is_multicast()
+        || carrier_grade_nat)
+}
+
+/// Validates the hostname every CNAME will follow.
+///
+/// Reuses [`validate_domain`]: a CNAME target is a DNS name and needs
+/// exactly the same allowlist, for exactly the same reason -- it is written
+/// into the host's settings and read back by the reconciler.
+///
+/// # Arguments
+/// * `raw` - what the operator typed.
+///
+/// # Returns
+/// The trimmed, lowercased hostname.
+///
+/// # Errors
+/// When it is empty (naming the Nix assertion that would otherwise fire
+/// much later), or when it is not a syntactically valid DNS name.
+fn validate_cname_target(raw: &str) -> anyhow::Result<String> {
+    if raw.trim().is_empty() {
+        anyhow::bail!(
+            "a target hostname is required. modules/proxy/dns.nix refuses to \
+             evaluate with an empty ferrum.proxy.dns.cnameTarget rather than \
+             write records that follow nothing -- so an empty answer here \
+             fails the install later instead of this question now. It is \
+             typically a dynamic-DNS name that already tracks this host's \
+             address, e.g. myhost.dynamic-dns.example.net."
+        );
+    }
+    validate_domain(raw)
+}
+
+/// Asks A2's record-target question and A8's updater question.
+///
+/// Both are asked, never inferred. A2 exists because ferrum cannot know
+/// which shape is right for a given host, and A8 exists because the failure
+/// a stale record causes is one the operator cannot observe: every app goes
+/// unreachable from outside while the host stays healthy, its services keep
+/// running and its certificates stay valid, with no error logged anywhere.
+/// That is why the updater's default is on rather than off.
+///
+/// # Arguments
+/// * `domain` - `ferrum.proxy.baseDomain`, used only to make the question
+///   concrete about which names are at stake.
+/// * `io` - the question-and-answer channel with the operator.
+///
+/// # Returns
+/// The decision, ready to be rendered into `ferrum.proxy.dns`.
+///
+/// # Errors
+/// An input failure, or an answer that fails validation three times.
+pub fn decide_dns(domain: &str, io: &mut impl PromptIo) -> anyhow::Result<DnsDecision> {
+    io.say(&format!(
+        "\nferrum also creates the DNS record for every hostname it publishes, so \
+         <app>.{domain}\nresolves without you opening a DNS console. It needs to know \
+         what those records should\npoint at, and it will not guess: a wrong answer \
+         publishes every app at a server that\nis not this one.\n\n  \
+         a      A records pointing at this server's own public IPv4 address\n  \
+         cname  records following a hostname something else keeps current\n         \
+         (typically a dynamic-DNS name)"
+    ));
+    let mode = ask_valid(io, "Record target ('a' or 'cname') [a]:", |raw| {
+        // The prompt's own default, applied before the strict parse, so that
+        // pressing enter means "a" without the parser itself accepting a
+        // blank recordMode out of a settings document.
+        parse_record_mode(if raw.trim().is_empty() { "a" } else { raw })
+    })?;
+
+    let target = match mode {
+        RecordMode::A => {
+            let address = ask_valid(
+                io,
+                "This server's public IPv4 address:",
+                validate_public_ipv4,
+            )?;
+            if !is_reachable_from_outside(&address) {
+                io.say(&format!(
+                    "  Note: {address} is not an address anything outside this network \
+                     can reach.\n  The records will resolve and every app will still be \
+                     unreachable from the\n  internet. Continuing with it, as you asked."
+                ));
+            }
+            RecordTarget::A(address)
+        }
+        RecordMode::Cname => RecordTarget::Cname(ask_valid(
+            io,
+            "Hostname the records should follow:",
+            validate_cname_target,
+        )?),
+    };
+
+    let ddns_updater = match &target {
+        // Not offered, rather than merely defaulted off: modules/proxy/dns.nix
+        // asserts the updater and CNAME mode are incompatible, so an operator
+        // who said yes here would meet that assertion instead of an install.
+        RecordTarget::Cname(_) => false,
+        RecordTarget::A(_) => {
+            io.say(
+                "\nIf this server's public address ever changes, those A records go \
+                 stale and every\napp becomes unreachable from outside -- while the host \
+                 stays healthy, the services\nkeep running and the certificates stay \
+                 valid, with nothing anywhere reporting an\nerror. An hourly check \
+                 corrects them, and only ever touches records ferrum\ncreated. \
+                 Recommended unless this address is contractually static.",
+            );
+            let answer = io.ask("Keep the records up to date automatically? [Y/n]")?;
+            !matches!(answer.to_lowercase().as_str(), "n" | "no")
+        }
+    };
+
+    Ok(DnsDecision {
+        target,
+        ddns_updater,
+    })
+}
+
 /// Collects every operator answer.
 ///
 /// # Arguments
@@ -254,6 +517,15 @@ pub fn collect(io: &mut impl PromptIo, make_client: ClientFactory<'_>) -> anyhow
         _ => None,
     };
 
+    // Asked after the token, and only when there is one. Record management
+    // uses that same credential and modules/proxy/dns.nix asserts it is
+    // declared, so asking for a record target on a run whose token has just
+    // been refused would be collecting an answer that cannot be used.
+    let dns = match (&base_domain, &cloudflare_token) {
+        (Some(domain), Some(_)) => Some(decide_dns(domain, io)?),
+        _ => None,
+    };
+
     Ok(Answers {
         hostname,
         base_domain,
@@ -261,6 +533,7 @@ pub fn collect(io: &mut impl PromptIo, make_client: ClientFactory<'_>) -> anyhow
         sso,
         apps,
         cloudflare_token,
+        dns,
     })
 }
 
@@ -577,7 +850,78 @@ pub fn from_stage2(body: &str, hostname: &str) -> anyhow::Result<Answers> {
         },
         apps,
         cloudflare_token: None,
+        dns: dns_from_settings(&doc)?,
     })
+}
+
+/// Recovers R1 A2/A8's decision from a generated settings document.
+///
+/// Re-validated exactly like every other recovered field, and for the same
+/// reason this function's caller gives: between an interrupted run and a
+/// resume, that file can legitimately have been edited by hand. An empty
+/// `staticAddress` or a `cnameTarget` that is not a hostname must fail here,
+/// with the fix in the message, rather than as a Nix assertion thirty
+/// minutes into a build.
+///
+/// # Arguments
+/// * `doc` - the parsed `settings.stage2.json`.
+///
+/// # Returns
+/// The recovered decision, or `None` when the document manages no DNS --
+/// which is the honest answer for a host that publishes nothing, and is
+/// distinguishable from a malformed one because that is an error instead.
+///
+/// # Errors
+/// A record mode that is neither `a` nor `cname`, a target that fails the
+/// same validation the prompt applies, or the updater enabled alongside
+/// CNAME mode -- the one combination `modules/proxy/dns.nix` rejects.
+fn dns_from_settings(doc: &serde_json::Value) -> anyhow::Result<Option<DnsDecision>> {
+    let Some(dns) = doc.pointer("/proxy/dns") else {
+        return Ok(None);
+    };
+    if !dns
+        .get("enable")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Ok(None);
+    }
+
+    let target = match parse_record_mode(
+        dns.get("recordMode")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("a"),
+    )? {
+        RecordMode::A => RecordTarget::A(validate_public_ipv4(
+            dns.get("staticAddress")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default(),
+        )?),
+        RecordMode::Cname => RecordTarget::Cname(validate_cname_target(
+            dns.get("cnameTarget")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default(),
+        )?),
+    };
+
+    let ddns_updater = dns
+        .pointer("/ddnsUpdater/enable")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if ddns_updater && matches!(target, RecordTarget::Cname(_)) {
+        anyhow::bail!(
+            "the recovered settings enable ferrum.proxy.dns.ddnsUpdater with \
+             recordMode = \"cname\". modules/proxy/dns.nix asserts that \
+             combination is invalid: a CNAME already delegates address \
+             tracking to whatever owns the target name, so the updater would \
+             have nothing to correct. Turn one of the two off."
+        );
+    }
+
+    Ok(Some(DnsDecision {
+        target,
+        ddns_updater,
+    }))
 }
 
 /// Whether a resumed run still needs the Cloudflare token.
@@ -748,6 +1092,9 @@ mod tests {
             "", // SSO: default yes
             "admin@thesyms.ca",
             "cftokenvalue1234567890abcdefghijklmnopqr",
+            "",             // record target: default 'a'
+            "203.0.113.10", // this server's public address
+            "",             // updater: default yes
         ]);
         let fake = healthy_cloudflare();
         let a = collect(&mut io, &verifying_against(&fake)).unwrap();
@@ -758,6 +1105,13 @@ mod tests {
         assert_eq!(
             a.cloudflare_token.as_ref().map(Secret::expose),
             Some("cftokenvalue1234567890abcdefghijklmnopqr")
+        );
+        assert_eq!(
+            a.dns,
+            Some(DnsDecision {
+                target: RecordTarget::A("203.0.113.10".parse().unwrap()),
+                ddns_updater: true,
+            })
         );
     }
 
@@ -843,6 +1197,9 @@ mod tests {
             "",
             "a@b.co",
             "secrettoken1234567890abcdefghijklmnopqrs",
+            "a",
+            "203.0.113.10",
+            "n",
         ]);
         let fake = healthy_cloudflare();
         let a = collect(&mut io, &verifying_against(&fake)).unwrap();
@@ -855,6 +1212,296 @@ mod tests {
         assert_eq!(
             a.cloudflare_token.as_ref().map(Secret::expose),
             Some("secrettoken1234567890abcdefghijklmnopqrs")
+        );
+    }
+
+    /// The answers a full run gives after the token, so each DNS test can
+    /// say only what it is about.
+    fn upto_token(token: &'static str) -> Vec<&'static str> {
+        vec![
+            "saltbox",
+            "thesyms.ca",
+            "me@thesyms.ca",
+            "sonarr",
+            "",
+            "a@b.co",
+            token,
+        ]
+    }
+
+    /// Runs a full collect whose DNS answers are `extra`.
+    fn collect_with_dns(fake: &FakeCloudflare, extra: &[&'static str]) -> anyhow::Result<Answers> {
+        let mut script = upto_token(GOOD_TOKEN);
+        script.extend_from_slice(extra);
+        let mut io = Scripted::new(&script);
+        collect(&mut io, &verifying_against(fake))
+    }
+
+    /// R1 A2. Both shapes are supported and the choice is the operator's.
+    ///
+    /// Mutation check: render only one mode and the second half fails.
+    #[test]
+    fn both_record_shapes_are_collected() {
+        let fake = healthy_cloudflare();
+        let a = collect_with_dns(&fake, &["a", "203.0.113.10", "n"]).unwrap();
+        assert_eq!(
+            a.dns,
+            Some(DnsDecision {
+                target: RecordTarget::A("203.0.113.10".parse().unwrap()),
+                ddns_updater: false,
+            })
+        );
+
+        script_healthy_zone(&fake);
+        let c = collect_with_dns(&fake, &["cname", "Saltbox.Dynamic-DNS.example.net"]).unwrap();
+        assert_eq!(
+            c.dns,
+            Some(DnsDecision {
+                // Lowercased by validate_domain, like every other name.
+                target: RecordTarget::Cname("saltbox.dynamic-dns.example.net".into()),
+                ddns_updater: false,
+            })
+        );
+    }
+
+    /// R1 A8. The updater is opt-in but recommended, so pressing enter
+    /// takes it -- and the question says WHY, because the failure it
+    /// prevents is one the operator can never observe for themselves.
+    #[test]
+    fn the_updater_defaults_to_on_and_says_why() {
+        let fake = healthy_cloudflare();
+        let mut script = upto_token(GOOD_TOKEN);
+        script.extend_from_slice(&["a", "203.0.113.10", ""]);
+        let mut io = Scripted::new(&script);
+        let a = collect(&mut io, &verifying_against(&fake)).unwrap();
+        assert_eq!(
+            a.dns.as_ref().map(|d| d.ddns_updater),
+            Some(true),
+            "an empty answer must take the recommended path"
+        );
+        let t = io.transcript();
+        assert!(
+            t.contains("unreachable from outside"),
+            "the operator must be told what goes wrong: {t}"
+        );
+
+        // ...and 'n' is still honoured. It is a recommendation, not a gate.
+        script_healthy_zone(&fake);
+        let off = collect_with_dns(&fake, &["a", "203.0.113.10", "no"]).unwrap();
+        assert_eq!(off.dns.map(|d| d.ddns_updater), Some(false));
+    }
+
+    /// R1 A8 / modules/proxy/dns.nix's own assertion: the updater exists to
+    /// correct an A record, and a CNAME already delegates that job. Asking
+    /// would let the operator answer yes and meet a Nix assertion instead
+    /// of an install.
+    ///
+    /// Mutation check: offer it unconditionally and the script runs one
+    /// answer short, so this fails.
+    #[test]
+    fn the_updater_is_not_offered_at_all_for_a_cname() {
+        let fake = healthy_cloudflare();
+        let mut script = upto_token(GOOD_TOKEN);
+        script.extend_from_slice(&["cname", "dyn.example.net"]);
+        let mut io = Scripted::new(&script);
+        let a = collect(&mut io, &verifying_against(&fake)).unwrap();
+        assert_eq!(a.dns.map(|d| d.ddns_updater), Some(false));
+        let t = io.transcript();
+        assert!(
+            !t.contains("up to date automatically"),
+            "the question must not have been asked: {t}"
+        );
+    }
+
+    /// D-11(b) again, for this story's own inputs. An empty answer must be
+    /// an error with a message, never a value that quietly becomes "".
+    /// modules/proxy/dns.nix's assertions would catch it, but thirty
+    /// minutes later and naming Nix rather than the question.
+    #[test]
+    fn an_empty_target_is_refused_at_the_prompt_naming_the_assertion() {
+        for blank in ["", "   "] {
+            let address = validate_public_ipv4(blank).unwrap_err().to_string();
+            assert!(address.contains("staticAddress"), "{blank:?}: {address}");
+            let hostname = validate_cname_target(blank).unwrap_err().to_string();
+            assert!(hostname.contains("cnameTarget"), "{blank:?}: {hostname}");
+        }
+    }
+
+    /// UF-18. IPv6 is out of scope by decision, and the message has to say
+    /// so: an operator who pastes their AAAA address and gets "not an IPv4
+    /// address" will reasonably read it as a parser that cannot cope.
+    #[test]
+    fn ipv6_is_refused_as_a_scope_decision_not_a_parse_failure() {
+        for v6 in ["2001:db8::1", "::1", "fe80::1"] {
+            let err = validate_public_ipv4(v6).unwrap_err().to_string();
+            assert!(err.contains("UF-18"), "{v6}: {err}");
+            assert!(err.contains("AAAA"), "{v6}: {err}");
+        }
+    }
+
+    #[test]
+    fn an_address_must_actually_be_one() {
+        assert_eq!(
+            validate_public_ipv4(" 203.0.113.10 ").unwrap(),
+            std::net::Ipv4Addr::new(203, 0, 113, 10)
+        );
+        for bad in [
+            "203.0.113",
+            "203.0.113.256",
+            "203.0.113.10/32",
+            "example.com",
+            "203.0.113.10;id",
+        ] {
+            assert!(validate_public_ipv4(bad).is_err(), "accepted {bad:?}");
+        }
+    }
+
+    /// The reachability note is a note. An operator on a network this
+    /// installer does not understand still gets to decide.
+    #[test]
+    fn an_unreachable_address_is_reported_and_still_accepted() {
+        let fake = healthy_cloudflare();
+        let mut script = upto_token(GOOD_TOKEN);
+        // 100.64/10 -- carrier-grade NAT, the case a residential connection
+        // hits when the ISP hands out no real address.
+        script.extend_from_slice(&["a", "100.64.1.5", "n"]);
+        let mut io = Scripted::new(&script);
+        let a = collect(&mut io, &verifying_against(&fake)).unwrap();
+        assert_eq!(
+            a.dns.map(|d| d.target),
+            Some(RecordTarget::A("100.64.1.5".parse().unwrap())),
+            "the answer is the operator's"
+        );
+        assert!(
+            io.transcript().contains("outside this network can reach"),
+            "but they must be told: {}",
+            io.transcript()
+        );
+
+        for reachable in ["203.0.113.10", "8.8.8.8"] {
+            assert!(is_reachable_from_outside(&reachable.parse().unwrap()));
+        }
+        for unreachable in ["192.168.1.10", "10.0.0.1", "127.0.0.1", "169.254.1.1"] {
+            assert!(
+                !is_reachable_from_outside(&unreachable.parse().unwrap()),
+                "{unreachable} should have been flagged"
+            );
+        }
+    }
+
+    /// A CNAME target is a DNS name and gets the same allowlist every other
+    /// name in this file gets -- it reaches the same settings document and
+    /// the same reconciler.
+    #[test]
+    fn a_cname_target_must_be_a_hostname() {
+        assert_eq!(
+            validate_cname_target(" Dyn.Example.NET ").unwrap(),
+            "dyn.example.net"
+        );
+        for bad in [
+            "localhost",
+            "dyn.example.net`id`",
+            "dyn example.net",
+            "-a.com",
+        ] {
+            assert!(validate_cname_target(bad).is_err(), "accepted {bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_record_mode_must_be_one_of_the_two() {
+        assert_eq!(parse_record_mode(" A ").unwrap(), RecordMode::A);
+        assert_eq!(parse_record_mode("CNAME").unwrap(), RecordMode::Cname);
+        // Deliberately NOT defaulted: the prompt supplies its own default,
+        // so a blank recordMode in a settings document is an error.
+        for bad in ["", "aaaa", "alias", "txt"] {
+            assert!(parse_record_mode(bad).is_err(), "accepted {bad:?}");
+        }
+    }
+
+    /// No token means no credential to manage records with, and
+    /// modules/proxy/dns.nix asserts one is declared -- so the question is
+    /// not asked, rather than asked and discarded.
+    #[test]
+    fn no_token_means_the_dns_questions_are_never_asked() {
+        let mut io = Scripted::new(&["saltbox", "", "plex"]);
+        let fake = FakeCloudflare::start();
+        let a = collect(&mut io, &verifying_against(&fake)).unwrap();
+        assert_eq!(a.dns, None);
+        let t = io.transcript();
+        assert!(!t.contains("Record target"), "should not have asked: {t}");
+    }
+
+    /// Recovered like every other field, and re-validated like every other
+    /// field: that document lives in the operator's own bind mount.
+    #[test]
+    fn the_dns_decision_is_recovered_and_re_validated() {
+        let doc = |dns: serde_json::Value| {
+            serde_json::json!({
+                "proxy": { "baseDomain": "thesyms.ca", "dns": dns },
+                "apps": { "sonarr": { "enable": true } },
+            })
+            .to_string()
+        };
+
+        let a = from_stage2(
+            &doc(serde_json::json!({
+                "enable": true,
+                "recordMode": "a",
+                "staticAddress": "203.0.113.10",
+                "ddnsUpdater": { "enable": true },
+            })),
+            "saltbox",
+        )
+        .unwrap();
+        assert_eq!(
+            a.dns,
+            Some(DnsDecision {
+                target: RecordTarget::A("203.0.113.10".parse().unwrap()),
+                ddns_updater: true,
+            })
+        );
+
+        // A hand-blanked address is the exact shape of D-11(b)'s failure:
+        // an empty value that reads as "nothing to do".
+        let blanked = from_stage2(
+            &doc(serde_json::json!({ "enable": true, "recordMode": "a", "staticAddress": "" })),
+            "saltbox",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(blanked.contains("staticAddress"), "{blanked}");
+
+        // The one combination dns.nix rejects, caught here instead.
+        let impossible = from_stage2(
+            &doc(serde_json::json!({
+                "enable": true,
+                "recordMode": "cname",
+                "cnameTarget": "dyn.example.net",
+                "ddnsUpdater": { "enable": true },
+            })),
+            "saltbox",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(impossible.contains("ddnsUpdater"), "{impossible}");
+
+        // Disabled, and absent, both mean "this host manages no records".
+        assert_eq!(
+            from_stage2(&doc(serde_json::json!({ "enable": false })), "saltbox")
+                .unwrap()
+                .dns,
+            None
+        );
+        assert_eq!(
+            from_stage2(
+                &serde_json::json!({ "proxy": { "baseDomain": "thesyms.ca" }, "apps": {} })
+                    .to_string(),
+                "saltbox"
+            )
+            .unwrap()
+            .dns,
+            None
         );
     }
 
@@ -922,6 +1569,9 @@ mod tests {
             "",
             "a@b.co",
             "tokentokentoken1234567890abcdefghijklmno",
+            "a",
+            "203.0.113.10",
+            "n",
         ]);
         let fake = healthy_cloudflare();
         collect(&mut io, &verifying_against(&fake)).unwrap();
@@ -943,6 +1593,9 @@ mod tests {
             "",
             "a@b.co",
             "supersecret1234567890abcdefghijklmnopqrs",
+            "a",
+            "203.0.113.10",
+            "n",
         ]);
         let fake = healthy_cloudflare();
         let a = collect(&mut io, &verifying_against(&fake)).unwrap();
