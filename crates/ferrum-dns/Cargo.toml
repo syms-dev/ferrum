@@ -1,0 +1,18 @@
+[package]
+name = "ferrum-dns"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = { version = "2", features = ["json"] }
+
+[features]
+# The fake Cloudflare server in `testing` always compiles for this crate's
+# own tests. The feature exists so the other call site the R1 developer
+# documentation names -- ferrum-install's A5/A7 tests -- can reach the same
+# fake through a dev-dependency rather than growing a second one, which is
+# the whole point of keeping Cloudflare behind a single seam.
+testing = []

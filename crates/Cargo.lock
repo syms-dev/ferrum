@@ -644,6 +644,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferrum-dns"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "ureq",
+]
+
+[[package]]
 name = "ferrum-install"
 version = "0.1.0"
 dependencies = [
