@@ -44,7 +44,8 @@
 //! * [`zone`] -- which zone a base domain belongs to, and whether that zone
 //!   is actually authoritative for it.
 //! * [`ownership`] -- the marker that decides whether a record is ferrum's
-//!   to change. The Critical guards live here.
+//!   to change, and the explicit per-name operator adoption that is the only
+//!   other way past it. The Critical guards live here.
 //! * [`record`] -- the record model and the idempotent reconcile plan.
 //!
 //! **One thing this crate still owes a live API.** Decision D-01 rests on

@@ -278,6 +278,33 @@ in
           '';
         };
 
+        adoptedNames = mkOption {
+          type = types.listOf types.str;
+          default = [ ];
+          example = [ "plex.example.com" ];
+          description = ''
+            The fully qualified record names the operator explicitly handed
+            to ferrum, from the installer's pre-erase DNS gate.
+
+            ferrum never overwrites a record it did not create. A name listed
+            here is the one exception, and it is deliberately narrow: it
+            authorises replacing THAT record and nothing else. Adopting
+            plex.example.com says nothing about sonarr.example.com, and there
+            is no value here that means "all of them" -- a wildcard string is
+            just a name no record has.
+
+            The list matters only once. The adopting write carries ferrum's
+            ownership marker, so from the next reconcile onward the record is
+            ferrum's under the ordinary rule and this list is not consulted
+            for it. Leaving a name here therefore grants nothing the marker
+            does not already grant; removing one does not hand the record
+            back.
+
+            It never authorises a DELETE. A record at a name this host no
+            longer publishes is left alone whether it was adopted or not.
+          '';
+        };
+
         ddnsUpdater = {
           enable = mkOption {
             type = types.bool;

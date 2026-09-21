@@ -33,6 +33,18 @@
 //! adopt a foreign record would otherwise see every future apply degrade
 //! forever.
 //!
+//! **Adoption is the operator's decision, arriving as data (A3).** A foreign
+//! record is skipped by default and that is the whole of A3's first half.
+//! Its second half -- *"unless the operator opts in"* -- arrives here as
+//! `adoptedNames` in the document, written from the answer the installer's
+//! pre-erase gate collected per name. This module does not decide anything
+//! about it: it hands the list to
+//! [`ferrum_dns::record::plan_with_adoptions`], which is the only public way
+//! to mint a capability over a record ferrum does not own, and which matches
+//! per name so an adoption of `plex` reaches nothing else. An empty list --
+//! the ordinary case, and the case for every document written before this
+//! field existed -- plans exactly what it always did.
+//!
 //! **The credential is not a bare token (decision D-11 / finding UF-07).**
 //! `/run/secrets/acme-dns` is a systemd `EnvironmentFile=`, so its content
 //! is the literal line `CLOUDFLARE_DNS_API_TOKEN=<value>`.
@@ -62,7 +74,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use ferrum_dns::client::Client;
 use ferrum_dns::dns_query::Verification;
-use ferrum_dns::record::{DesiredRecord, RecordAction};
+use ferrum_dns::ownership::AdoptedNames;
+use ferrum_dns::record::{plan_with_adoptions, DesiredRecord, RecordAction};
 use ferrum_dns::{CloudflareError, RecordTarget, Secret, Zone};
 use serde::Deserialize;
 
@@ -110,6 +123,17 @@ pub struct DnsConfig {
     /// The scheduled-updater block.
     #[serde(rename = "ddnsUpdater")]
     pub ddns_updater: DdnsUpdater,
+    /// The names the operator explicitly handed to ferrum at the install
+    /// gate (A3), from `ferrum.proxy.dns.adoptedNames`.
+    ///
+    /// Defaulted rather than required, on purpose in both directions: a
+    /// document written before this field existed parses and adopts nothing,
+    /// which is the safe reading, and a host whose operator declined
+    /// everything carries an empty list rather than a missing key. The list
+    /// is never a permission to write generally -- it only ever converts one
+    /// named `SkipForeign` into one named `Adopt`.
+    #[serde(rename = "adoptedNames", default)]
+    pub adopted_names: Vec<String>,
 }
 
 /// One name `dns.nix` wants a record for.
@@ -351,6 +375,11 @@ pub enum Operation {
     /// A record ferrum does not own occupies the name (A3). Reported, never
     /// written to.
     SkipForeign,
+    /// A record ferrum did not create, taken over because the operator
+    /// explicitly adopted that name (A3's opt-in half). Its own word rather
+    /// than `update`: an operator reading the breakdown must be able to see
+    /// that their record was replaced, not that ferrum corrected its own.
+    Adopt,
 }
 
 impl Operation {
@@ -363,6 +392,7 @@ impl Operation {
             Operation::Unchanged => "unchanged",
             Operation::Delete => "delete",
             Operation::SkipForeign => "skip (not ferrum's)",
+            Operation::Adopt => "adopt (was yours, you handed it over)",
         }
     }
 }
@@ -599,7 +629,14 @@ pub fn reconcile_with(
         .collect();
 
     let zone = client.resolve_zone(&config.base_domain)?;
-    let actions = client.plan_records(&zone, &desired)?;
+    // Deliberately `list_records` + `plan_with_adoptions` rather than
+    // `Client::plan_records`: the latter plans with no adoptions, which is
+    // the right default for every other caller and the wrong one here. The
+    // listing is still the single source of truth -- ownership is re-derived
+    // from it on every run, and the adopted list only widens what the plan
+    // may do to names the operator named.
+    let existing = client.list_records(&zone)?;
+    let actions = plan_with_adoptions(&desired, &existing, &AdoptedNames::recorded(&config.adopted_names));
 
     let records = actions
         .into_iter()
@@ -660,6 +697,27 @@ fn execute(
                 note: Some("no longer published by this host".to_string()),
             },
             Err(e) => failed(name, Operation::Delete, &e.to_string()),
+        },
+        // A3's opt-in half. The write is the ordinary one, so it carries the
+        // ownership marker and this record is ferrum's from the next listing
+        // onwards -- the adopted list is a one-time transition, not a
+        // standing permission.
+        RecordAction::Adopt {
+            record_id,
+            name,
+            current,
+            target,
+        } => match client.update_record(zone, &record_id, &name, &target) {
+            Ok(_) => {
+                let mut report = verified(client, zone, verify, name, Operation::Adopt, &target);
+                if report.failure.is_none() {
+                    report.note = Some(format!(
+                        "you adopted this name at install; it pointed at {current} and now                          points at {target}, and ferrum owns it from here"
+                    ));
+                }
+                report
+            }
+            Err(e) => failed(name, Operation::Adopt, &e.to_string()),
         },
         // A3. Not a failure: see this module's header. The note is what the
         // operator needs -- their record, where it points, and what ferrum
@@ -834,6 +892,14 @@ mod tests {
 
     fn parsed(records: &[(&str, &str)]) -> DnsConfig {
         serde_json::from_str(&config_json(records, true)).expect("the document parses")
+    }
+
+    /// The same document, plus the names the operator adopted at the gate.
+    fn parsed_with_adoptions(records: &[(&str, &str)], adopted: &[&str]) -> DnsConfig {
+        let mut value: serde_json::Value =
+            serde_json::from_str(&config_json(records, true)).expect("the document parses");
+        value["adoptedNames"] = serde_json::json!(adopted);
+        serde_json::from_value(value).expect("the document with adoptions parses")
     }
 
     /// A fake holding `example.com`, with `existing` already in it.
@@ -1400,5 +1466,158 @@ mod tests {
         assert!(report.is_clean());
         assert_eq!(report.failure_summary(), None);
         assert!(report.full_summary().contains("no DNS records"));
+    }
+    // ---- A3's opt-in half, end to end through the document -------------
+
+    /// The mechanism this story exists to add: a name the operator adopted
+    /// is taken over, and the write carries the ownership marker so the next
+    /// run needs no decision at all.
+    #[test]
+    fn an_adopted_name_is_taken_over_and_the_write_carries_the_marker() {
+        let fake = fake_zone(serde_json::json!([record_json(
+            "theirs",
+            "plex.example.com",
+            "198.51.100.9",
+            false
+        )]));
+        fake.script(
+            Route::put("/zones/z1/dns_records/theirs"),
+            CannedResponse::ok(record_json("theirs", "plex.example.com", "203.0.113.7", true)),
+        );
+
+        let report = reconcile_with(
+            &parsed_with_adoptions(&[("plex.example.com", "app:plex")], &["plex.example.com"]),
+            &client_for(&fake),
+            &always_matches,
+        )
+        .expect("the run completes");
+
+        assert_eq!(report.records[0].operation, Operation::Adopt);
+        assert!(report.is_clean(), "{report:?}");
+
+        let writes = fake.requests_for(&Route::put("/zones/z1/dns_records/theirs"));
+        assert_eq!(writes.len(), 1, "exactly one write to the adopted record");
+        let body: serde_json::Value =
+            serde_json::from_str(&writes[0].body).expect("the write carries a JSON body");
+        assert_eq!(
+            body["comment"],
+            serde_json::json!(ferrum_dns::OWNERSHIP_MARKER),
+            "without the marker the adoption would have to be re-decided every run"
+        );
+        assert_eq!(body["content"], serde_json::json!("203.0.113.7"));
+    }
+
+    /// The per-name guarantee, at the level an operator would feel it:
+    /// adopting `plex` leaves `sonarr` exactly where it was.
+    #[test]
+    fn adopting_one_name_does_not_adopt_another() {
+        let fake = fake_zone(serde_json::json!([
+            record_json("theirs-plex", "plex.example.com", "198.51.100.9", false),
+            record_json("theirs-sonarr", "sonarr.example.com", "198.51.100.9", false),
+        ]));
+        fake.script(
+            Route::put("/zones/z1/dns_records/theirs-plex"),
+            CannedResponse::ok(record_json("theirs-plex", "plex.example.com", "203.0.113.7", true)),
+        );
+
+        let report = reconcile_with(
+            &parsed_with_adoptions(
+                &[
+                    ("plex.example.com", "app:plex"),
+                    ("sonarr.example.com", "app:sonarr"),
+                ],
+                &["plex.example.com"],
+            ),
+            &client_for(&fake),
+            &always_matches,
+        )
+        .expect("the run completes");
+
+        let sonarr = report
+            .records
+            .iter()
+            .find(|r| r.name == "sonarr.example.com")
+            .expect("sonarr is reported");
+        assert_eq!(sonarr.operation, Operation::SkipForeign);
+        assert!(
+            fake.requests_for(&Route::put("/zones/z1/dns_records/theirs-sonarr"))
+                .is_empty(),
+            "adopting plex must not write to sonarr"
+        );
+        assert!(
+            fake.requests_for(&Route::delete("/zones/z1/dns_records/theirs-sonarr"))
+                .is_empty(),
+            "adopting plex must not delete sonarr"
+        );
+    }
+
+    /// The guard that must survive this story: with no adopted names, a
+    /// foreign record is still untouchable. This is the test the mutation
+    /// report kills by removing the per-name check.
+    #[test]
+    fn a_name_the_operator_did_not_adopt_is_still_never_written_to() {
+        let fake = fake_zone(serde_json::json!([record_json(
+            "theirs",
+            "sonarr.example.com",
+            "198.51.100.9",
+            false
+        )]));
+
+        let report = reconcile_with(
+            &parsed_with_adoptions(&[("sonarr.example.com", "app:sonarr")], &["plex.example.com"]),
+            &client_for(&fake),
+            &always_matches,
+        )
+        .expect("the run completes");
+
+        assert_eq!(report.records[0].operation, Operation::SkipForeign);
+        for method in ["POST", "PUT", "DELETE"] {
+            assert!(
+                fake.requests().iter().all(|r| r.method != method),
+                "an unadopted foreign record must not be written to ({method})"
+            );
+        }
+    }
+
+    /// A document written before `adoptedNames` existed must still parse,
+    /// and must adopt nothing -- the safe reading in both directions.
+    #[test]
+    fn a_document_without_the_adopted_field_adopts_nothing() {
+        let config = parsed(&[("plex.example.com", "app:plex")]);
+        assert!(config.adopted_names.is_empty());
+    }
+
+    /// An adopted name that nothing publishes any more is not a licence to
+    /// prune the operator's zone: the record survives.
+    #[test]
+    fn an_adopted_name_nothing_publishes_is_still_never_deleted() {
+        let fake = fake_zone(serde_json::json!([record_json(
+            "theirs",
+            "plex.example.com",
+            "198.51.100.9",
+            false
+        )]));
+
+        let report = reconcile_with(
+            &parsed_with_adoptions(&[], &["plex.example.com"]),
+            &client_for(&fake),
+            &always_matches,
+        )
+        .expect("the run completes");
+
+        assert!(report.records.is_empty(), "{report:?}");
+        assert!(
+            fake.requests_for(&Route::delete("/zones/z1/dns_records/theirs"))
+                .is_empty(),
+            "an adopted hostname is not permission to delete the operator's record"
+        );
+    }
+
+    /// The breakdown must not describe a takeover of the operator's record
+    /// with the same word it uses for correcting ferrum's own.
+    #[test]
+    fn the_breakdown_says_adopt_rather_than_update() {
+        assert_eq!(Operation::Adopt.label(), "adopt (was yours, you handed it over)");
+        assert_ne!(Operation::Adopt.label(), Operation::Update.label());
     }
 }

@@ -19,6 +19,14 @@
 //!   round-robin the two, sending roughly half of all traffic to the wrong
 //!   host, which is worse than the record being absent because it looks
 //!   intermittent rather than broken.
+//! * A desired name occupied by a foreign record the operator **explicitly
+//!   adopted** yields [`RecordAction::Adopt`] instead -- A3's *"unless the
+//!   operator opts in"*. It is a separate variant from
+//!   [`RecordAction::Update`] so the operator's own report cannot describe
+//!   a takeover of their record with the same word it uses for correcting
+//!   ferrum's. The adopting write carries [`OWNERSHIP_MARKER`], so from the
+//!   next run onwards that record is simply ferrum's and takes the ordinary
+//!   `Update`/`Unchanged` path with no adoption list involved.
 //! * `proxied` is always written `false` (decision D-05). Cloudflare's
 //!   orange cloud makes every request arrive from an edge address, which
 //!   turns the LAN allow-list in front of `lan` apps into a total outage and
@@ -27,7 +35,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::ownership::{is_ferrum_marker, ManagedRecordId};
+use crate::ownership::{is_ferrum_marker, AdoptedNames, ManagedRecordId};
 use crate::zone::normalize_domain;
 use crate::{DnsRecord, RecordTarget, OWNERSHIP_MARKER};
 
@@ -81,6 +89,26 @@ pub enum RecordAction {
         record_id: ManagedRecordId,
         /// The fully qualified name.
         name: String,
+    },
+    /// A record ferrum does not own occupies a name ferrum wants, and the
+    /// operator explicitly adopted that name (A3's opt-in half).
+    ///
+    /// Distinct from [`RecordAction::Update`] on purpose: this one writes
+    /// over a record the operator placed, which is exactly the act A3
+    /// forbids by default. Keeping it visible as its own variant means a
+    /// report, a log line and a future `match` all have to acknowledge it,
+    /// rather than it disappearing into the ordinary update count.
+    Adopt {
+        /// Proof that the operator named this exact record, and the id to
+        /// write to.
+        record_id: ManagedRecordId,
+        /// The fully qualified name being taken over.
+        name: String,
+        /// Where the operator's record points today, so the report can say
+        /// what was replaced.
+        current: RecordTarget,
+        /// Where ferrum will point it.
+        target: RecordTarget,
     },
     /// A record ferrum does not own occupies a name ferrum wants (A3). It
     /// is reported and left alone; adopting it is the operator's call.
@@ -211,6 +239,39 @@ impl RecordJson {
 /// zone, and ferrum is a guest in it.
 #[must_use]
 pub fn plan(desired: &[DesiredRecord], existing: &[DnsRecord]) -> Vec<RecordAction> {
+    plan_with_adoptions(desired, existing, &AdoptedNames::none())
+}
+
+/// Computes the reconcile plan, honouring the names the operator explicitly
+/// adopted (A3's opt-in half).
+///
+/// This is the whole public surface of adoption: there is no way to obtain a
+/// [`ManagedRecordId`] for a foreign record except by passing an
+/// [`AdoptedNames`] set that names it here. A caller holding a client, a zone
+/// and a listing still cannot write to the operator's record -- it has to go
+/// through this function, with a name the operator actually gave.
+///
+/// # Arguments
+/// * `desired` - every record ferrum wants, from the published-app set.
+/// * `existing` - the **whole** listing, as [`plan`] requires.
+/// * `adopted` - the names the operator handed to ferrum at the install gate,
+///   carried to the host in `ferrum.proxy.dns.adoptedNames`. Matching is per
+///   name: a set containing `plex.example.com` changes nothing about
+///   `sonarr.example.com`.
+///
+/// # Returns
+/// The same plan as [`plan`], except that a desired name occupied by a
+/// foreign record the operator adopted becomes [`RecordAction::Adopt`]
+/// instead of [`RecordAction::SkipForeign`]. Every other guarantee is
+/// unchanged -- in particular a foreign record at a name nobody adopted is
+/// still never written to, and a foreign record at a name nothing wants is
+/// still never deleted whether it was adopted or not.
+#[must_use]
+pub fn plan_with_adoptions(
+    desired: &[DesiredRecord],
+    existing: &[DnsRecord],
+    adopted: &AdoptedNames,
+) -> Vec<RecordAction> {
     let mut actions = Vec::new();
     let mut claimed: Vec<&str> = Vec::new();
 
@@ -244,11 +305,31 @@ pub fn plan(desired: &[DesiredRecord], existing: &[DnsRecord]) -> Vec<RecordActi
             // and adding a second record beside it would not add ferrum's
             // answer -- it would round-robin traffic between the two.
             if let Some(foreign) = theirs.first() {
-                actions.push(RecordAction::SkipForeign {
-                    name: want.name.clone(),
-                    current: foreign.target.clone(),
-                    wanted: want.target.clone(),
-                });
+                // A3's opt-in half. The capability is minted only when the
+                // operator's decision names this exact record, so an
+                // adoption of one name cannot reach another -- and with no
+                // decision at all there is nothing to mint, which is why the
+                // default below stays untouchable rather than merely
+                // discouraged.
+                let adoption = adopted
+                    .decision_for(&want.name)
+                    .and_then(|decision| ManagedRecordId::adopt_by_operator(foreign, &decision));
+                match adoption {
+                    Some(record_id) => {
+                        claimed.push(foreign.id.as_str());
+                        actions.push(RecordAction::Adopt {
+                            record_id,
+                            name: foreign.name.clone(),
+                            current: foreign.target.clone(),
+                            target: want.target.clone(),
+                        });
+                    }
+                    None => actions.push(RecordAction::SkipForeign {
+                        name: want.name.clone(),
+                        current: foreign.target.clone(),
+                        wanted: want.target.clone(),
+                    }),
+                }
             } else {
                 actions.push(RecordAction::Create {
                     name: want.name.clone(),
@@ -308,6 +389,7 @@ pub fn plan(desired: &[DesiredRecord], existing: &[DnsRecord]) -> Vec<RecordActi
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ownership::AdoptedNames;
     use std::net::Ipv4Addr;
 
     const HOST: Ipv4Addr = Ipv4Addr::new(203, 0, 113, 7);
@@ -586,5 +668,134 @@ mod tests {
         }))
         .expect("parses");
         assert!(json.into_model().is_none());
+    }
+    // ---- A3's opt-in half: the planner ----
+
+    /// The adopted name is taken over; every other foreign record in the
+    /// same zone is still reported and left alone.
+    #[test]
+    fn an_adopted_name_is_taken_over_and_its_neighbours_are_not() {
+        let zone = vec![
+            existing("theirs-plex", "plex.example.com", OTHER, false),
+            existing("theirs-sonarr", "sonarr.example.com", OTHER, false),
+        ];
+        let actions = plan_with_adoptions(
+            &[want("plex.example.com"), want("sonarr.example.com")],
+            &zone,
+            &AdoptedNames::recorded(&["plex.example.com"]),
+        );
+        assert_eq!(
+            actions,
+            vec![
+                RecordAction::Adopt {
+                    record_id: ManagedRecordId::unchecked("theirs-plex"),
+                    name: "plex.example.com".to_string(),
+                    current: RecordTarget::A(OTHER),
+                    target: RecordTarget::A(HOST),
+                },
+                RecordAction::SkipForeign {
+                    name: "sonarr.example.com".to_string(),
+                    current: RecordTarget::A(OTHER),
+                    wanted: RecordTarget::A(HOST),
+                },
+            ],
+            "adopting plex must not adopt sonarr"
+        );
+    }
+
+    /// A3's default, restated against the adoption-aware planner: with no
+    /// decision recorded, nothing changes at all.
+    #[test]
+    fn an_empty_adoption_set_plans_exactly_what_the_plain_planner_plans() {
+        let zone = vec![
+            existing("theirs", "plex.example.com", OTHER, false),
+            existing("mine", "auth.example.com", HOST, true),
+            existing("stale", "old.example.com", HOST, true),
+        ];
+        let desired = [want("plex.example.com"), want("auth.example.com")];
+        assert_eq!(
+            plan_with_adoptions(&desired, &zone, &AdoptedNames::none()),
+            plan(&desired, &zone)
+        );
+        assert!(
+            !plan_with_adoptions(&desired, &zone, &AdoptedNames::none())
+                .iter()
+                .any(|a| matches!(a, RecordAction::Adopt { .. })),
+            "no decision means no adoption"
+        );
+    }
+
+    /// Adoption is scoped to names ferrum actually wants. A foreign record
+    /// nothing publishes is never deleted, adopted or not -- deleting it is
+    /// the irreversible act A4 exists to prevent, and the operator adopted a
+    /// hostname for an app, not a licence to prune their zone.
+    #[test]
+    fn an_adopted_name_nothing_wants_is_still_never_deleted() {
+        let zone = vec![existing("theirs", "plex.example.com", OTHER, false)];
+        let actions =
+            plan_with_adoptions(&[], &zone, &AdoptedNames::recorded(&["plex.example.com"]));
+        assert!(
+            actions.is_empty(),
+            "an adopted name that nothing publishes produces no action at all: {actions:?}"
+        );
+    }
+
+    /// The second run. The adopting write carried the marker, so the record
+    /// now reaches the ordinary path and the adopted set is irrelevant to it.
+    #[test]
+    fn the_run_after_an_adoption_needs_no_decision_and_writes_nothing() {
+        let zone = vec![existing("theirs-plex", "plex.example.com", HOST, true)];
+        let desired = [want("plex.example.com")];
+        let expected = vec![RecordAction::Unchanged {
+            record_id: ManagedRecordId::unchecked("theirs-plex"),
+            name: "plex.example.com".to_string(),
+        }];
+        assert_eq!(
+            plan_with_adoptions(
+                &desired,
+                &zone,
+                &AdoptedNames::recorded(&["plex.example.com"])
+            ),
+            expected
+        );
+        assert_eq!(
+            plan_with_adoptions(&desired, &zone, &AdoptedNames::none()),
+            expected,
+            "once the marker is there the decision is no longer load-bearing"
+        );
+    }
+
+    /// Adopting a name ferrum already owns a record for changes nothing: the
+    /// managed record wins and the foreign one is left where it is.
+    #[test]
+    fn adoption_does_not_disturb_a_name_ferrum_already_owns() {
+        let zone = vec![
+            existing("mine", "auth.example.com", OTHER, true),
+            existing("theirs", "auth.example.com", OTHER, false),
+        ];
+        let actions = plan_with_adoptions(
+            &[want("auth.example.com")],
+            &zone,
+            &AdoptedNames::recorded(&["auth.example.com"]),
+        );
+        assert_eq!(
+            actions,
+            vec![RecordAction::Update {
+                record_id: ManagedRecordId::unchecked("mine"),
+                name: "auth.example.com".to_string(),
+                current: RecordTarget::A(OTHER),
+                target: RecordTarget::A(HOST),
+            }]
+        );
+    }
+
+    /// The write that follows an adoption is the ordinary one, so it carries
+    /// the marker -- which is what makes adoption a one-time transition
+    /// rather than a standing grant.
+    #[test]
+    fn the_adopting_write_carries_the_ownership_marker() {
+        let body = RecordWrite::new("plex.example.com", &RecordTarget::A(HOST));
+        assert_eq!(body.comment, OWNERSHIP_MARKER);
+        assert!(!body.proxied);
     }
 }

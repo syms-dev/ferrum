@@ -26,6 +26,7 @@ use std::path::Path;
 
 use crate::answers::{Answers, DnsDecision, RecordTarget};
 use crate::confirm::Approved;
+use crate::dns::Adoption;
 use crate::inventory::{Device, Firmware};
 
 /// The real template, linked at compile time purely so the test below can
@@ -544,10 +545,13 @@ fn media(disks: &[&Device]) -> anyhow::Result<String> {
 ///
 /// # Arguments
 /// * `decision` - what the operator chose at the prompt.
+/// * `adoption` - R1 A3's outcome from the pre-erase gate. Only the adopted
+///   names are written; a decline is a report line, not a setting, because
+///   the absence of a name from this list already means "left alone".
 ///
 /// # Returns
 /// The `ferrum.proxy.dns` object.
-fn dns_settings(decision: &DnsDecision) -> serde_json::Value {
+fn dns_settings(decision: &DnsDecision, adoption: &Adoption) -> serde_json::Value {
     let mut dns = serde_json::Map::new();
     dns.insert("enable".into(), serde_json::json!(true));
     match &decision.target {
@@ -569,10 +573,25 @@ fn dns_settings(decision: &DnsDecision) -> serde_json::Value {
     if decision.ddns_updater {
         dns.insert("ddnsUpdater".into(), serde_json::json!({ "enable": true }));
     }
+    // A3's opt-in half. Written only when the operator actually adopted
+    // something, so a settings file carries no empty list to explain -- and
+    // so an operator reading their own settings sees the names they typed
+    // `adopt` for, and nothing else. This is the ONLY thing that turns the
+    // gate's answer into a record ferrum will write; without it the operator
+    // opts in and the host still leaves their record alone.
+    let adopted = adoption.adopted_names();
+    if !adopted.is_empty() {
+        dns.insert("adoptedNames".into(), serde_json::json!(adopted));
+    }
     serde_json::Value::Object(dns)
 }
 
-fn settings(answers: &Answers, stage: Stage, data_disks: usize) -> serde_json::Value {
+fn settings(
+    answers: &Answers,
+    stage: Stage,
+    data_disks: usize,
+    adoption: &Adoption,
+) -> serde_json::Value {
     let mut root = serde_json::Map::new();
     root.insert("schemaVersion".into(), serde_json::json!(1));
 
@@ -610,7 +629,7 @@ fn settings(answers: &Answers, stage: Stage, data_disks: usize) -> serde_json::V
         // about a credential that cannot exist yet.
         if stage == Stage::Two {
             if let Some(decision) = &answers.dns {
-                proxy.insert("dns".into(), dns_settings(decision));
+                proxy.insert("dns".into(), dns_settings(decision, adoption));
             }
         }
         root.insert("proxy".into(), serde_json::Value::Object(proxy));
@@ -665,16 +684,46 @@ pub enum Stage {
     Two,
 }
 
-/// Renders the whole host repository.
+/// Renders the whole host repository for a run that adopted nothing.
+///
+/// # Arguments
+/// * `answers` - the operator's answers.
+/// * `approved` - the confirmed disk selection.
+/// * `ssh_keys` - the operator's public keys.
+/// * `ferrum_rev` - the revision this installer was built from.
 ///
 /// # Errors
-/// Returns an error if any generated file still contains a placeholder
-/// sentinel -- asserted here rather than left to the operator.
+/// As [`render_with_adoption`].
 pub fn render(
     answers: &Answers,
     approved: &Approved,
     ssh_keys: &[String],
     ferrum_rev: &str,
+) -> anyhow::Result<Files> {
+    render_with_adoption(answers, approved, ssh_keys, ferrum_rev, &Adoption::none())
+}
+
+/// Renders the whole host repository, carrying R1 A3's adoption decision
+/// into `ferrum.proxy.dns.adoptedNames`.
+///
+/// # Arguments
+/// * `answers` - the operator's answers.
+/// * `approved` - the confirmed disk selection.
+/// * `ssh_keys` - the operator's public keys.
+/// * `ferrum_rev` - the revision this installer was built from.
+/// * `adoption` - what `crate::dns::gate` recorded. An empty outcome is the
+///   ordinary case: a host with no base domain, or a resume, which never
+///   re-asks and therefore has nothing to carry.
+///
+/// # Errors
+/// Returns an error if any generated file still contains a placeholder
+/// sentinel -- asserted here rather than left to the operator.
+pub fn render_with_adoption(
+    answers: &Answers,
+    approved: &Approved,
+    ssh_keys: &[String],
+    ferrum_rev: &str,
+    adoption: &Adoption,
 ) -> anyhow::Result<Files> {
     let os_disk = approved
         .device
@@ -703,14 +752,14 @@ pub fn render(
         "settings.json".into(),
         format!(
             "{}\n",
-            serde_json::to_string_pretty(&settings(answers, Stage::One, disks.len()))?
+            serde_json::to_string_pretty(&settings(answers, Stage::One, disks.len(), adoption))?
         ),
     );
     files.insert(
         "settings.stage2.json".into(),
         format!(
             "{}\n",
-            serde_json::to_string_pretty(&settings(answers, Stage::Two, disks.len()))?
+            serde_json::to_string_pretty(&settings(answers, Stage::Two, disks.len(), adoption))?
         ),
     );
 
@@ -1790,5 +1839,97 @@ mod tests {
         let f = render(&answers(), &approved(Firmware::Uefi), &keys(), "abc").unwrap();
         write_repo(dir.path(), &f).unwrap();
         write_repo(dir.path(), &f).unwrap();
+    }
+    // ---- R1 A3: the adoption decision has to reach the host -----------
+
+    fn adoption_of(names: &[&str]) -> crate::dns::Adoption {
+        crate::dns::Adoption {
+            adopted: names
+                .iter()
+                .map(|name| crate::dns::ForeignName {
+                    name: (*name).to_string(),
+                    current: "198.51.100.9".to_string(),
+                    wanted: "203.0.113.10".to_string(),
+                })
+                .collect(),
+            declined: Vec::new(),
+        }
+    }
+
+    /// The whole point of the gate. An operator who typed `adopt` and got
+    /// nothing in their settings has opted in to a takeover that will never
+    /// happen -- which is the "reported and left alone" behaviour they
+    /// explicitly declined.
+    #[test]
+    fn an_adopted_name_reaches_the_host_settings() {
+        let f = render_with_adoption(
+            &answers(),
+            &approved(Firmware::Uefi),
+            &keys(),
+            "abc1234",
+            &adoption_of(&["plex.thesyms.ca"]),
+        )
+        .unwrap();
+        let s: serde_json::Value = serde_json::from_str(&f["settings.stage2.json"]).unwrap();
+        assert_eq!(
+            s["proxy"]["dns"]["adoptedNames"],
+            serde_json::json!(["plex.thesyms.ca"]),
+            "{s}"
+        );
+    }
+
+    /// Per name, all the way to settings: adopting one does not write the
+    /// other, even though both were offered at the same gate.
+    #[test]
+    fn only_the_names_the_operator_adopted_are_written() {
+        let mut adoption = adoption_of(&["plex.thesyms.ca"]);
+        adoption.declined.push(crate::dns::ForeignName {
+            name: "sonarr.thesyms.ca".to_string(),
+            current: "198.51.100.9".to_string(),
+            wanted: "203.0.113.10".to_string(),
+        });
+        let f = render_with_adoption(
+            &answers(),
+            &approved(Firmware::Uefi),
+            &keys(),
+            "abc1234",
+            &adoption,
+        )
+        .unwrap();
+        let s: serde_json::Value = serde_json::from_str(&f["settings.stage2.json"]).unwrap();
+        let adopted = s["proxy"]["dns"]["adoptedNames"]
+            .as_array()
+            .expect("the adopted list is an array");
+        assert_eq!(adopted, &[serde_json::json!("plex.thesyms.ca")], "{s}");
+        assert!(
+            !f["settings.stage2.json"].contains("sonarr.thesyms.ca"),
+            "a declined name must not be written as adopted"
+        );
+    }
+
+    /// The ordinary run. No adoption means no key at all, rather than an
+    /// empty list an operator would have to interpret.
+    #[test]
+    fn a_run_that_adopted_nothing_writes_no_adopted_list() {
+        let f = render(&answers(), &approved(Firmware::Uefi), &keys(), "abc1234").unwrap();
+        let s: serde_json::Value = serde_json::from_str(&f["settings.stage2.json"]).unwrap();
+        assert!(s["proxy"]["dns"].get("adoptedNames").is_none(), "{s}");
+    }
+
+    /// Stage 1 declares no credential and therefore no dns block at all, so
+    /// an adoption must not smuggle one in and fail the first evaluation on
+    /// modules/proxy/dns.nix's credential assertion.
+    #[test]
+    fn stage_one_carries_no_adopted_list_either() {
+        let f = render_with_adoption(
+            &answers(),
+            &approved(Firmware::Uefi),
+            &keys(),
+            "abc1234",
+            &adoption_of(&["plex.thesyms.ca"]),
+        )
+        .unwrap();
+        let s: serde_json::Value = serde_json::from_str(&f["settings.json"]).unwrap();
+        assert!(s["proxy"].get("dns").is_none(), "{s}");
     }
 }

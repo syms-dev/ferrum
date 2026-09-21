@@ -201,6 +201,22 @@ impl Adoption {
     pub fn none() -> Self {
         Self::default()
     }
+
+    /// The adopted names, for `ferrum.proxy.dns.adoptedNames`.
+    ///
+    /// This is the one value that has to survive the gate: without it the
+    /// operator types `adopt`, reads a line saying it was recorded, and the
+    /// host then does nothing with the record -- which is the "reported and
+    /// left alone" behaviour they explicitly opted out of.
+    ///
+    /// # Returns
+    /// The fully qualified names in the order the operator was asked about
+    /// them, so a diff of two settings files reads the way the gate read.
+    /// Declines contribute nothing: only an explicit `adopt` appears here.
+    #[must_use]
+    pub fn adopted_names(&self) -> Vec<String> {
+        self.adopted.iter().map(|r| r.name.clone()).collect()
+    }
 }
 
 /// A computed plan for one zone.
@@ -445,6 +461,7 @@ fn action_name(action: &RecordAction) -> &str {
         | RecordAction::Update { name, .. }
         | RecordAction::Unchanged { name, .. }
         | RecordAction::Delete { name, .. }
+        | RecordAction::Adopt { name, .. }
         | RecordAction::SkipForeign { name, .. } => name,
     }
 }
@@ -486,6 +503,23 @@ fn render_action(action: &RecordAction, name_width: usize) -> String {
             "  {:<ACTION_WIDTH$} {name:<name_width$}  ferrum created it and nothing needs \
              it now\n",
             "delete"
+        ),
+        // Reachable only on a re-run of the gate for a host whose settings
+        // already carry the adoption -- the first pass plans against an
+        // empty adopted set, because the decision has not been made yet.
+        // Worded as strongly as SKIPPED for the opposite reason: this is the
+        // one line that says ferrum is about to write over something the
+        // operator put there.
+        RecordAction::Adopt {
+            name,
+            current,
+            target,
+            ..
+        } => format!(
+            "  {:<ACTION_WIDTH$} {name:<name_width$}  you adopted this name; ferrum will \
+             take it over.\n  {:<ACTION_WIDTH$} {:<name_width$}  it points at {current} \
+             and will point at {target}.\n",
+            "ADOPT", "", ""
         ),
         RecordAction::SkipForeign {
             name,
@@ -544,9 +578,9 @@ pub fn gate(
     for record in foreign {
         io.say(&format!(
             "\n  {} points at {} and ferrum wanted {}.\n\n    \
-             adopt   hand this name to ferrum. Recorded now and reported at the end; \
-             ferrum\n            never writes to a record it did not create, so the \
-             takeover itself is\n            not automatic yet.\n    \
+             adopt   hand this name to ferrum. Your record is REPLACED on the first \
+             apply\n            and ferrum owns it from then on. Nothing else in your \
+             zone is\n            affected, and this name only.\n    \
              leave   (default) ferrum does not touch it. The name keeps pointing at {}, \
              and\n            the app will NOT be reachable at {}.",
             record.name, record.current, record.wanted, record.current, record.name
@@ -597,8 +631,8 @@ pub fn report_lines(adoption: &Adoption) -> Vec<String> {
             lines.push(format!("  {}", record.name));
         }
         lines.push(
-            "  ferrum does not overwrite a record it did not create, so it has not taken \
-             these over yet."
+            "  ferrum replaces each of these on the first apply and owns it from then on. \
+             Every other record in your zone is untouched."
                 .to_string(),
         );
     }

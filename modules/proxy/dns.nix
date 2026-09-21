@@ -35,6 +35,15 @@
 #     exists so the ruling is a one-line change if it is ever revisited.
 #     Standing up a daemon vhost is R13's work, explicitly not this file's.
 #
+#   * ferrum.proxy.dns.adoptedNames carried through verbatim (A3). ferrum
+#     never overwrites a record it did not create; a name in this list is the
+#     operator's explicit, per-name exception to that, collected by the
+#     installer's pre-erase gate. Nothing is computed from it here -- the
+#     whole point is that the list the operator approved is the list the
+#     reconciler enforces, name for name. crates/ferrum-dns matches it per
+#     record, so adopting one hostname cannot reach another, and it only ever
+#     licenses a replacement, never a delete.
+#
 #   * proxied = false on every record (decision D-05). Cloudflare's orange
 #     cloud makes every request arrive from a Cloudflare edge address, which
 #     inverts nginx.nix's `allow ${net}; deny all;` against
@@ -110,11 +119,17 @@ let
     enable = dnsEnabled;
     inherit baseDomain records target;
     credentialFile = if credentialProvided then credentialFile else null;
+    # Sorted and de-duplicated for the same reason `records` is: a rebuild
+    # that changes nothing must produce a byte-identical file, and a diff of
+    # two generations' documents has to be readable.
+    adoptedNames = lib.sort (a: b: a < b) (lib.unique dns.adoptedNames);
     ddnsUpdater = {
       enable = ddnsEnabled;
       intervalMinutes = dns.ddnsUpdater.intervalMinutes;
     };
   });
+
+  adoptedNamesChecked = lib.unique dns.adoptedNames;
 
   configPath = "/etc/ferrum-dns-config.json";
 in
@@ -157,6 +172,23 @@ in
         token as ACME DNS-01 (Zone:Read + DNS:Edit). Add it to ferrum.secrets
         in settings.json and encrypt the token to this host's own age
         recipient -- see README.md's reverse-proxy section -- then re-apply.
+      '';
+    }
+    {
+      # An adopted name that is not a record this host publishes cannot be
+      # acted on -- the reconciler only ever converts a wanted name's
+      # SkipForeign into an Adopt -- so it is an operator who believes a
+      # takeover is configured when nothing will happen. Fail at evaluation
+      # with the names, rather than at runtime with silence.
+      assertion = !dnsEnabled
+        || (lib.subtractLists (map (r: r.name) records) adoptedNamesChecked) == [ ];
+      message = ''
+        ferrum.proxy.dns.adoptedNames lists ${
+          lib.concatStringsSep ", "
+            (lib.subtractLists (map (r: r.name) records) adoptedNamesChecked)
+        }, which this host does not publish a record for. Adoption only ever
+        replaces a record at a name ferrum wants, so these entries would do
+        nothing at all. Remove them, or enable the app that owns the name.
       '';
     }
     {
