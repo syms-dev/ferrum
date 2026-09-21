@@ -31,18 +31,81 @@
 //!    call fails CI by construction. [`testing`] is the fake every test
 //!    points at instead.
 //!
-//! **What is not here yet.** The `Client` and its zone/ownership/record
-//! logic are the next story's work (R1-S2); this file carries only the data
-//! types that seam is expressed in, so that story adds behaviour rather than
-//! re-deciding vocabulary. Those modules are not declared here because a
-//! `mod` declaration without its file does not compile and those files are
-//! outside this story's scope.
+//! **Where the rest of it lives.** This file holds the vocabulary -- the
+//! types the seam is expressed in. The behaviour is in four modules, each
+//! owning one decision:
+//!
+//! * [`client`] -- every HTTP call, with the `success`-field check,
+//!   pagination, and timeouts the house idiom lacks.
+//! * [`zone`] -- which zone a base domain belongs to, and whether that zone
+//!   is actually authoritative for it.
+//! * [`ownership`] -- the marker that decides whether a record is ferrum's
+//!   to change. The Critical guards live here.
+//! * [`record`] -- the record model and the idempotent reconcile plan.
+//!
+//! **One thing this crate still owes a live API.** Decision D-01 rests on
+//! Cloudflare's `comment` field persisting across reads, being returned by a
+//! listing without a second call, being long enough for
+//! [`OWNERSHIP_MARKER`], and surviving a reduced-scope token. That has not
+//! been verified against the real API -- this desk has no access to one --
+//! so it is built exactly as specified and the marker is read and written
+//! through the same seam as every other Cloudflare call. If the field turns
+//! out to be unusable, the fallback is an **advisory-only** local cache
+//! keyed by record id, never authoritative, and it is a swap inside
+//! [`client`] rather than a redesign.
 
 use std::fmt;
 use std::net::Ipv4Addr;
 
+pub mod client;
+pub mod ownership;
+pub mod record;
+pub mod zone;
+
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
+
+/// A secret that cannot be printed by accident.
+///
+/// The Cloudflare token grants zone-wide DNS manipulation, which makes it
+/// the highest-value credential ferrum handles. Transport discipline alone
+/// is not enough: a single `dbg!` on a struct holding a bare `String` leaks
+/// it with nothing to catch that, so the redaction is in the type.
+///
+/// Deliberately a local newtype rather than a reuse of
+/// `ferrum-install`'s: that crate depends on this one, so the dependency
+/// cannot run the other way, and the discipline is identical.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Secret(String);
+
+impl Secret {
+    /// Wraps a token.
+    ///
+    /// # Arguments
+    /// * `value` - the bare token. On-host the caller must already have
+    ///   stripped the `CLOUDFLARE_DNS_API_TOKEN=` prefix that the secret
+    ///   file carries, because that file is a systemd `EnvironmentFile=`
+    ///   line rather than a bare credential.
+    #[must_use]
+    pub fn new(value: String) -> Self {
+        Self(value)
+    }
+
+    /// The token itself, for the one place that may see it: the
+    /// `Authorization` header.
+    #[must_use]
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for Secret {
+    /// Renders `<redacted>`. There is deliberately no `Display`: a token
+    /// that can be formatted into a string is a token that ends up in a log.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
 
 /// A Cloudflare zone the configured token can see.
 ///
@@ -137,6 +200,25 @@ pub struct DnsRecord {
 }
 
 /// Why a Cloudflare call did not produce the answer the caller needed.
+///
+/// **This taxonomy is an interface, not an implementation detail.** Stories
+/// R1-S4, R1-S8 and R1-S9 match on these variants to decide whether to
+/// re-prompt the operator, degrade the apply, or retry, so the rule for
+/// which variant a failure becomes is fixed here rather than at each call
+/// site:
+///
+/// | What happened | Variant |
+/// |---|---|
+/// | Any response, any HTTP status, whose body says `success: false` and names an error | [`CloudflareError::Api`] |
+/// | A failing HTTP status whose body is not a usable Cloudflare envelope | [`CloudflareError::Transport`] |
+/// | Connection refused, TLS failure, timeout, truncated read | [`CloudflareError::Transport`] |
+/// | A body that is not JSON, not the documented shape, or claims failure while naming no error | [`CloudflareError::Malformed`] |
+/// | No visible zone covers the base domain | [`CloudflareError::ZoneNotFound`] |
+/// | A zone covers it, but the name is served by other nameservers | [`CloudflareError::ZoneDelegated`] |
+///
+/// The first row is the load-bearing one: an HTTP 200 carrying
+/// `success: false` is a **refusal**, and collapsing it into a transport
+/// error or (worse) a success is the defect UF-15 records.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CloudflareError {
     /// Cloudflare refused the request in its own response body, carrying its
@@ -160,6 +242,23 @@ pub enum CloudflareError {
         /// The `ferrum.proxy.baseDomain` that could not be matched.
         base_domain: String,
     },
+    /// A zone covering the base domain exists, but the base domain (or an
+    /// ancestor of it below the zone apex) has been delegated to other
+    /// nameservers with an `NS` record.
+    ///
+    /// This is a refusal rather than a warning because the alternative is
+    /// the exact failure R1 exists to fix: Cloudflare accepts every write,
+    /// the installer reports success, and not one hostname resolves --
+    /// because the servers the world asks are not the ones ferrum wrote to.
+    ZoneDelegated {
+        /// The `ferrum.proxy.baseDomain` that cannot be served from here.
+        base_domain: String,
+        /// The delegated name found in the zone.
+        delegated_name: String,
+        /// The nameservers it was delegated to, so the operator can see
+        /// where their records would actually have to go.
+        nameservers: Vec<String>,
+    },
     /// Cloudflare answered with a body this crate could not read as the
     /// shape its API documents.
     Malformed(String),
@@ -180,6 +279,21 @@ impl fmt::Display for CloudflareError {
             CloudflareError::ZoneNotFound { base_domain } => write!(
                 f,
                 "no Cloudflare zone this token can see covers {base_domain}"
+            ),
+            CloudflareError::ZoneDelegated {
+                base_domain,
+                delegated_name,
+                nameservers,
+            } => write!(
+                f,
+                "{base_domain} is delegated away from this Cloudflare zone: \
+                 an NS record for {delegated_name} points at {}. Records \
+                 written here would be accepted and would resolve nowhere.",
+                if nameservers.is_empty() {
+                    "other nameservers".to_string()
+                } else {
+                    nameservers.join(", ")
+                }
             ),
             CloudflareError::Malformed(detail) => {
                 write!(f, "Cloudflare returned an unexpected response: {detail}")
@@ -217,6 +331,27 @@ mod tests {
         let rendered = err.to_string();
         assert!(rendered.contains("9109"), "{rendered}");
         assert!(rendered.contains("Invalid access token"), "{rendered}");
+    }
+
+    #[test]
+    fn a_delegation_refusal_names_the_nameservers_the_records_would_need_to_go_to() {
+        let err = CloudflareError::ZoneDelegated {
+            base_domain: "home.example.com".to_string(),
+            delegated_name: "home.example.com".to_string(),
+            nameservers: vec!["ns1.elsewhere.net".to_string()],
+        };
+        let rendered = err.to_string();
+        assert!(rendered.contains("home.example.com"), "{rendered}");
+        assert!(rendered.contains("ns1.elsewhere.net"), "{rendered}");
+        assert!(rendered.contains("resolve nowhere"), "{rendered}");
+    }
+
+    #[test]
+    fn a_secret_redacts_itself_rather_than_trusting_every_future_call_site() {
+        let secret = Secret::new("a-real-looking-token".to_string());
+        assert_eq!(format!("{secret:?}"), "<redacted>");
+        assert!(!format!("{secret:?}").contains("a-real-looking-token"));
+        assert_eq!(secret.expose(), "a-real-looking-token");
     }
 
     #[test]
