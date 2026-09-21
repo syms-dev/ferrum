@@ -1,6 +1,6 @@
 # Phase 1.7c — you can actually reach the thing that manages it
 
-**Status:** R13 requirements drafted 2026-09-21. R14 is **not new design** — it is the existing
+**Status:** R13 requirements settled 2026-09-21; OQ1 answered by the owner (SSO alone). R14 is **not new design** — it is the existing
 Phase 1.6 updates spec, which is already through its planning gate and was never implemented.
 Not yet through the planning review gate; no implementation until that runs, and not until the
 Phase 1.7 R1 pipeline run finishes (one pipeline run per checkout).
@@ -119,11 +119,15 @@ Two notes carried forward rather than re-decided:
 R13 before R14, and both after Phase 1.7 R1 — R1 creates the DNS record that A6 depends on, and
 only one pipeline run may be active per checkout.
 
-## Open questions for the owner
+## Open questions — answered
 
-- **OQ1.** Should the daemon's vhost be restricted to `ferrum.proxy.trustedNetworks` as well as
-  SSO — LAN-only by default, published only if the operator opts in? Recommendation: **no**.
-  Locking the control plane to the LAN reintroduces the tunnel problem for the operator who is away
-  from home, which is the case where remote management is worth most. SSO plus A3/A4 is the defence.
-  Worth a deliberate answer rather than a default, because it is the one decision here that trades
-  reach against exposure.
+- **OQ1 — ANSWERED: SSO alone. No `trustedNetworks` restriction on the daemon vhost.**
+  The owner's call, matching the recommendation. Restricting the control plane to the LAN would
+  reintroduce the SSH-tunnel problem exactly when remote management is worth most — away from home,
+  when something has gone wrong. The defence is therefore Authelia (A2) plus the same-site
+  mitigations (A3 enforced CORS absence, A4 `SameSite=Strict` and a header state-changing routes
+  require), with the loopback listener (A5) as the recovery route when the proxy or Authelia is
+  itself what broke.
+
+  This is a deliberate exposure decision and should be revisited if the same-site mitigations ever
+  weaken — not silently inherited.
