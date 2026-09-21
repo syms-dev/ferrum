@@ -8,6 +8,10 @@
   "overrides": {
     "SchemaField": {
       "cardMode": "column"
+    },
+    "ConfirmErase": {
+      "cardMode": "single",
+      "viewport": "760x560"
     }
   },
   "readmeHeader": ".design-sync/conventions.md"

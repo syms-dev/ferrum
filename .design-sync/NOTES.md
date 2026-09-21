@@ -78,3 +78,18 @@ None. The final validate was clean: 18/18 render, 0 bad, 0 thin, 0 variants-iden
 - A hand-reconstructed `remote-sync.json` is rejected as malformed if `sourceHashes` is
   omitted. That is safe (it re-verifies everything) but slow — fetch the real file with
   `DesignSync(get_file, path: "_ds_sync.json")` and save it byte-for-byte.
+
+## ConfirmErase (added third sync)
+- The erase gate now opens `ConfirmErase` instead of firing `onConfirm` directly. It
+  exists as its own exported component rather than internal state so the OPEN state is
+  previewable; a modal hidden behind `useState` can never appear on a card.
+- Its scrim is `position: fixed`, which has no layout height, so a preview card collapses
+  to a sliver around it. `.design-sync/previews/ConfirmErase.tsx` wraps it in a `Stage`
+  with `transform: translateZ(0)`, which makes that wrapper the containing block. Real
+  apps hit the same rule: any ancestor with a transform, filter or `contain` traps this
+  dialog.
+- `cfg.overrides.ConfirmErase = {cardMode: "single", viewport: "760x560"}`.
+- **A cascade collision cost the danger colour and only the screenshot showed it:**
+  `.fk-confirm-actions button` is (0,1,1) and beat the bare `.fk-confirm-go` (0,1,0), so
+  the destructive button rendered in ordinary text colour. Component CSS here should
+  qualify a modifier with its parent, not rely on source order.

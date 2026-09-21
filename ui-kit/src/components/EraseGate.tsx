@@ -1,4 +1,5 @@
 import { useId, useState } from "react";
+import { ConfirmErase } from "./ConfirmErase";
 import { Copyable } from "./Copyable";
 import "./EraseGate.css";
 
@@ -41,6 +42,7 @@ export interface EraseGateProps {
  */
 export function EraseGate({ diskName, serial, otherSerials = {}, onConfirm }: EraseGateProps) {
   const [typed, setTyped] = useState("");
+  const [confirming, setConfirming] = useState(false);
   const inputId = useId();
   const warnId = useId();
 
@@ -82,12 +84,29 @@ export function EraseGate({ diskName, serial, otherSerials = {}, onConfirm }: Er
         </p>
       )}
 
-      <button type="button" className="fk-gate-go" disabled={!matches} onClick={onConfirm}>
+      <button
+        type="button"
+        className="fk-gate-go"
+        disabled={!matches}
+        onClick={() => setConfirming(true)}
+      >
         Erase {diskName} and install
       </button>
       <p className="fk-gate-hint">
         Enter moves to the button. It won&apos;t erase anything on its own.
       </p>
+
+      {confirming && (
+        <ConfirmErase
+          diskName={diskName}
+          serial={serial}
+          onCancel={() => setConfirming(false)}
+          onConfirm={() => {
+            setConfirming(false);
+            onConfirm?.();
+          }}
+        />
+      )}
     </section>
   );
 }

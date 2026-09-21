@@ -36,3 +36,5 @@ export { RollbackConfirm } from "./components/RollbackConfirm";
 export type { RollbackConfirmProps } from "./components/RollbackConfirm";
 export { Copyable } from "./components/Copyable";
 export type { CopyableProps } from "./components/Copyable";
+export { ConfirmErase } from "./components/ConfirmErase";
+export type { ConfirmEraseProps } from "./components/ConfirmErase";
