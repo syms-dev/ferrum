@@ -1385,6 +1385,90 @@ mod tests {
         );
     }
 
+    /// The stronger form of the idempotence claim: not merely "an
+    /// already-matching zone is left alone" but "running the same
+    /// reconcile twice in a row, the way the DDNS timer actually does,
+    /// creates once and then goes quiet". The first call creates the
+    /// record from an empty zone; the second call is scripted to see that
+    /// exact record on its listing (as a real Cloudflare zone would) and
+    /// must issue zero write requests.
+    ///
+    /// Mutation check: have a second `reconcile_with` call re-create or
+    /// re-update a record it just wrote, and this fails on the `all(|r|
+    /// r.method == "GET")` assertion below.
+    #[test]
+    fn running_reconcile_twice_creates_once_and_then_converges_with_no_writes() {
+        let fake = FakeCloudflare::start();
+        let zone = || {
+            CannedResponse::ok(serde_json::json!([{
+                "id": "z1",
+                "name": "example.com",
+                "name_servers": ["amber.ns.cloudflare.com"],
+            }]))
+        };
+        // Round 1: GET /zones, the NS-delegation listing, the real listing
+        // (empty -- nothing exists yet), then the create.
+        fake.script(Route::get("/zones"), zone());
+        fake.script(
+            Route::get("/zones/z1/dns_records"),
+            CannedResponse::ok(serde_json::json!([])),
+        );
+        fake.script(
+            Route::get("/zones/z1/dns_records"),
+            CannedResponse::ok(serde_json::json!([])),
+        );
+        fake.script(
+            Route::post("/zones/z1/dns_records"),
+            CannedResponse::ok(record_json("r1", "auth.example.com", "203.0.113.7", true)),
+        );
+        // Round 2: the same two listings, this time reporting the record
+        // round 1 just created -- exactly what a real zone would show on a
+        // second poll. No write route is scripted at all for round 2: an
+        // unscripted write would fail the request outright and any write
+        // attempt would show up as a non-GET entry below.
+        fake.script(Route::get("/zones"), zone());
+        fake.script(
+            Route::get("/zones/z1/dns_records"),
+            CannedResponse::ok(serde_json::json!([])),
+        );
+        fake.script(
+            Route::get("/zones/z1/dns_records"),
+            CannedResponse::ok(serde_json::json!([record_json(
+                "r1",
+                "auth.example.com",
+                "203.0.113.7",
+                true
+            )])),
+        );
+
+        let client = client_for(&fake);
+        let config = parsed(&[("auth.example.com", "auth")]);
+
+        let first = reconcile_with(&config, &client, &always_matches).expect("round 1 completes");
+        assert_eq!(first.records[0].operation, Operation::Create);
+        let after_first = fake.requests().len();
+
+        let second =
+            reconcile_with(&config, &client, &always_matches).expect("round 2 completes");
+        assert_eq!(
+            second.records[0].operation,
+            Operation::Unchanged,
+            "the record round 1 created must be recognised as already correct"
+        );
+        assert!(second.is_clean());
+
+        let round_two_requests = &fake.requests()[after_first..];
+        assert!(
+            !round_two_requests.is_empty(),
+            "round 2 must actually have talked to the fake"
+        );
+        assert!(
+            round_two_requests.iter().all(|r| r.method == "GET"),
+            "a converged zone must issue no create/update/delete on the next \
+             run: {round_two_requests:?}"
+        );
+    }
+
     // ---- D-08 result semantics ------------------------------------------
 
     /// A partial result is a reported failure, never a success.

@@ -373,6 +373,76 @@
           schemaShapes = present;
         };
 
+      # modules/lib/settings-schema.json is not documentation: ferrumd
+      # compiles it and validates every PUT /api/settings against it
+      # (crates/ferrumd/src/settings.rs), and every object in it is
+      # `additionalProperties: false`. So an option added under ferrum.*
+      # without a matching schema entry is not a doc gap -- it is a 400 on
+      # the next settings save for every host that sets it, including a save
+      # that only round-trips the block back unchanged.
+      #
+      # That is not hypothetical. This check was written after R1 added
+      # ferrum.proxy.dns.* and ferrum.daemon.dns.includeRecord and touched
+      # nothing here, which broke saving settings from the web UI on the
+      # default shape of a domain install; it immediately found a second,
+      # older instance in ferrum.storage.pool.*, unschema'd since the
+      # mergerfs work and reached by any multi-disk install. Both were
+      # confirmed against a real JSON Schema validator.
+      #
+      # NEITHER existing guardrail catches this class, so do not delete it as
+      # redundant with them: schema-uniformity only forbids non-JSON option
+      # TYPES, and ui-renders-every-schema-type only asks whether a shape
+      # ALREADY in the schema has a UI control. Both were green against a
+      # schema that rejected real documents.
+      #
+      # The direction is options -> schema deliberately. A schema property
+      # with no option is caught loudly at evaluation by the module system
+      # itself; an option with no schema property is caught by nothing until
+      # an operator hits Save.
+      schemaCoversEveryOption =
+        let
+          schema = builtins.fromJSON (builtins.readFile ../../../modules/lib/settings-schema.json);
+
+          # `internal`, because every submodule carries the module system's
+          # own `_module.*` plumbing under it -- options no settings.json
+          # ever contains and no schema should name.
+          ferrumDocs = builtins.filter
+            (o:
+              lib.elemAt o.loc 0 == "ferrum"
+              && builtins.length o.loc > 1
+              && !(o.internal or false))
+            (lib.optionAttrSetToDocList exampleHosts.minimal.options);
+
+          # Walks the schema alongside one option path, mirroring how the
+          # validator itself descends. A node declaring no child vocabulary
+          # at all is OPAQUE and covers everything beneath it -- that is the
+          # `apps` escape hatch, whose per-app shape the schema defers on
+          # purpose (see its own description there).
+          covers = node: path:
+            if path == [ ] then true
+            else if !(node ? properties || node ? additionalProperties || node ? patternProperties)
+            then true
+            else
+              let
+                key = builtins.head path;
+                rest = builtins.tail path;
+                props = node.properties or { };
+                extra = node.additionalProperties or null;
+              in
+              # optionAttrSetToDocList renders an attrsOf/submodule key as
+              # the literal "<name>", which is the validator's
+              # additionalProperties slot.
+              if key == "<name>" then builtins.isAttrs extra && covers extra rest
+              else if props ? ${key} then covers props.${key} rest
+              else false;
+
+          uncovered = builtins.filter (o: !(covers schema (builtins.tail o.loc))) ferrumDocs;
+        in
+        {
+          ok = uncovered == [ ];
+          missingFromSchema = map (o: lib.concatStringsSep "." o.loc) uncovered;
+        };
+
       # The auth model, asserted against the GENERATED nginx config rather
       # than against the metadata that describes it.
       #
@@ -616,6 +686,8 @@
         schema-uniformity = mkAssertionCheck "schema-uniformity" schemaUniformity;
         ui-renders-every-schema-type =
           mkAssertionCheck "ui-renders-every-schema-type" uiRendersEverySchemaType;
+        settings-schema-covers-every-option =
+          mkAssertionCheck "settings-schema-covers-every-option" schemaCoversEveryOption;
         installer-offers-every-catalog-app =
           mkAssertionCheck "installer-offers-every-catalog-app" installerOffersEveryCatalogApp;
         sopsfile-are-paths = mkAssertionCheck "sopsfile-are-paths" sopsFilesArePaths;

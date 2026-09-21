@@ -12,6 +12,16 @@
         "snapshotDir": { "type": "string" },
         "journalDir": { "type": "string" },
         "mediaDir": { "type": "string" },
+        "pool": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enable": { "type": "boolean" },
+            "branches": { "type": "array", "items": { "type": "string" } },
+            "minFreeGiB": { "type": "integer" },
+            "policy": { "type": "string", "enum": ["epmfs", "mfs"] }
+          }
+        },
         "mediaGroup": { "type": "string" },
         "minFreeGiB": { "type": "integer" },
         "keepGenerations": { "type": "integer" }
@@ -34,7 +44,26 @@
             "staging": { "type": "boolean" }
           }
         },
-        "trustedNetworks": { "type": "array", "items": { "type": "string" } }
+        "trustedNetworks": { "type": "array", "items": { "type": "string" } },
+        "dns": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enable": { "type": "boolean" },
+            "recordMode": { "type": "string", "enum": ["a", "cname"] },
+            "staticAddress": { "type": "string" },
+            "cnameTarget": { "type": "string" },
+            "adoptedNames": { "type": "array", "items": { "type": "string" } },
+            "ddnsUpdater": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "enable": { "type": "boolean" },
+                "intervalMinutes": { "type": "integer" }
+              }
+            }
+          }
+        }
       }
     },
     "auth": {
@@ -87,7 +116,14 @@
         "enable": { "type": "boolean" },
         "port": { "type": "integer" },
         "listenAddress": { "type": "string" },
-        "subdomain": { "type": "string" }
+        "subdomain": { "type": "string" },
+        "dns": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "includeRecord": { "type": "boolean" }
+          }
+        }
       }
     },
     "apps": {
