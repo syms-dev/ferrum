@@ -72,7 +72,7 @@ export function AppTile({ app, onToggle, onOpenSettings }: AppTileProps) {
                 {app.url}
               </a>
             ) : (
-              <span className="fk-tile-local">reachable only from this machine</span>
+              <span className="fk-tile-local">only reachable from this box</span>
             )}
             <button type="button" onClick={() => onOpenSettings?.(app.id)}>
               Settings

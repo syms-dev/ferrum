@@ -60,8 +60,8 @@ export function SchemaField({ name, schema, value, onChange, unsupported }: Sche
       <div className="fk-field" data-unsupported="true">
         <span className="fk-field-label">{label}</span>
         <p className="fk-field-note">
-          This ferrum UI does not know how to edit a &quot;{schema.type}&quot; value. Edit it in{" "}
-          <code>settings.json</code> on the host, or in <code>custom/</code> if it belongs there.
+          This one&apos;s too complex for the form. Edit it in <code>settings.json</code> on the
+          box, or in <code>custom/</code> if it belongs there.
         </p>
       </div>
     );

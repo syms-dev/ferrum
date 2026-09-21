@@ -1,4 +1,5 @@
 import { useId, useState } from "react";
+import { Copyable } from "./Copyable";
 import "./EraseGate.css";
 
 export interface EraseGateProps {
@@ -48,20 +49,20 @@ export function EraseGate({ diskName, serial, otherSerials = {}, onConfirm }: Er
 
   return (
     <section className="fk-gate" aria-labelledby={`${inputId}-h`}>
-      <h3 id={`${inputId}-h`}>Type the serial of the disk to erase</h3>
-      <p>Not a checkbox. The serial is the one thing that cannot be got right by reflex.</p>
+      <h3 id={`${inputId}-h`}>Type this disk's serial to erase it</h3>
+      <p>The serial is the one thing you can&apos;t get right by accident.</p>
 
       <label className="fk-gate-label" htmlFor={inputId}>
-        Serial of <span className="fk-gate-mono">{diskName}</span> —{" "}
-        <span className="fk-gate-mono">{serial}</span>
+        {diskName}&apos;s serial
       </label>
+      <Copyable value={serial} describe={`Copy ${diskName}'s serial`} />
       <input
         id={inputId}
         className="fk-gate-input"
         value={typed}
         autoComplete="off"
         spellCheck={false}
-        placeholder="type it exactly"
+        placeholder="type or paste it"
         aria-describedby={wrongDisk ? warnId : undefined}
         aria-invalid={wrongDisk ? true : undefined}
         onChange={(e) => setTyped(e.target.value)}
@@ -77,8 +78,7 @@ export function EraseGate({ diskName, serial, otherSerials = {}, onConfirm }: Er
 
       {wrongDisk && wrongDisk !== diskName && (
         <p className="fk-gate-warn" id={warnId} role="alert">
-          That is the serial of {wrongDisk}, not {diskName}. {wrongDisk} is not the disk you
-          selected.
+          That&apos;s {wrongDisk}&apos;s serial, not {diskName}&apos;s. You picked {diskName}.
         </p>
       )}
 
@@ -86,7 +86,7 @@ export function EraseGate({ diskName, serial, otherSerials = {}, onConfirm }: Er
         Erase {diskName} and install
       </button>
       <p className="fk-gate-hint">
-        Pressing Enter moves focus to the button — it does not submit.
+        Enter moves to the button. It won&apos;t erase anything on its own.
       </p>
     </section>
   );

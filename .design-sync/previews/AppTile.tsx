@@ -47,7 +47,7 @@ export const Off = () => (
     app={{
       id: "jellyfin",
       displayName: "Jellyfin",
-      summary: "Open-source media server. An alternative to Plex, not a companion.",
+      summary: "Open-source media server. Run it instead of Plex, not alongside.",
       enabled: false,
     }}
   />

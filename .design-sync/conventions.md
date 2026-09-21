@@ -47,6 +47,24 @@ Two rules the kit enforces about meaning, which designs should not work around:
   `EraseGate`, which own that red.
 - **A default is shown, never pre-filled.** `SchemaField` renders a schema default
   as placeholder text. Writing it into a value freezes it forever.
+- **Anything the operator retypes gets a `Copyable`.** Serials, by-id paths, IPs,
+  whole logs. It reports a failed clipboard write rather than claiming success.
+
+## How ferrum talks
+
+The copy is part of the design. Write it the way ferrum does:
+
+- The operator is **you**. ferrum is **ferrum**, lower-case, and says **I** for
+  something it did. Never "we", never "the user".
+- Their hardware is a **disk** and a **box** — not "storage device" or "target host".
+- **Precision beats friendliness.** Keep the real number, path, serial and unit:
+  `8.0 TB`, `/data/media/tv`. Never round them off to sound approachable.
+- A failure says what broke, what it means, and what to do. No apology, no
+  reassurance. "Sonarr didn't start. It can't write to `/data/media/tv`."
+- Avoid the AI tells: not-X-but-Y contrasts, one-line closers, forced triads,
+  dashes as the universal connector, "simply", "just", exclamation marks.
+
+Product names keep their own capitalisation: Plex, Sonarr, qBittorrent, Authelia.
 
 ## Where the truth is
 

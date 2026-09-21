@@ -45,7 +45,7 @@ export const Number = () => (
     schema={{
       type: "integer",
       title: "Port",
-      description: "The port the service listens on inside the host.",
+      description: "The port the service listens on inside the box.",
       default: 8989,
     }}
   />

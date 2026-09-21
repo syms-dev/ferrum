@@ -55,3 +55,26 @@ None. The final validate was clean: 18/18 render, 0 bad, 0 thin, 0 variants-iden
   not read from any real machine, so they never go stale, but don't cite them as facts.
 - Grades live in the gitignored `.design-sync/.cache/`; carry-forward across machines
   comes from the uploaded `_ds_sync.json`, not from git.
+
+## Voice (added in the second sync)
+- ferrum's copy is governed by two skills: the installed plugin **`humanizer@humanizer`**
+  (`blader/humanizer`, 25 AI-writing patterns from Wikipedia's "Signs of AI writing") and
+  `.claude/skills/humanize/SKILL.md`, which is a THIN FERRUM LAYER over it — who is
+  reading, what ferrum calls things, and the rule that precision outranks voice.
+  Do not let the ferrum skill grow into a competing rule set; that was its first draft
+  and the user replaced it with the real base.
+- **The preview `.tsx` copy is part of the deliverable**, not scaffolding. The design
+  agent imitates it. The first voice pass rewrote only the component strings and left
+  the previews reading like a product; it took a second build to notice.
+- Two documented exceptions where ferrum overrides humanizer: keep a contrast when it
+  marks a real distinction (structural vs a setting), and keep the passive for a
+  destructive fact ("This disk is erased" is a fact; "You erased this disk" accuses).
+
+## Re-sync risks — additions
+- **Grades key on the PREVIEW sources, not the component sources.** Changing a string
+  inside `ui-kit/src` does NOT clear the grade, so a carried-forward grade can vouch for
+  words nobody has looked at. After any copy change in `ui-kit/src`, delete the affected
+  `.design-sync/.cache/review/<Name>.grade.json` by hand, or read the contact sheets.
+- A hand-reconstructed `remote-sync.json` is rejected as malformed if `sourceHashes` is
+  omitted. That is safe (it re-verifies everything) but slow — fetch the real file with
+  `DesignSync(get_file, path: "_ds_sync.json")` and save it byte-for-byte.

@@ -21,15 +21,15 @@ export interface SafeListProps {
 export function SafeList({ disks }: SafeListProps) {
   return (
     <section className="fk-safe" aria-label="Disks that will not be touched">
-      <h3>These disks will not be touched</h3>
+      <h3>ferrum won&apos;t touch these</h3>
       <ul>
         {disks.map((d) => (
           <li key={d}>{d}</li>
         ))}
       </ul>
       <p>
-        A disk not named in the generated <code>disko.nix</code> is never opened, partitioned or
-        mounted. That is a structural guarantee, not a setting.
+        ferrum never opens them. They aren&apos;t in the partition plan
+        (<code>disko.nix</code>), so there&apos;s no setting that could turn that off.
       </p>
     </section>
   );

@@ -34,3 +34,5 @@ export { ApplyProgress } from "./components/ApplyProgress";
 export type { ApplyProgressProps, ApplyStep } from "./components/ApplyProgress";
 export { RollbackConfirm } from "./components/RollbackConfirm";
 export type { RollbackConfirmProps } from "./components/RollbackConfirm";
+export { Copyable } from "./components/Copyable";
+export type { CopyableProps } from "./components/Copyable";

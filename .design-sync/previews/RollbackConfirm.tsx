@@ -8,7 +8,7 @@ export const Confirming = () => (
     current={48}
     effects={[
       "Prowlarr goes back to disabled.",
-      "The media root returns to /mnt/ferrum-disk-0 — your files are not moved.",
+      "The media root returns to /mnt/ferrum-disk-0; your files don't move.",
       "Sonarr and Radarr return to their generation-47 settings.",
     ]}
     onConfirm={noop}

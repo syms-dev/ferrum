@@ -68,21 +68,21 @@ export function LivenessPanel({
         <b>{title}</b>
         {state === "talking" && (
           <small>
-            Output {ago(sinceOutput)}.{plausible ? ` This step normally takes ${plausible}.` : ""}
+            Last output {ago(sinceOutput)}.{plausible ? ` This step usually takes ${plausible}.` : ""}
           </small>
         )}
         {state === "quiet" && (
           <small>
-            No output for {ago(sinceOutput).replace(" ago", "")}. Still alive — the target answered
-            a probe {ago(sinceProbe)}.{plausible ? ` Long silences are normal here; this step normally takes ${plausible}.` : ""}
+            Quiet for {ago(sinceOutput).replace(" ago", "")}, but still alive: the box answered{" "}
+            {ago(sinceProbe)}.{plausible ? ` Quiet is normal here — this step usually takes ${plausible}.` : ""}
           </small>
         )}
         {state === "overdue" && (
           <small>
             {attempts !== undefined && (
-              <span className="fk-live-attempts">{attempts} attempts, none succeeded. </span>
+              <span className="fk-live-attempts">{attempts} tries, none worked. </span>
             )}
-            {plausible ? `This step normally completes in ${plausible}. ` : ""}
+            {plausible ? `It usually takes ${plausible}. ` : ""}
             {likelyCause}
           </small>
         )}

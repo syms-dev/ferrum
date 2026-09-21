@@ -12,7 +12,7 @@ export const Dashboard = () => (
     hostname="ferrum.example.com"
     nav={NAV}
     current="#/apps"
-    status={<StatusLine state="ok" message="Up to date — generation 48, applied 2 hours ago." />}
+    status={<StatusLine state="ok" message="Up to date on generation 48, applied 2 hours ago." />}
   >
     <AppTile
       app={{
@@ -34,11 +34,11 @@ export const WhileApplying = () => (
     nav={NAV}
     current="#/apply"
     status={
-      <StatusLine state="busy" message="Applying generation 49 — building sonarr." progress={0.42} />
+      <StatusLine state="busy" message="Applying generation 49: building sonarr." progress={0.42} />
     }
   >
     <p style={{ margin: 0, color: "var(--ferrum-muted)" }}>
-      The host stays reachable throughout. Nothing switches over until the build succeeds.
+      The box stays reachable. Nothing switches over until the build succeeds.
     </p>
   </AppShell>
 );

@@ -32,9 +32,8 @@ export function RollbackConfirm({
     <div className="fk-rollback" role="dialog" aria-modal="true" aria-label={`Roll back to generation ${target}`}>
       <h3>Roll back to generation #{target}?</h3>
       <p>
-        The system is on #{current}. Rolling back switches the whole configuration and the
-        application state it was captured with, together. #{current} is not deleted — you can move
-        forward again afterwards.
+        You&apos;re on #{current}. Rolling back moves the setup and the app state it was captured
+        with in one step. #{current} stays where it is, so you can come back to it.
       </p>
       {effects.length > 0 && (
         <ul className="fk-rollback-effects">

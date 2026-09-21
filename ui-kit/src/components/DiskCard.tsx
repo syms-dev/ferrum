@@ -1,5 +1,6 @@
 import { Badge } from "./Badge";
 import { CapacityBar } from "./CapacityBar";
+import { Copyable } from "./Copyable";
 import "./DiskCard.css";
 
 export interface DiskPartition {
@@ -88,8 +89,8 @@ export function DiskCard({ disk, selected = false, onSelect }: DiskCardProps) {
 
       {!selectable && (
         <p className="fk-disk-note">
-          This device reports no serial, so there is nothing you could type to name it. It cannot
-          be chosen — and its presence does not disqualify this machine.
+          This disk reports no serial, so there&apos;s nothing you could type to name it. You
+          can&apos;t pick it. It doesn&apos;t stop you installing on the others.
         </p>
       )}
 
@@ -100,8 +101,8 @@ export function DiskCard({ disk, selected = false, onSelect }: DiskCardProps) {
           )}
 
           <span className="fk-disk-badges">
-            {disk.isOsDisk && <Badge tone="accent">Currently the OS disk</Badge>}
-            {disk.hasFerrum && <Badge>ferrum install detected</Badge>}
+            {disk.isOsDisk && <Badge tone="accent">Running the OS</Badge>}
+            {disk.hasFerrum && <Badge>Has a ferrum install</Badge>}
             {!disk.isOsDisk && disk.used !== undefined && disk.used > 0 && (
               <Badge tone="ok">Holds data</Badge>
             )}
@@ -109,11 +110,19 @@ export function DiskCard({ disk, selected = false, onSelect }: DiskCardProps) {
 
           <span className="fk-disk-kv">
             <span className="fk-disk-k">serial</span>
-            <span className="fk-disk-v">{disk.serial}</span>
+            <Copyable
+              value={disk.serial ?? ""}
+              describe={`Copy ${disk.name}'s serial`}
+              variant="inline"
+            />
             {disk.byId && (
               <>
                 <span className="fk-disk-k">by-id</span>
-                <span className="fk-disk-v">{disk.byId}</span>
+                <Copyable
+                  value={disk.byId}
+                  describe={`Copy ${disk.name}'s by-id path`}
+                  variant="inline"
+                />
               </>
             )}
           </span>
