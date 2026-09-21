@@ -1,0 +1,13 @@
+.fk-status { display: flex; align-items: center; gap: .55rem; font-size: .88rem; }
+.fk-status-dot { width: .55rem; height: .55rem; border-radius: 50%; flex: none; background: var(--ferrum-muted); }
+.fk-status[data-state="ok"] .fk-status-dot { background: var(--ferrum-ok); }
+.fk-status[data-state="busy"] .fk-status-dot { background: var(--ferrum-accent); }
+.fk-status[data-state="drifted"] .fk-status-dot,
+.fk-status[data-state="failed"] .fk-status-dot { background: var(--ferrum-danger); }
+.fk-status[data-state="drifted"] .fk-status-msg,
+.fk-status[data-state="failed"] .fk-status-msg { color: var(--ferrum-danger); }
+.fk-status-bar {
+  margin-left: auto; width: 8rem; height: .3rem; border-radius: .15rem;
+  background: var(--ferrum-line); overflow: hidden;
+}
+.fk-status-bar > span { display: block; height: 100%; background: var(--ferrum-accent); }
