@@ -164,7 +164,7 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
     // run's settings while reporting the new ones. Both phases here are
     // pre-destructive, so re-rendering costs nothing.
     if asked_fresh {
-        let files = generate(&pre, cli, &answers, &approved)?;
+        let files = generate(&pre, cli, &answers, &approved, &adoption)?;
         println!("\ngenerated host repository in {}:", pre.host_dir.display());
         for f in files.keys() {
             println!("  {f}");
@@ -341,6 +341,7 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
     st.phase = state::Phase::Verified;
     state::write(&pre.host_dir, &st)?;
 
+    report_external_reachability(&answers);
     final_report(&pre, &answers, &evidence, &adoption)?;
     Ok(())
 }
@@ -362,15 +363,41 @@ fn ferrum_revision() -> anyhow::Result<&'static str> {
 }
 
 /// Renders and commits the host repository.
+///
+/// **The adoption decision has to arrive here, not merely be reported.**
+/// R1 A3 lets the operator type `adopt` at the pre-erase gate to hand a
+/// record ferrum did not create over to ferrum; the host acts on that only
+/// through `ferrum.proxy.dns.adoptedNames` in the settings this function
+/// renders. Rendering without it -- which is what calling
+/// [`render::render`] here does, since that wrapper substitutes
+/// [`dns::Adoption::none`] -- produces an install where the gate said the
+/// name was adopted and the host then leaves it alone: the "reported and
+/// left alone" behaviour the operator explicitly opted out of.
+///
+/// # Arguments
+/// * `pre` - the checked-in preconditions, for the host directory.
+/// * `cli` - for the SSH directory the operator's public keys come from.
+/// * `answers` - the operator's answers.
+/// * `approved` - the confirmed disk selection.
+/// * `adoption` - what `dns::gate` recorded at the pre-erase gate. Empty on
+///   a resume, which never re-asks.
+///
+/// # Returns
+/// The rendered files, also written to the host directory.
+///
+/// # Errors
+/// If the installer carries no pinned revision, if no public key is
+/// readable, or if rendering or writing fails.
 fn generate(
     pre: &preconditions::Preconditions,
     cli: &Cli,
     answers: &answers::Answers,
     approved: &confirm::Approved,
+    adoption: &dns::Adoption,
 ) -> anyhow::Result<render::Files> {
     let keys = preconditions::find_public_keys(&cli.ssh_dir)?;
     let rev = ferrum_revision()?;
-    let files = render::render(answers, approved, &keys, rev)?;
+    let files = render::render_with_adoption(answers, approved, &keys, rev, adoption)?;
     render::write_repo(&pre.host_dir, &files)?;
     Ok(files)
 }
@@ -883,6 +910,43 @@ fn verify_host(
     Ok(failures)
 }
 
+/// R1 A8's last step: prove the published address is where traffic arrives.
+///
+/// Every other check in this binary runs on the target, over SSH. This one
+/// must not, and the distinction is the whole value of it -- a host asking
+/// itself whether the world can reach it can only ever answer yes. So the
+/// probe is made by this process, from the operator's own machine, across
+/// the public internet, with no `Target` and no `SshAuth` anywhere in
+/// reach: see [`verify::external_reachability_checks`].
+///
+/// **Reported, never fatal.** An operator legitimately installs before the
+/// port forward exists, and failing the install at this point would destroy
+/// a working host over a router setting. It runs after verification, so
+/// nothing it says can be confused with the host being unhealthy.
+///
+/// # Arguments
+/// * `answers` - for the base domain, the SSO choice, the app list and the
+///   address the operator confirmed.
+fn report_external_reachability(answers: &answers::Answers) {
+    let Some(domain) = answers.base_domain.as_deref() else {
+        return;
+    };
+    let checks = verify::external_reachability_checks(
+        domain,
+        &answers.apps,
+        answers.sso.enabled,
+        answers.dns.as_ref(),
+    );
+    if checks.is_empty() {
+        return;
+    }
+
+    println!("\nchecking from HERE, over the internet -- not from the server:");
+    for outcome in verify::assess(&checks, verify::tcp_probe, verify::outbound_control) {
+        println!("{}", outcome.summary());
+    }
+}
+
 /// The report's URL block and everything that qualifies it.
 ///
 /// A pure function rather than a run of `println!` inside [`final_report`]
@@ -1379,6 +1443,199 @@ mod tests {
             .find("< state::Phase::PreflightPassed")
             .unwrap_or(usize::MAX);
         assert!(backstop < gated, "the backstop must not be phase-gated");
+    }
+
+    // ---- R1-S11 Part 1: the adoption wire -----------------------------
+
+    /// **The wire, pinned at the call site.**
+    ///
+    /// R1-S12 built adoption end to end -- the gate, the settings field, the
+    /// Nix option, the reconciler -- and could not connect the last hop,
+    /// because `main.rs` belonged to another lane. The result was an
+    /// installer where the operator typed `adopt`, was told the record was
+    /// adopted, and the host then left it alone.
+    ///
+    /// `generate` cannot be called from a test: it needs `ferrum_revision`,
+    /// a compile-time `option_env!` that is absent outside Nix. So this
+    /// reads its source, the way
+    /// `the_authentication_backstop_runs_before_anything_destructive` does.
+    /// Crude, and it is exactly the property that was missing.
+    ///
+    /// Mutation check: put `render::render` back in `generate`, or drop the
+    /// `adoption` argument at either end, and this fails.
+    #[test]
+    fn generate_renders_with_the_adoption_decision_the_gate_returned() {
+        let src = include_str!("main.rs");
+        let body = &src[src.find("\nfn generate(").expect("generate() exists")..];
+        let body = &body[..body.find("\n}\n").expect("generate() ends")];
+
+        assert!(
+            body.contains("render::render_with_adoption("),
+            "generate() must render WITH the adoption decision; render::render \
+             substitutes Adoption::none() and the host then ignores every name \
+             the operator adopted:\n{body}"
+        );
+        assert!(
+            body.contains("rev, adoption)"),
+            "the gate's own adoption value must reach the render call:\n{body}"
+        );
+        assert!(
+            !body.contains("Adoption::none"),
+            "keeping the parameter and passing an empty adoption is the same \
+             bug wearing the right signature:\n{body}"
+        );
+
+        // ...and the caller must hand it the live value from the gate. A
+        // freshly-constructed empty one would satisfy the assertions above
+        // and still ship the bug.
+        let run = &src[src.find("fn run(cli: &Cli)").expect("run() exists")..];
+        assert!(
+            run.contains("generate(&pre, cli, &answers, &approved, &adoption)"),
+            "run() must pass the gate's own Adoption to generate()"
+        );
+    }
+
+    /// **The behaviour, from the operator's keystroke to the settings file.**
+    ///
+    /// The gate is driven with a real prompt answering `adopt`, and the
+    /// `Adoption` it returns goes through the very call `generate` now
+    /// makes. Adopting must put the name in `adoptedNames`; declining must
+    /// leave the key absent entirely -- an empty array would read to
+    /// `modules/proxy/dns.nix` as "adopt nothing", which is the same outcome
+    /// but asserts something the operator never said.
+    ///
+    /// Mutation check: have `Adoption::adopted_names` include the declined
+    /// names, or have `dns::gate` record a decline as an adoption, and the
+    /// halves swap and both assertions fail.
+    #[test]
+    fn an_adopted_name_reaches_the_settings_and_a_declined_one_does_not() {
+        let settings_for = |answer: &str| {
+            let fake = contested_cloudflare();
+            let base_url = fake.base_url().to_string();
+            let client =
+                move |token| ferrum_dns::client::Client::with_base_url(token, base_url.clone());
+            let mut io = Scripted::new(&[answer]);
+            // Minted through the one sanctioned producer, because
+            // `the_resume_call_site_cannot_mint_an_unverified_token` forbids
+            // this file from constructing a token-bearing Secret directly --
+            // and a test is not an exception to that, or the guard has a
+            // hole in the shape of a test helper.
+            let mut answers = adoption_answers();
+            answers.cloudflare_token = Some(
+                answers::validate_and_verify_cloudflare_token(TEST_TOKEN, "thesyms.ca", &client)
+                    .expect("the fake accepts the test token"),
+            );
+
+            let adoption = dns::gate(&answers, &client, &mut io).expect("the gate runs");
+            let files = render::render_with_adoption(
+                &answers,
+                &adoption_approved(),
+                &["ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAreal me@mac".to_string()],
+                "9656ab2",
+                &adoption,
+            )
+            .expect("the repository renders");
+            serde_json::from_str::<serde_json::Value>(&files["settings.stage2.json"])
+                .expect("settings.stage2.json is JSON")
+        };
+
+        let adopted = settings_for("adopt");
+        assert_eq!(
+            adopted["proxy"]["dns"]["adoptedNames"],
+            serde_json::json!(["plex.thesyms.ca"]),
+            "the operator typed 'adopt' and the host must be told which name:\n{adopted:#}"
+        );
+        println!(
+            "--- settings.stage2.json, proxy.dns -- operator typed 'adopt' ---\n{}",
+            serde_json::to_string_pretty(&adopted["proxy"]["dns"]).unwrap()
+        );
+
+        let declined = settings_for("");
+        assert!(
+            declined["proxy"]["dns"].get("adoptedNames").is_none(),
+            "a decline must leave the record alone and say nothing about it:\n{declined:#}"
+        );
+        println!(
+            "--- settings.stage2.json, proxy.dns -- operator pressed enter (decline) ---\n{}",
+            serde_json::to_string_pretty(&declined["proxy"]["dns"]).unwrap()
+        );
+    }
+
+    /// Answers that reach the DNS gate: a base domain, a stated address,
+    /// and an app whose record the zone below already holds.
+    fn adoption_answers() -> answers::Answers {
+        answers::Answers {
+            hostname: "saltbox".into(),
+            base_domain: Some("thesyms.ca".into()),
+            acme_email: Some("me@thesyms.ca".into()),
+            sso: crate::sso::SsoDecision {
+                enabled: true,
+                unauthenticated_accepted_for: Vec::new(),
+                admin_email: Some("me@thesyms.ca".into()),
+            },
+            apps: vec!["plex".into()],
+            // Filled in by the caller through
+            // `answers::validate_and_verify_cloudflare_token`.
+            cloudflare_token: None,
+            dns: Some(answers::DnsDecision {
+                target: answers::RecordTarget::A("203.0.113.10".parse().expect("a literal")),
+                ddns_updater: true,
+            }),
+        }
+    }
+
+    /// A zone in which `plex.thesyms.ca` already exists and is not ferrum's
+    /// -- the only situation in which the gate asks anything at all.
+    ///
+    /// `/zones` is scripted twice and the records route three times because
+    /// this test makes two zone resolutions -- one for A5's token check, one
+    /// inside the dry run -- and each reads the records once for `NS`
+    /// delegations before `plan_records` reads it for the listing.
+    fn contested_cloudflare() -> FakeCloudflare {
+        let fake = FakeCloudflare::start();
+        let zone = || {
+            CannedResponse::ok(serde_json::json!([{
+                "id": "z1",
+                "name": "thesyms.ca",
+                "name_servers": ["amber.ns.cloudflare.com"],
+            }]))
+        };
+        fake.script(Route::get("/zones"), zone());
+        fake.script(Route::get("/zones"), zone());
+        for _ in 0..2 {
+            fake.script(
+                Route::get("/zones/z1/dns_records"),
+                CannedResponse::ok(serde_json::json!([])),
+            );
+        }
+        fake.script(
+            Route::get("/zones/z1/dns_records"),
+            CannedResponse::ok(serde_json::json!([{
+                "id": "r2",
+                "name": "plex.thesyms.ca",
+                "type": "A",
+                "content": "198.51.100.9",
+                "proxied": false,
+            }])),
+        );
+        fake
+    }
+
+    /// A disk selection good enough to render a repository from.
+    fn adoption_approved() -> confirm::Approved {
+        let device = inventory::Device {
+            name: "sda".into(),
+            size: "500G".into(),
+            model: Some("TEST".into()),
+            serial: Some("SER123".into()),
+            by_id: Some("/dev/disk/by-id/ata-TEST_SER123".into()),
+            children: Vec::new(),
+        };
+        confirm::Approved {
+            device: device.clone(),
+            firmware: inventory::Firmware::Uefi,
+            all_devices: vec![device],
+        }
     }
 
     #[test]

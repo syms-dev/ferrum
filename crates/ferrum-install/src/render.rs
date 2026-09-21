@@ -686,6 +686,14 @@ pub enum Stage {
 
 /// Renders the whole host repository for a run that adopted nothing.
 ///
+/// **Test-only, deliberately.** R1-S11 made `main::generate` call
+/// [`render_with_adoption`] directly, because this wrapper substitutes
+/// [`Adoption::none`] -- so a production path routed through it produces a
+/// host that ignores every name the operator typed `adopt` for. Keeping it
+/// out of the non-test build is what stops that wire being undone by
+/// someone reaching for the shorter signature; the tests below that do not
+/// exercise adoption keep it for brevity.
+///
 /// # Arguments
 /// * `answers` - the operator's answers.
 /// * `approved` - the confirmed disk selection.
@@ -694,6 +702,7 @@ pub enum Stage {
 ///
 /// # Errors
 /// As [`render_with_adoption`].
+#[cfg(test)]
 pub fn render(
     answers: &Answers,
     approved: &Approved,
