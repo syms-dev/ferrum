@@ -55,7 +55,10 @@ fn base_args_in(auth: &SshAuth, port: u16, host_dir: Option<&Path>) -> Vec<Strin
     ];
     if let Some(dir) = host_dir {
         args.push("-o".into());
-        args.push(format!("UserKnownHostsFile={}", dir.join(KNOWN_HOSTS).display()));
+        args.push(format!(
+            "UserKnownHostsFile={}",
+            dir.join(KNOWN_HOSTS).display()
+        ));
     }
     if let SshAuth::Key(path) = auth {
         // IdentitiesOnly stops ssh from silently trying agent keys when we
@@ -88,7 +91,11 @@ pub fn sh_quote(value: &str) -> String {
 /// problems, and ssh already words them better than a wrapper would.
 pub fn run(target: &Target, auth: &SshAuth, command: &str) -> anyhow::Result<String> {
     let output = Command::new("ssh")
-        .args(base_args_in(auth, target.port, target.known_hosts_dir.as_deref()))
+        .args(base_args_in(
+            auth,
+            target.port,
+            target.known_hosts_dir.as_deref(),
+        ))
         .arg(target.to_string())
         .arg(command)
         .output()
@@ -96,10 +103,7 @@ pub fn run(target: &Target, auth: &SshAuth, command: &str) -> anyhow::Result<Str
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!(
-            "ssh {target} failed running {command:?}: {}",
-            stderr.trim()
-        );
+        anyhow::bail!("ssh {target} failed running {command:?}: {}", stderr.trim());
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
@@ -137,7 +141,11 @@ pub fn run(target: &Target, auth: &SshAuth, command: &str) -> anyhow::Result<Str
 /// If ssh cannot start, or the remote command exits non-zero.
 pub fn run_streaming(target: &Target, auth: &SshAuth, command: &str) -> anyhow::Result<()> {
     let status = Command::new("ssh")
-        .args(base_args_in(auth, target.port, target.known_hosts_dir.as_deref()))
+        .args(base_args_in(
+            auth,
+            target.port,
+            target.known_hosts_dir.as_deref(),
+        ))
         .arg(target.to_string())
         .arg(command)
         .status()
@@ -157,7 +165,11 @@ pub fn run_with_stdin(
     use std::io::Write;
 
     let mut child = Command::new("ssh")
-        .args(base_args_in(auth, target.port, target.known_hosts_dir.as_deref()))
+        .args(base_args_in(
+            auth,
+            target.port,
+            target.known_hosts_dir.as_deref(),
+        ))
         .arg(target.to_string())
         .arg(command)
         .stdin(std::process::Stdio::piped())
@@ -255,10 +267,16 @@ mod tests {
     /// installer could never reach a freshly-imaged machine at all.
     #[test]
     fn a_new_host_is_accepted_once_and_remembered() {
-        let args = base_args_in(&SshAuth::Agent(PathBuf::from("/s")), 22, Some(Path::new("/host")));
+        let args = base_args_in(
+            &SshAuth::Agent(PathBuf::from("/s")),
+            22,
+            Some(Path::new("/host")),
+        );
         assert!(args.contains(&"StrictHostKeyChecking=accept-new".to_string()));
-        assert!(args.contains(&"UserKnownHostsFile=/host/known_hosts".to_string()),
-                "trust must persist across a --rm container: {args:?}");
+        assert!(
+            args.contains(&"UserKnownHostsFile=/host/known_hosts".to_string()),
+            "trust must persist across a --rm container: {args:?}"
+        );
     }
 
     /// accept-new trusts a NEW host; a CHANGED key is still refused. That
@@ -271,7 +289,9 @@ mod tests {
 
     #[test]
     fn sh_quote_neutralises_every_metacharacter_that_matters() {
-        for raw in ["a;id", "a`id`", "a$(id)", "a|id", "a&id", "a>f", "a<f", "a\nb"] {
+        for raw in [
+            "a;id", "a`id`", "a$(id)", "a|id", "a&id", "a>f", "a<f", "a\nb",
+        ] {
             let q = sh_quote(raw);
             assert!(q.starts_with('\'') && q.ends_with('\''), "{q}");
         }

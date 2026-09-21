@@ -296,7 +296,12 @@ mod tests {
     /// and this fails.
     #[test]
     fn a_target_that_moved_after_the_wipe_is_never_told_to_use_fresh() {
-        for phase in [Phase::Installing, Phase::Installed, Phase::HardwareConfigured, Phase::Stage2Applied] {
+        for phase in [
+            Phase::Installing,
+            Phase::Installed,
+            Phase::HardwareConfigured,
+            Phase::Stage2Applied,
+        ] {
             let r = plan(Some(&state(phase)), "root@192.168.2.50", false);
             let Resume::Conflict(msg) = r else {
                 panic!("{phase:?}: a different target must not silently continue");
@@ -316,9 +321,14 @@ mod tests {
         // the message may say so.
         for phase in [Phase::Generated, Phase::PreflightPassed] {
             let r = plan(Some(&state(phase)), "root@192.168.2.50", false);
-            let Resume::Conflict(msg) = r else { panic!("{phase:?}") };
+            let Resume::Conflict(msg) = r else {
+                panic!("{phase:?}")
+            };
             assert!(!msg.contains("DO NOT use --fresh"), "{phase:?}: {msg}");
-            assert!(msg.contains("Nothing has been erased yet"), "{phase:?}: {msg}");
+            assert!(
+                msg.contains("Nothing has been erased yet"),
+                "{phase:?}: {msg}"
+            );
         }
     }
 
@@ -371,7 +381,10 @@ mod tests {
         std::fs::write(dir.path().join("install-state.json"), "{ truncated").unwrap();
         let err = read(dir.path()).unwrap_err().to_string();
         assert!(err.contains("Refusing to guess"), "{err}");
-        assert!(err.contains("--fresh"), "the escape hatch must be named: {err}");
+        assert!(
+            err.contains("--fresh"),
+            "the escape hatch must be named: {err}"
+        );
     }
 
     #[test]
@@ -386,7 +399,12 @@ mod tests {
     /// a resume must not ask for the serial again.
     #[test]
     fn a_resume_past_the_wipe_does_not_re_ask_for_the_serial() {
-        for phase in [Phase::Installing, Phase::Installed, Phase::HardwareConfigured, Phase::Stage2Applied] {
+        for phase in [
+            Phase::Installing,
+            Phase::Installed,
+            Phase::HardwareConfigured,
+            Phase::Stage2Applied,
+        ] {
             let r = plan(Some(&state(phase)), "root@saltbox", false);
             assert!(
                 !needs_disk_confirmation(&r),
@@ -467,7 +485,12 @@ mod tests {
     /// regenerate, so its recorded progress still stands.
     #[test]
     fn a_resume_past_the_wipe_keeps_its_progress() {
-        for phase in [Phase::Installing, Phase::Installed, Phase::HardwareConfigured, Phase::Stage2Applied] {
+        for phase in [
+            Phase::Installing,
+            Phase::Installed,
+            Phase::HardwareConfigured,
+            Phase::Stage2Applied,
+        ] {
             let r = plan(Some(&state(phase)), "root@saltbox", false);
             assert_eq!(effective_reached(&r), Some(phase), "{phase:?}");
         }
@@ -504,7 +527,10 @@ mod tests {
         let r = plan(Some(&state(Phase::Installed)), "root@other", false);
         match r {
             Resume::Conflict(m) => {
-                assert!(m.contains("root@saltbox") && m.contains("root@other"), "{m}");
+                assert!(
+                    m.contains("root@saltbox") && m.contains("root@other"),
+                    "{m}"
+                );
                 assert!(m.contains("--fresh"), "{m}");
             }
             other => panic!("expected a conflict, got {other:?}"),
@@ -535,7 +561,10 @@ mod tests {
         )
         .unwrap();
         let st = read(dir.path()).unwrap().unwrap();
-        assert!(st.unauthenticated_accepted_for.is_empty(), "absence must never mean consent");
+        assert!(
+            st.unauthenticated_accepted_for.is_empty(),
+            "absence must never mean consent"
+        );
     }
 
     #[test]

@@ -90,8 +90,7 @@ pub const HARDWARE_CONFIG_SENTINEL: &str = "# PLACEHOLDER";
 /// existed would otherwise run `git add -A` with no ignore file and commit
 /// the operator's own files right back into the history that ships to the
 /// host.
-pub const GITIGNORE: &str =
-        "# This installer's own working files. They are the OPERATOR's, not\n\
+pub const GITIGNORE: &str = "# This installer's own working files. They are the OPERATOR's, not\n\
          # the host's: install-state.json tracks this run's progress,\n\
          # install-inventory.json holds every disk on the machine, and\n\
          # known_hosts records which hosts you manage and their\n\
@@ -102,8 +101,7 @@ pub const GITIGNORE: &str =
          install-state.json.tmp\n\
          install-inventory.json\n\
          install-inventory.json.tmp\n\
-         known_hosts\n"
-        ;
+         known_hosts\n";
 
 /// The disko revision generated hosts pin.
 ///
@@ -271,7 +269,7 @@ fn disko(os_disk: &str, firmware: Firmware, serial: Option<&str>) -> anyhow::Res
             mountOptions = [ "umask=0077" ];
           };
         };"#
-            .to_string(),
+        .to_string(),
         Firmware::Bios => r#"        boot = {
           priority = 1;
           name = "bios-boot";
@@ -632,7 +630,11 @@ pub fn render(
     let mut files = Files::new();
     files.insert(
         "disko.nix".into(),
-        disko(os_disk, approved.firmware, approved.device.serial.as_deref())?,
+        disko(
+            os_disk,
+            approved.firmware,
+            approved.device.serial.as_deref(),
+        )?,
     );
     files.insert(
         "flake.nix".into(),
@@ -644,11 +646,17 @@ pub fn render(
 
     files.insert(
         "settings.json".into(),
-        format!("{}\n", serde_json::to_string_pretty(&settings(answers, Stage::One, disks.len()))?),
+        format!(
+            "{}\n",
+            serde_json::to_string_pretty(&settings(answers, Stage::One, disks.len()))?
+        ),
     );
     files.insert(
         "settings.stage2.json".into(),
-        format!("{}\n", serde_json::to_string_pretty(&settings(answers, Stage::Two, disks.len()))?),
+        format!(
+            "{}\n",
+            serde_json::to_string_pretty(&settings(answers, Stage::Two, disks.len()))?
+        ),
     );
 
     if !disks.is_empty() {
@@ -775,9 +783,14 @@ pub fn write_repo(dir: &Path, files: &Files) -> anyhow::Result<()> {
         .status()?;
     if !staged.success() {
         git(&[
-            "-c", "user.name=ferrum-install",
-            "-c", "user.email=ferrum-install@localhost",
-            "commit", "-q", "-m", "ferrum-install: generated host configuration",
+            "-c",
+            "user.name=ferrum-install",
+            "-c",
+            "user.email=ferrum-install@localhost",
+            "commit",
+            "-q",
+            "-m",
+            "ferrum-install: generated host configuration",
         ])?;
     }
     Ok(())
@@ -799,11 +812,17 @@ mod tests {
         let f = render(&answers(), &a, &keys(), "9656ab2").unwrap();
         let m = &f["custom/media.nix"];
         assert!(m.contains(&format!("fileSystems.\"{MEDIA_ROOT}\"")), "{m}");
-        assert!(!m.contains("/mnt/media-"), "the disconnected path must be gone:\n{m}");
+        assert!(
+            !m.contains("/mnt/media-"),
+            "the disconnected path must be gone:\n{m}"
+        );
 
         // One disk needs no pool.
         let st: serde_json::Value = serde_json::from_str(&f["settings.json"]).unwrap();
-        assert!(st.get("storage").is_none(), "a single disk is not a pool: {st}");
+        assert!(
+            st.get("storage").is_none(),
+            "a single disk is not a pool: {st}"
+        );
     }
 
     /// Several disks become pool branches, and the pool is turned on.
@@ -893,13 +912,20 @@ mod tests {
         // Exactly what a resume passes: no .gitignore anywhere in it.
         let mut files = Files::new();
         files.insert("flake.nix".into(), "{ }\n".into());
-        assert!(!files.contains_key(".gitignore"), "the caller must not supply it");
+        assert!(
+            !files.contains_key(".gitignore"),
+            "the caller must not supply it"
+        );
 
         write_repo(dir.path(), &files).unwrap();
 
         let written = std::fs::read_to_string(dir.path().join(".gitignore"))
             .expect("write_repo must write it regardless of the caller");
-        for name in ["install-state.json", "install-inventory.json", "known_hosts"] {
+        for name in [
+            "install-state.json",
+            "install-inventory.json",
+            "known_hosts",
+        ] {
             assert!(written.contains(name), "{name} not ignored:\n{written}");
         }
 
@@ -987,14 +1013,16 @@ mod tests {
         let err = disko("/dev/disk/by-id/ata-OS_1", Firmware::Uefi, None)
             .expect_err("no serial must be refused, never silently unguarded");
         let msg = err.to_string();
-        assert!(msg.contains("no \\\n             serial") || msg.contains("no serial"), "{msg}");
+        assert!(
+            msg.contains("no \\\n             serial") || msg.contains("no serial"),
+            "{msg}"
+        );
         assert!(msg.contains("preCreateHook"), "{msg}");
 
         // With a serial, the guard is present.
         let ok = disko("/dev/disk/by-id/ata-OS_1", Firmware::Uefi, Some("S1")).unwrap();
         assert!(ok.contains("preCreateHook"), "the guard must be emitted");
     }
-
 
     /// The transfer guard and the verify check both look for
     /// [`HARDWARE_CONFIG_SENTINEL`] in this file's body. If the placeholder
@@ -1027,8 +1055,7 @@ mod tests {
         assert!(!PLACEHOLDERS.contains(&HARDWARE_CONFIG_SENTINEL));
         let mut files = Files::new();
         insert_hardware_config_placeholder(&mut files);
-        check_no_placeholders(&files)
-            .expect("render must not reject its own placeholder file");
+        check_no_placeholders(&files).expect("render must not reject its own placeholder file");
     }
     use super::*;
     use crate::inventory::Filesystem;
@@ -1110,7 +1137,10 @@ mod tests {
             );
         }
         for sub in ["\"@root\"", "\"@nix\"", "\"@state\"", "\"@snapshots\""] {
-            assert!(SUBVOLUMES.contains(sub), "{sub} missing from the generated layout");
+            assert!(
+                SUBVOLUMES.contains(sub),
+                "{sub} missing from the generated layout"
+            );
         }
     }
 
@@ -1120,7 +1150,8 @@ mod tests {
     #[test]
     fn device_strings_cannot_break_out_of_the_generated_nix() {
         let mut a = approved(Firmware::Uefi);
-        a.device.by_id = Some(r#"/dev/disk/by-id/evil"; boot.loader.grub.device = "/dev/sda"#.into());
+        a.device.by_id =
+            Some(r#"/dev/disk/by-id/evil"; boot.loader.grub.device = "/dev/sda"#.into());
         a.all_devices[0] = a.device.clone();
         a.all_devices[1].model = Some("Model ${builtins.currentSystem}".into());
 
@@ -1128,7 +1159,10 @@ mod tests {
         let d = &f["disko.nix"];
         // The quote is escaped, so the injected attribute never becomes Nix.
         assert!(d.contains(r#"\""#), "quote not escaped:\n{d}");
-        assert!(!d.contains("\n    boot.loader.grub.device"), "broke out:\n{d}");
+        assert!(
+            !d.contains("\n    boot.loader.grub.device"),
+            "broke out:\n{d}"
+        );
         // And an antiquotation is inert rather than evaluated. Checking
         // for an UNESCAPED occurrence: `\${builtins` trivially contains
         // `${builtins`, so a substring test alone proves nothing.
@@ -1152,7 +1186,10 @@ mod tests {
         let f = render(&answers(), &approved(Firmware::Uefi), &keys(), "abc1234").unwrap();
         let d = &f["disko.nix"];
         assert!(d.contains("/dev/disk/by-id/ata-OS_1"));
-        assert!(!d.contains("ata-DATA_1"), "a data disk must never appear in disko.nix:\n{d}");
+        assert!(
+            !d.contains("ata-DATA_1"),
+            "a data disk must never appear in disko.nix:\n{d}"
+        );
         assert!(!d.contains("ata-EMPTY_1"), "{d}");
     }
 
@@ -1163,13 +1200,19 @@ mod tests {
         let f = render(&answers(), &approved(Firmware::Uefi), &keys(), "abc").unwrap();
         let d = &f["disko.nix"];
         assert!(d.contains("preCreateHook"), "no pre-partition hook:\n{d}");
-        assert!(d.contains("sda-serial"), "the approved serial must be baked in:\n{d}");
+        assert!(
+            d.contains("sda-serial"),
+            "the approved serial must be baked in:\n{d}"
+        );
         assert!(d.contains("REFUSING TO PARTITION"), "{d}");
         // Fails closed: the comparison is against the read value, so an
         // unreadable serial is an empty string and therefore a mismatch.
         // The quotes are Nix-escaped, because the hook is a double-quoted
         // Nix string -- see a_serial_containing_an_apostrophe_... for why.
-        assert!(d.contains(r#"[ \"$ferrum_got\" != \"$ferrum_want\" ]"#), "{d}");
+        assert!(
+            d.contains(r#"[ \"$ferrum_got\" != \"$ferrum_want\" ]"#),
+            "{d}"
+        );
         assert!(d.contains("exit 1"), "{d}");
     }
 
@@ -1240,8 +1283,14 @@ mod tests {
         for (disk, serial) in [
             (format!("/dev/disk/by-id/ata-X{payload}"), "SER".to_string()),
             ("/dev/disk/by-id/ata-X".to_string(), format!("SER{payload}")),
-            (format!("/dev/disk/by-id/`touch {}`", marker.display()), "SER".into()),
-            (format!("/dev/disk/by-id/ata-X'; touch {}; '", marker.display()), "SER".into()),
+            (
+                format!("/dev/disk/by-id/`touch {}`", marker.display()),
+                "SER".into(),
+            ),
+            (
+                format!("/dev/disk/by-id/ata-X'; touch {}; '", marker.display()),
+                "SER".into(),
+            ),
         ] {
             // Execute BOTH the raw guard and the text as it emerges from
             // the Nix layer. Those are not always the same string, and the
@@ -1252,7 +1301,10 @@ mod tests {
                 // The guard is expected to FAIL (the serial will not match a
                 // device that does not exist); what must not happen is the
                 // payload running.
-                let _ = std::process::Command::new("sh").arg("-c").arg(script).output();
+                let _ = std::process::Command::new("sh")
+                    .arg("-c")
+                    .arg(script)
+                    .output();
                 assert!(
                     !marker.exists(),
                     "the {label} guard executed an injected payload.\n  \
@@ -1289,7 +1341,10 @@ mod tests {
             "the device path must be spliced once, not repeated into messages:\n{g}"
         );
         assert!(g.contains("ferrum_disk='/dev/disk/by-id/DISK'"), "{g}");
-        assert!(g.contains("\"$ferrum_disk\""), "later uses must go through the variable:\n{g}");
+        assert!(
+            g.contains("\"$ferrum_disk\""),
+            "later uses must go through the variable:\n{g}"
+        );
         assert_eq!(g.matches("'SERIAL'").count(), 1, "{g}");
     }
 
@@ -1303,7 +1358,9 @@ mod tests {
     /// proof; this defect was found and fixed by running nix-instantiate.
     #[test]
     fn dump_adversarial_disko_for_nix_parsing() {
-        let Ok(dest) = std::env::var("FERRUM_DUMP_DISKO") else { return };
+        let Ok(dest) = std::env::var("FERRUM_DUMP_DISKO") else {
+            return;
+        };
         let mut a = approved(Firmware::Uefi);
         a.device.serial = Some("abc'def\"x${builtins.currentSystem}".into());
         let f = render(&answers(), &a, &keys(), "abc").unwrap();
@@ -1323,12 +1380,18 @@ mod tests {
         let rest = &d[hook_start + "preCreateHook = \"".len()..];
         let end = rest.find("\";").expect("the hook string must be closed");
         let body = &rest[..end];
-        assert!(body.contains("abc"), "the serial must still be there: {body}");
+        assert!(
+            body.contains("abc"),
+            "the serial must still be there: {body}"
+        );
         // No unescaped double quote inside the body.
         let unescaped_quote = body
             .match_indices('"')
             .any(|(i, _)| i == 0 || !body[..i].ends_with('\\'));
-        assert!(!unescaped_quote, "an unescaped quote closes the hook early: {body}");
+        assert!(
+            !unescaped_quote,
+            "an unescaped quote closes the hook early: {body}"
+        );
     }
 
     /// A serial crafted to inject Nix must be inert.
@@ -1386,8 +1449,14 @@ mod tests {
         let f = render(&answers(), &approved(Firmware::Uefi), &keys(), "abc1234").unwrap();
         let m = &f["custom/media.nix"];
         assert!(m.contains("ata-DATA_1") && m.contains("ext4"));
-        assert!(m.contains("nofail"), "a missing disk must not break boot: {m}");
-        assert!(!m.contains("ata-EMPTY_1"), "an empty disk is not a data disk: {m}");
+        assert!(
+            m.contains("nofail"),
+            "a missing disk must not break boot: {m}"
+        );
+        assert!(
+            !m.contains("ata-EMPTY_1"),
+            "an empty disk is not a data disk: {m}"
+        );
     }
 
     /// `importDir ./custom` is unconditional in the generated flake, and
@@ -1404,8 +1473,14 @@ mod tests {
         let hw = f
             .get("hardware-configuration.nix")
             .expect("preflight cannot evaluate the flake without this file");
-        assert!(hw.contains("PLACEHOLDER"), "it must be obviously temporary: {hw}");
-        assert!(hw.contains("{ ... }: { }"), "it must be a valid empty module: {hw}");
+        assert!(
+            hw.contains("PLACEHOLDER"),
+            "it must be obviously temporary: {hw}"
+        );
+        assert!(
+            hw.contains("{ ... }: { }"),
+            "it must be a valid empty module: {hw}"
+        );
         assert!(f["flake.nix"].contains("./hardware-configuration.nix"));
     }
 
@@ -1520,12 +1595,21 @@ mod tests {
     #[test]
     fn a_real_ed25519_key_is_not_mistaken_for_a_placeholder() {
         let real = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIdz0kygj48zqJh cs@mac".to_string();
-        let f = render(&answers(), &approved(Firmware::Uefi), std::slice::from_ref(&real), "abc").unwrap();
+        let f = render(
+            &answers(),
+            &approved(Firmware::Uefi),
+            std::slice::from_ref(&real),
+            "abc",
+        )
+        .unwrap();
         assert!(f["flake.nix"].contains(&real));
 
         // ...while the template's actual placeholder is still caught.
         let mut bad = Files::new();
-        bad.insert("flake.nix".into(), "\"ssh-ed25519 AAAA...CHANGE-ME\"".into());
+        bad.insert(
+            "flake.nix".into(),
+            "\"ssh-ed25519 AAAA...CHANGE-ME\"".into(),
+        );
         assert!(check_no_placeholders(&bad).is_err());
     }
 
@@ -1534,7 +1618,10 @@ mod tests {
         let mut f = Files::new();
         f.insert("settings.json".into(), "{\"d\":\"example.invalid\"}".into());
         let err = check_no_placeholders(&f).unwrap_err().to_string();
-        assert!(err.contains("settings.json") && err.contains("example.invalid"), "{err}");
+        assert!(
+            err.contains("settings.json") && err.contains("example.invalid"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -1555,7 +1642,12 @@ mod tests {
             .output()
             .unwrap();
         let list = String::from_utf8(tracked.stdout).unwrap();
-        for expected in ["disko.nix", "flake.nix", "settings.json", "custom/media.nix"] {
+        for expected in [
+            "disko.nix",
+            "flake.nix",
+            "settings.json",
+            "custom/media.nix",
+        ] {
             assert!(list.contains(expected), "{expected} is untracked:\n{list}");
         }
     }

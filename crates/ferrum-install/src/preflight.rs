@@ -266,7 +266,8 @@ mod tests {
 
     #[test]
     fn authenticated_apps_pass() {
-        check_published_apps_are_authenticated(&files(published(&["sonarr"], true), "h"), &[]).unwrap();
+        check_published_apps_are_authenticated(&files(published(&["sonarr"], true), "h"), &[])
+            .unwrap();
     }
 
     /// The check that must not be vacuous.
@@ -285,8 +286,11 @@ mod tests {
     /// Plex and Jellyfin carry their own login.
     #[test]
     fn apps_with_their_own_login_are_not_flagged() {
-        check_published_apps_are_authenticated(&files(published(&["plex", "jellyfin"], false), "h"), &[])
-            .unwrap();
+        check_published_apps_are_authenticated(
+            &files(published(&["plex", "jellyfin"], false), "h"),
+            &[],
+        )
+        .unwrap();
     }
 
     #[test]
@@ -324,8 +328,13 @@ mod tests {
     fn a_placeholder_fails_tier1_before_anything_else() {
         let dir = tempfile::tempdir().unwrap();
         let mut f = files(published(&[], true), "saltbox");
-        f.insert("disko.nix".into(), "device = \"/dev/disk/by-id/CHANGE-ME\";".into());
-        let err = tier1(dir.path(), &f, "saltbox", &[]).unwrap_err().to_string();
+        f.insert(
+            "disko.nix".into(),
+            "device = \"/dev/disk/by-id/CHANGE-ME\";".into(),
+        );
+        let err = tier1(dir.path(), &f, "saltbox", &[])
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("CHANGE-ME"), "{err}");
     }
 
@@ -335,7 +344,10 @@ mod tests {
     fn consent_does_not_stretch_to_apps_it_was_not_given_for() {
         let f = |apps: &[&str]| {
             let mut m = Files::new();
-            m.insert("settings.stage2.json".into(), published(apps, false).to_string());
+            m.insert(
+                "settings.stage2.json".into(),
+                published(apps, false).to_string(),
+            );
             m
         };
         // Granted for sonarr, and sonarr is what is published: fine.
@@ -372,7 +384,10 @@ mod tests {
 
     #[test]
     fn evidence_never_claims_a_boot_it_did_not_do() {
-        let e = Evidence { evaluated: true, booted: false };
+        let e = Evidence {
+            evaluated: true,
+            booted: false,
+        };
         assert!(e.describe().contains("boot verified by CI"));
         assert!(!e.describe().contains("and boot verified"));
     }

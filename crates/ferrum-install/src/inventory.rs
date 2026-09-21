@@ -287,7 +287,8 @@ pub fn check_recovered_device(d: &mut Device) -> anyhow::Result<()> {
                  the \"serial\" field for {} in {RECOVERY_FILE}, or re-run with \
                  --fresh to discard the recorded state and start over. \
                  Re-running the SAME command will hit this again.",
-                d.name, d.name
+                d.name,
+                d.name
             );
         }
     }
@@ -349,7 +350,11 @@ fn check_device_name(name: &str) -> anyhow::Result<()> {
 
 fn clean_required(v: String) -> String {
     let c = strip_controls(&v);
-    if c.is_empty() { "?".to_string() } else { c }
+    if c.is_empty() {
+        "?".to_string()
+    } else {
+        c
+    }
 }
 
 fn clean(v: Option<String>) -> Option<String> {
@@ -373,21 +378,21 @@ pub fn parse_lsblk(json: &str) -> anyhow::Result<Vec<Device>> {
             check_device_name(&d.name)
                 .map_err(|e| e.context("the target's own lsblk reported this device"))?;
             Ok(Device {
-            name: clean_required(d.name),
-            size: clean(d.size).unwrap_or_else(|| "?".to_string()),
-            model: clean(d.model),
-            serial: clean(d.serial),
-            by_id: None,
-            children: d
-                .children
-                .into_iter()
-                .map(|c| Filesystem {
-                    name: clean_required(c.name),
-                    fstype: clean(c.fstype),
-                    mountpoint: clean(c.mountpoint),
-                             by_id: None,
-                         })
-                .collect(),
+                name: clean_required(d.name),
+                size: clean(d.size).unwrap_or_else(|| "?".to_string()),
+                model: clean(d.model),
+                serial: clean(d.serial),
+                by_id: None,
+                children: d
+                    .children
+                    .into_iter()
+                    .map(|c| Filesystem {
+                        name: clean_required(c.name),
+                        fstype: clean(c.fstype),
+                        mountpoint: clean(c.mountpoint),
+                        by_id: None,
+                    })
+                    .collect(),
             })
         })
         .collect::<anyhow::Result<Vec<_>>>()
@@ -652,15 +657,19 @@ pub fn render(devices: &[Device]) -> String {
         ));
         out.push_str(&format!(
             "  {:<10} {:>8}  serial: {}\n",
-            "", "",
+            "",
+            "",
             d.serial
                 .as_deref()
                 .unwrap_or("(none reported -- cannot be selected)")
         ));
         out.push_str(&format!(
             "  {:<10} {:>8}  {}\n",
-            "", "",
-            d.by_id.as_deref().unwrap_or("(no stable /dev/disk/by-id path)")
+            "",
+            "",
+            d.by_id
+                .as_deref()
+                .unwrap_or("(no stable /dev/disk/by-id path)")
         ));
         if d.children.is_empty() {
             out.push_str(&format!("  {:<10} {:>8}  empty -- no partitions\n", "", ""));
@@ -668,7 +677,8 @@ pub fn render(devices: &[Device]) -> String {
             for c in &d.children {
                 out.push_str(&format!(
                     "  {:<10} {:>8}    {} {}{}\n",
-                    "", "",
+                    "",
+                    "",
                     c.name,
                     c.fstype.as_deref().unwrap_or("(no filesystem)"),
                     c.mountpoint
@@ -773,7 +783,10 @@ mod tests {
         );
         assert!(e.contains("install-inventory.json"), "{e}");
         assert!(e.contains("--fresh"), "{e}");
-        assert!(!e.contains("the target reported"), "false on the resume path: {e}");
+        assert!(
+            !e.contains("the target reported"),
+            "false on the resume path: {e}"
+        );
 
         // NORMALISED, never refused: these render and decide nothing once
         // the disk is gone. Real ATA models are vendor-padded, so an
@@ -799,8 +812,8 @@ mod tests {
             name: "sda1".into(),
             fstype: Some("ext4\u{202e}".into()),
             mountpoint: Some("/mnt\u{1b}[2K\r".into()),
-                                   by_id: None,
-                               });
+            by_id: None,
+        });
         super::check_recovered_device(&mut d).unwrap();
         for v in [
             d.model.as_deref().unwrap(),
@@ -831,7 +844,10 @@ mod tests {
         // The remainder is REPORTED, never silently dropped -- a disk
         // missing from the table can still be named by serial.
         assert!(table.contains("more device(s) not shown"), "{table}");
-        assert!(table.contains(&format!("{} more", 5000 - super::MAX_DEVICES)), "{table}");
+        assert!(
+            table.contains(&format!("{} more", 5000 - super::MAX_DEVICES)),
+            "{table}"
+        );
 
         // An ordinary machine is unaffected.
         let few = vec![dev("sda", Some("A")), dev("sdb", Some("B"))];
@@ -872,24 +888,20 @@ mod tests {
         // `strip_controls(name) != name` clause and this fails. It
         // survived the first time, which is why it is here.
         let long = "a".repeat(70);
-        let json = format!(
-            r#"{{"blockdevices":[{{"name":"{long}","type":"disk","size":"1T"}}]}}"#
-        );
+        let json = format!(r#"{{"blockdevices":[{{"name":"{long}","type":"disk","size":"1T"}}]}}"#);
         let err = super::parse_lsblk(&json)
             .expect_err("a name that truncates under cleaning must be refused");
         assert!(format!("{err:#}").contains("kernel device name"), "{err:#}");
         // Exactly at the cap is fine.
         let at_cap = "a".repeat(super::MAX_FIELD);
-        let json = format!(
-            r#"{{"blockdevices":[{{"name":"{at_cap}","type":"disk","size":"1T"}}]}}"#
-        );
+        let json =
+            format!(r#"{{"blockdevices":[{{"name":"{at_cap}","type":"disk","size":"1T"}}]}}"#);
         assert_eq!(super::parse_lsblk(&json).unwrap()[0].name, at_cap);
 
         // Real names still parse.
         for good in ["sda", "nvme0n1", "vdb", "mmcblk0", "dm-0"] {
-            let json = format!(
-                r#"{{"blockdevices":[{{"name":"{good}","type":"disk","size":"1T"}}]}}"#
-            );
+            let json =
+                format!(r#"{{"blockdevices":[{{"name":"{good}","type":"disk","size":"1T"}}]}}"#);
             assert_eq!(super::parse_lsblk(&json).unwrap()[0].name, good);
         }
     }
@@ -902,17 +914,25 @@ mod tests {
         // category Cc; U+202E RIGHT-TO-LEFT OVERRIDE is category Cf and
         // went straight through, reproducing the wrong-disk outcome with
         // every guard agreeing.
-        let bidi = "\u{202e}321AIDEM";           // renders as MEDIA123 reversed
+        let bidi = "\u{202e}321AIDEM"; // renders as MEDIA123 reversed
         let others = [
-            "\u{200e}x", "\u{200f}x", "\u{2066}x", "\u{2067}x", "\u{2068}x",
-            "\u{2069}x", "\u{00ad}x", "\u{200b}x", "\u{feff}x",
+            "\u{200e}x",
+            "\u{200f}x",
+            "\u{2066}x",
+            "\u{2067}x",
+            "\u{2068}x",
+            "\u{2069}x",
+            "\u{00ad}x",
+            "\u{200b}x",
+            "\u{feff}x",
         ];
         for payload in std::iter::once(bidi).chain(others) {
             let got = super::clean(Some(payload.to_string())).unwrap_or_default();
             for c in got.chars() {
                 assert!(
                     c.is_ascii_graphic() || c == ' ',
-                    "{payload:?} left {c:?} ({:#x}) in the table", c as u32
+                    "{payload:?} left {c:?} ({:#x}) in the table",
+                    c as u32
                 );
             }
         }
@@ -923,8 +943,15 @@ mod tests {
         // prompt.
         let flood = "A".repeat(200_000);
         let capped = super::clean(Some(flood)).unwrap();
-        assert!(capped.chars().count() <= super::MAX_FIELD, "{}", capped.chars().count());
-        assert!(capped.ends_with("..."), "truncation must be visible: {capped:?}");
+        assert!(
+            capped.chars().count() <= super::MAX_FIELD,
+            "{}",
+            capped.chars().count()
+        );
+        assert!(
+            capped.ends_with("..."),
+            "truncation must be visible: {capped:?}"
+        );
 
         // A realistic value is untouched by the cap.
         assert_eq!(
@@ -995,13 +1022,20 @@ mod tests {
         assert!(!decoy.chars().any(|c| c.is_control()), "{decoy:?}");
 
         // Ordinary values are untouched, and absent ones stay absent.
-        assert_eq!(super::clean(Some("  WD-WCC4N5PJ  ".into())), Some("WD-WCC4N5PJ".into()));
+        assert_eq!(
+            super::clean(Some("  WD-WCC4N5PJ  ".into())),
+            Some("WD-WCC4N5PJ".into())
+        );
         assert_eq!(super::clean(Some("   ".into())), None);
         // Stripping the ESC leaves the literal text "[2K", which is inert --
         // it cannot move a cursor or erase a line. A value that is ONLY
         // control bytes does become None.
         assert_eq!(super::clean(Some("\u{1b}[2K".into())), Some("[2K".into()));
-        assert_eq!(super::clean(Some("\u{1b}\r\u{7}".into())), None, "control-only is not a value");
+        assert_eq!(
+            super::clean(Some("\u{1b}\r\u{7}".into())),
+            None,
+            "control-only is not a value"
+        );
         assert_eq!(super::clean(None), None);
     }
 
@@ -1090,7 +1124,10 @@ lrwxrwxrwx 1 root root 13 Sep 17 10:00 nvme-Samsung_SSD_980_S5P2NG0N123456 -> ..
     #[test]
     fn drops_partition_and_opaque_aliases() {
         let m = parse_by_id(BY_ID);
-        assert_eq!(m.get("sda").map(String::as_str), Some("ata-WDC_WD20EZAZ_WD-ABC123"));
+        assert_eq!(
+            m.get("sda").map(String::as_str),
+            Some("ata-WDC_WD20EZAZ_WD-ABC123")
+        );
         assert_eq!(m.get("sdb").map(String::as_str), Some("ata-ST4000VN_ZDH9"));
         // wwn- lost to the ata- alias; -part1 never considered at all.
         assert!(!m.values().any(|v| v.contains("-part")));
@@ -1163,10 +1200,7 @@ lrwxrwxrwx 1 root root 13 Sep 17 10:00 nvme-Samsung_SSD_980_S5P2NG0N123456 -> ..
     /// none -- it made the installer unusable on ordinary hardware.
     #[test]
     fn a_device_with_no_serial_is_unselectable_not_disqualifying() {
-        let devs = vec![
-            disk("fd0", None, vec![]),
-            disk("sda", Some("A1"), vec![]),
-        ];
+        let devs = vec![disk("fd0", None, vec![]), disk("sda", Some("A1"), vec![])];
         check_serials_identify(&devs).unwrap();
         // ...and it still cannot be chosen, because nothing can name it.
         assert!(devs.iter().filter(|d| d.serial.is_none()).count() == 1);
@@ -1184,7 +1218,10 @@ lrwxrwxrwx 1 root root 13 Sep 17 10:00 nvme-Samsung_SSD_980_S5P2NG0N123456 -> ..
         // was holding an IMPOSSIBLE instruction in place. There is no flag
         // that takes a by-id path; see
         // `the_no_serial_refusal_does_not_promise_a_flag_that_does_not_exist`.
-        assert!(err.contains("virtio"), "the real cause should be named: {err}");
+        assert!(
+            err.contains("virtio"),
+            "the real cause should be named: {err}"
+        );
     }
 
     /// Same-batch drives and USB bridges reporting the enclosure's serial.
@@ -1197,7 +1234,10 @@ lrwxrwxrwx 1 root root 13 Sep 17 10:00 nvme-Samsung_SSD_980_S5P2NG0N123456 -> ..
         ];
         let err = check_serials_identify(&devs).unwrap_err().to_string();
         assert!(err.contains("sda") && err.contains("sdb"), "{err}");
-        assert!(!err.contains("sdc"), "should not implicate the unique one: {err}");
+        assert!(
+            !err.contains("sdc"),
+            "should not implicate the unique one: {err}"
+        );
     }
 
     // --- the firmware truth table, every row ---
@@ -1212,7 +1252,11 @@ lrwxrwxrwx 1 root root 13 Sep 17 10:00 nvme-Samsung_SSD_980_S5P2NG0N123456 -> ..
 
     #[test]
     fn efi_firmware_corroborated_by_an_esp_is_uefi() {
-        let d = disk("sda", Some("A"), vec![fs("sda1", Some("vfat")), fs("sda2", Some("ext4"))]);
+        let d = disk(
+            "sda",
+            Some("A"),
+            vec![fs("sda1", Some("vfat")), fs("sda2", Some("ext4"))],
+        );
         assert_eq!(infer_firmware(true, &d).unwrap(), Firmware::Uefi);
     }
 
@@ -1250,15 +1294,22 @@ lrwxrwxrwx 1 root root 13 Sep 17 10:00 nvme-Samsung_SSD_980_S5P2NG0N123456 -> ..
         assert!(out.contains("sda") && out.contains("sdb"), "{out}");
         assert!(out.contains("WD-ABC123"), "serial must be shown: {out}");
         assert!(out.contains("/dev/disk/by-id/ata-WDC"), "{out}");
-        assert!(out.contains("mounted at /"), "mounts identify a drive: {out}");
+        assert!(
+            out.contains("mounted at /"),
+            "mounts identify a drive: {out}"
+        );
         assert!(out.contains("empty -- no partitions"), "{out}");
     }
 
     #[test]
     fn the_render_is_explicit_about_missing_identifiers() {
         let d = vec![Device {
-            name: "vda".into(), size: "20G".into(), model: None,
-            serial: None, by_id: None, children: vec![],
+            name: "vda".into(),
+            size: "20G".into(),
+            model: None,
+            serial: None,
+            by_id: None,
+            children: vec![],
         }];
         let out = render(&d);
         assert!(out.contains("cannot be selected"), "{out}");

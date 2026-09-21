@@ -79,17 +79,19 @@ pub fn env(answers: &Answers) -> Vec<(String, String)> {
         .map(|&name| {
             let value = match name {
                 "FERRUM_SERVARR_APPS" => servarr.join(","),
-                "FERRUM_AUTH_ENABLED" => {
-                    if answers.sso.enabled { "1" } else { "0" }.to_string()
-                }
+                "FERRUM_AUTH_ENABLED" => if answers.sso.enabled { "1" } else { "0" }.to_string(),
                 "FERRUM_ADMIN_EMAIL" => answers.sso.admin_email.clone().unwrap_or_default(),
                 "FERRUM_SABNZBD_STATE_DIR" => {
-                    if sabnzbd_on { SABNZBD_STATE_DIR.to_string() } else { String::new() }
+                    if sabnzbd_on {
+                        SABNZBD_STATE_DIR.to_string()
+                    } else {
+                        String::new()
+                    }
                 }
                 "FERRUM_SABNZBD_PORT" => SABNZBD_PORT.to_string(),
-                other => unreachable!(
-                    "{other} is listed in STAGE2_OVERRIDDEN but has no value here"
-                ),
+                other => {
+                    unreachable!("{other} is listed in STAGE2_OVERRIDDEN but has no value here")
+                }
             };
             (name.to_string(), value)
         })
@@ -194,7 +196,10 @@ mod tests {
         let e = env(&answers(&["sonarr"], true));
         let emitted: Vec<&str> = e.iter().map(|(k, _)| k.as_str()).collect();
         for expected in STAGE2_OVERRIDDEN {
-            assert!(emitted.contains(expected), "{expected} is missing from {emitted:?}");
+            assert!(
+                emitted.contains(expected),
+                "{expected} is missing from {emitted:?}"
+            );
         }
         assert_eq!(e.len(), STAGE2_OVERRIDDEN.len(), "no extras either");
     }
@@ -204,20 +209,32 @@ mod tests {
     /// value survives the filter and collects to an empty list.
     #[test]
     fn servarr_apps_lists_only_the_selected_servarr_apps() {
-        assert_eq!(get(&answers(&["sonarr", "plex"], true), "FERRUM_SERVARR_APPS"), "sonarr");
         assert_eq!(
-            get(&answers(&["prowlarr", "radarr", "sonarr"], true), "FERRUM_SERVARR_APPS"),
+            get(&answers(&["sonarr", "plex"], true), "FERRUM_SERVARR_APPS"),
+            "sonarr"
+        );
+        assert_eq!(
+            get(
+                &answers(&["prowlarr", "radarr", "sonarr"], true),
+                "FERRUM_SERVARR_APPS"
+            ),
             "sonarr,radarr,prowlarr",
             "order follows overlays.nix's own list"
         );
-        assert_eq!(get(&answers(&["plex", "jellyfin"], true), "FERRUM_SERVARR_APPS"), "");
+        assert_eq!(
+            get(&answers(&["plex", "jellyfin"], true), "FERRUM_SERVARR_APPS"),
+            ""
+        );
     }
 
     /// qbittorrent and sabnzbd have their own mechanisms and must not be
     /// treated as servarr apps, matching overlays.nix.
     #[test]
     fn non_servarr_apps_never_appear_in_the_servarr_list() {
-        let v = get(&answers(&["qbittorrent", "sabnzbd", "jellyfin", "plex"], true), "FERRUM_SERVARR_APPS");
+        let v = get(
+            &answers(&["qbittorrent", "sabnzbd", "jellyfin", "plex"], true),
+            "FERRUM_SERVARR_APPS",
+        );
         assert_eq!(v, "");
     }
 
@@ -241,8 +258,14 @@ mod tests {
             get(&answers(&["sabnzbd"], true), "FERRUM_SABNZBD_STATE_DIR"),
             "/var/lib/ferrum/state/sabnzbd"
         );
-        assert_eq!(get(&answers(&["sonarr"], true), "FERRUM_SABNZBD_STATE_DIR"), "");
-        assert_eq!(get(&answers(&["sabnzbd"], true), "FERRUM_SABNZBD_PORT"), "8080");
+        assert_eq!(
+            get(&answers(&["sonarr"], true), "FERRUM_SABNZBD_STATE_DIR"),
+            ""
+        );
+        assert_eq!(
+            get(&answers(&["sabnzbd"], true), "FERRUM_SABNZBD_PORT"),
+            "8080"
+        );
     }
 
     #[test]
@@ -250,7 +273,10 @@ mod tests {
         let p = env_prefix(&answers(&["sonarr"], true));
         assert!(p.contains("FERRUM_SERVARR_APPS='sonarr'"), "{p}");
         assert!(p.contains("FERRUM_AUTH_ENABLED='1'"), "{p}");
-        assert!(p.contains("FERRUM_SABNZBD_STATE_DIR=''"), "empty must still be set: {p}");
+        assert!(
+            p.contains("FERRUM_SABNZBD_STATE_DIR=''"),
+            "empty must still be set: {p}"
+        );
     }
 
     /// An empty value must be EXPORTED as empty, not omitted -- omitting it
@@ -297,9 +323,18 @@ mod tests {
     #[test]
     fn the_token_is_delivered_before_the_apply() {
         let c = commands(&answers(&["sonarr"], true));
-        let put = c.iter().position(|x| x.contains("put-secret acme-dns")).unwrap();
-        let apply = c.iter().position(|x| x.contains("ferrum-apply apply")).unwrap();
-        assert!(put < apply, "the .sops file must exist before the build evaluates");
+        let put = c
+            .iter()
+            .position(|x| x.contains("put-secret acme-dns"))
+            .unwrap();
+        let apply = c
+            .iter()
+            .position(|x| x.contains("ferrum-apply apply"))
+            .unwrap();
+        assert!(
+            put < apply,
+            "the .sops file must exist before the build evaluates"
+        );
     }
 
     #[test]
@@ -335,7 +370,10 @@ mod tests {
             .iter()
             .position(|x| *x == crate::install::extract_into_etc_ferrum())
             .expect("settings.json and .git must be delivered to the host");
-        let apply = c.iter().position(|x| x.contains("ferrum-apply apply")).unwrap();
+        let apply = c
+            .iter()
+            .position(|x| x.contains("ferrum-apply apply"))
+            .unwrap();
         assert!(extract < apply, "{c:?}");
     }
 
@@ -371,7 +409,10 @@ mod tests {
             .skip(extract)
             .position(|x| x == ownership_repair())
             .expect("settings.json arrives root:root and must be fixed");
-        let apply = c.iter().position(|x| x.contains("ferrum-apply apply")).unwrap();
+        let apply = c
+            .iter()
+            .position(|x| x.contains("ferrum-apply apply"))
+            .unwrap();
         assert!(extract + repair_after < apply, "{c:?}");
     }
 }

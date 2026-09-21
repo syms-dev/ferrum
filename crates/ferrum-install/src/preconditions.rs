@@ -306,7 +306,10 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("does not exist"), "{err}");
-        assert!(err.contains("-v"), "the message should show the mount flag: {err}");
+        assert!(
+            err.contains("-v"),
+            "the message should show the mount flag: {err}"
+        );
     }
 
     #[test]
@@ -349,7 +352,10 @@ mod tests {
     fn an_empty_agent_variable_is_not_an_agent() {
         let dir = tempfile::tempdir().unwrap();
         let key = write_key(dir.path(), "id_rsa");
-        assert_eq!(find_ssh_auth(dir.path(), Some("")).unwrap(), SshAuth::Key(key));
+        assert_eq!(
+            find_ssh_auth(dir.path(), Some("")).unwrap(),
+            SshAuth::Key(key)
+        );
     }
 
     #[test]
@@ -366,7 +372,10 @@ mod tests {
         let err = find_ssh_auth(dir.path(), None).unwrap_err().to_string();
         assert!(err.contains("no SSH credentials"), "{err}");
         assert!(err.contains("id_ed25519"), "{err}");
-        assert!(err.contains(":ro"), "the message should show the read-only mount: {err}");
+        assert!(
+            err.contains(":ro"),
+            "the message should show the read-only mount: {err}"
+        );
     }
 
     /// The security property of R1 A5. A key whose bytes cannot be read at
@@ -407,16 +416,26 @@ mod tests {
     fn check_in_reports_the_target_problem_before_the_mount_problem() {
         // Both are wrong; the target is the one the operator typed, so it
         // is the one worth reporting first.
-        let err = check_in("saltbox", 22, Path::new("/definitely/not/here"), Path::new("/ssh"), None)
-            .unwrap_err()
-            .to_string();
+        let err = check_in(
+            "saltbox",
+            22,
+            Path::new("/definitely/not/here"),
+            Path::new("/ssh"),
+            None,
+        )
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("user@host"), "{err}");
     }
 
     #[test]
     fn public_keys_are_collected_and_deduplicated() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("id_ed25519.pub"), "ssh-ed25519 AAAA me@mac\n").unwrap();
+        std::fs::write(
+            dir.path().join("id_ed25519.pub"),
+            "ssh-ed25519 AAAA me@mac\n",
+        )
+        .unwrap();
         std::fs::write(
             dir.path().join("id_rsa.pub"),
             "# a comment\nssh-rsa BBBB me@other\nssh-ed25519 AAAA me@mac\n",
@@ -426,7 +445,10 @@ mod tests {
         std::fs::write(dir.path().join("id_ed25519"), "PRIVATE").unwrap();
 
         let keys = find_public_keys(dir.path()).unwrap();
-        assert_eq!(keys, vec!["ssh-ed25519 AAAA me@mac", "ssh-rsa BBBB me@other"]);
+        assert_eq!(
+            keys,
+            vec!["ssh-ed25519 AAAA me@mac", "ssh-rsa BBBB me@other"]
+        );
         assert!(!keys.iter().any(|k| k.contains("PRIVATE")));
         assert!(!keys.iter().any(|k| k.starts_with('#')));
     }

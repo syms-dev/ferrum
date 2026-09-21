@@ -246,12 +246,24 @@ fn base64_encode(bytes: &[u8]) -> String {
     const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
-        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
         let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
         out.push(T[(n >> 18) as usize & 63] as char);
         out.push(T[(n >> 12) as usize & 63] as char);
-        out.push(if chunk.len() > 1 { T[(n >> 6) as usize & 63] as char } else { '=' });
-        out.push(if chunk.len() > 2 { T[n as usize & 63] as char } else { '=' });
+        out.push(if chunk.len() > 1 {
+            T[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            T[n as usize & 63] as char
+        } else {
+            '='
+        });
     }
     out
 }
@@ -332,13 +344,20 @@ mod tests {
         // Written by the installer into the same directory, then committed
         // again -- exactly the real ordering.
         std::fs::write(h.join("install-inventory.json"), "{\"secret\":\"disks\"}").unwrap();
-        std::fs::write(h.join(crate::collect::KNOWN_HOSTS), "saltbox ssh-ed25519 AAAA").unwrap();
+        std::fs::write(
+            h.join(crate::collect::KNOWN_HOSTS),
+            "saltbox ssh-ed25519 AAAA",
+        )
+        .unwrap();
         crate::render::write_repo(h, &files).unwrap();
 
         let scratch = tempfile::tempdir().unwrap();
         let root = stage_extra_files(scratch.path(), h).unwrap();
         let git_dir = root.join("etc/ferrum/.git");
-        assert!(git_dir.is_dir(), ".git must travel, or the host cannot evaluate");
+        assert!(
+            git_dir.is_dir(),
+            ".git must travel, or the host cannot evaluate"
+        );
 
         for name in ["install-inventory.json", "known_hosts"] {
             // Not in the working tree...
@@ -348,8 +367,10 @@ mod tests {
             );
             // ...and not reachable through the history that DID travel.
             let out = Command::new("git")
-                .arg("--git-dir").arg(&git_dir)
-                .arg("show").arg(format!("HEAD:{name}"))
+                .arg("--git-dir")
+                .arg(&git_dir)
+                .arg("show")
+                .arg(format!("HEAD:{name}"))
                 .output()
                 .expect("git must be available");
             assert!(
@@ -364,22 +385,44 @@ mod tests {
 
     #[test]
     fn the_build_happens_on_the_target() {
-        let a = args("root@saltbox", "saltbox", Path::new("/tmp/x"), 22, &SshAuth::Key(std::path::PathBuf::from("/ssh/id_ed25519")));
+        let a = args(
+            "root@saltbox",
+            "saltbox",
+            Path::new("/tmp/x"),
+            22,
+            &SshAuth::Key(std::path::PathBuf::from("/ssh/id_ed25519")),
+        );
         let i = a.iter().position(|x| x == "--build-on").unwrap();
-        assert_eq!(a[i + 1], "remote", "an aarch64 operator machine cannot build x86_64");
+        assert_eq!(
+            a[i + 1],
+            "remote",
+            "an aarch64 operator machine cannot build x86_64"
+        );
     }
 
     /// Always used, so the target need not already run NixOS.
     #[test]
     fn the_hardware_config_is_always_generated() {
-        let a = args("root@saltbox", "saltbox", Path::new("/tmp/x"), 22, &SshAuth::Key(std::path::PathBuf::from("/ssh/id_ed25519")));
+        let a = args(
+            "root@saltbox",
+            "saltbox",
+            Path::new("/tmp/x"),
+            22,
+            &SshAuth::Key(std::path::PathBuf::from("/ssh/id_ed25519")),
+        );
         assert!(a.contains(&"--generate-hardware-config".to_string()));
         assert!(a.contains(&"./hardware-configuration.nix".to_string()));
     }
 
     #[test]
     fn the_flake_attribute_is_the_hostname() {
-        let a = args("root@saltbox", "saltbox", Path::new("/tmp/x"), 22, &SshAuth::Key(std::path::PathBuf::from("/ssh/id_ed25519")));
+        let a = args(
+            "root@saltbox",
+            "saltbox",
+            Path::new("/tmp/x"),
+            22,
+            &SshAuth::Key(std::path::PathBuf::from("/ssh/id_ed25519")),
+        );
         assert!(a.contains(&".#saltbox".to_string()));
         assert_eq!(a.last().unwrap(), "root@saltbox");
     }
@@ -388,14 +431,26 @@ mod tests {
     /// cannot run.
     #[test]
     fn the_host_repository_is_transferred() {
-        let a = args("root@saltbox", "saltbox", Path::new("/tmp/extra"), 22, &SshAuth::Key(std::path::PathBuf::from("/ssh/id_ed25519")));
+        let a = args(
+            "root@saltbox",
+            "saltbox",
+            Path::new("/tmp/extra"),
+            22,
+            &SshAuth::Key(std::path::PathBuf::from("/ssh/id_ed25519")),
+        );
         let i = a.iter().position(|x| x == "--extra-files").unwrap();
         assert_eq!(a[i + 1], "/tmp/extra");
     }
 
     #[test]
     fn a_non_default_port_reaches_nixos_anywhere() {
-        let a = args("root@h", "h", Path::new("/x"), 2222, &SshAuth::Key(std::path::PathBuf::from("/ssh/id_ed25519")));
+        let a = args(
+            "root@h",
+            "h",
+            Path::new("/x"),
+            2222,
+            &SshAuth::Key(std::path::PathBuf::from("/ssh/id_ed25519")),
+        );
         let i = a.iter().position(|x| x == "--ssh-port").unwrap();
         assert_eq!(a[i + 1], "2222");
         assert_eq!(a.last().unwrap(), "root@h", "the target stays last");
@@ -404,7 +459,14 @@ mod tests {
     /// The common case must not grow a redundant flag.
     #[test]
     fn port_22_adds_no_flag() {
-        assert!(!args("root@h", "h", Path::new("/x"), 22, &SshAuth::Key(std::path::PathBuf::from("/ssh/id_ed25519"))).contains(&"--ssh-port".to_string()));
+        assert!(!args(
+            "root@h",
+            "h",
+            Path::new("/x"),
+            22,
+            &SshAuth::Key(std::path::PathBuf::from("/ssh/id_ed25519"))
+        )
+        .contains(&"--ssh-port".to_string()));
     }
 
     #[test]
@@ -440,15 +502,15 @@ mod tests {
     fn the_staged_tree_carries_only_the_placeholder_hardware_config() {
         let scratch = tempfile::tempdir().unwrap();
         let host = tempfile::tempdir().unwrap();
-        std::fs::write(host.path().join("flake.nix"), "./hardware-configuration.nix").unwrap();
+        std::fs::write(
+            host.path().join("flake.nix"),
+            "./hardware-configuration.nix",
+        )
+        .unwrap();
         // Exactly what render() writes at this point in the run.
         let mut files = crate::render::Files::new();
         crate::render::insert_hardware_config_placeholder(&mut files);
-        std::fs::write(
-            host.path().join(HARDWARE_CONFIG),
-            &files[HARDWARE_CONFIG],
-        )
-        .unwrap();
+        std::fs::write(host.path().join(HARDWARE_CONFIG), &files[HARDWARE_CONFIG]).unwrap();
 
         let root = stage_extra_files(scratch.path(), host.path()).unwrap();
         let staged = std::fs::read_to_string(root.join("etc/ferrum").join(HARDWARE_CONFIG))
@@ -502,7 +564,9 @@ mod tests {
         let payload = tar_payload(host.path(), &[".git", HARDWARE_CONFIG]).unwrap();
         assert!(!payload.is_empty());
         assert!(
-            payload.chars().all(|c| c.is_ascii_alphanumeric() || "+/=".contains(c)),
+            payload
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "+/=".contains(c)),
             "payload must be transport-safe base64"
         );
     }
@@ -516,7 +580,9 @@ mod tests {
         std::fs::write(&secret, "PRIVATE").unwrap();
         std::os::unix::fs::symlink(&secret, host.path().join("innocent.nix")).unwrap();
 
-        let err = stage_extra_files(scratch.path(), host.path()).unwrap_err().to_string();
+        let err = stage_extra_files(scratch.path(), host.path())
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("is a symlink"), "{err}");
     }
 

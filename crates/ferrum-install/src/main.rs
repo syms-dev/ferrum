@@ -23,12 +23,12 @@ mod install;
 mod inventory;
 mod preconditions;
 mod preflight;
+mod prompt;
 mod render;
+mod sso;
 mod stage2;
 mod state;
 mod verify;
-mod prompt;
-mod sso;
 
 use clap::Parser;
 
@@ -96,7 +96,10 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
         anyhow::bail!("{message}");
     }
     if let state::Resume::ContinueAfter(p) = &resume {
-        println!("\nresuming: this directory already reached '{}'", p.describe());
+        println!(
+            "\nresuming: this directory already reached '{}'",
+            p.describe()
+        );
     }
 
     // The disk gate is re-run only when nothing has been written yet.
@@ -186,8 +189,12 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
     // between an interrupted run and this one -- the same reasoning as the
     // authenticated-apps check directly above.
     println!("\npreflight: evaluating the generated configuration ...");
-    let evidence =
-        preflight::tier1(&pre.host_dir, &files, &answers.hostname, &st.unauthenticated_accepted_for)?;
+    let evidence = preflight::tier1(
+        &pre.host_dir,
+        &files,
+        &answers.hostname,
+        &st.unauthenticated_accepted_for,
+    )?;
     if reached.unwrap_or(state::Phase::Generated) < state::Phase::PreflightPassed {
         st.phase = state::Phase::PreflightPassed;
         state::write(&pre.host_dir, &st)?;
@@ -217,7 +224,13 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
         println!("\ninstalling. THIS ERASES {}.", st.approved_disk);
         run_streaming(
             "nixos-anywhere",
-            &install::args(&cli.target, &answers.hostname, &extra, cli.ssh_port, &pre.ssh_auth),
+            &install::args(
+                &cli.target,
+                &answers.hostname,
+                &extra,
+                cli.ssh_port,
+                &pre.ssh_auth,
+            ),
             &pre.host_dir,
         )?;
 
@@ -267,7 +280,10 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
             std::fs::copy(&stage2_path, &live)?;
             let mut files = render::Files::new();
             files.insert("settings.json".into(), std::fs::read_to_string(&live)?);
-            files.insert("settings.stage1.json".into(), std::fs::read_to_string(&stage1_path)?);
+            files.insert(
+                "settings.stage1.json".into(),
+                std::fs::read_to_string(&stage1_path)?,
+            );
             render::write_repo(&pre.host_dir, &files)?;
         }
         install::commit_all(&pre.host_dir, "stage 2: enable apps")?;
@@ -275,11 +291,14 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
         println!("\nenabling apps and authentication ...");
         for command in stage2::commands(&answers) {
             if command == install::extract_into_etc_ferrum() {
-                let payload =
-                    install::tar_payload(&pre.host_dir, &[".git", "settings.json"])?;
+                let payload = install::tar_payload(&pre.host_dir, &[".git", "settings.json"])?;
                 collect::run_with_stdin(&pre.target, &pre.ssh_auth, &command, &payload)?;
             } else if command.contains("put-secret") {
-                let token = answers.cloudflare_token.as_ref().map(answers::Secret::expose).unwrap_or_default();
+                let token = answers
+                    .cloudflare_token
+                    .as_ref()
+                    .map(answers::Secret::expose)
+                    .unwrap_or_default();
                 collect::run_with_stdin(
                     &pre.target,
                     &pre.ssh_auth,
@@ -358,10 +377,7 @@ fn generate(
 /// the host's `disko.nix` as a `preCreateHook` -- see
 /// `render::precreate_serial_guard` -- because nixos-anywhere exposes no
 /// hook back into this code.
-fn recheck(
-    pre: &preconditions::Preconditions,
-    approved: &confirm::Approved,
-) -> anyhow::Result<()> {
+fn recheck(pre: &preconditions::Preconditions, approved: &confirm::Approved) -> anyhow::Result<()> {
     let raw = collect::collect(&pre.target, &pre.ssh_auth)?;
     let mut devices = inventory::parse_lsblk(&raw.lsblk)?;
     inventory::attach_by_id(&mut devices, &inventory::parse_by_id(&raw.by_id));
@@ -407,7 +423,11 @@ fn inventory_phase(
 
     println!(
         "\nfirmware: {}\narchitecture: {}\n\ndisks:\n{}",
-        if raw.efi_present { "EFI (/sys/firmware/efi present)" } else { "legacy BIOS" },
+        if raw.efi_present {
+            "EFI (/sys/firmware/efi present)"
+        } else {
+            "legacy BIOS"
+        },
         raw.arch,
         inventory::render(&devices)
     );
@@ -512,7 +532,12 @@ fn read_hostname(dir: &std::path::Path) -> anyhow::Result<String> {
 
 fn read_generated(dir: &std::path::Path) -> anyhow::Result<render::Files> {
     let mut files = render::Files::new();
-    for rel in ["flake.nix", "disko.nix", "settings.json", "settings.stage2.json"] {
+    for rel in [
+        "flake.nix",
+        "disko.nix",
+        "settings.json",
+        "settings.stage2.json",
+    ] {
         let p = dir.join(rel);
         if p.exists() {
             files.insert(rel.to_string(), std::fs::read_to_string(p)?);
@@ -1120,11 +1145,20 @@ mod tests {
              the host's permanent hardware configuration"
         );
         // Fresh runs and every earlier phase also owe it.
-        for p in [None, Some(Phase::Generated), Some(Phase::PreflightPassed), Some(Phase::Installing)] {
+        for p in [
+            None,
+            Some(Phase::Generated),
+            Some(Phase::PreflightPassed),
+            Some(Phase::Installing),
+        ] {
             assert!(needs_hardware_config_transfer(p), "{p:?}");
         }
         // ...and once done, it is not repeated.
-        for p in [Phase::HardwareConfigured, Phase::Stage2Applied, Phase::Verified] {
+        for p in [
+            Phase::HardwareConfigured,
+            Phase::Stage2Applied,
+            Phase::Verified,
+        ] {
             assert!(!needs_hardware_config_transfer(Some(p)), "{p:?}");
         }
     }
@@ -1242,7 +1276,9 @@ mod tests {
         }
         // ...and it must not be inside the phase-gated block, or a resume
         // skips it again.
-        let gated = body.find("< state::Phase::PreflightPassed").unwrap_or(usize::MAX);
+        let gated = body
+            .find("< state::Phase::PreflightPassed")
+            .unwrap_or(usize::MAX);
         assert!(backstop < gated, "the backstop must not be phase-gated");
     }
 

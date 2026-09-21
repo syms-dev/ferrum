@@ -198,10 +198,7 @@ pub fn data_disk_checks(kept: &[&Device]) -> Vec<Check> {
 /// stage-2 apply, whenever SSO is on. Printing only the first would report
 /// success while leaving the operator locked out of every app.
 pub fn credential_paths(sso_enabled: bool) -> Vec<(&'static str, &'static str)> {
-    let mut v = vec![(
-        "ferrum UI",
-        "/var/lib/ferrum/daemon/ferrumd-setup-password",
-    )];
+    let mut v = vec![("ferrum UI", "/var/lib/ferrum/daemon/ferrumd-setup-password")];
     if sso_enabled {
         v.push((
             "single sign-on",
@@ -239,12 +236,20 @@ mod tests {
         std::fs::write(&path, &files["hardware-configuration.nix"]).unwrap();
         assert_eq!(run(), "STANDIN");
 
-        std::fs::write(&path, "{ ... }:\n{ boot.initrd.availableKernelModules = [ \"nvme\" ]; }\n").unwrap();
+        std::fs::write(
+            &path,
+            "{ ... }:\n{ boot.initrd.availableKernelModules = [ \"nvme\" ]; }\n",
+        )
+        .unwrap();
         assert_eq!(run(), "REAL");
 
         // `expect` is matched with `contains`, so the three words must not
         // shadow each other.
-        for (a, b) in [("REAL", "STANDIN"), ("REAL", "MISSING"), ("STANDIN", "MISSING")] {
+        for (a, b) in [
+            ("REAL", "STANDIN"),
+            ("REAL", "MISSING"),
+            ("STANDIN", "MISSING"),
+        ] {
             assert!(!b.contains(a) && !a.contains(b), "{a} / {b}");
         }
     }
@@ -265,8 +270,8 @@ mod tests {
                         name: "sdb1".into(),
                         fstype: Some(f.into()),
                         mountpoint: None,
-                             by_id: None,
-                         }]
+                        by_id: None,
+                    }]
                 })
                 .unwrap_or_default(),
         }
@@ -296,7 +301,10 @@ mod tests {
         let apps = vec!["sonarr".to_string(), "plex".to_string()];
         let c = auth_checks("thesyms.ca", &apps, true);
         assert!(c.iter().any(|c| c.command.contains("auth.thesyms.ca")));
-        let sonarr = c.iter().find(|c| c.command.contains("sonarr.thesyms.ca")).unwrap();
+        let sonarr = c
+            .iter()
+            .find(|c| c.command.contains("sonarr.thesyms.ca"))
+            .unwrap();
         assert_eq!(sonarr.expect, "302");
         // plex carries its own login, so ferrum does not put Authelia in
         // front of it and a redirect would be the wrong expectation.
@@ -311,8 +319,14 @@ mod tests {
         assert!(auth_checks("d.com", &apps, false).is_empty());
 
         let inverted = unauthenticated_checks("d.com", &apps);
-        let sonarr = inverted.iter().find(|c| c.command.contains("sonarr")).unwrap();
-        assert_eq!(sonarr.expect, "200", "a redirect would mean SSO is on after all");
+        let sonarr = inverted
+            .iter()
+            .find(|c| c.command.contains("sonarr"))
+            .unwrap();
+        assert_eq!(
+            sonarr.expect, "200",
+            "a redirect would mean SSO is on after all"
+        );
         assert!(
             !inverted.iter().any(|c| c.command.contains("plex")),
             "plex has its own login and is not part of this claim"
@@ -322,7 +336,11 @@ mod tests {
     #[test]
     fn remote_urls_are_shell_quoted_at_the_sink() {
         let c = auth_checks("d.com", &["sonarr".into()], true);
-        assert!(c.iter().all(|c| c.command.contains("'https://")), "{:?}", c[0].command);
+        assert!(
+            c.iter().all(|c| c.command.contains("'https://")),
+            "{:?}",
+            c[0].command
+        );
     }
 
     #[test]
@@ -331,7 +349,11 @@ mod tests {
         let c = data_disk_checks(&[&d]);
         assert_eq!(c.len(), 1);
         assert!(c[0].command.contains("ata-DATA_1"));
-        assert!(c[0].command.contains("'/dev/disk/by-id/ata-DATA_1'"), "must be quoted: {}", c[0].command);
+        assert!(
+            c[0].command.contains("'/dev/disk/by-id/ata-DATA_1'"),
+            "must be quoted: {}",
+            c[0].command
+        );
         assert_eq!(c[0].expect, "ext4");
     }
 

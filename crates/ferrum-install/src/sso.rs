@@ -203,7 +203,11 @@ mod tests {
     fn an_explicit_yes_also_enables_it() {
         for yes in ["y", "Y", "yes", "YES"] {
             let mut io = Scripted::new(&[yes, "a@b.co"]);
-            assert!(decide(Some("d.com"), &apps(&["sonarr"]), &mut io).unwrap().enabled);
+            assert!(
+                decide(Some("d.com"), &apps(&["sonarr"]), &mut io)
+                    .unwrap()
+                    .enabled
+            );
         }
     }
 
@@ -237,14 +241,25 @@ mod tests {
     #[test]
     fn consent_is_not_recorded_on_any_other_path() {
         let mut io = Scripted::new(&["", "a@b.co"]);
-        assert!(decide(Some("d.com"), &apps(&["sonarr"]), &mut io).unwrap().unauthenticated_accepted_for.is_empty());
+        assert!(decide(Some("d.com"), &apps(&["sonarr"]), &mut io)
+            .unwrap()
+            .unauthenticated_accepted_for
+            .is_empty());
 
         let mut io = Scripted::new(&["n"]);
-        assert!(decide(Some("d.com"), &apps(&["plex"]), &mut io).unwrap().unauthenticated_accepted_for.is_empty(),
-                "nothing was left open, so nothing was consented to");
+        assert!(
+            decide(Some("d.com"), &apps(&["plex"]), &mut io)
+                .unwrap()
+                .unauthenticated_accepted_for
+                .is_empty(),
+            "nothing was left open, so nothing was consented to"
+        );
 
         let mut io = Scripted::new(&[]);
-        assert!(decide(None, &apps(&["sonarr"]), &mut io).unwrap().unauthenticated_accepted_for.is_empty());
+        assert!(decide(None, &apps(&["sonarr"]), &mut io)
+            .unwrap()
+            .unauthenticated_accepted_for
+            .is_empty());
     }
 
     #[test]
@@ -269,7 +284,10 @@ mod tests {
         for reflex in ["y", "yes", "n", "DESTROY", ""] {
             let mut io = Scripted::new(&["n", reflex]);
             let err = decide(Some("d.com"), &apps(&["sonarr"]), &mut io).unwrap_err();
-            assert!(err.to_string().contains("not confirmed"), "{reflex:?}: {err}");
+            assert!(
+                err.to_string().contains("not confirmed"),
+                "{reflex:?}: {err}"
+            );
         }
     }
 
@@ -318,10 +336,23 @@ mod tests {
 
     #[test]
     fn email_validation_rejects_the_shapes_that_are_certainly_wrong() {
-        for bad in ["a", "@b.com", "a@", "a@b", "a b@c.com", "a@@b.com", "a@.com", "a@b."] {
+        for bad in [
+            "a",
+            "@b.com",
+            "a@",
+            "a@b",
+            "a b@c.com",
+            "a@@b.com",
+            "a@.com",
+            "a@b.",
+        ] {
             assert!(validate_email(bad).is_err(), "accepted {bad:?}");
         }
-        for good in ["a@b.co", "admin@thesyms.ca", "first.last+tag@sub.example.com"] {
+        for good in [
+            "a@b.co",
+            "admin@thesyms.ca",
+            "first.last+tag@sub.example.com",
+        ] {
             validate_email(good).unwrap_or_else(|e| panic!("rejected {good:?}: {e}"));
         }
     }

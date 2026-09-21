@@ -56,9 +56,7 @@ pub struct Approved {
 /// at `/` -- a target booted from rescue media, which is common -- there is
 /// no suggestion at all rather than a guess.
 pub fn propose(devices: &[Device]) -> Option<&Device> {
-    devices
-        .iter()
-        .find(|d| d.mounted_at().contains(&"/"))
+    devices.iter().find(|d| d.mounted_at().contains(&"/"))
 }
 
 /// Finds the single device whose serial the operator typed.
@@ -217,8 +215,8 @@ mod tests {
                         name: format!("{name}1"),
                         fstype: Some("ext4".into()),
                         mountpoint: Some(m.into()),
-                             by_id: None,
-                         }]
+                        by_id: None,
+                    }]
                 })
                 .unwrap_or_default(),
         }
@@ -226,8 +224,18 @@ mod tests {
 
     fn two_disks() -> Vec<Device> {
         vec![
-            dev("sda", Some("OS-123"), Some("/dev/disk/by-id/ata-OS_123"), Some("/")),
-            dev("sdb", Some("DATA-9"), Some("/dev/disk/by-id/ata-DATA_9"), Some("/srv/media")),
+            dev(
+                "sda",
+                Some("OS-123"),
+                Some("/dev/disk/by-id/ata-OS_123"),
+                Some("/"),
+            ),
+            dev(
+                "sdb",
+                Some("DATA-9"),
+                Some("/dev/disk/by-id/ata-DATA_9"),
+                Some("/srv/media"),
+            ),
         ]
     }
 
@@ -292,7 +300,9 @@ mod tests {
     #[test]
     fn pressing_enter_does_not_accept_the_suggestion() {
         let mut io = Scripted::new(&[""]);
-        let err = confirm(&two_disks(), false, &mut io).unwrap_err().to_string();
+        let err = confirm(&two_disks(), false, &mut io)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("nothing has been changed"), "{err}");
     }
 
@@ -303,7 +313,10 @@ mod tests {
         let t = io.transcript();
         assert!(t.contains("suggestion, not a default"), "{t}");
         assert!(t.contains("COMPLETELY ERASED"), "{t}");
-        assert!(t.contains("not even named"), "the structural protection: {t}");
+        assert!(
+            t.contains("not even named"),
+            "the structural protection: {t}"
+        );
     }
 
     /// /dev/sdX is not stable across boots and disko.nix is re-read on
@@ -373,6 +386,9 @@ mod tests {
         let a = confirm(&two_disks(), false, &mut io).unwrap();
         let json = serde_json::to_string(&a).unwrap();
         assert!(json.contains("OS-123") && json.contains("DATA-9"), "{json}");
-        assert!(json.contains("/srv/media"), "kept disks must be recorded: {json}");
+        assert!(
+            json.contains("/srv/media"),
+            "kept disks must be recorded: {json}"
+        );
     }
 }
