@@ -2,17 +2,19 @@
 
 A NixOS-based, rollback-safe alternative to [Saltbox](https://github.com/saltyorg/Saltbox) for self-hosted media and automation servers.
 
-**Status: pre-alpha — running on real hardware, no install path, no update mechanism.**
+**Status: pre-alpha — installs and runs on real hardware; no update mechanism, and the installer's own VM tests have never passed.**
 
-Built and tested: the rollback engine, the seven-app catalog, the reverse proxy with TLS and SSO, sops secrets, the cross-app reconciler, `ferrumd` (the unprivileged daemon with its polkit privilege boundary), and the schema-driven web UI. 166 Rust unit tests and eight NixOS VM tests cover them.
+Built and tested: the rollback engine, the seven-app catalog, the reverse proxy with TLS and SSO, sops secrets, the cross-app reconciler, storage pooling over several disks, `ferrumd` (the unprivileged daemon with its polkit privilege boundary), the schema-driven web UI, and an installer that takes a bare machine to a published, logged-in system. 518 Rust unit tests and nine NixOS VM tests cover them.
 
 Proven on a real machine, not just in CI: a rollback that reverted both the system closure and application state together; Plex reachable on a real domain with a real Let's Encrypt certificate, served through ferrum's own nginx vhost from a typed `settings.json` with no hand-written Nix.
 
-Not built: the install path, and **any way to update an app**. App versions come from the nixpkgs revision ferrum's own flake pins, so updating means hand-editing pins across two repositories and re-applying; see [the Phase 1.6 spec](docs/superpowers/specs/2026-09-16-phase-1-6-updates-design.md), whose planning gate is currently open.
+Not built: **any way to update an app**. App versions come from the nixpkgs revision ferrum's own flake pins, so updating means hand-editing pins across two repositories and re-applying; see [the Phase 1.6 spec](docs/superpowers/specs/2026-09-16-phase-1-6-updates-design.md), whose planning gate is currently open.
 
 `ferrum-apply gc` **is** implemented (it was a stub until 2026-09-15) and prunes to `ferrum.storage.keepGenerations`, default 10. No timer runs it, so it is operator-triggered. Note that it protects only the *currently-running* generation's snapshot, so an older generation's snapshot can be pruned and that generation then becomes unrollbackable.
 
-It has now been installed on a real machine end to end, and rollback has been exercised there for real. That is one machine, run by its author, over one evening — **still do not point this at a server holding data you care about.**
+It has now been installed on a real machine end to end, and rollback has been exercised there for real. That is one machine, run by its author — **still do not point this at a server holding data you care about.**
+
+Two gaps worth knowing before you try it. The installer's own VM tests (`tests/stage2`) have never passed in CI, so the install path is proven by one person on one machine rather than mechanically; and ferrum does not yet create the DNS records for the hostnames it publishes, so every app needs a record you make yourself.
 
 ## Why
 
