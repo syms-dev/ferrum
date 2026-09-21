@@ -21,6 +21,9 @@
     },
     "VpnSettings": {
       "cardMode": "column"
+    },
+    "StepRail": {
+      "cardMode": "column"
     }
   },
   "readmeHeader": ".design-sync/conventions.md"

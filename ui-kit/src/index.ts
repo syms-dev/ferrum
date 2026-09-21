@@ -46,3 +46,7 @@ export { VpnStatus } from "./components/VpnStatus";
 export type { VpnStatusProps } from "./components/VpnStatus";
 export { VpnSettings } from "./components/VpnSettings";
 export type { VpnProvider, VpnSettingsProps } from "./components/VpnSettings";
+export { StepRail } from "./components/StepRail";
+export type { Step, StepRailProps } from "./components/StepRail";
+export { CredentialsField } from "./components/CredentialsField";
+export type { CredentialsFieldProps } from "./components/CredentialsField";
