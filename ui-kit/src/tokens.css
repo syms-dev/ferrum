@@ -70,3 +70,17 @@
   --ferrum-wash-ok: #eef7f0;
   --ferrum-wash-danger: #fdf0ef;
 }
+
+/* The base every component assumes but only AppShell actually set.
+ *
+ * Found by screenshotting the preview cards: outside the shell the whole
+ * library rendered in the browser's serif default, because no component
+ * but AppShell declares a font-family. A design agent composes these one
+ * at a time, not always inside the shell, so the base belongs here --
+ * rendered designs receive this file's @import closure and nothing else. */
+body {
+  margin: 0;
+  font-family: var(--ferrum-sans);
+  color: var(--ferrum-text);
+  background: var(--ferrum-bg);
+}

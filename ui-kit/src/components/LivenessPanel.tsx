@@ -19,7 +19,12 @@ export interface LivenessPanelProps {
    * seconds for three hours while the screen showed one static line.
    */
   attempts?: number;
-  /** How long this step usually takes, in human words. */
+  /**
+   * How long this step usually takes, as a bare duration phrase —
+   * `"20 to 40 minutes"`, `"a couple of minutes"`. It is spliced into a
+   * carrier sentence ("this step normally takes ..."), so a full
+   * sentence here produces a broken one on screen.
+   */
   plausible?: string;
   /** What is most likely wrong, shown only when overdue. */
   likelyCause?: string;

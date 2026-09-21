@@ -60,10 +60,10 @@ export function AppTile({ app, onToggle, onOpenSettings }: AppTileProps) {
         <>
           <div className="fk-tile-badges">
             {app.health === "active" && <Badge tone="ok">Running</Badge>}
-            {app.health === "failed" && <Badge tone="accent">Not running</Badge>}
+            {app.health === "failed" && <Badge tone="danger">Not running</Badge>}
             {app.auth === "sso" && <Badge tone="accent">Behind SSO</Badge>}
             {app.auth === "own-login" && <Badge>Its own login</Badge>}
-            {app.auth === "none" && <Badge tone="accent">No authentication</Badge>}
+            {app.auth === "none" && <Badge tone="danger">No authentication</Badge>}
           </div>
 
           <div className="fk-tile-foot">

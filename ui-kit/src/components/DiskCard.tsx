@@ -34,6 +34,20 @@ export interface Disk {
   hasFerrum?: boolean;
 }
 
+/**
+ * Disk size as the label on the drive reads it.
+ *
+ * Decimal units, because that is what manufacturers print and what lsblk
+ * reports -- and a unit switch below 1 TB, because a 240 GB boot SSD
+ * rendered as "0.3 TB" tells the operator nothing they can match against
+ * the hardware in front of them.
+ */
+function formatSize(bytes: number): string {
+  return bytes >= 1e12
+    ? `${(bytes / 1e12).toFixed(1)} TB`
+    : `${Math.round(bytes / 1e9)} GB`;
+}
+
 export interface DiskCardProps {
   disk: Disk;
   selected?: boolean;
@@ -65,7 +79,7 @@ export function DiskCard({ disk, selected = false, onSelect }: DiskCardProps) {
     >
       <span className="fk-disk-head">
         <span className="fk-disk-name">{disk.name}</span>
-        <span className="fk-disk-size">{(disk.size / 1e12).toFixed(1)} TB</span>
+        <span className="fk-disk-size">{formatSize(disk.size)}</span>
         <span className="fk-disk-model">{disk.model ?? "(no model reported)"}</span>
         <span className="fk-disk-pick">
           {!selectable ? "Not selectable" : selected ? "Will be erased" : "Select"}

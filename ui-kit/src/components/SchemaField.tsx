@@ -69,7 +69,14 @@ export function SchemaField({ name, schema, value, onChange, unsupported }: Sche
 
   const shown = value === undefined ? "" : String(value);
   const placeholder =
-    schema.default !== undefined ? `default: ${String(schema.default)}` : undefined;
+    schema.default === undefined
+      ? undefined
+      : // An empty-string default is a real default, but rendering it as
+        // "default:" followed by nothing reads as a truncated label. Say
+        // what the empty value means instead.
+        String(schema.default) === ""
+        ? "default: empty"
+        : `default: ${String(schema.default)}`;
 
   return (
     <div className="fk-field">

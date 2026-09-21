@@ -42,6 +42,11 @@ CLAUDE.md
 # ui-kit build products and deps
 ui-kit/node_modules/
 ui-kit/dist/
-.design-sync/
+# design-sync: the durable inputs (config.json, NOTES.md, conventions.md,
+# previews/, overrides/) ARE committed so a re-sync on another machine
+# reuses them. Only machine state and staged scripts are ignored.
+.design-sync/.cache/
+.design-sync/learnings/
+.design-sync/node_modules/
 ds-bundle/
 .ds-sync/
