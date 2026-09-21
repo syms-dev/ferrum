@@ -396,7 +396,6 @@ mod tests {
         );
     }
 
-    #[test]
     /// Exit 4 with everything healthy AFTER the settle window is a
     /// success, not a degradation.
     ///
@@ -447,7 +446,7 @@ mod tests {
             calls += 1;
             Ok(true)
         });
-        assert_eq!(result.unwrap(), true);
+        assert!(result.unwrap());
         assert_eq!(calls, 1, "must not poll again once healthy");
     }
 
@@ -462,7 +461,7 @@ mod tests {
                 Ok(true)
             }
         });
-        assert_eq!(result.unwrap(), true);
+        assert!(result.unwrap());
     }
 
     #[test]
@@ -470,7 +469,7 @@ mod tests {
         let result = wait_for_healthy_with(Duration::from_millis(20), Duration::from_millis(5), || {
             Ok(false)
         });
-        assert_eq!(result.unwrap(), false);
+        assert!(!result.unwrap());
     }
 
     #[test]

@@ -200,7 +200,7 @@ pub fn commit_all(host_dir: &Path, message: &str) -> anyhow::Result<()> {
     git(&["add", "-A"])?;
     // Nothing staged means it was already committed -- a resume, which is
     // not an error.
-    if !git(&["diff", "--cached", "--quiet"]).is_ok() {
+    if git(&["diff", "--cached", "--quiet"]).is_err() {
         git(&[
             "-c",
             "user.name=ferrum-install",

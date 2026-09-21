@@ -790,10 +790,14 @@
           version = "0.1.0";
           src = lib.cleanSource ../../../crates;
           cargoLock.lockFile = ../../../crates/Cargo.lock;
-          buildAndTestSubdir = "ferrum-apply";
           nativeBuildInputs = [ pkgs.clippy ];
           buildPhase = "true";
-          checkPhase = "cargo clippy --offline -- -D warnings";
+          # `-p`, not buildAndTestSubdir: this derivation replaces buildPhase
+          # with `true`, which skips the hook that would cd into the subdir --
+          # so cargo ran at the workspace root and linted EVERY member. That
+          # made this check fail on a defect in a crate it does not own, and
+          # made it unable to say which crate was at fault.
+          checkPhase = "cargo clippy --offline -p ferrum-apply --all-targets -- -D warnings";
           installPhase = "mkdir -p $out";
         };
 
@@ -873,10 +877,14 @@
           version = "0.1.0";
           src = lib.cleanSource ../../../crates;
           cargoLock.lockFile = ../../../crates/Cargo.lock;
-          buildAndTestSubdir = "ferrum-reconcile";
           nativeBuildInputs = [ pkgs.clippy ];
           buildPhase = "true";
-          checkPhase = "cargo clippy --offline -- -D warnings";
+          # `-p`, not buildAndTestSubdir: this derivation replaces buildPhase
+          # with `true`, which skips the hook that would cd into the subdir --
+          # so cargo ran at the workspace root and linted EVERY member. That
+          # made this check fail on a defect in a crate it does not own, and
+          # made it unable to say which crate was at fault.
+          checkPhase = "cargo clippy --offline -p ferrum-reconcile --all-targets -- -D warnings";
           installPhase = "mkdir -p $out";
         };
 
@@ -887,10 +895,14 @@
           version = "0.1.0";
           src = lib.cleanSource ../../../crates;
           cargoLock.lockFile = ../../../crates/Cargo.lock;
-          buildAndTestSubdir = "ferrumd";
           nativeBuildInputs = [ pkgs.clippy ];
           buildPhase = "true";
-          checkPhase = "cargo clippy --offline -- -D warnings";
+          # `-p`, not buildAndTestSubdir: this derivation replaces buildPhase
+          # with `true`, which skips the hook that would cd into the subdir --
+          # so cargo ran at the workspace root and linted EVERY member. That
+          # made this check fail on a defect in a crate it does not own, and
+          # made it unable to say which crate was at fault.
+          checkPhase = "cargo clippy --offline -p ferrumd --all-targets -- -D warnings";
           installPhase = "mkdir -p $out";
         };
 
