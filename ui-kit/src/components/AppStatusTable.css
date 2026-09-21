@@ -1,0 +1,12 @@
+.fk-apps-scroll { overflow-x: auto; }
+.fk-apps { border-collapse: collapse; width: 100%; font-size: .88rem; }
+.fk-apps th, .fk-apps td {
+  text-align: left; padding: .45rem .5rem; border-bottom: 1px solid var(--ferrum-line);
+}
+.fk-apps th {
+  font-size: .72rem; text-transform: uppercase; letter-spacing: .06em;
+  color: var(--ferrum-muted);
+}
+.fk-apps-mono { font-family: var(--ferrum-mono); }
+.fk-yes { color: var(--ferrum-ok); font-weight: 650; }
+.fk-no { color: var(--ferrum-danger); font-weight: 650; }

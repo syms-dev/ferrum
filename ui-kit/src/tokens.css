@@ -1,0 +1,72 @@
+/* ferrum's design tokens.
+ *
+ * These are the SAME values as ui/style.css, which is the shipped
+ * dashboard. Two rules keep them from drifting:
+ *
+ *   1. This file is the source of truth and ui/style.css follows it.
+ *   2. The light-mode block overrides the semantic colours too. It did
+ *      not, once: --accent, --ok and --danger kept their dark-panel
+ *      values and landed on white at 2.54 / 2.46 / 3.68 : 1, all failing
+ *      WCAG AA. The installer says which disk is about to be erased in
+ *      those colours, so that was not cosmetic.
+ *
+ * Every value below clears 4.5:1 against both surfaces of its own theme.
+ */
+:root {
+  --ferrum-bg: #14161a;
+  --ferrum-panel: #1c1f26;
+  --ferrum-line: #2c313b;
+  --ferrum-text: #e6e8ec;
+  --ferrum-muted: #9aa3b2;
+  --ferrum-accent: #5aa9e6;   /* 6.48 on panel, 7.12 on bg */
+  --ferrum-ok: #56b96b;       /* 6.71 / 7.37 */
+  --ferrum-danger: #e86257;   /* 4.96 / 5.45 */
+
+  /* Washes: the tinted grounds a severity uses when it owns a whole
+   * block rather than a word. Kept distinct from the line colour so a
+   * bordered panel and a washed panel never read as the same object. */
+  --ferrum-wash-accent: #16222e;
+  --ferrum-wash-ok: #16241a;
+  --ferrum-wash-danger: #2a1a18;
+
+  --ferrum-radius: .6rem;
+  --ferrum-radius-sm: .4rem;
+  --ferrum-gap: .75rem;
+
+  /* No web font. ferrum runs on a box that may have no route to the
+   * internet, and a font request that silently fails is a page that
+   * silently changes shape. The mono stack is not decoration: serials
+   * and by-id paths are compared character by character. */
+  --ferrum-sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --ferrum-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+
+@media (prefers-color-scheme: light) {
+  :root:not([data-ferrum-theme="dark"]) {
+    --ferrum-bg: #f6f7f9;
+    --ferrum-panel: #fff;
+    --ferrum-line: #dfe3e8;
+    --ferrum-text: #1b1f27;
+    --ferrum-muted: #5c6673;
+    --ferrum-accent: #15639f;  /* 6.33 on #fff, 5.91 on #f6f7f9 */
+    --ferrum-ok: #1a7f37;      /* 5.08 / 4.74 */
+    --ferrum-danger: #b3261e;  /* 6.54 / 6.10 */
+    --ferrum-wash-accent: #eef4fa;
+    --ferrum-wash-ok: #eef7f0;
+    --ferrum-wash-danger: #fdf0ef;
+  }
+}
+
+:root[data-ferrum-theme="light"] {
+  --ferrum-bg: #f6f7f9;
+  --ferrum-panel: #fff;
+  --ferrum-line: #dfe3e8;
+  --ferrum-text: #1b1f27;
+  --ferrum-muted: #5c6673;
+  --ferrum-accent: #15639f;
+  --ferrum-ok: #1a7f37;
+  --ferrum-danger: #b3261e;
+  --ferrum-wash-accent: #eef4fa;
+  --ferrum-wash-ok: #eef7f0;
+  --ferrum-wash-danger: #fdf0ef;
+}

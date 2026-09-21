@@ -1,0 +1,23 @@
+.fk-live {
+  display: flex; gap: .6rem; align-items: flex-start;
+  padding: .8rem 1rem; border-radius: .5rem;
+  border: 1px solid var(--ferrum-line); background: var(--ferrum-panel);
+}
+.fk-live-dot {
+  width: .6rem; height: .6rem; border-radius: 50%;
+  background: var(--ferrum-ok); margin-top: .45rem; flex: 0 0 auto;
+}
+.fk-live[data-state="talking"] .fk-live-dot { animation: fk-pulse 1.4s ease-in-out infinite; }
+@keyframes fk-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .25; } }
+@media (prefers-reduced-motion: reduce) {
+  .fk-live[data-state="talking"] .fk-live-dot { animation: none; }
+}
+.fk-live[data-state="quiet"] { border-color: var(--ferrum-muted); }
+.fk-live[data-state="quiet"] .fk-live-dot { background: var(--ferrum-muted); }
+.fk-live[data-state="overdue"] {
+  border-color: var(--ferrum-danger); background: var(--ferrum-wash-danger);
+}
+.fk-live[data-state="overdue"] .fk-live-dot { background: var(--ferrum-danger); }
+.fk-live-body b { display: block; }
+.fk-live-body small { color: var(--ferrum-muted); }
+.fk-live-attempts { font-family: var(--ferrum-mono); font-weight: 700; color: var(--ferrum-danger); }

@@ -1,0 +1,42 @@
+.fk-disk {
+  display: block; width: 100%; text-align: left; font: inherit; color: inherit;
+  background: var(--ferrum-panel);
+  border: 1px solid var(--ferrum-line);
+  border-left: 4px solid var(--ferrum-line);
+  border-radius: var(--ferrum-radius);
+  padding: .85rem 1rem; margin-bottom: .7rem; cursor: pointer;
+}
+.fk-disk:hover:not([data-locked="true"]) { border-color: var(--ferrum-accent); }
+.fk-disk:focus-visible { outline: 3px solid var(--ferrum-accent); outline-offset: 2px; }
+.fk-disk[data-selected="true"] {
+  border-color: var(--ferrum-danger);
+  border-left-color: var(--ferrum-danger);
+  background: var(--ferrum-wash-danger);
+}
+.fk-disk[data-locked="true"] { cursor: not-allowed; opacity: .72; }
+
+.fk-disk-head { display: flex; align-items: baseline; gap: .6rem; flex-wrap: wrap; }
+.fk-disk-name { font-family: var(--ferrum-mono); font-size: 1.05rem; font-weight: 700; }
+.fk-disk-size { font-variant-numeric: tabular-nums; font-weight: 650; }
+.fk-disk-model { color: var(--ferrum-muted); }
+.fk-disk-pick {
+  margin-left: auto; font-size: .78rem; text-transform: uppercase;
+  letter-spacing: .06em; color: var(--ferrum-muted);
+}
+.fk-disk[data-selected="true"] .fk-disk-pick { color: var(--ferrum-danger); font-weight: 700; }
+
+.fk-disk-note { margin: .5rem 0 0; font-size: .84rem; color: var(--ferrum-muted); }
+.fk-disk-badges { display: flex; gap: .4rem; flex-wrap: wrap; margin: .55rem 0 .2rem; }
+
+.fk-disk-kv {
+  display: grid; grid-template-columns: 5.5rem 1fr; gap: .1rem .6rem;
+  margin-top: .55rem; font-size: .84rem;
+}
+.fk-disk-k { color: var(--ferrum-muted); }
+.fk-disk-v { font-family: var(--ferrum-mono); overflow-wrap: anywhere; }
+
+.fk-disk-parts {
+  display: block; margin-top: .5rem; font-size: .82rem;
+  font-family: var(--ferrum-mono); color: var(--ferrum-muted);
+}
+.fk-disk-parts > span { display: block; padding: .1rem 0; }

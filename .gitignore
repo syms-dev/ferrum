@@ -38,3 +38,10 @@ CLAUDE.md
 .claude-kit-managed-execution.lock
 *.claude-kit
 *.codex-kit
+
+# ui-kit build products and deps
+ui-kit/node_modules/
+ui-kit/dist/
+.design-sync/
+ds-bundle/
+.ds-sync/
