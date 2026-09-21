@@ -40,26 +40,25 @@
 //! program does not compile. A3 and A4 therefore hold for callers that do
 //! not exist yet, which is the situation this crate is actually in.
 //!
-//! ## `verify_authoritative` -- deliberately absent, owned by R1-S3
+//! ## `verify_authoritative` -- here, but not an HTTP call
 //!
-//! The frozen seam also names
-//! `verify_authoritative(&self, zone: &Zone, name: &str, expected:
-//! &RecordTarget) -> Result<bool, std::io::Error>`. It is **not implemented
-//! here**, and its absence is a decision rather than an omission: decision
-//! D-10 makes it a DNS query issued with `dig` against
-//! [`crate::Zone::nameservers`] -- the zone's own authoritative servers,
-//! never the host's recursive resolver, which can hold a negative-cache
-//! entry from an earlier lookup and report a freshly created record as
-//! absent. It is not an HTTP call, shares none of this module's machinery,
-//! and belongs to story R1-S3. [`Zone::nameservers`] is carried on the zone
-//! by [`Client::resolve_zone`] precisely so that story has them without a
-//! second lookup.
+//! [`Client::verify_authoritative`] is the one method on this type that
+//! talks to no HTTP API at all. Decision D-10 makes it a DNS query issued
+//! with `dig` against [`crate::Zone::nameservers`] -- the zone's own
+//! authoritative servers, never the host's recursive resolver, which can
+//! hold a negative-cache entry from an earlier lookup and report a freshly
+//! created record as absent. It shares none of this module's machinery and
+//! is a thin call into [`crate::dns_query`], kept on [`Client`] because the
+//! frozen seam puts it there and because [`Zone::nameservers`] is carried on
+//! the zone by [`Client::resolve_zone`] precisely so it needs no second
+//! lookup.
 
 use std::time::Duration;
 
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 
+use crate::dns_query::{verify, Nameserver, PollPolicy, Verification};
 use crate::ownership::ManagedRecordId;
 use crate::record::{plan, DesiredRecord, RecordAction, RecordJson, RecordWrite};
 use crate::zone::{delegation_away, Delegation, ZoneJson};
@@ -462,6 +461,50 @@ impl Client {
         desired: &[DesiredRecord],
     ) -> Result<Vec<RecordAction>, CloudflareError> {
         Ok(plan(desired, &self.list_records(zone)?))
+    }
+
+    /// Proves a record ferrum wrote is actually answered by the zone's own
+    /// nameservers (A8, decision D-07).
+    ///
+    /// The one method here that makes no HTTP call. Cloudflare accepting a
+    /// write proves only that Cloudflare accepted it; the incident R1 exists
+    /// to fix is a name that never resolved while the install reported
+    /// success. The query goes to [`Zone::nameservers`] -- carried on the
+    /// zone by [`Client::resolve_zone`] for exactly this -- and never to the
+    /// host's recursive resolver, which can hold a negative-cache entry from
+    /// a lookup made before the record existed and would report a freshly
+    /// created record as absent.
+    ///
+    /// # Arguments
+    /// * `zone` - from [`Client::resolve_zone`], for its nameservers.
+    /// * `name` - the fully qualified record name just written.
+    /// * `expected` - the target it was written with. Its variant decides
+    ///   the record type queried.
+    ///
+    /// # Returns
+    /// A [`Verification`]. Both non-matching variants fold into
+    /// `ApplyResult::Degraded` per decision D-08, but they carry different
+    /// sentences on purpose: an operator must never be told their DNS is
+    /// wrong because a nameserver happened to be unreachable.
+    ///
+    /// # Errors
+    /// None. A failed lookup is [`Verification::CouldNotCheck`] rather than
+    /// an `Err`: see [`crate::dns_query::verify`] for why the frozen seam's
+    /// `Result<bool, std::io::Error>` could not express D-10's required
+    /// distinction and was widened here.
+    #[must_use]
+    pub fn verify_authoritative(
+        &self,
+        zone: &Zone,
+        name: &str,
+        expected: &RecordTarget,
+    ) -> Verification {
+        let servers: Vec<Nameserver> = zone
+            .nameservers
+            .iter()
+            .map(|ns| Nameserver::new(ns))
+            .collect();
+        verify(&servers, name, expected, &PollPolicy::default())
     }
 
     /// Parses a single-record response into the model.
@@ -1191,5 +1234,34 @@ mod tests {
 
         let records = client(&fake).list_records(&test_zone()).expect("a listing");
         assert!(!may_overwrite(&records[0]));
+    }
+
+    /// The round trip through the real `dig` is covered in
+    /// [`crate::dns_query`], which can point it at a fake nameserver on a
+    /// loopback port. What belongs here is the seam itself: the zone's own
+    /// nameservers are what gets asked, and a zone with none is honestly
+    /// reported as unverifiable rather than as a record that is wrong.
+    #[test]
+    fn verify_authoritative_reports_a_zone_with_no_nameservers_as_unverifiable() {
+        let fake = FakeCloudflare::start();
+        let zone = Zone {
+            id: "z1".to_string(),
+            name: "example.com".to_string(),
+            nameservers: Vec::new(),
+        };
+
+        let verdict =
+            client(&fake).verify_authoritative(&zone, "auth.example.com", &RecordTarget::A(HOST));
+
+        match verdict {
+            crate::dns_query::Verification::CouldNotCheck { reason } => {
+                assert!(reason.contains("auth.example.com"), "{reason}");
+            }
+            other => panic!("an unaskable zone is not a wrong record: {other:?}"),
+        }
+        assert!(
+            fake.requests().is_empty(),
+            "verification is a DNS query, not a Cloudflare call"
+        );
     }
 }

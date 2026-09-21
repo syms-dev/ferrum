@@ -37,6 +37,10 @@
 //!
 //! * [`client`] -- every HTTP call, with the `success`-field check,
 //!   pagination, and timeouts the house idiom lacks.
+//! * [`dns_query`] -- the post-apply proof that a record ferrum wrote is
+//!   actually answered by the zone's own nameservers. The only module here
+//!   that is not an HTTP call: it shells out to `dig` (decision D-10), so
+//!   no DNS wire format is ever parsed in this process.
 //! * [`zone`] -- which zone a base domain belongs to, and whether that zone
 //!   is actually authoritative for it.
 //! * [`ownership`] -- the marker that decides whether a record is ferrum's
@@ -58,6 +62,7 @@ use std::fmt;
 use std::net::Ipv4Addr;
 
 pub mod client;
+pub mod dns_query;
 pub mod ownership;
 pub mod record;
 pub mod zone;

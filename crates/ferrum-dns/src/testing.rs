@@ -1,4 +1,6 @@
-//! A fake Cloudflare API, so no test ever calls the real one.
+//! Fake servers, so no test ever calls a real one: a Cloudflare API over
+//! HTTP ([`FakeCloudflare`]) and an authoritative nameserver over UDP
+//! ([`FakeNameserver`]).
 //!
 //! Two facts make this module a precondition rather than a convenience. The
 //! Nix derivation that runs the workspace suite (`workspace-tests` in
@@ -43,7 +45,7 @@
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -599,6 +601,328 @@ fn write_reply(stream: &mut TcpStream, status: u16, body: &str) {
     let _ = stream.write_all(response.as_bytes());
     let _ = stream.flush();
     let _ = stream.shutdown(Shutdown::Write);
+}
+
+/// How the fake nameserver answers.
+///
+/// The three variants are exactly the three cases
+/// [`crate::dns_query::verify`] has to tell apart, and nothing else: a
+/// server that answers with a target, a server that answers with no record,
+/// and a server that does not answer at all. The second and third look
+/// identical to a caller that only reads `dig`'s output, and opposite to an
+/// operator -- one means their DNS is wrong, the other means ferrum could
+/// not tell.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NsBehaviour {
+    /// Answer every query with these targets, rendered as whatever record
+    /// type was asked for.
+    Answer(Vec<String>),
+    /// Answer `NOERROR` with an empty answer section -- the name exists,
+    /// the record does not.
+    Empty,
+    /// Receive the query and never reply, so `dig` times out.
+    Silent,
+}
+
+impl NsBehaviour {
+    /// An [`NsBehaviour::Answer`] from string targets.
+    ///
+    /// # Arguments
+    /// * `targets` - IPv4 addresses for an `A` query, hostnames for a
+    ///   `CNAME` query. Which one is used is decided by the query, not here.
+    #[must_use]
+    pub fn answer(targets: &[&str]) -> Self {
+        NsBehaviour::Answer(targets.iter().map(ToString::to_string).collect())
+    }
+}
+
+/// What the fake nameserver recorded about one query it received.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RecordedQuery {
+    /// The queried name, without its trailing root dot.
+    name: String,
+    /// The queried type as a string, e.g. `A` or `CNAME`.
+    record_type: String,
+}
+
+/// State shared with the responder thread.
+struct NsShared {
+    behaviour: NsBehaviour,
+    received: Mutex<Vec<RecordedQuery>>,
+    shutdown: AtomicBool,
+}
+
+/// An authoritative nameserver bound to an ephemeral loopback UDP port.
+///
+/// **Why a real server rather than a mocked `dig`.** Decision D-10 makes
+/// `dig` the mechanism, which means the things most likely to break are the
+/// argv this crate builds and the round trip through `dig`'s own output --
+/// neither of which a stubbed-out command would exercise at all. Pointing
+/// the real `dig` at this fake tests both.
+///
+/// **Why this works with no network.** The Nix sandbox that runs
+/// `workspace-tests` has no *external* network, but loopback works inside
+/// it: [`FakeCloudflare`] already proves that today, in that same sandbox,
+/// with a `TcpListener`. This is the same trick over UDP.
+///
+/// It speaks just enough DNS to answer `dig`: it echoes the transaction id
+/// and question, sets `QR`/`AA`, and appends an answer record. The wire
+/// handling it does is deliberately confined to this test-only module --
+/// the production path in [`crate::dns_query`] parses no wire format at all,
+/// which is the entire point of D-10's ruling.
+pub struct FakeNameserver {
+    port: u16,
+    socket: UdpSocket,
+    shared: Arc<NsShared>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl FakeNameserver {
+    /// Starts a nameserver on `127.0.0.1` with an ephemeral port.
+    ///
+    /// # Arguments
+    /// * `behaviour` - how it answers every query it receives.
+    ///
+    /// # Returns
+    /// A running server; point a query at `127.0.0.1` on
+    /// [`FakeNameserver::port`].
+    ///
+    /// # Panics
+    /// If loopback UDP cannot be bound, which in a test environment means
+    /// the test cannot run at all.
+    #[must_use]
+    pub fn start(behaviour: NsBehaviour) -> Self {
+        let socket = UdpSocket::bind("127.0.0.1:0").expect("bind loopback for the fake nameserver");
+        let port = socket
+            .local_addr()
+            .expect("read the fake nameserver's own port")
+            .port();
+        // A read timeout rather than a blocking receive: the responder has
+        // to wake up periodically to notice the shutdown flag, and a
+        // `Silent` server never sends anything that could wake it otherwise.
+        socket
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .expect("set the fake nameserver's read timeout");
+        let shared = Arc::new(NsShared {
+            behaviour,
+            received: Mutex::new(Vec::new()),
+            shutdown: AtomicBool::new(false),
+        });
+        let thread_socket = socket
+            .try_clone()
+            .expect("clone the fake nameserver socket");
+        let thread_shared = Arc::clone(&shared);
+        let handle = std::thread::spawn(move || serve_dns(&thread_socket, &thread_shared));
+        FakeNameserver {
+            port,
+            socket,
+            shared,
+            handle: Some(handle),
+        }
+    }
+
+    /// The loopback UDP port this server is listening on.
+    #[must_use]
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
+    /// How many queries have reached it.
+    ///
+    /// # Panics
+    /// If the responder thread panicked while holding the query lock.
+    #[must_use]
+    pub fn queries(&self) -> usize {
+        self.shared
+            .received
+            .lock()
+            .expect("the fake nameserver's query lock")
+            .len()
+    }
+
+    /// The type of the most recent query, e.g. `A` or `CNAME`.
+    ///
+    /// # Returns
+    /// `None` when nothing has been asked yet.
+    ///
+    /// # Panics
+    /// If the responder thread panicked while holding the query lock.
+    #[must_use]
+    pub fn last_query_type(&self) -> Option<String> {
+        self.shared
+            .received
+            .lock()
+            .expect("the fake nameserver's query lock")
+            .last()
+            .map(|q| q.record_type.clone())
+    }
+
+    /// The name of the most recent query, without its trailing root dot.
+    ///
+    /// # Returns
+    /// `None` when nothing has been asked yet.
+    ///
+    /// # Panics
+    /// If the responder thread panicked while holding the query lock.
+    #[must_use]
+    pub fn last_query_name(&self) -> Option<String> {
+        self.shared
+            .received
+            .lock()
+            .expect("the fake nameserver's query lock")
+            .last()
+            .map(|q| q.name.clone())
+    }
+}
+
+impl Drop for FakeNameserver {
+    /// Stops the responder and joins its thread, so no thread outlives the
+    /// test that started it.
+    fn drop(&mut self) {
+        self.shared.shutdown.store(true, Ordering::SeqCst);
+        // The responder wakes on its own read timeout, so nothing needs to
+        // be sent; this only shortens the wait.
+        let _ = self.socket.send_to(&[0u8; 12], ("127.0.0.1", self.port));
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// The responder loop: answer one datagram at a time until shutdown.
+fn serve_dns(socket: &UdpSocket, shared: &Arc<NsShared>) {
+    let mut buffer = [0u8; 1500];
+    while !shared.shutdown.load(Ordering::SeqCst) {
+        let Ok((len, from)) = socket.recv_from(&mut buffer) else {
+            continue; // the read timeout firing, which is how shutdown is noticed
+        };
+        if shared.shutdown.load(Ordering::SeqCst) {
+            return;
+        }
+        let Some(question) = read_question(&buffer[..len]) else {
+            continue;
+        };
+        shared
+            .received
+            .lock()
+            .expect("the fake nameserver's query lock")
+            .push(RecordedQuery {
+                name: question.name.clone(),
+                record_type: type_name(question.qtype).to_string(),
+            });
+
+        if shared.behaviour == NsBehaviour::Silent {
+            continue;
+        }
+        let answers = match &shared.behaviour {
+            NsBehaviour::Answer(targets) => targets
+                .iter()
+                .filter_map(|t| answer_rdata(question.qtype, t))
+                .collect(),
+            _ => Vec::new(),
+        };
+        let _ = socket.send_to(&dns_response(&buffer[..len], &question, &answers), from);
+    }
+}
+
+/// The question section of a query, as far as the fake needs to read it.
+struct Question {
+    /// The queried name in presentation form, without a trailing dot.
+    name: String,
+    /// The queried type code, e.g. 1 for `A`.
+    qtype: u16,
+    /// Where the question section ends in the datagram.
+    end: usize,
+}
+
+/// Reads the question out of a query datagram.
+///
+/// Test-only, and deliberately minimal: no compression pointers are followed
+/// (a query's question section never uses them), and every read is bounds
+/// checked so a malformed datagram ends the parse rather than the process.
+fn read_question(datagram: &[u8]) -> Option<Question> {
+    if datagram.len() < 12 {
+        return None;
+    }
+    let mut labels: Vec<String> = Vec::new();
+    let mut cursor = 12;
+    loop {
+        let length = *datagram.get(cursor)? as usize;
+        cursor += 1;
+        if length == 0 {
+            break;
+        }
+        // A pointer (top two bits set) is not something a question section
+        // contains, so treat it as a datagram this fake does not serve.
+        if length >= 0xC0 {
+            return None;
+        }
+        let label = datagram.get(cursor..cursor + length)?;
+        labels.push(String::from_utf8_lossy(label).to_string());
+        cursor += length;
+    }
+    let qtype = u16::from_be_bytes([*datagram.get(cursor)?, *datagram.get(cursor + 1)?]);
+    Some(Question {
+        name: labels.join("."),
+        qtype,
+        end: cursor + 4,
+    })
+}
+
+/// The presentation name for a query type code.
+fn type_name(qtype: u16) -> &'static str {
+    match qtype {
+        1 => "A",
+        5 => "CNAME",
+        _ => "OTHER",
+    }
+}
+
+/// Encodes one answer's rdata for the queried type.
+///
+/// # Returns
+/// `None` when the target cannot be rendered as that type -- an unparseable
+/// address for an `A` query -- which makes the fake answer emptily rather
+/// than send something `dig` would reject.
+fn answer_rdata(qtype: u16, target: &str) -> Option<Vec<u8>> {
+    match qtype {
+        1 => Some(target.parse::<Ipv4Addr>().ok()?.octets().to_vec()),
+        5 => Some(encode_name(target)),
+        _ => None,
+    }
+}
+
+/// Encodes a presentation name as DNS labels.
+fn encode_name(name: &str) -> Vec<u8> {
+    let mut encoded = Vec::new();
+    for label in name.trim_end_matches('.').split('.') {
+        encoded.push(u8::try_from(label.len()).unwrap_or(0));
+        encoded.extend_from_slice(label.as_bytes());
+    }
+    encoded.push(0);
+    encoded
+}
+
+/// Builds the response: the query's own id and question, `QR`/`AA` set, and
+/// one answer per rdata.
+fn dns_response(query: &[u8], question: &Question, answers: &[Vec<u8>]) -> Vec<u8> {
+    let mut response = Vec::new();
+    response.extend_from_slice(&query[..2]); // the transaction id, echoed
+    response.extend_from_slice(&0x8400u16.to_be_bytes()); // QR + AA, NOERROR
+    response.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT
+    response.extend_from_slice(&u16::try_from(answers.len()).unwrap_or(0).to_be_bytes());
+    response.extend_from_slice(&0u16.to_be_bytes()); // NSCOUNT
+    response.extend_from_slice(&0u16.to_be_bytes()); // ARCOUNT
+    response.extend_from_slice(&query[12..question.end]);
+    for rdata in answers {
+        response.extend_from_slice(&[0xC0, 0x0C]); // a pointer to the question's name
+        response.extend_from_slice(&question.qtype.to_be_bytes());
+        response.extend_from_slice(&1u16.to_be_bytes()); // class IN
+        response.extend_from_slice(&60u32.to_be_bytes()); // TTL
+        response.extend_from_slice(&u16::try_from(rdata.len()).unwrap_or(0).to_be_bytes());
+        response.extend_from_slice(rdata);
+    }
+    response
 }
 
 #[cfg(test)]

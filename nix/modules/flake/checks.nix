@@ -507,6 +507,98 @@
           echo ok > $out
         '';
 
+      # modules/proxy/dns.nix decides WHICH hostnames ferrum publishes a
+      # record for, and that decision was proven correct exactly once -- by
+      # hand-evaluating ferrumDnsConfig and reading the JSON. That is good
+      # evidence for that run and no protection at all against the next edit,
+      # on a file whose four rulings are each a real incident or a real
+      # decision:
+      #
+      #   * a `lan` app gets NO record (D-03). It has an nginx vhost and an
+      #     IP allow-list but no ACME certificate, so a public record would
+      #     hand an external client a self-signed handshake before nginx
+      #     denies them -- publishing the very thing the LAN restriction
+      #     exists to prevent.
+      #   * auth.<baseDomain> appears exactly when ferrum.auth.enable does,
+      #     mirroring acme.nix's own condition. A certificate for a name that
+      #     does not resolve is the incident R1 exists to fix.
+      #   * the daemon's own record is present (owner ruling H-01, option C).
+      #   * EVERY record carries proxied = false (D-05). Cloudflare's orange
+      #     cloud makes every request arrive from a Cloudflare edge address,
+      #     which inverts nginx.nix's allow/deny against trustedNetworks into
+      #     a total outage for the apps that restriction protects.
+      #
+      # Cheap by construction: it realizes one `writeText` JSON file, never a
+      # system closure, so this stays a genuinely runnable CI check rather
+      # than the disk-hungry eval-example-hosts below.
+      dnsRecordSet =
+        let
+          mkDnsHost = { auth }: ferrumLib.mkHost {
+            inherit system;
+            settings = {
+              schemaVersion = realMigrations.currentVersion;
+              proxy = {
+                enable = true;
+                baseDomain = "example.invalid";
+                acme.email = "admin@example.invalid";
+                dns = {
+                  enable = true;
+                  recordMode = "a";
+                  staticAddress = "203.0.113.10";
+                };
+              };
+              auth.enable = auth;
+              apps = {
+                # Deliberately `lan`: this is the app that must NOT appear.
+                sonarr = { enable = true; exposure = "lan"; };
+                radarr.enable = true;
+              };
+            };
+            modules = [ ../../../examples/hosts/minimal/configuration.nix ];
+          };
+          withAuth = (mkDnsHost { auth = true; }).config.system.build.ferrumDnsConfig;
+          withoutAuth = (mkDnsHost { auth = false; }).config.system.build.ferrumDnsConfig;
+        in
+        pkgs.runCommand "ferrum-check-dns-record-set" { } ''
+          set -eu
+          with_auth=${withAuth}
+          without_auth=${withoutAuth}
+          fail() {
+            echo "dns record-set check: $1" >&2
+            echo "--- with auth ---" >&2; cat "$with_auth" >&2
+            echo "--- without auth ---" >&2; cat "$without_auth" >&2
+            exit 1
+          }
+
+          ${pkgs.jq}/bin/jq -e '.records[] | select(.source == "app:radarr") | select(.name == "radarr.example.invalid")' \
+            "$with_auth" > /dev/null \
+            || fail "the public app radarr has no record"
+
+          ${pkgs.jq}/bin/jq -e '[.records[] | select(.source == "app:sonarr")] | length == 0' \
+            "$with_auth" > /dev/null \
+            || fail "the lan-exposure app sonarr got a public record -- it has no certificate, so that publishes a self-signed handshake to the internet"
+
+          ${pkgs.jq}/bin/jq -e '.records[] | select(.source == "auth") | select(.name == "auth.example.invalid")' \
+            "$with_auth" > /dev/null \
+            || fail "auth.example.invalid has no record while ferrum.auth.enable is true -- that is the original incident"
+
+          ${pkgs.jq}/bin/jq -e '[.records[] | select(.source == "auth")] | length == 0' \
+            "$without_auth" > /dev/null \
+            || fail "an auth record was created on a host with SSO off"
+
+          ${pkgs.jq}/bin/jq -e '.records[] | select(.source == "daemon") | select(.name == "ferrum.example.invalid")' \
+            "$with_auth" > /dev/null \
+            || fail "the daemon record is missing (owner ruling H-01, option C)"
+
+          for cfg in "$with_auth" "$without_auth"; do
+            ${pkgs.jq}/bin/jq -e '(.records | length) > 0 and all(.records[]; .proxied == false)' \
+              "$cfg" > /dev/null \
+              || fail "a record is proxied -- orange-cloud proxying makes every request arrive from a Cloudflare edge address"
+          done
+
+          echo ok > $out
+        '';
+
       mkAssertionCheck = name: result:
         pkgs.runCommand "ferrum-check-${name}" { } (
           if result.ok then
@@ -519,6 +611,7 @@
       checks = {
         auth-model-enforced = mkAssertionCheck "auth-model-enforced" authModelEnforced;
         root-folders-reach-the-apps = rootFoldersReachTheApps;
+        dns-record-set = dnsRecordSet;
         catalog-consistency = mkAssertionCheck "catalog-consistency" catalogConsistency;
         schema-uniformity = mkAssertionCheck "schema-uniformity" schemaUniformity;
         ui-renders-every-schema-type =
@@ -578,7 +671,8 @@
         # matching how every other Rust artifact here is built. The runtime
         # tools are the union of what the workspace's tests shell out to --
         # btrfs (preflight::check_is_subvolume), sops/ssh-to-age (secrets),
-        # authelia (argon2id hashing). Confirmed real, by really running the
+        # authelia (argon2id hashing), dig (ferrum-dns::dns_query's
+        # authoritative-nameserver check). Confirmed real, by really running the
         # suite in a container on 2026-09-15: without btrfs on PATH,
         # is_subvolume_check_fails_on_a_plain_directory fails on the spawn
         # error rather than the assertion it means to make.
@@ -615,7 +709,12 @@
           cargoLock.lockFile = ../../../crates/Cargo.lock;
           cargoRoot = "crates";
           buildAndTestSubdir = "crates";
-          nativeCheckInputs = [ pkgs.btrfs-progs pkgs.sops pkgs.ssh-to-age pkgs.authelia pkgs.git ];
+          # pkgs.dnsutils provides `dig`, which ferrum-dns' dns_query tests
+          # really invoke against a fake nameserver on loopback. It is here
+          # for exactly the reason btrfs-progs is (see the header above):
+          # without it those tests fail on the spawn error rather than the
+          # assertion they mean to make.
+          nativeCheckInputs = [ pkgs.btrfs-progs pkgs.sops pkgs.ssh-to-age pkgs.authelia pkgs.git pkgs.dnsutils ];
           # The point of this derivation is the checkPhase; nothing consumes
           # its binaries, so skip the install entirely.
           installPhase = "touch $out";
@@ -731,6 +830,39 @@
           # would otherwise honour cargoRoot, so cargo runs at the source
           # root where there is no Cargo.toml.
           checkPhase = "cd crates && cargo clippy --offline -p ferrum-install --all-targets -- -D warnings";
+          installPhase = "mkdir -p $out";
+        };
+
+        # ferrum-dns is a LIBRARY crate with no package of its own, so unlike
+        # its siblings there is no `cargo-test-ferrum-dns` alias to pair with
+        # -- workspace-tests above runs its tests, because that derivation
+        # sets buildAndTestSubdir = "crates" and so picks up every workspace
+        # member. What that does NOT do is lint it: buildRustPackage's check
+        # phase runs `cargo test`, never clippy. Without this derivation the
+        # crate holding every Cloudflare call and the one subprocess boundary
+        # in the workspace would be the only crate nothing lints.
+        #
+        # --all-targets, so the fake nameserver and the dig round-trip tests
+        # are linted too: most of this crate's new surface is its tests.
+        #
+        # `-p ferrum-dns` rather than the siblings' `buildAndTestSubdir`,
+        # and that difference is load-bearing. A custom `buildPhase` skips
+        # the hook that would otherwise honour `buildAndTestSubdir`, so
+        # cargo runs at the workspace root and checks EVERY member --
+        # including ferrum-install, whose `include_str!` of
+        # examples/hosts/template/disko.nix escapes this `src` and cannot
+        # resolve. Verified by really building it: with the subdir form this
+        # derivation fails on ferrum-install's include, not on anything in
+        # ferrum-dns. `-p` scopes cargo to this package and its own
+        # dependencies, which is what the derivation's name claims.
+        clippy-ferrum-dns = pkgs.rustPlatform.buildRustPackage {
+          pname = "ferrum-dns-clippy";
+          version = "0.1.0";
+          src = lib.cleanSource ../../../crates;
+          cargoLock.lockFile = ../../../crates/Cargo.lock;
+          nativeBuildInputs = [ pkgs.clippy ];
+          buildPhase = "true";
+          checkPhase = "cargo clippy --offline -p ferrum-dns --all-targets -- -D warnings";
           installPhase = "mkdir -p $out";
         };
 
