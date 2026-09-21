@@ -81,9 +81,9 @@ lib.mkIf proxyEnabled {
   # never attempts to decrypt a .sops file that was declared but never
   # actually written.
   #
-  # The three consumer branches are each load-bearing -- do not collapse them
-  # back to `publicApps != { }`. The same Cloudflare token now has more than
-  # one reader:
+  # Both consumer branches are load-bearing -- do not collapse them back to
+  # `publicApps != { }`. The same Cloudflare token now has more than one
+  # reader:
   #
   #   * publicApps != { } -- lego's DNS-01 challenge, via the
   #     security.acme.certs entries below. The original, narrowest reader.
@@ -95,24 +95,29 @@ lib.mkIf proxyEnabled {
   #     records on conditions of their own) would otherwise reach Cloudflare
   #     with no token on disk and fail at runtime with a missing-file error.
   #
-  #   * ferrum.proxy.dns.ddnsUpdater.enable -- the timer-driven
-  #     ferrum-dns-updater unit, which fires on a schedule long after any
-  #     apply finished and reads the same path. Written against the raw
-  #     option rather than dns.nix's internal `dnsEnabled && ...`
-  #     conjunction deliberately: a credential materialized for a unit that
-  #     turns out not to exist is inert, whereas one missing when the timer
-  #     fires is a silent stale-record failure -- exactly the failure the
-  #     updater exists to prevent.
+  # The timer-driven ferrum-dns-updater unit reads the same path on a
+  # schedule long after any apply finished, and it needs no branch of its
+  # own: dns.nix gates both the timer and the service on its internal
+  # `ddnsEnabled = ferrum.proxy.enable && dns.enable && dns.ddnsUpdater.enable`,
+  # so the unit cannot exist unless ferrum.proxy.dns.enable is already true
+  # and the branch above has already materialized the credential -- and
+  # dns.nix asserts credentialProvided on that same condition, so there is
+  # no host where the timer exists and the token does not. A third
+  # disjunct on the RAW ferrum.proxy.dns.ddnsUpdater.enable used to sit here,
+  # justified as insurance against "a credential missing when the timer
+  # fires" -- a state the conjunction above makes unreachable. What it did
+  # reach was the opposite case: dns.enable = false with ddnsUpdater.enable
+  # = true decrypted a Zone:Read + DNS:Edit token to /run/secrets with no
+  # consumer of any kind on the host.
   #
-  # Ownership stays acme:acme in every branch. ferrum-dns-updater runs as
+  # Ownership stays acme:acme in both branches. ferrum-dns-updater runs as
   # root (dns.nix's own serviceConfig comment), so it reads the file without
   # a second principal; adding a user or group here would widen the set of
   # identities that can read a Zone:Read + DNS:Edit token for no gain.
   sops.secrets."${credentialSecret}" = lib.mkIf
     (credentialProvided
       && (publicApps != { }
-      || ferrum.proxy.dns.enable
-      || ferrum.proxy.dns.ddnsUpdater.enable))
+      || ferrum.proxy.dns.enable))
     {
       sopsFile = /. + "${ferrum.secretsDir}/${credentialSecret}.sops";
       format = "binary";

@@ -60,7 +60,7 @@ use serde::Deserialize;
 
 use crate::dns_query::{verify, Nameserver, PollPolicy, Verification};
 use crate::ownership::ManagedRecordId;
-use crate::record::{plan, DesiredRecord, RecordAction, RecordJson, RecordWrite};
+use crate::record::{plan, DesiredRecord, RecordAction, RecordJson, RecordWrite, ZoneListing};
 use crate::zone::{delegation_away, Delegation, ZoneJson};
 use crate::{CloudflareError, DnsRecord, RecordTarget, Secret, Zone};
 
@@ -282,19 +282,21 @@ impl Client {
     /// * `zone` - from [`Client::resolve_zone`].
     ///
     /// # Returns
-    /// Every page of the listing, in Cloudflare's order. Records of other
-    /// types -- including the `_acme-challenge` `TXT` records lego creates
-    /// and removes -- are not returned; they are not ferrum's to reconcile.
+    /// Every page of the listing, in Cloudflare's order, split into the
+    /// `A`/`CNAME` records ferrum reconciles and the records of other types
+    /// it only discloses ([`ZoneListing`]). The `_acme-challenge` `TXT`
+    /// records lego creates and removes appear in neither half: they are
+    /// ferrum's own certificate machinery, so reporting them to the operator
+    /// as something in their zone would be noise.
     ///
     /// # Errors
     /// [`CloudflareError::Api`], [`CloudflareError::Transport`] or
     /// [`CloudflareError::Malformed`].
-    pub fn list_records(&self, zone: &Zone) -> Result<Vec<DnsRecord>, CloudflareError> {
-        Ok(self
-            .list_all::<RecordJson>(&format!("/zones/{}/dns_records", zone.id), &[])?
-            .into_iter()
-            .filter_map(RecordJson::into_model)
-            .collect())
+    pub fn list_records(&self, zone: &Zone) -> Result<ZoneListing, CloudflareError> {
+        Ok(ZoneListing::from_wire(self.list_all::<RecordJson>(
+            &format!("/zones/{}/dns_records", zone.id),
+            &[],
+        )?))
     }
 
     /// The zone's `NS` records: every subtree handed to other nameservers.
@@ -1024,7 +1026,8 @@ mod tests {
             ),
         );
 
-        let records = client(&fake).list_records(&test_zone()).expect("a listing");
+        let listing = client(&fake).list_records(&test_zone()).expect("a listing");
+        let records = listing.records();
 
         assert_eq!(records.len(), 2, "both pages must be read: {records:?}");
         assert!(records[0].owned_by_ferrum);
@@ -1232,8 +1235,8 @@ mod tests {
             )])),
         );
 
-        let records = client(&fake).list_records(&test_zone()).expect("a listing");
-        assert!(!may_overwrite(&records[0]));
+        let listing = client(&fake).list_records(&test_zone()).expect("a listing");
+        assert!(!may_overwrite(&listing.records()[0]));
     }
 
     /// The round trip through the real `dig` is covered in

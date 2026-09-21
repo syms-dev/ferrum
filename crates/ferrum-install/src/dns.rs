@@ -462,7 +462,8 @@ fn action_name(action: &RecordAction) -> &str {
         | RecordAction::Unchanged { name, .. }
         | RecordAction::Delete { name, .. }
         | RecordAction::Adopt { name, .. }
-        | RecordAction::SkipForeign { name, .. } => name,
+        | RecordAction::SkipForeign { name, .. }
+        | RecordAction::SkipUnmodelledType { name, .. } => name,
     }
 }
 
@@ -530,6 +531,18 @@ fn render_action(action: &RecordAction, name_width: usize) -> String {
              and will not touch it.\n  {:<ACTION_WIDTH$} {:<name_width$}  it points at \
              {current}; ferrum wanted {wanted}.\n",
             "SKIPPED", "", ""
+        ),
+        // An extra line beside this name's own, never instead of it. The
+        // case that makes it worth the noise is an existing AAAA: ferrum
+        // creates its A, both answer, and every IPv6-capable client keeps
+        // reaching the old host. Silence there is indistinguishable from a
+        // clean plan.
+        RecordAction::SkipUnmodelledType { name, record_type } => format!(
+            "  {:<ACTION_WIDTH$} {name:<name_width$}  a {record_type} record also answers \
+             here. ferrum does not\n  {:<ACTION_WIDTH$} {:<name_width$}  manage \
+             {record_type} records and leaves it alone; clients that\n  \
+             {:<ACTION_WIDTH$} {:<name_width$}  prefer it will not reach this server.\n",
+            "ALSO HERE", "", "", "", ""
         ),
     }
 }
@@ -823,6 +836,43 @@ mod tests {
             .expect("the unchanged name is on a line of its own");
         assert!(skip_line.contains("SKIPPED"), "{skip_line}");
         assert!(unchanged_line.contains("unchanged"), "{unchanged_line}");
+    }
+
+    /// The dry run is the operator's last look before the disk is erased,
+    /// so a record type ferrum cannot reconcile must appear in it. Before
+    /// this line existed the `AAAA` was dropped on the way in and the plan
+    /// showed a bare `create` -- true, and materially incomplete.
+    #[test]
+    fn a_record_type_ferrum_does_not_manage_is_disclosed_beside_the_create() {
+        let fake = fake_with(serde_json::json!([{
+            "id": "theirs-v6",
+            "name": "plex.thesyms.ca",
+            "type": "AAAA",
+            "content": "2001:db8::1",
+            "proxied": false,
+        }]));
+        let a = answers(&["plex"]);
+        let plan = dry_run("thesyms.ca", &a, a.dns.as_ref().unwrap(), &against(&fake)).unwrap();
+        let rendered = render(&plan);
+
+        assert!(
+            rendered.contains("ALSO HERE"),
+            "the other record must be visible: {rendered}"
+        );
+        assert!(
+            rendered.contains("a AAAA record also answers here"),
+            "the type must be named: {rendered}"
+        );
+        assert!(
+            rendered.contains("create     plex.thesyms.ca"),
+            "ferrum still creates its own record: {rendered}"
+        );
+        assert!(
+            plan.foreign().is_empty(),
+            "a type ferrum cannot manage is not something the operator can \
+             adopt: {:?}",
+            plan.foreign()
+        );
     }
 
     /// A6, at the first of its two emission sites.

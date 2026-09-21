@@ -380,6 +380,10 @@ pub enum Operation {
     /// than `update`: an operator reading the breakdown must be able to see
     /// that their record was replaced, not that ferrum corrected its own.
     Adopt,
+    /// A record of a type ferrum does not model shares a name ferrum
+    /// manages. Nothing was called; the entry exists so the operator is told
+    /// what else answers at that name.
+    SkipUnmodelledType,
 }
 
 impl Operation {
@@ -393,6 +397,7 @@ impl Operation {
             Operation::Delete => "delete",
             Operation::SkipForeign => "skip (not ferrum's)",
             Operation::Adopt => "adopt (was yours, you handed it over)",
+            Operation::SkipUnmodelledType => "also here (a type ferrum does not manage)",
         }
     }
 }
@@ -712,7 +717,8 @@ fn execute(
                 let mut report = verified(client, zone, verify, name, Operation::Adopt, &target);
                 if report.failure.is_none() {
                     report.note = Some(format!(
-                        "you adopted this name at install; it pointed at {current} and now                          points at {target}, and ferrum owns it from here"
+                        "you adopted this name at install; it pointed at {current} and now \
+                         points at {target}, and ferrum owns it from here"
                     ));
                 }
                 report
@@ -733,6 +739,20 @@ fn execute(
             note: Some(format!(
                 "left alone: it points at {current} and ferrum did not create it \
                  (ferrum would have pointed it at {wanted})"
+            )),
+        },
+        // Disclosure, not an outcome: ferrum's own record at this name was
+        // still created or corrected by its own entry. An AAAA left silently
+        // beside ferrum's A sends IPv6-capable clients to the old host, and
+        // the operator has no way to see it if this line is missing.
+        RecordAction::SkipUnmodelledType { name, record_type } => RecordReport {
+            name,
+            operation: Operation::SkipUnmodelledType,
+            failure: None,
+            note: Some(format!(
+                "a {record_type} record also answers at this name. ferrum does not manage \
+                 {record_type} records, so it was left exactly as it is -- but clients that \
+                 prefer it will not reach this server"
             )),
         },
     }
@@ -1199,6 +1219,58 @@ mod tests {
         );
     }
 
+    /// The silent case: an `AAAA` at a wanted name. ferrum still creates its
+    /// `A`, but the report has to say the other record is there -- otherwise
+    /// the operator's IPv6-capable clients keep reaching the old host and
+    /// nothing ferrum printed ever mentioned it.
+    #[test]
+    fn an_aaaa_sharing_a_wanted_name_is_reported_and_never_written_to() {
+        let fake = fake_zone(serde_json::json!([{
+            "id": "theirs-v6",
+            "name": "plex.example.com",
+            "type": "AAAA",
+            "content": "2001:db8::1",
+            "proxied": false,
+        }]));
+        fake.script(
+            Route::post("/zones/z1/dns_records"),
+            CannedResponse::ok(record_json("r1", "plex.example.com", "203.0.113.7", true)),
+        );
+
+        let report = reconcile_with(
+            &parsed(&[("plex.example.com", "app:plex")]),
+            &client_for(&fake),
+            &always_matches,
+        )
+        .expect("the run completes");
+
+        assert!(
+            report.is_clean(),
+            "a disclosure must not degrade: {report:?}"
+        );
+        let disclosed = report
+            .records
+            .iter()
+            .find(|r| r.operation == Operation::SkipUnmodelledType)
+            .expect("the AAAA is disclosed");
+        let note = disclosed.note.as_deref().expect("a disclosure explains");
+        assert!(note.contains("AAAA"), "{note}");
+        assert!(
+            report
+                .records
+                .iter()
+                .any(|r| r.operation == Operation::Create),
+            "the A record is still created: {report:?}"
+        );
+
+        for method in ["PUT", "DELETE"] {
+            assert!(
+                fake.requests().iter().all(|r| r.method != method),
+                "a record ferrum does not model must never be written to"
+            );
+        }
+    }
+
     /// A3, at the level this module is responsible for: a foreign record
     /// occupying a wanted name produces no write of any kind.
     ///
@@ -1494,6 +1566,24 @@ mod tests {
 
         assert_eq!(report.records[0].operation, Operation::Adopt);
         assert!(report.is_clean(), "{report:?}");
+
+        // The note is the only place the operator reads what happened to
+        // their record, so its prose is asserted rather than assumed: an
+        // earlier revision shipped a run of 26 spaces mid-sentence, and a
+        // test that checked only the operation could not see it.
+        let note = report.records[0]
+            .note
+            .as_deref()
+            .expect("an adoption explains itself");
+        assert_eq!(
+            note,
+            "you adopted this name at install; it pointed at 198.51.100.9 and now points at \
+             203.0.113.7, and ferrum owns it from here"
+        );
+        assert!(
+            !note.contains("  "),
+            "no run of spaces mid-sentence: {note}"
+        );
 
         let writes = fake.requests_for(&Route::put("/zones/z1/dns_records/theirs"));
         assert_eq!(writes.len(), 1, "exactly one write to the adopted record");

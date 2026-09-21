@@ -188,21 +188,82 @@ pub const OWNERSHIP_MARKER: &str = "ferrum-managed";
 /// `comment` on every listing rather than remembered locally. A record
 /// without the marker is foreign: it is reported and left alone, never
 /// overwritten and never deleted.
+///
+/// **The fields are crate-private, and that is what the ownership guard
+/// rests on.** [`crate::record::plan`] mints a
+/// [`crate::ownership::ManagedRecordId`] -- the capability every write and
+/// delete demands -- from `owned_by_ferrum`. If a caller could set that
+/// flag, it could hand the planner a record it invented and receive a real
+/// capability for an id it chose, which is the guard defeated without
+/// touching the guard. So the only way to obtain a `DnsRecord` is a live
+/// listing: `RecordJson::into_model` is the sole constructor and it is
+/// crate-private, which makes the forgery a compile error rather than a
+/// review finding.
+///
+/// ```compile_fail
+/// # use ferrum_dns::{DnsRecord, RecordTarget};
+/// # use std::net::Ipv4Addr;
+/// // Claiming a record is ferrum's is not something a caller may do.
+/// let forged = DnsRecord {
+///     id: "an-id-i-chose".to_string(),
+///     name: "plex.example.com".to_string(),
+///     target: RecordTarget::A(Ipv4Addr::new(203, 0, 113, 7)),
+///     proxied: false,
+///     owned_by_ferrum: true,
+/// };
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DnsRecord {
     /// Cloudflare's opaque record identifier.
-    pub id: String,
+    pub(crate) id: String,
     /// The fully qualified record name, e.g. `auth.example.com`.
-    pub name: String,
+    pub(crate) name: String,
     /// Where the record points.
-    pub target: RecordTarget,
+    pub(crate) target: RecordTarget,
     /// Cloudflare's orange-cloud proxying. ferrum always writes `false`:
     /// proxying makes every request arrive from a Cloudflare edge address,
     /// which turns the LAN allow-list in front of `lan` apps into a total
     /// outage, and it routes Plex/Jellyfin streams through that edge.
-    pub proxied: bool,
+    pub(crate) proxied: bool,
     /// Whether [`OWNERSHIP_MARKER`] was present on this record.
-    pub owned_by_ferrum: bool,
+    pub(crate) owned_by_ferrum: bool,
+}
+
+impl DnsRecord {
+    /// Cloudflare's opaque record identifier.
+    ///
+    /// Read-only on purpose: an id is not proof of ownership, and the only
+    /// id a write accepts is the one carried inside a
+    /// [`crate::ownership::ManagedRecordId`].
+    #[must_use]
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// The fully qualified record name, e.g. `auth.example.com`.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Where the record points.
+    #[must_use]
+    pub fn target(&self) -> &RecordTarget {
+        &self.target
+    }
+
+    /// Whether Cloudflare's orange-cloud proxying is on for this record.
+    #[must_use]
+    pub fn proxied(&self) -> bool {
+        self.proxied
+    }
+
+    /// Whether [`OWNERSHIP_MARKER`] was present on this record when the zone
+    /// was listed.
+    #[must_use]
+    pub fn owned_by_ferrum(&self) -> bool {
+        self.owned_by_ferrum
+    }
 }
 
 /// Why a Cloudflare call did not produce the answer the caller needed.

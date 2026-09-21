@@ -234,6 +234,67 @@ in
       # privileged coordination over ferrum's own data, not privilege
       # escalation over untrusted input.
       ExecStart = "${pkgs.ferrum-apply}/bin/ferrum-apply reconcile-dns --config ${configPath}";
+
+      # Containment hardening, same shape and for the same reason as
+      # modules/core/daemon.nix's ferrumd block: none of this is what stops
+      # this unit doing something privileged, it is what limits the blast
+      # radius if the code it runs is ever subverted. The case for it here
+      # is stronger than for the reconciler this unit was otherwise modelled
+      # on (modules/core/reconciler.nix): that one only ever talks to
+      # localhost, whereas this one runs unattended on a timer, reaches an
+      # internet-facing API, and holds a Zone:Read + DNS:Edit credential for
+      # the operator's real domain while it does.
+      ProtectSystem = "strict";
+      # The ONE path this unit writes, and the reason it must stay writable:
+      # crates/ferrum-apply/src/main.rs's run_reconcile_dns records a
+      # last-success timestamp at <stateDir>/dns-updater-last-success after
+      # every clean cycle, and the AGE of that file is the whole of A8's
+      # staleness signal -- a timer that has been erroring for six weeks is
+      # otherwise indistinguishable from one that has never had anything to
+      # do. ProtectSystem = "strict" makes the entire hierarchy read-only,
+      # so removing this line does not tidy anything up: it silently turns
+      # every successful reconcile into a failed write and takes the signal
+      # with it. The directory itself already exists as root:root 0751 from
+      # modules/core/storage.nix's tmpfiles rule. Named from the option
+      # rather than hardcoded because modules/core/overlays.nix wraps
+      # ferrum-apply with --set-default FERRUM_STATE_DIR
+      # ${ferrum.storage.stateDir}, which is the path the binary actually
+      # writes.
+      ReadWritePaths = [ ferrum.storage.stateDir ];
+      ProtectHome = true;
+      PrivateTmp = true;
+      NoNewPrivileges = true;
+      # NOT the empty set daemon.nix uses, and the difference is
+      # load-bearing: ferrumd runs as the `ferrum` user and owns everything
+      # it reads, while this unit runs as root and must read
+      # /run/secrets/${credentialSecret}, which sops-nix materializes 0400
+      # acme:acme (modules/proxy/acme.nix keeps that ownership deliberately,
+      # so that root is the only other principal that can read the token).
+      # uid 0 bypasses those file modes solely by virtue of
+      # CAP_DAC_OVERRIDE, and an empty bounding set takes that capability
+      # away along with the rest -- measured, not assumed: uid 0 with
+      # CapBnd = 0 gets EACCES on a 0400 file owned by another user, and the
+      # same read succeeds with CapBnd = CAP_DAC_OVERRIDE alone. Every other
+      # capability is dropped, so this is one capability away from the empty
+      # set rather than a weaker posture than the house pattern.
+      CapabilityBoundingSet = [ "CAP_DAC_OVERRIDE" ];
+      # AF_INET/AF_INET6 for the Cloudflare HTTPS calls and for the `dig`
+      # queries crates/ferrum-dns/src/dns_query.rs makes against the zone's
+      # authoritative nameservers; AF_UNIX for nsswitch/NSS lookups on the
+      # way there. Deliberately no AF_NETLINK and no AF_PACKET, matching
+      # daemon.nix: nothing here has any business enumerating interfaces or
+      # opening raw sockets.
+      RestrictAddressFamilies = [ "AF_INET" "AF_INET6" "AF_UNIX" ];
+      SystemCallFilter = [ "@system-service" "~@privileged" "~@resources" ];
+      SystemCallErrorNumber = "EPERM";
+      SystemCallArchitectures = "native";
+      LockPersonality = true;
+      RestrictSUIDSGID = true;
+      RestrictRealtime = true;
+      ProtectKernelTunables = true;
+      ProtectKernelModules = true;
+      ProtectControlGroups = true;
+      ProtectClock = true;
     };
   };
 

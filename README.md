@@ -14,7 +14,9 @@ Not built: **any way to update an app**. App versions come from the nixpkgs revi
 
 It has now been installed on a real machine end to end, and rollback has been exercised there for real. That is one machine, run by its author — **still do not point this at a server holding data you care about.**
 
-Two gaps worth knowing before you try it. The installer's own VM tests (`tests/stage2`) have never passed in CI, so the install path is proven by one person on one machine rather than mechanically; and ferrum does not yet create the DNS records for the hostnames it publishes, so every app needs a record you make yourself.
+One gap worth knowing before you try it: the installer's own VM tests (`tests/stage2`) have never passed in CI, so the install path is proven by one person on one machine rather than mechanically.
+
+**DNS is ferrum's to manage now.** It creates and reconciles one record per published app, plus `auth` when SSO is on and `ferrum` for the daemon itself — on every apply, and on a timer if you enable the dynamic-address updater. The records it wrote carry a marker in their Cloudflare `comment`, and that marker is the whole permission model: a record without it is *yours*, so ferrum reports it, leaves it exactly as it is, and never writes to or deletes it — unless you name that one hostname at the install gate and hand it over explicitly. A record of a type ferrum does not model (an `AAAA`, say) sharing one of those names is disclosed in the plan rather than silently stepped around. **Cloudflare is the only provider**, which ferrum already required for ACME DNS-01. Split-horizon DNS is out of scope: every record points at the public address, so reaching these names from inside your own LAN depends on your router supporting NAT hairpin, and many do not.
 
 ## Why
 
