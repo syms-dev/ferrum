@@ -77,15 +77,48 @@ lib.mkIf proxyEnabled {
   # pathExists pattern, mirrored here). Must go through sops-nix's own
   # decryption like every other secret in this codebase; environmentFile
   # cannot point at the raw .sops ciphertext directly. Gated on
-  # credentialProvided too (not just publicApps != {}) so this never
-  # attempts to decrypt a .sops file that was declared but never actually
-  # written.
-  sops.secrets."${credentialSecret}" = lib.mkIf (publicApps != { } && credentialProvided) {
-    sopsFile = /. + "${ferrum.secretsDir}/${credentialSecret}.sops";
-    format = "binary";
-    owner = "acme";
-    group = "acme";
-  };
+  # credentialProvided too (not just the consumer branches below) so this
+  # never attempts to decrypt a .sops file that was declared but never
+  # actually written.
+  #
+  # The three consumer branches are each load-bearing -- do not collapse them
+  # back to `publicApps != { }`. The same Cloudflare token now has more than
+  # one reader:
+  #
+  #   * publicApps != { } -- lego's DNS-01 challenge, via the
+  #     security.acme.certs entries below. The original, narrowest reader.
+  #
+  #   * ferrum.proxy.dns.enable -- modules/proxy/dns.nix's record
+  #     reconciliation, which names /run/secrets/${credentialSecret}
+  #     literally as its credentialFile. A host that publishes no app but
+  #     still wants its records managed (dns.nix emits the auth and daemon
+  #     records on conditions of their own) would otherwise reach Cloudflare
+  #     with no token on disk and fail at runtime with a missing-file error.
+  #
+  #   * ferrum.proxy.dns.ddnsUpdater.enable -- the timer-driven
+  #     ferrum-dns-updater unit, which fires on a schedule long after any
+  #     apply finished and reads the same path. Written against the raw
+  #     option rather than dns.nix's internal `dnsEnabled && ...`
+  #     conjunction deliberately: a credential materialized for a unit that
+  #     turns out not to exist is inert, whereas one missing when the timer
+  #     fires is a silent stale-record failure -- exactly the failure the
+  #     updater exists to prevent.
+  #
+  # Ownership stays acme:acme in every branch. ferrum-dns-updater runs as
+  # root (dns.nix's own serviceConfig comment), so it reads the file without
+  # a second principal; adding a user or group here would widen the set of
+  # identities that can read a Zone:Read + DNS:Edit token for no gain.
+  sops.secrets."${credentialSecret}" = lib.mkIf
+    (credentialProvided
+      && (publicApps != { }
+      || ferrum.proxy.dns.enable
+      || ferrum.proxy.dns.ddnsUpdater.enable))
+    {
+      sopsFile = /. + "${ferrum.secretsDir}/${credentialSecret}.sops";
+      format = "binary";
+      owner = "acme";
+      group = "acme";
+    };
 
   # lego reads CLOUDFLARE_DNS_API_TOKEN from this file via systemd's
   # EnvironmentFile= mechanism (confirmed by reading
