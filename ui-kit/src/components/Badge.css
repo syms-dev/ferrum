@@ -7,3 +7,4 @@
 .fk-badge[data-tone="ok"] { color: var(--ferrum-ok); border-color: var(--ferrum-ok); }
 .fk-badge[data-tone="accent"] { color: var(--ferrum-accent); border-color: var(--ferrum-accent); }
 .fk-badge[data-tone="danger"] { color: var(--ferrum-danger); border-color: var(--ferrum-danger); }
+.fk-badge[data-tone="warn"] { color: var(--ferrum-warn); border-color: var(--ferrum-warn); }

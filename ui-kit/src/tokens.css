@@ -21,6 +21,7 @@
   --ferrum-accent: #5aa9e6;   /* 6.48 on panel, 7.12 on bg */
   --ferrum-ok: #56b96b;       /* 6.71 / 7.37 */
   --ferrum-danger: #e86257;   /* 4.96 / 5.45 */
+  --ferrum-warn: #d9a441;     /* 8.15 on panel, 8.95 on bg */
 
   /* Washes: the tinted grounds a severity uses when it owns a whole
    * block rather than a word. Kept distinct from the line colour so a
@@ -28,6 +29,7 @@
   --ferrum-wash-accent: #16222e;
   --ferrum-wash-ok: #16241a;
   --ferrum-wash-danger: #2a1a18;
+  --ferrum-wash-warn: #2a2418;
 
   --ferrum-radius: .6rem;
   --ferrum-radius-sm: .4rem;
@@ -51,9 +53,11 @@
     --ferrum-accent: #15639f;  /* 6.33 on #fff, 5.91 on #f6f7f9 */
     --ferrum-ok: #1a7f37;      /* 5.08 / 4.74 */
     --ferrum-danger: #b3261e;  /* 6.54 / 6.10 */
+    --ferrum-warn: #8a5a00;    /* 5.42 on #fff, 5.06 on #f6f7f9 */
     --ferrum-wash-accent: #eef4fa;
     --ferrum-wash-ok: #eef7f0;
     --ferrum-wash-danger: #fdf0ef;
+    --ferrum-wash-warn: #fcf6e8;
   }
 }
 
@@ -66,9 +70,11 @@
   --ferrum-accent: #15639f;
   --ferrum-ok: #1a7f37;
   --ferrum-danger: #b3261e;
+  --ferrum-warn: #8a5a00;
   --ferrum-wash-accent: #eef4fa;
   --ferrum-wash-ok: #eef7f0;
   --ferrum-wash-danger: #fdf0ef;
+  --ferrum-wash-warn: #fcf6e8;
 }
 
 /* The base every component assumes but only AppShell actually set.

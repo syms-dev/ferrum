@@ -23,3 +23,12 @@ export const Warning = () => (
     <Badge>Its own login</Badge>
   </div>
 );
+
+/** `warn` sits between accent and danger: read it, but nothing is broken. */
+export const NeedsReading = () => (
+  <div style={{ display: "flex", gap: ".5rem", flexWrap: "wrap" }}>
+    <Badge tone="warn">Read this</Badge>
+    <Badge tone="warn">Self-signed</Badge>
+    <Badge tone="ok">Ready</Badge>
+  </div>
+);
