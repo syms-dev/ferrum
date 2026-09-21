@@ -50,6 +50,7 @@
     ./core/recyclarr.nix
     ./core/reconciler.nix
     ./proxy/acme.nix
+    ./proxy/dns.nix
     ./proxy/nginx.nix
     ./proxy/selfsigned-cert.nix
     ./proxy/authelia.nix

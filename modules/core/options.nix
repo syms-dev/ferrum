@@ -210,6 +210,106 @@ in
         type = types.listOf types.str;
         default = [ "10.0.0.0/8" "172.16.0.0/12" "192.168.0.0/16" ];
       };
+
+      # ferrum creating the A/CNAME records for the hostnames it publishes.
+      # Until this existed, ferrum used the Cloudflare token ONLY for ACME
+      # DNS-01 challenge TXT records: certificates issued for names that had
+      # no address record at all, and the install reported success while
+      # auth.<baseDomain> -- the gate in front of every *arr -- did not
+      # resolve. See modules/proxy/dns.nix.
+      dns = {
+        enable = mkOption {
+          type = types.bool;
+          default = false;
+          description = ''
+            Whether ferrum creates and maintains the DNS records for the
+            hostnames it publishes.
+
+            Off by default only because it cannot work without a record
+            target (staticAddress or cnameTarget below) that nobody can
+            guess safely -- a wrong address publishes every app at someone
+            else's server. The installer asks for the target and turns this
+            on, so a normal install gets records without the operator
+            touching a DNS console; a host upgrading in place keeps its
+            existing behaviour until it sets one.
+          '';
+        };
+
+        recordMode = mkOption {
+          type = types.enum [ "a" "cname" ];
+          default = "a";
+          description = ''
+            Whether records are A records pointing at a stated address, or
+            CNAMEs following a stated hostname.
+
+            This is a decision, not an assumption: a server on a static
+            public address wants "a", while one behind a changing address
+            wants "cname" onto a name something else already keeps current
+            (or "a" plus ddnsUpdater below). Guessing wrong publishes an app
+            at an address that is not this server.
+          '';
+        };
+
+        staticAddress = mkOption {
+          type = types.str;
+          default = "";
+          example = "203.0.113.10";
+          description = ''
+            The public IPv4 address every A record points at, used when
+            recordMode = "a". The installer detects a candidate from the
+            target host itself and shows it for confirmation rather than
+            writing it silently -- an address detected from the operator's
+            own machine can easily be a VPN or office egress, not the
+            server's.
+
+            IPv4 only: ferrum publishes no AAAA record today.
+          '';
+        };
+
+        cnameTarget = mkOption {
+          type = types.str;
+          default = "";
+          example = "myhost.dynamic-dns.example.net";
+          description = ''
+            The hostname every record follows, used when recordMode =
+            "cname". Typically a dynamic-DNS name maintained outside ferrum,
+            which is what makes this the right mode for a host whose address
+            changes.
+          '';
+        };
+
+        ddnsUpdater = {
+          enable = mkOption {
+            type = types.bool;
+            default = false;
+            description = ''
+              Whether a timer re-checks this host's real public address on a
+              schedule and corrects the records ferrum owns when it has
+              moved. Opt-in, but RECOMMENDED on any host whose address is
+              not contractually static.
+
+              The failure it prevents is the one an operator cannot observe:
+              a stale A record leaves every app unreachable from outside
+              while the host is healthy, its services are running and its
+              certificates are valid, with no error anywhere. It only ever
+              touches records ferrum created; a record it does not own is
+              reported, never rewritten.
+            '';
+          };
+
+          intervalMinutes = mkOption {
+            type = types.int;
+            default = 60;
+            description = ''
+              How often the updater re-checks the public address. Hourly is
+              a deliberate compromise: an address change is rare and costs
+              at most this long of outside-world downtime, while a shorter
+              interval spends API calls and an address-echo lookup on a
+              value that almost never changes.
+            '';
+          };
+        };
+      };
     };
 
     auth = {
@@ -290,6 +390,23 @@ in
         type = types.str;
         default = "ferrum";
         description = "Hostname label under ferrum.proxy.baseDomain for the daemon's own web UI -- same mechanism as every app's own subdomain option, just not tied to the catalog since the daemon isn't a catalog app.";
+      };
+
+      dns.includeRecord = mkOption {
+        type = types.bool;
+        default = true;
+        description = ''
+          Whether ferrum's DNS management creates a record for the daemon's
+          own subdomain above.
+
+          On by default, honestly: ferrumd has no vhost yet, so nginx's
+          catch-all answers this hostname with a closed connection until
+          daemon web access ships -- a name that resolves and then dies,
+          rather than a clean NXDOMAIN. That was the deliberate choice (the
+          record the operator will want exists the moment the UI does, and
+          the installer says so out loud); this option is here so reversing
+          it is one line rather than a redesign.
+        '';
       };
     };
 
