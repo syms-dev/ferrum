@@ -176,10 +176,18 @@ fn ask_valid<T>(
 
 /// Collects every operator answer.
 ///
+/// # Arguments
+/// * `io` - the question-and-answer channel with the operator.
+/// * `make_client` - how the Cloudflare token is checked once it has been
+///   entered. Production passes [`cloudflare_client`]; tests pass a factory
+///   pointed at `ferrum_dns::testing::FakeCloudflare`, because the sandbox
+///   that runs the suite has no network and must never reach the real API.
+///
 /// # Errors
-/// An input failure, an answer that fails validation three times, or a
-/// declined SSO confirmation (see `sso::decide`).
-pub fn collect(io: &mut impl PromptIo) -> anyhow::Result<Answers> {
+/// An input failure, an answer that fails validation three times, a
+/// declined SSO confirmation (see `sso::decide`), or a Cloudflare token
+/// that cannot manage records for the base domain.
+pub fn collect(io: &mut impl PromptIo, make_client: ClientFactory<'_>) -> anyhow::Result<Answers> {
     let hostname = ask_valid(io, "Hostname for this machine:", validate_hostname)?;
 
     io.say(
@@ -215,17 +223,24 @@ pub fn collect(io: &mut impl PromptIo) -> anyhow::Result<Answers> {
     // Asked last, and only when it is genuinely required, so an operator
     // exploring the questions is never prompted for a credential they do
     // not yet need.
-    let cloudflare_token = if base_domain.is_some() && needs_acme_credential(&apps) {
-        io.say(
-            "\nLet's Encrypt issues these certificates over DNS-01, which needs a \
-             Cloudflare API token\nscoped to Zone:Read + DNS:Edit on this domain. \
-             It is held in memory, written to no file\nhere, and encrypted to the \
-             host's own key once the host exists.",
-        );
-        let token = validate_cloudflare_token(&io.ask_secret("Cloudflare API token:")?)?;
-        Some(Secret::new(token))
-    } else {
-        None
+    let cloudflare_token = match base_domain.as_deref() {
+        Some(domain) if needs_acme_credential(&apps) => {
+            io.say(
+                "\nLet's Encrypt issues these certificates over DNS-01, and ferrum \
+                 publishes each app's\nDNS record with the same credential, so it needs \
+                 a Cloudflare API token scoped\nZone:Read + DNS:Edit on this domain. It \
+                 is held in memory, written to no file here,\nand encrypted to the \
+                 host's own key once the host exists.\n\nIt is checked against \
+                 Cloudflare as soon as you enter it, so a token that cannot\nsee this \
+                 domain fails here rather than after the install.",
+            );
+            Some(validate_and_verify_cloudflare_token(
+                &io.ask_secret("Cloudflare API token:")?,
+                domain,
+                make_client,
+            )?)
+        }
+        _ => None,
     };
 
     Ok(Answers {
@@ -311,6 +326,165 @@ pub fn validate_cloudflare_token(raw: &str) -> anyhow::Result<String> {
         );
     }
     Ok(token.to_string())
+}
+
+/// How token verification reaches Cloudflare.
+///
+/// The client is built *from* the token, so the seam is a factory rather
+/// than a client: production hands over [`cloudflare_client`], and tests
+/// hand over a factory pointed at `ferrum_dns::testing::FakeCloudflare`.
+/// The Nix sandbox running the workspace suite has no network at all, so a
+/// test that reached the real API would fail CI by construction.
+pub type ClientFactory<'a> = &'a dyn Fn(ferrum_dns::Secret) -> ferrum_dns::client::Client;
+
+/// The production factory: a client pointed at the real Cloudflare API.
+///
+/// # Arguments
+/// * `token` - the bare token the operator just entered.
+///
+/// # Returns
+/// A client every call site of [`validate_and_verify_cloudflare_token`]
+/// shares, so there is one place the endpoint and timeouts are decided.
+#[must_use]
+pub fn cloudflare_client(token: ferrum_dns::Secret) -> ferrum_dns::client::Client {
+    ferrum_dns::client::Client::new(token)
+}
+
+/// Both halves of A5's check: the token is well-formed **and** Cloudflare
+/// agrees it can manage records for this domain.
+///
+/// This is the only way a [`Secret`] holding a Cloudflare token is minted
+/// in this binary, and that is the point. The installer has two places it
+/// asks for the token -- the first interactive run, and a resume after the
+/// disk has been erased -- and until this function existed only the first
+/// ran even the syntactic check (UF-20). The resumed path is the likelier
+/// one after the failure that loses a credential, so the verification was
+/// missing exactly where it mattered most.
+///
+/// Order matters. The syntactic checks run first and refuse an empty,
+/// whitespace-only or malformed value **before** any request is made. An
+/// unset credential producing an empty request that Cloudflare answers
+/// blandly is the failure mode this whole story exists to remove: an empty
+/// answer reads exactly like "not supported", and a wrong conclusion
+/// reached confidently from a silent failure is worse than an error.
+///
+/// Zone resolution is a longest-suffix match over every zone the token can
+/// see (decision D-06), not `GET /zones?name=<base_domain>`:
+/// `modules/core/options.nix` documents `home.example.com` as a base
+/// domain, and the exact-name form would reject a perfectly good token
+/// scoped to `example.com`.
+///
+/// # Arguments
+/// * `raw` - what the operator typed or pasted.
+/// * `base_domain` - `ferrum.proxy.baseDomain`, the domain the records
+///   will be published under.
+/// * `make_client` - the factory described on [`ClientFactory`].
+///
+/// # Returns
+/// The trimmed token, wrapped so it cannot be printed by accident.
+///
+/// # Errors
+/// The syntactic failures of [`validate_cloudflare_token`], or a distinct
+/// message per verification failure: Cloudflare refusing the credential,
+/// no visible zone covering the domain, the domain being delegated to
+/// other nameservers, and the API being unreachable. Each has a different
+/// remedy, so each says a different thing.
+pub fn validate_and_verify_cloudflare_token(
+    raw: &str,
+    base_domain: &str,
+    make_client: ClientFactory<'_>,
+) -> anyhow::Result<Secret> {
+    let token = validate_cloudflare_token(raw)?;
+    let client = make_client(ferrum_dns::Secret::new(token.clone()));
+    match client.verify_zone_access(base_domain) {
+        Ok(()) => Ok(Secret::new(token)),
+        Err(failure) => Err(explain_verification_failure(&failure, base_domain)),
+    }
+}
+
+/// Where the credential lives once a host exists, named exactly.
+///
+/// Worth stating rather than paraphrasing: it is not a bare token on the
+/// host. It is the sops secret named by `ferrum.proxy.acme.credentialSecret`
+/// and it is a systemd `EnvironmentFile`, so its content is a `KEY=value`
+/// line. An operator told to "check the token file" who then pastes a bare
+/// value into it has produced a file every reader will parse as empty.
+const CREDENTIAL_LOCATION: &str = "On a host ferrum has already installed this credential is the \
+     sops secret named by ferrum.proxy.acme.credentialSecret (default \
+     \"acme-dns\"). It is mounted at /run/secrets/acme-dns and is a systemd \
+     EnvironmentFile, so its content is the single line \
+     CLOUDFLARE_DNS_API_TOKEN=<token> -- not a bare token.";
+
+/// Turns a `ferrum-dns` failure into something the operator can act on.
+///
+/// Four failures arrive here and they have four different remedies: issue a
+/// new token, add the zone to this Cloudflare account, undo an `NS`
+/// delegation, or fix the network. Rendering them all as "invalid token"
+/// would send the operator to re-issue a credential that was never the
+/// problem.
+///
+/// # Arguments
+/// * `failure` - what `verify_zone_access` returned.
+/// * `base_domain` - the domain that was being checked, for the message.
+///
+/// # Returns
+/// An error whose text names the cause and the fix. Never the token: it
+/// travels only in the `Authorization` header, and `CloudflareError`'s own
+/// `Display` is written to the same rule.
+fn explain_verification_failure(
+    failure: &ferrum_dns::CloudflareError,
+    base_domain: &str,
+) -> anyhow::Error {
+    use ferrum_dns::CloudflareError as E;
+    match failure {
+        E::Api { code, message } => anyhow::anyhow!(
+            "Cloudflare rejected that API token (its own error {code}: {message}).\n\n\
+             The token must exist, be unexpired, and be scoped Zone:Read + DNS:Edit on \
+             the zone that contains {base_domain}. Re-issue it in the Cloudflare \
+             dashboard under My Profile -> API Tokens.\n\n{CREDENTIAL_LOCATION}"
+        ),
+        E::ZoneNotFound { .. } => anyhow::anyhow!(
+            "That token was accepted, but no Cloudflare zone it can see covers \
+             {base_domain}, so it cannot publish any of this host's records.\n\n\
+             ferrum matches the longest zone name that is a suffix of the domain, so a \
+             token scoped to \"example.com\" is correct for a base domain of \
+             \"home.example.com\". This means neither {base_domain} nor any parent of \
+             it is a zone in the account this token belongs to.\n\n\
+             Check that the domain is in this Cloudflare account, and that the token's \
+             Zone Resources include that zone rather than a different one."
+        ),
+        E::ZoneDelegated {
+            delegated_name,
+            nameservers,
+            ..
+        } => anyhow::anyhow!(
+            "{base_domain} sits in a Cloudflare zone this token can manage, but an NS \
+             record for {delegated_name} delegates it to {}. Records written in \
+             Cloudflare would be accepted and would resolve nowhere, because the \
+             servers the world asks are not the ones ferrum would be writing to.\n\n\
+             Either remove that NS delegation so Cloudflare serves {base_domain}, or \
+             choose a base domain that is not delegated away.",
+            if nameservers.is_empty() {
+                "other nameservers".to_string()
+            } else {
+                nameservers.join(", ")
+            }
+        ),
+        E::Transport(detail) => anyhow::anyhow!(
+            "Could not reach the Cloudflare API to check that token ({detail}).\n\n\
+             The token has NOT been checked, and it is not accepted on trust: checking \
+             it here is what stops a bad credential surfacing hours later as an install \
+             that finished and published nothing. Restore this machine's network path \
+             to api.cloudflare.com and run the installer again."
+        ),
+        E::Malformed(detail) => anyhow::anyhow!(
+            "Cloudflare answered the token check with something this installer could \
+             not read ({detail}).\n\n\
+             The token has NOT been checked, so it is refused rather than accepted on \
+             trust. If api.cloudflare.com is reachable only through a proxy that \
+             rewrites responses, that proxy is the thing to fix."
+        ),
+    }
 }
 
 pub fn from_stage2(body: &str, hostname: &str) -> anyhow::Result<Answers> {
@@ -439,6 +613,49 @@ mod tests {
 
     use super::*;
     use crate::prompt::testing::Scripted;
+    use ferrum_dns::testing::{CannedResponse, FakeCloudflare, Route, TEST_TOKEN};
+
+    /// The zone every test that is not *about* the zone check wants: one
+    /// visible zone covering `thesyms.ca`, delegated nowhere.
+    ///
+    /// Scripted answers are consumed one per request, so a run that made a
+    /// call nobody expected gets the fake's loud "nothing scripted" refusal
+    /// rather than a plausible success.
+    fn script_healthy_zone(fake: &FakeCloudflare) {
+        fake.script(
+            Route::get("/zones"),
+            CannedResponse::ok(serde_json::json!([{
+                "id": "z1",
+                "name": "thesyms.ca",
+                "name_servers": ["amber.ns.cloudflare.com", "bob.ns.cloudflare.com"],
+            }])),
+        );
+        fake.script(
+            Route::get("/zones/z1/dns_records"),
+            CannedResponse::ok(serde_json::json!([])),
+        );
+    }
+
+    /// A fake Cloudflare that accepts any well-formed token for
+    /// `thesyms.ca`.
+    fn healthy_cloudflare() -> FakeCloudflare {
+        let fake = FakeCloudflare::start();
+        script_healthy_zone(&fake);
+        fake
+    }
+
+    /// A factory pointing `Client` at the fake instead of the real API.
+    ///
+    /// Every test in this module goes through this: the Nix sandbox that
+    /// runs the workspace suite has no network, so a test reaching
+    /// api.cloudflare.com would fail CI by construction -- and would be
+    /// checking Cloudflare's availability rather than this code.
+    fn verifying_against(
+        fake: &FakeCloudflare,
+    ) -> impl Fn(ferrum_dns::Secret) -> ferrum_dns::client::Client + '_ {
+        let base_url = fake.base_url().to_string();
+        move |token| ferrum_dns::client::Client::with_base_url(token, base_url.clone())
+    }
 
     #[test]
     fn hostnames_must_be_dns_labels() {
@@ -492,7 +709,8 @@ mod tests {
             "admin@thesyms.ca",
             "cftokenvalue1234567890abcdefghijklmnopqr",
         ]);
-        let a = collect(&mut io).unwrap();
+        let fake = healthy_cloudflare();
+        let a = collect(&mut io, &verifying_against(&fake)).unwrap();
         assert_eq!(a.hostname, "saltbox");
         assert_eq!(a.base_domain.as_deref(), Some("thesyms.ca"));
         assert_eq!(a.apps, vec!["plex", "sonarr"]);
@@ -506,7 +724,8 @@ mod tests {
     #[test]
     fn no_domain_skips_acme_and_the_token() {
         let mut io = Scripted::new(&["saltbox", "", "plex"]);
-        let a = collect(&mut io).unwrap();
+        let fake = FakeCloudflare::start();
+        let a = collect(&mut io, &verifying_against(&fake)).unwrap();
         assert_eq!(a.base_domain, None);
         assert_eq!(a.acme_email, None);
         assert_eq!(a.cloudflare_token, None);
@@ -520,18 +739,53 @@ mod tests {
     #[test]
     fn a_domain_with_no_apps_does_not_require_the_token() {
         let mut io = Scripted::new(&["saltbox", "thesyms.ca", "me@thesyms.ca", "", "", "a@b.co"]);
-        let a = collect(&mut io).unwrap();
+        let fake = FakeCloudflare::start();
+        let a = collect(&mut io, &verifying_against(&fake)).unwrap();
         assert!(a.apps.is_empty());
         assert_eq!(a.cloudflare_token, None);
+        assert!(
+            fake.requests().is_empty(),
+            "nothing was collected to check, so nothing should have been asked of Cloudflare"
+        );
     }
 
+    /// D-11(b). An unset credential must be an error with a message, never
+    /// an empty success.
+    ///
+    /// The owner's first attempt at this failed exactly that way: a missing
+    /// file left the token empty, every request went out unauthenticated,
+    /// and the blank result read as "the feature is unsupported" -- a wrong
+    /// conclusion reached confidently from a silent failure. So the empty
+    /// value is refused *before* a request is made, and the refusal says
+    /// why.
+    ///
+    /// Mutation check: make `validate_cloudflare_token` return `Ok` for an
+    /// empty string and this fails on both counts -- the collect succeeds,
+    /// and the fake records a request it should never have seen.
     #[test]
-    fn an_empty_token_is_refused_with_the_reason() {
-        let mut io = Scripted::new(&[
-            "saltbox", "thesyms.ca", "me@thesyms.ca", "sonarr", "", "a@b.co", "",
-        ]);
-        let err = collect(&mut io).unwrap_err().to_string();
-        assert!(err.contains("acme.nix"), "{err}");
+    fn an_empty_token_is_refused_with_the_reason_and_never_reaches_the_api() {
+        let fake = healthy_cloudflare();
+        for blank in ["", "   ", "\t"] {
+            let mut io = Scripted::new(&[
+                "saltbox",
+                "thesyms.ca",
+                "me@thesyms.ca",
+                "sonarr",
+                "",
+                "a@b.co",
+                blank,
+            ]);
+            let err = collect(&mut io, &verifying_against(&fake))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("acme.nix"), "{blank:?}: {err}");
+            assert!(err.contains("required"), "{blank:?}: {err}");
+        }
+        assert!(
+            fake.requests().is_empty(),
+            "an empty credential must fail at the prompt, not become an \
+             unauthenticated request whose blank answer reads as \"unsupported\""
+        );
     }
 
     /// The token must never be written anywhere on the operator's machine.
@@ -541,7 +795,8 @@ mod tests {
         let mut io = Scripted::new(&[
             "saltbox", "thesyms.ca", "me@thesyms.ca", "sonarr", "", "a@b.co", "secrettoken1234567890abcdefghijklmnopqrs",
         ]);
-        let a = collect(&mut io).unwrap();
+        let fake = healthy_cloudflare();
+        let a = collect(&mut io, &verifying_against(&fake)).unwrap();
         assert!(
             !io.transcript().contains("secrettoken1234567890abcdefghijklmnopqrs"),
             "the token must never be echoed back: {}",
@@ -610,7 +865,8 @@ mod tests {
             "saltbox", "thesyms.ca", "me@thesyms.ca", "sonarr", "", "a@b.co",
             "tokentokentoken1234567890abcdefghijklmno",
         ]);
-        collect(&mut io).unwrap();
+        let fake = healthy_cloudflare();
+        collect(&mut io, &verifying_against(&fake)).unwrap();
         assert_eq!(io.secret_asks.len(), 1, "the token must use the non-echoing prompt");
         assert!(io.secret_asks[0].contains("Cloudflare"));
     }
@@ -620,12 +876,266 @@ mod tests {
         let mut io = Scripted::new(&[
             "saltbox", "thesyms.ca", "me@thesyms.ca", "sonarr", "", "a@b.co", "supersecret1234567890abcdefghijklmnopqrs",
         ]);
-        let a = collect(&mut io).unwrap();
+        let fake = healthy_cloudflare();
+        let a = collect(&mut io, &verifying_against(&fake)).unwrap();
         let rendered = format!("{a:?}");
         assert!(!rendered.contains("supersecret1234567890abcdefghijklmnopqrs"), "Debug leaked the token: {rendered}");
         assert!(rendered.contains("<redacted>"), "{rendered}");
         // ...and it is still retrievable where it is genuinely needed.
         assert_eq!(a.cloudflare_token.as_ref().map(Secret::expose), Some("supersecret1234567890abcdefghijklmnopqrs"));
+    }
+
+    /// The only credential these tests transmit: the fake's own dummy,
+    /// which is well-formed enough to pass the syntactic checks and
+    /// self-describing enough that a stray capture is obviously harmless.
+    const GOOD_TOKEN: &str = TEST_TOKEN;
+
+    /// A5's happy path, and the proof that the check is a real call rather
+    /// than a comment: the fake sees the zone listing, and the token
+    /// travels only in the `Authorization` header.
+    #[test]
+    fn a_token_that_can_see_the_zone_is_accepted_and_actually_checked() {
+        let fake = healthy_cloudflare();
+        let token = validate_and_verify_cloudflare_token(
+            GOOD_TOKEN,
+            "thesyms.ca",
+            &verifying_against(&fake),
+        )
+        .expect("a token scoped to the zone is accepted");
+        assert_eq!(token.expose(), GOOD_TOKEN);
+
+        let requests = fake.requests();
+        assert!(
+            !requests.is_empty(),
+            "A5 is a Cloudflare call, not a string check -- no request means no verification"
+        );
+        for request in requests {
+            assert_eq!(
+                request.header("authorization"),
+                Some(format!("Bearer {GOOD_TOKEN}").as_str()),
+            );
+            assert!(
+                !request.path.contains(GOOD_TOKEN) && !request.query.contains(GOOD_TOKEN),
+                "the token must never reach a URL"
+            );
+        }
+    }
+
+    /// The first of A5's two call sites, pinned at `collect` rather than at
+    /// the function it delegates to.
+    ///
+    /// Testing `validate_and_verify_cloudflare_token` alone proves the
+    /// check works, never that `collect` still runs it -- dropping the
+    /// verification here and keeping only the syntactic half leaves every
+    /// other test in this module green. Its sibling on the resumed path is
+    /// `main.rs`'s `a_resumed_run_refuses_a_token_the_zone_check_rejects`.
+    ///
+    /// Mutation check: replace this call site's
+    /// `validate_and_verify_cloudflare_token` with
+    /// `validate_cloudflare_token` and this fails.
+    #[test]
+    fn the_first_run_refuses_a_token_the_zone_check_rejects() {
+        let fake = FakeCloudflare::start();
+        fake.script(
+            Route::get("/zones"),
+            CannedResponse::api_error(9109, "Invalid access token"),
+        );
+        let mut io = Scripted::new(&[
+            "saltbox",
+            "thesyms.ca",
+            "me@thesyms.ca",
+            "sonarr",
+            "",
+            "a@b.co",
+            GOOD_TOKEN,
+        ]);
+
+        let err = collect(&mut io, &verifying_against(&fake))
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("9109"), "{err}");
+        assert!(err.contains("/run/secrets/acme-dns"), "{err}");
+        assert!(
+            !fake.requests().is_empty(),
+            "the first run must actually ask Cloudflare, not just inspect the string"
+        );
+    }
+
+    /// D-06. `options.nix` documents `home.example.com` as a base domain,
+    /// so the zone is matched by longest suffix. A `GET /zones?name=` would
+    /// reject this perfectly good token.
+    #[test]
+    fn a_base_domain_below_the_zone_apex_is_accepted() {
+        let fake = FakeCloudflare::start();
+        fake.script(
+            Route::get("/zones"),
+            CannedResponse::ok(serde_json::json!([{
+                "id": "z9",
+                "name": "example.com",
+                "name_servers": ["amber.ns.cloudflare.com"],
+            }])),
+        );
+        fake.script(
+            Route::get("/zones/z9/dns_records"),
+            CannedResponse::ok(serde_json::json!([])),
+        );
+
+        validate_and_verify_cloudflare_token(
+            GOOD_TOKEN,
+            "home.example.com",
+            &verifying_against(&fake),
+        )
+        .expect("a token scoped to the apex covers a subdomain base domain");
+    }
+
+    /// Failure mode 1 of 4: Cloudflare itself refuses the credential.
+    ///
+    /// Note the shape -- HTTP 200 with `success: false`, which is how
+    /// Cloudflare really answers a permission failure. The remedy is a new
+    /// token, so the message says so, and it names where the credential
+    /// lives on an installed host in the shape it actually has.
+    #[test]
+    fn a_credential_cloudflare_rejects_says_to_reissue_it() {
+        let fake = FakeCloudflare::start();
+        fake.script(
+            Route::get("/zones"),
+            CannedResponse::api_error(9109, "Invalid access token"),
+        );
+
+        let err = validate_and_verify_cloudflare_token(
+            GOOD_TOKEN,
+            "thesyms.ca",
+            &verifying_against(&fake),
+        )
+        .expect_err("a rejected credential must fail at the prompt")
+        .to_string();
+
+        assert!(err.contains("9109"), "{err}");
+        assert!(err.contains("Invalid access token"), "{err}");
+        assert!(err.contains("Zone:Read + DNS:Edit"), "{err}");
+        // D-11(a): the real path, and the real shape. An operator sent to
+        // /run/secrets/acme-dns who writes a bare token there has produced
+        // a file systemd reads as empty.
+        assert!(err.contains("/run/secrets/acme-dns"), "{err}");
+        assert!(err.contains("CLOUDFLARE_DNS_API_TOKEN="), "{err}");
+        assert!(
+            !err.contains(GOOD_TOKEN),
+            "the token must never reach an error string"
+        );
+    }
+
+    /// Failure mode 2 of 4: the credential is fine, the domain is not in
+    /// this account. Re-issuing the token would not help, so the message
+    /// must not suggest it.
+    #[test]
+    fn a_domain_no_visible_zone_covers_says_so_rather_than_blaming_the_token() {
+        let fake = FakeCloudflare::start();
+        fake.script(
+            Route::get("/zones"),
+            CannedResponse::ok(serde_json::json!([{
+                "id": "z1",
+                "name": "someone-elses.example",
+                "name_servers": ["amber.ns.cloudflare.com"],
+            }])),
+        );
+
+        let err = validate_and_verify_cloudflare_token(
+            GOOD_TOKEN,
+            "thesyms.ca",
+            &verifying_against(&fake),
+        )
+        .expect_err("a token that cannot see the domain must fail at the prompt")
+        .to_string();
+
+        assert!(err.contains("thesyms.ca"), "{err}");
+        assert!(err.contains("no Cloudflare zone"), "{err}");
+        assert!(err.contains("Zone Resources"), "{err}");
+        assert!(
+            err.contains("longest zone name"),
+            "the operator needs to know a parent zone would have been accepted: {err}"
+        );
+    }
+
+    /// Failure mode 3 of 4: the zone is here, the name is served
+    /// elsewhere. Cloudflare would accept every write and not one record
+    /// would resolve -- the exact silent success R1 exists to end.
+    #[test]
+    fn a_delegated_base_domain_is_refused_with_the_nameservers_that_really_serve_it() {
+        let fake = FakeCloudflare::start();
+        fake.script(
+            Route::get("/zones"),
+            CannedResponse::ok(serde_json::json!([{
+                "id": "z1",
+                "name": "example.com",
+                "name_servers": ["amber.ns.cloudflare.com"],
+            }])),
+        );
+        fake.script(
+            Route::get("/zones/z1/dns_records"),
+            CannedResponse::ok(serde_json::json!([{
+                "id": "r1",
+                "name": "home.example.com",
+                "type": "NS",
+                "content": "ns1.elsewhere.net",
+                "proxied": false,
+                "comment": null,
+            }])),
+        );
+
+        let err = validate_and_verify_cloudflare_token(
+            GOOD_TOKEN,
+            "home.example.com",
+            &verifying_against(&fake),
+        )
+        .expect_err("a delegated domain must fail at the prompt")
+        .to_string();
+
+        assert!(err.contains("home.example.com"), "{err}");
+        assert!(err.contains("ns1.elsewhere.net"), "{err}");
+        assert!(err.contains("resolve nowhere"), "{err}");
+        assert!(err.contains("NS"), "{err}");
+    }
+
+    /// Failure mode 4 of 4: the check could not run. The token is refused
+    /// rather than accepted on trust -- accepting it would restore the very
+    /// "install finished, nothing published" outcome A5 removes.
+    #[test]
+    fn an_unreachable_api_refuses_the_token_rather_than_accepting_it_unchecked() {
+        let fake = FakeCloudflare::start();
+        fake.script(Route::get("/zones"), CannedResponse::transport_failure());
+
+        let err = validate_and_verify_cloudflare_token(
+            GOOD_TOKEN,
+            "thesyms.ca",
+            &verifying_against(&fake),
+        )
+        .expect_err("an unchecked token must not be accepted")
+        .to_string();
+
+        assert!(err.contains("Could not reach"), "{err}");
+        assert!(err.contains("NOT been checked"), "{err}");
+        assert!(err.contains("api.cloudflare.com"), "{err}");
+    }
+
+    /// A malformed token never becomes a request. Same discipline as the
+    /// empty case: the cheapest refusal is the one that costs no call.
+    #[test]
+    fn a_malformed_token_is_refused_before_any_request_is_made() {
+        let fake = healthy_cloudflare();
+        let err = validate_and_verify_cloudflare_token(
+            "abcdefghij1234567890abcdefghij1234567890%",
+            "thesyms.ca",
+            &verifying_against(&fake),
+        )
+        .expect_err("a trailing % cannot go in an HTTP header")
+        .to_string();
+
+        assert!(err.contains("Authorization"), "{err}");
+        assert!(
+            fake.requests().is_empty(),
+            "a malformed token must be caught before it is sent anywhere"
+        );
     }
 
     #[test]

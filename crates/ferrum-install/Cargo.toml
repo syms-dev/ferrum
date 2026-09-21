@@ -14,5 +14,21 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"
 
+# The one seam every Cloudflare call in this workspace goes through. A path
+# dependency on a workspace member rather than a direct `ureq` dependency:
+# this binary and `ferrum-apply` reach Cloudflare through one library, so
+# the zone, ownership and error-envelope logic cannot drift between them.
+# No new package enters `Cargo.lock` -- `ureq` is already resolved there
+# via `ferrum-reconcile`.
+ferrum-dns = { path = "../ferrum-dns" }
+
 [dev-dependencies]
 tempfile = "3"
+# The same crate with its fake Cloudflare server switched on. A5's
+# verification is only testable if the tests can point the client at
+# something other than the real API, and the Nix sandbox that runs
+# `workspace-tests` has no network at all -- a test reaching
+# api.cloudflare.com would fail CI by construction. Enabling the existing
+# `testing` feature here keeps that fake single rather than growing a
+# second one on this side of the boundary.
+ferrum-dns = { path = "../ferrum-dns", features = ["testing"] }

@@ -243,15 +243,12 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
     // --- Stage 2. The host exists now, so the things that could not exist
     //     before it can be created. ---
     if reached.unwrap_or(state::Phase::Generated) < state::Phase::Stage2Applied {
-        if answers.cloudflare_token.is_none()
-            && answers::token_still_needed(&answers, acme_secret_present(&pre)?)
-        {
-            let mut io = prompt::stdio();
-            answers.cloudflare_token = Some(answers::Secret::new(prompt::PromptIo::ask_secret(
-                &mut io,
-                "\nCloudflare API token (not recoverable from the generated files):",
-            )?));
-        }
+        ensure_cloudflare_token(
+            &mut answers,
+            acme_secret_present(&pre)?,
+            &mut prompt::stdio(),
+            &answers::cloudflare_client,
+        )?;
 
         // R4 A5, and now also a precondition of the transfer below: the
         // repository the operator keeps must hold the settings the host is
@@ -452,7 +449,7 @@ fn plan_install(
 ) -> anyhow::Result<(answers::Answers, confirm::Approved)> {
     let (devices, efi_present) = inventory_phase(pre)?;
     let mut io = prompt::stdio();
-    let answers = answers::collect(&mut io)?;
+    let answers = answers::collect(&mut io, &answers::cloudflare_client)?;
     let approved = confirm::confirm(&devices, efi_present, &mut io)?;
 
     recheck(pre, &approved)?;
@@ -729,6 +726,64 @@ fn acme_secret_present(pre: &preconditions::Preconditions) -> anyhow::Result<boo
     .unwrap_or(false))
 }
 
+/// Re-asks for the Cloudflare token on a resumed run, and checks it the
+/// same way the first run does.
+///
+/// **This is the fix for a live defect (UF-20), not a refactor.** The token
+/// is the one answer a resume cannot recover -- it was deliberately never
+/// written anywhere -- so it is the one answer re-asked after the disk has
+/// been erased. Until this function existed that second prompt took the
+/// operator's input straight into `Secret`, reaching neither the charset
+/// check that exists because a zsh trailing `%` once broke every
+/// certificate order, nor the zone check A5 asks for. A resume is the
+/// likeliest path after the very failure that loses a credential, so the
+/// verification was absent exactly where it was needed most.
+///
+/// Both prompts now reach `answers::validate_and_verify_cloudflare_token`,
+/// which is the only thing in this binary that produces a token-bearing
+/// `answers::Secret`.
+///
+/// # Arguments
+/// * `answers` - the recovered answers; its `cloudflare_token` is filled
+///   in when one is needed and absent.
+/// * `already_on_host` - whether an earlier attempt already delivered the
+///   encrypted secret, in which case nothing is asked.
+/// * `io` - the question-and-answer channel with the operator.
+/// * `make_client` - how the token is checked; see
+///   [`answers::ClientFactory`].
+///
+/// # Errors
+/// An input failure, or a token that is malformed or cannot manage records
+/// for the recovered base domain. Failing here costs a re-run; failing
+/// later costs an install that finishes and publishes nothing.
+fn ensure_cloudflare_token(
+    answers: &mut answers::Answers,
+    already_on_host: bool,
+    io: &mut impl prompt::PromptIo,
+    make_client: answers::ClientFactory<'_>,
+) -> anyhow::Result<()> {
+    // A host with no base domain publishes nothing and needs no token --
+    // the same condition `token_still_needed` checks, taken first so the
+    // domain the verification needs is in hand without an unreachable
+    // branch to handle its absence.
+    let Some(domain) = answers.base_domain.clone() else {
+        return Ok(());
+    };
+    if answers.cloudflare_token.is_some() || !answers::token_still_needed(answers, already_on_host)
+    {
+        return Ok(());
+    }
+
+    let raw =
+        io.ask_secret("\nCloudflare API token (not recoverable from the generated files):")?;
+    answers.cloudflare_token = Some(answers::validate_and_verify_cloudflare_token(
+        &raw,
+        &domain,
+        make_client,
+    )?);
+    Ok(())
+}
+
 /// Runs every check and returns the ones that failed.
 fn verify_host(
     pre: &preconditions::Preconditions,
@@ -837,8 +892,218 @@ mod tests {
         assert!(msg.contains("partially written"), "{msg}");
     }
 
-    use super::{check_hardware_config_body, needs_hardware_config_transfer};
+    use super::{
+        check_hardware_config_body, ensure_cloudflare_token, needs_hardware_config_transfer,
+    };
+    use crate::prompt::testing::Scripted;
     use crate::state::Phase;
+    use ferrum_dns::testing::{CannedResponse, FakeCloudflare, Route, TEST_TOKEN};
+
+    /// A fake Cloudflare that resolves `thesyms.ca` with no delegation.
+    fn healthy_cloudflare() -> FakeCloudflare {
+        let fake = FakeCloudflare::start();
+        fake.script(
+            Route::get("/zones"),
+            CannedResponse::ok(serde_json::json!([{
+                "id": "z1",
+                "name": "thesyms.ca",
+                "name_servers": ["amber.ns.cloudflare.com"],
+            }])),
+        );
+        fake.script(
+            Route::get("/zones/z1/dns_records"),
+            CannedResponse::ok(serde_json::json!([])),
+        );
+        fake
+    }
+
+    fn verifying_against(
+        fake: &FakeCloudflare,
+    ) -> impl Fn(ferrum_dns::Secret) -> ferrum_dns::client::Client + '_ {
+        let base_url = fake.base_url().to_string();
+        move |token| ferrum_dns::client::Client::with_base_url(token, base_url.clone())
+    }
+
+    /// Answers as a resume recovers them: everything except the token,
+    /// which was deliberately never written anywhere.
+    fn recovered_answers() -> answers::Answers {
+        answers::from_stage2(
+            &serde_json::json!({
+                "proxy": { "enable": true, "baseDomain": "thesyms.ca" },
+                "apps": { "sonarr": { "enable": true } },
+            })
+            .to_string(),
+            "saltbox",
+        )
+        .expect("the stage-2 document is well formed")
+    }
+
+    /// UF-20, the defect this story exists to fix.
+    ///
+    /// The resumed run is the second of the installer's two token prompts,
+    /// and until now it took the operator's input straight into `Secret`,
+    /// reaching neither the charset check nor A5's zone check. It is the
+    /// likelier prompt after the failure that loses a credential, so the
+    /// verification was missing precisely where it was needed most.
+    ///
+    /// Mutation check: put the bare `ask_secret` wrapped in `answers`'
+    /// `Secret` constructor back at the call site in the stage-2 block and
+    /// this test's sibling
+    /// `the_resume_call_site_cannot_mint_an_unverified_token` fails; revert
+    /// the verification inside `ensure_cloudflare_token` and this one does.
+    #[test]
+    fn a_resumed_run_refuses_a_token_the_zone_check_rejects() {
+        let fake = FakeCloudflare::start();
+        fake.script(
+            Route::get("/zones"),
+            CannedResponse::api_error(9109, "Invalid access token"),
+        );
+        let mut answers = recovered_answers();
+        let mut io = Scripted::new(&[TEST_TOKEN]);
+
+        let err = ensure_cloudflare_token(&mut answers, false, &mut io, &verifying_against(&fake))
+            .expect_err("a resumed run must check the token, not just take it")
+            .to_string();
+
+        assert!(err.contains("9109"), "{err}");
+        assert!(err.contains("/run/secrets/acme-dns"), "{err}");
+        assert!(
+            answers.cloudflare_token.is_none(),
+            "a refused token must not be kept"
+        );
+    }
+
+    /// The charset check, at the prompt the resume uses. A zsh trailing
+    /// `%` once broke every certificate order on a real install, and it
+    /// reported itself as a DNS zone problem hours later.
+    #[test]
+    fn a_resumed_run_refuses_a_token_carrying_a_shell_artifact_without_calling_out() {
+        let fake = healthy_cloudflare();
+        let mut answers = recovered_answers();
+        let mut io = Scripted::new(&["abcdefghij1234567890abcdefghij1234567890%"]);
+
+        let err = ensure_cloudflare_token(&mut answers, false, &mut io, &verifying_against(&fake))
+            .expect_err("a trailing % cannot go in an HTTP header")
+            .to_string();
+
+        assert!(err.contains("Authorization"), "{err}");
+        assert!(
+            fake.requests().is_empty(),
+            "a malformed token is refused before it is sent anywhere"
+        );
+    }
+
+    /// D-11(b), on the resume path: an empty answer is an error with a
+    /// message, never an empty success and never an unauthenticated
+    /// request whose blank response reads as "unsupported".
+    #[test]
+    fn a_resumed_run_refuses_an_empty_token_rather_than_proceeding_silently() {
+        let fake = healthy_cloudflare();
+        let mut answers = recovered_answers();
+        let mut io = Scripted::new(&[""]);
+
+        let err = ensure_cloudflare_token(&mut answers, false, &mut io, &verifying_against(&fake))
+            .expect_err("an unset credential must fail loudly")
+            .to_string();
+
+        assert!(err.contains("required"), "{err}");
+        assert!(answers.cloudflare_token.is_none());
+        assert!(fake.requests().is_empty());
+    }
+
+    /// The happy path, and the proof the verification really ran: the fake
+    /// saw the zone listing, and the token went out only as a header.
+    #[test]
+    fn a_resumed_run_accepts_and_actually_checks_a_good_token() {
+        let fake = healthy_cloudflare();
+        let mut answers = recovered_answers();
+        let mut io = Scripted::new(&[TEST_TOKEN]);
+
+        ensure_cloudflare_token(&mut answers, false, &mut io, &verifying_against(&fake))
+            .expect("a token scoped to the zone is accepted");
+
+        assert_eq!(
+            answers
+                .cloudflare_token
+                .as_ref()
+                .map(answers::Secret::expose),
+            Some(TEST_TOKEN)
+        );
+        assert_eq!(
+            io.secret_asks.len(),
+            1,
+            "the token must use the non-echoing prompt"
+        );
+        let requests = fake.requests();
+        assert!(!requests.is_empty(), "no request means no verification");
+        for request in requests {
+            assert_eq!(
+                request.header("authorization"),
+                Some(format!("Bearer {TEST_TOKEN}").as_str())
+            );
+            assert!(!request.path.contains(TEST_TOKEN) && !request.query.contains(TEST_TOKEN));
+        }
+    }
+
+    /// Nothing is asked when nothing is owed -- a token already delivered
+    /// to the host on an earlier attempt, or a host that publishes nothing.
+    #[test]
+    fn a_resumed_run_asks_for_nothing_it_does_not_need() {
+        let fake = FakeCloudflare::start();
+        let mut delivered = recovered_answers();
+        let mut io = Scripted::new(&[]);
+        ensure_cloudflare_token(&mut delivered, true, &mut io, &verifying_against(&fake))
+            .expect("the secret is already on the host");
+
+        let mut no_domain = answers::from_stage2(
+            &serde_json::json!({ "apps": { "sonarr": { "enable": true } } }).to_string(),
+            "saltbox",
+        )
+        .unwrap();
+        ensure_cloudflare_token(&mut no_domain, false, &mut io, &verifying_against(&fake))
+            .expect("a host with no base domain publishes nothing");
+
+        assert!(io.secret_asks.is_empty(), "nothing should have been asked");
+        assert!(
+            fake.requests().is_empty(),
+            "nothing should have been checked"
+        );
+    }
+
+    /// The other half of the UF-20 guard, and the reason it is written
+    /// against the source text rather than against behaviour.
+    ///
+    /// The tests above pin what `ensure_cloudflare_token` *does*. They
+    /// cannot pin that the stage-2 block still *calls* it: re-introducing
+    /// the bare prompt at the call site leaves every one of them passing
+    /// while the live defect is back. In a binary crate there is no seam to
+    /// observe the call site through, so the call site is asserted
+    /// directly. The repo already does this shape of check -- `nix/modules/
+    /// flake/checks.nix` does a line lookup against `CATALOG_APPS` for the
+    /// same reason.
+    ///
+    /// Mutation check: restore the bare `ask_secret` -> `Secret::new` at
+    /// the stage-2 call site and this fails on both assertions.
+    #[test]
+    fn the_resume_call_site_cannot_mint_an_unverified_token() {
+        let source = include_str!("main.rs");
+        // Built at runtime so the needle is not itself a match in this file.
+        let bare_constructor = format!("{}::{}(", "Secret", "new");
+        assert!(
+            !source.contains(&bare_constructor),
+            "this binary must not construct a token-bearing Secret directly: the \
+             only legitimate producer is answers::validate_and_verify_cloudflare_token, \
+             which is what makes A5's zone check unavoidable on both prompts"
+        );
+        let production_factory = format!("&{}::{}", "answers", "cloudflare_client");
+        assert_eq!(
+            source.matches(production_factory.as_str()).count(),
+            2,
+            "both token-collection sites -- the first interactive run via \
+             answers::collect, and the stage-2 resume via ensure_cloudflare_token -- \
+             must hand the real Cloudflare client to the verification"
+        );
+    }
 
     /// SEC-H1, pinned at the decision rather than the enum.
     ///
