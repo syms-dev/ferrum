@@ -418,7 +418,10 @@ mod tests {
         // is the only way the decline path can ever complete an install.
         check_published_apps_are_authenticated(
             &f2,
-            &["sonarr".to_string(), crate::dns::DAEMON_SUBDOMAIN.to_string()],
+            &[
+                "sonarr".to_string(),
+                crate::dns::DAEMON_SUBDOMAIN.to_string(),
+            ],
         )
         .unwrap();
     }
