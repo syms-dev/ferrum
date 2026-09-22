@@ -42,6 +42,22 @@ struct LoginResponse {
     csrf_token: String,
 }
 
+/// The session cookie's name.
+///
+/// The `__Host-` prefix is a security control, not a naming convention
+/// (A4/D3). A browser refuses any `__Host-` cookie that carries a `Domain`
+/// attribute, or that is not `Secure` with `Path=/`. That refusal is what
+/// defends the control plane once it is published at
+/// `ferrum.<baseDomain>`: a compromised sibling such as
+/// `sonarr.<baseDomain>` is same-site, and can answer one of its own
+/// requests with `Set-Cookie: <name>=...; Domain=<baseDomain>; Path=/`.
+/// `HttpOnly` does not stop that -- it blocks JavaScript reads, not an
+/// inbound `Set-Cookie` -- and RFC 6265 leaves it unspecified which of two
+/// same-named cookies the browser then sends, while `require_session` does
+/// a single lookup by name. Under the prefix the planted cookie is never
+/// stored at all.
+const SESSION_COOKIE: &str = "__Host-ferrumd_session";
+
 async fn login_handler(
     State(state): State<Arc<AppState>>,
     cookies: Cookies,
@@ -49,10 +65,11 @@ async fn login_handler(
 ) -> impl IntoResponse {
     match auth::login(&state.db, &req.username, &req.password) {
         Ok(Some(result)) => {
-            let mut cookie = Cookie::new("ferrumd_session", result.session_token);
+            let mut cookie = Cookie::new(SESSION_COOKIE, result.session_token);
             cookie.set_http_only(true);
             cookie.set_same_site(tower_cookies::cookie::SameSite::Strict);
             cookie.set_path("/");
+            cookie.set_secure(true);
             cookies.add(cookie);
             (StatusCode::OK, Json(LoginResponse { csrf_token: result.csrf_token })).into_response()
         }
@@ -61,11 +78,25 @@ async fn login_handler(
     }
 }
 
+/// The cookie `logout_handler` hands to `tower_cookies::Cookies::remove`.
+///
+/// `remove` expires whatever it is given rather than synthesising its own
+/// attributes, so the removal `Set-Cookie` has to satisfy the `__Host-`
+/// rules exactly as the login one does. Built here instead of inline so
+/// the two cannot drift: a removal cookie the browser refuses revokes
+/// nothing client-side, and nothing about the 200 it returns would say so.
+fn removal_cookie() -> Cookie<'static> {
+    let mut cookie = Cookie::new(SESSION_COOKIE, "");
+    cookie.set_path("/");
+    cookie.set_secure(true);
+    cookie
+}
+
 async fn logout_handler(State(state): State<Arc<AppState>>, cookies: Cookies) -> impl IntoResponse {
-    if let Some(cookie) = cookies.get("ferrumd_session") {
+    if let Some(cookie) = cookies.get(SESSION_COOKIE) {
         let _ = auth::logout(&state.db, cookie.value());
     }
-    cookies.remove(Cookie::new("ferrumd_session", ""));
+    cookies.remove(removal_cookie());
     StatusCode::OK
 }
 
@@ -196,7 +227,7 @@ async fn require_session(
     mut request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Result<axum::response::Response, StatusCode> {
-    let token = cookies.get("ferrumd_session").ok_or(StatusCode::UNAUTHORIZED)?;
+    let token = cookies.get(SESSION_COOKIE).ok_or(StatusCode::UNAUTHORIZED)?;
     let session = match auth::validate_session(&state.db, token.value()) {
         Ok(Some(session)) => session,
         _ => return Err(StatusCode::UNAUTHORIZED),
@@ -249,7 +280,7 @@ async fn require_session(
 /// solely from `exposedApps`, and `ferrum.daemon.subdomain` is declared but
 /// unused), but once a daemon vhost exists under `ferrum.proxy.baseDomain`, a
 /// sibling catalog-app subdomain is same-site -- a compromised app WOULD have
-/// the browser attach `ferrumd_session` to a request here. What stops it
+/// the browser attach `__Host-ferrumd_session` to a request here. What stops it
 /// reading the answer is purely the absence of CORS.
 ///
 /// So the invariant to protect is specific: never serve this route with
@@ -601,7 +632,7 @@ mod tests {
         let mut builder = Request::builder()
             .method(method)
             .uri("/guarded")
-            .header("Cookie", format!("ferrumd_session={session}"));
+            .header("Cookie", format!("{SESSION_COOKIE}={session}"));
         if let Some(csrf) = csrf {
             builder = builder.header(CSRF_HEADER, csrf);
         }
@@ -638,7 +669,7 @@ mod tests {
         let request = Request::builder()
             .method(Method::GET)
             .uri("/api/session")
-            .header("Cookie", format!("ferrumd_session={session}"))
+            .header("Cookie", format!("{SESSION_COOKIE}={session}"))
             .body(Body::empty())
             .unwrap();
         let response = build_router(state.clone()).oneshot(request).await.unwrap();
@@ -656,7 +687,7 @@ mod tests {
         let mutating = Request::builder()
             .method(Method::POST)
             .uri("/api/password")
-            .header("Cookie", format!("ferrumd_session={session}"))
+            .header("Cookie", format!("{SESSION_COOKIE}={session}"))
             .header(CSRF_HEADER, &returned)
             .header("Content-Type", "application/json")
             .body(Body::from(r#"{"current_password":"wrong","new_password":"x"}"#))
@@ -681,7 +712,7 @@ mod tests {
         let request = Request::builder()
             .method(Method::GET)
             .uri("/api/session")
-            .header("Cookie", format!("ferrumd_session={}", other.session_token))
+            .header("Cookie", format!("{SESSION_COOKIE}={}", other.session_token))
             .body(Body::empty())
             .unwrap();
         let response = build_router(state).oneshot(request).await.unwrap();
@@ -808,7 +839,7 @@ mod tests {
             let request = Request::builder()
                 .method(method.clone())
                 .uri(uri)
-                .header("Cookie", format!("ferrumd_session={session}"))
+                .header("Cookie", format!("{SESSION_COOKIE}={session}"))
                 .header("Content-Type", "application/json")
                 .body(Body::from(r#"{"kind":"preflight"}"#))
                 .unwrap();
@@ -827,7 +858,7 @@ mod tests {
         let request = Request::builder()
             .method(Method::GET)
             .uri("/api/settings")
-            .header("Cookie", format!("ferrumd_session={session}"))
+            .header("Cookie", format!("{SESSION_COOKIE}={session}"))
             .body(Body::empty())
             .unwrap();
         let response = build_router(state).oneshot(request).await.unwrap();
@@ -860,7 +891,7 @@ mod tests {
         let mut builder = Request::builder()
             .method(Method::POST)
             .uri("/api/password")
-            .header("Cookie", format!("ferrumd_session={session}"))
+            .header("Cookie", format!("{SESSION_COOKIE}={session}"))
             .header("Content-Type", "application/json");
         if let Some(csrf) = csrf {
             builder = builder.header(CSRF_HEADER, csrf);
@@ -1104,6 +1135,265 @@ mod tests {
             let err = check_writable_paths(&settings, &file).unwrap_err();
             assert!(err.contains("not a directory"), "{err}");
         }
+    }
+
+    /// A4/D3/D13 -- the real `Set-Cookie` the real login route really emits.
+    ///
+    /// Asserted on the wire rather than on the `Cookie` value built in
+    /// `login_handler`, because the attribute that matters here is one the
+    /// BROWSER enforces: a cookie named with the `__Host-` prefix is
+    /// rejected outright unless it carries `Secure` and `Path=/` and
+    /// carries NO `Domain`. That rejection is the whole mitigation -- it is
+    /// what stops a compromised `sonarr.<baseDomain>` answering with
+    /// `Set-Cookie: <session>=...; Domain=<baseDomain>` and planting a
+    /// second same-named cookie that RFC 6265 lets the browser choose
+    /// between arbitrarily. Checking the name alone would pass while the
+    /// prefix was inert.
+    #[tokio::test]
+    async fn the_session_cookie_is_host_prefixed_secure_and_carries_no_domain() {
+        let (dir, state, _session, _csrf) = logged_in();
+        let password = std::fs::read_to_string(dir.path().join("ferrumd-setup-password")).unwrap();
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/api/login")
+            .header("Content-Type", "application/json")
+            .body(Body::from(
+                serde_json::json!({"username": "admin", "password": password.trim()}).to_string(),
+            ))
+            .unwrap();
+        let response = build_router(state).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let set_cookie = response
+            .headers()
+            .get(axum::http::header::SET_COOKIE)
+            .expect("a successful login must set the session cookie")
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        assert!(
+            set_cookie.starts_with(&format!("{SESSION_COOKIE}=")),
+            "the session cookie must be the __Host- prefixed name: {set_cookie}"
+        );
+        assert!(
+            SESSION_COOKIE.starts_with("__Host-"),
+            "the prefix IS the mitigation, not a naming preference"
+        );
+        assert!(set_cookie.contains("Secure"), "__Host- requires Secure: {set_cookie}");
+        assert!(set_cookie.contains("HttpOnly"), "{set_cookie}");
+        assert!(set_cookie.contains("SameSite=Strict"), "{set_cookie}");
+        assert!(set_cookie.contains("Path=/"), "__Host- requires Path=/: {set_cookie}");
+        assert!(
+            !set_cookie.to_ascii_lowercase().contains("domain="),
+            "a __Host- cookie carrying Domain is refused by every browser, which \
+             would silently log every operator out: {set_cookie}"
+        );
+    }
+
+    /// The rename must be real on the READ side too. A session token that
+    /// is genuinely valid, presented under the pre-R13 name, must not
+    /// authenticate -- otherwise `require_session` would still accept the
+    /// unprefixed cookie a compromised sibling subdomain can plant, and the
+    /// rename would be cosmetic.
+    #[tokio::test]
+    async fn a_valid_token_under_the_old_cookie_name_does_not_authenticate() {
+        let (_dir, state, session, _csrf) = logged_in();
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/api/session")
+            .header("Cookie", format!("ferrumd_session={session}"))
+            .body(Body::empty())
+            .unwrap();
+        let response = build_router(state).oneshot(request).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "the unprefixed cookie name must carry no authority at all"
+        );
+    }
+
+    /// Logout's removal cookie has to satisfy `__Host-`'s rules as well, or
+    /// the browser discards the `Set-Cookie` that was supposed to clear the
+    /// session and the operator stays logged in in their own tab. The
+    /// server-side session really is revoked either way, so this failure
+    /// mode is invisible to every test that only checks the status code.
+    #[tokio::test]
+    async fn logout_emits_a_removal_cookie_a_browser_will_actually_accept() {
+        let (_dir, state, session, csrf) = logged_in();
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/api/logout")
+            .header("Cookie", format!("{SESSION_COOKIE}={session}"))
+            .header(CSRF_HEADER, &csrf)
+            .body(Body::empty())
+            .unwrap();
+        let response = build_router(state.clone()).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let set_cookie = response
+            .headers()
+            .get(axum::http::header::SET_COOKIE)
+            .expect("logout must emit a removal cookie")
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(set_cookie.starts_with(&format!("{SESSION_COOKIE}=")), "{set_cookie}");
+        assert!(set_cookie.contains("Path=/"), "{set_cookie}");
+        assert!(set_cookie.contains("Secure"), "{set_cookie}");
+        assert!(
+            !set_cookie.to_ascii_lowercase().contains("domain="),
+            "{set_cookie}"
+        );
+
+        // And the session really is gone server-side, so the removal cookie
+        // is belt to a real braces rather than the only thing revoking it.
+        assert!(auth::validate_session(&state.db, &session).unwrap().is_none());
+    }
+
+    /// D4 -- ferrumd's own session is the sole authoritative gate.
+    ///
+    /// Authelia sits in front of the daemon vhost after R13 and, when a
+    /// deployment trusts it, hands downstream apps `Remote-User` &co. The
+    /// daemon deliberately does NOT join that scheme: neither
+    /// `modules/core/daemon.nix` nor any unit under `modules/apps/*` has
+    /// network-namespace isolation, so any local process -- a compromised or
+    /// SSRF'd catalog app -- can open `127.0.0.1:7788` directly and set
+    /// whatever headers it likes, going around the browser and every
+    /// same-site mitigation with it.
+    #[tokio::test]
+    async fn forged_forward_auth_headers_authenticate_nobody() {
+        let (_dir, state, _session, _csrf) = logged_in();
+        for header in FORWARD_AUTH_HEADERS {
+            let request = Request::builder()
+                .method(Method::GET)
+                .uri("/api/session")
+                .header(*header, "admin")
+                .body(Body::empty())
+                .unwrap();
+            let response = build_router(state.clone()).oneshot(request).await.unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{header} must not authenticate a caller with no session cookie"
+            );
+        }
+    }
+
+    /// The other half: with a real session, a forged identity header must
+    /// not REPLACE the identity the session proves either. A daemon that
+    /// preferred the header would let a local process act as any user it
+    /// named while still presenting its own valid session.
+    #[tokio::test]
+    async fn forged_forward_auth_headers_do_not_change_who_the_caller_is() {
+        let (_dir, state, session, _csrf) = logged_in();
+        let mut builder = Request::builder()
+            .method(Method::GET)
+            .uri("/api/session")
+            .header("Cookie", format!("{SESSION_COOKIE}={session}"));
+        for header in FORWARD_AUTH_HEADERS {
+            builder = builder.header(*header, "somebody-else");
+        }
+        let response = build_router(state)
+            .oneshot(builder.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            body["username"], "admin",
+            "the identity must come from the session row, never from a header"
+        );
+    }
+
+    /// The headers a forward-auth proxy conventionally injects. Named once
+    /// so the behavioural tests above and the source scan below cannot
+    /// drift apart into testing different sets.
+    const FORWARD_AUTH_HEADERS: &[&str] = &[
+        "Remote-User",
+        "Remote-Groups",
+        "Remote-Name",
+        "Remote-Email",
+        "X-Remote-User",
+        "X-Remote-Groups",
+        "X-Remote-Name",
+        "X-Remote-Email",
+    ];
+
+    /// Every source file this crate actually compiles.
+    ///
+    /// Spelled out rather than walked on disk so the scan below needs no
+    /// filesystem at test time, and kept honest by
+    /// `the_source_scan_covers_every_module`: a module that exists but is
+    /// missing here would make the scan quietly partial, which is the one
+    /// way an absence proof fails without failing.
+    const CRATE_SOURCES: &[(&str, &str)] = &[
+        ("main.rs", include_str!("main.rs")),
+        ("auth.rs", include_str!("auth.rs")),
+        ("catalog.rs", include_str!("catalog.rs")),
+        ("db.rs", include_str!("db.rs")),
+        ("dbus.rs", include_str!("dbus.rs")),
+        ("generations.rs", include_str!("generations.rs")),
+        ("jobs.rs", include_str!("jobs.rs")),
+        ("secrets_api.rs", include_str!("secrets_api.rs")),
+        ("settings.rs", include_str!("settings.rs")),
+        ("static_files.rs", include_str!("static_files.rs")),
+    ];
+
+    /// The behavioural tests above prove the routes they drive ignore a
+    /// forged header. This proves the stronger thing they cannot: no code
+    /// path anywhere in the crate so much as NAMES one, including paths no
+    /// test reaches. D4's promise is an absence, and an absence is only
+    /// really held by a check that reads everything.
+    #[test]
+    fn no_source_file_reads_a_forward_auth_header() {
+        let mut found = Vec::new();
+        for (name, source) in CRATE_SOURCES {
+            for (number, line) in source.lines().enumerate() {
+                // The test module names these headers on purpose, in the
+                // FORWARD_AUTH_HEADERS table and in the prose explaining
+                // why they are not trusted. Skipping the crate's own
+                // documentation of the rule is not a loophole in it: a real
+                // read is `headers().get(...)`, not a string in a comment.
+                let trimmed = line.trim_start();
+                if trimmed.starts_with("//") || trimmed.starts_with("\"") {
+                    continue;
+                }
+                for header in FORWARD_AUTH_HEADERS {
+                    if line.contains(header) {
+                        found.push(format!("{name}:{}: {}", number + 1, line.trim()));
+                    }
+                }
+            }
+        }
+        assert!(
+            found.is_empty(),
+            "ferrumd must never trust a forward-auth identity header (D4); found:\n{}",
+            found.join("\n")
+        );
+    }
+
+    /// Keeps `CRATE_SOURCES` complete: it must list exactly the modules
+    /// `main.rs` declares, so a new module cannot be added to the crate and
+    /// silently escape the scan above.
+    #[test]
+    fn the_source_scan_covers_every_module() {
+        let declared: Vec<String> = include_str!("main.rs")
+            .lines()
+            .filter_map(|line| line.strip_prefix("mod ")?.strip_suffix(';'))
+            .map(|name| format!("{name}.rs"))
+            .collect();
+        assert!(!declared.is_empty(), "the mod declarations must really have been found");
+        let scanned: Vec<String> = CRATE_SOURCES
+            .iter()
+            .filter(|(name, _)| *name != "main.rs")
+            .map(|(name, _)| (*name).to_string())
+            .collect();
+        assert_eq!(
+            declared, scanned,
+            "CRATE_SOURCES must list every module main.rs declares, in order"
+        );
     }
 
     #[test]
