@@ -1396,6 +1396,284 @@ mod tests {
         );
     }
 
+    /// A3/D5 -- the absence of CORS, enforced.
+    ///
+    /// The naive version of this test is worse than no test. A conforming
+    /// CORS layer ECHOES the request's `Origin`, so it emits no
+    /// `Access-Control-Allow-Origin` at all when the request carries none
+    /// -- and every other test in this file builds Origin-less requests. An
+    /// assertion over those would sit green against exactly the
+    /// reflected-origin configuration `session_handler`'s own comment names
+    /// as fatal. So every request below carries a real sibling `Origin`,
+    /// the one a compromised `sonarr.<baseDomain>` would send.
+    mod cors_is_absent {
+        use super::*;
+
+        /// A same-site sibling. After R13 the dashboard and every catalog
+        /// app share a registrable domain, so this is not a hypothetical
+        /// attacker-controlled origin -- it is the shape of the one the
+        /// spec's own threat model names.
+        const SIBLING_ORIGIN: &str = "https://sonarr.example.test";
+
+        /// Every `/api` route the real router declares: the pattern as
+        /// written in `build_router`, the method that really reaches it,
+        /// and a concrete URI that matches the pattern.
+        ///
+        /// Kept honest by `the_matrix_covers_every_api_route` below, which
+        /// re-derives the method/pattern pairs from `build_router`'s own
+        /// source. Without that, a route added later would simply not be
+        /// tested, and nothing would say so.
+        const API_ROUTES: &[(&str, &str, &str)] = &[
+            ("POST", "/api/login", "/api/login"),
+            ("POST", "/api/logout", "/api/logout"),
+            ("GET", "/api/catalog", "/api/catalog"),
+            ("GET", "/api/generations", "/api/generations"),
+            ("GET", "/api/settings", "/api/settings"),
+            ("PUT", "/api/settings", "/api/settings"),
+            ("POST", "/api/secrets/:name", "/api/secrets/cors-probe"),
+            ("GET", "/api/session", "/api/session"),
+            ("POST", "/api/jobs", "/api/jobs"),
+            ("GET", "/api/jobs", "/api/jobs"),
+            // Deliberately not a UUID: `get_job` and `stream_job` both
+            // reject it immediately, so the SSE route answers instead of
+            // holding the connection open for the length of the test run.
+            ("GET", "/api/jobs/:id", "/api/jobs/not-a-uuid"),
+            ("GET", "/api/jobs/:id/stream", "/api/jobs/not-a-uuid/stream"),
+            ("POST", "/api/password", "/api/password"),
+        ];
+
+        /// Fails on ANY `access-control-*` response header, not only
+        /// `Access-Control-Allow-Origin`. A3 names that one header because
+        /// it is the one that does the damage, but a response carrying
+        /// `Access-Control-Allow-Credentials` or an exposed-headers list is
+        /// already a CORS layer somebody is part-way through wiring up.
+        fn assert_no_cors_headers(context: &str, response: &axum::response::Response) {
+            let offending: Vec<String> = response
+                .headers()
+                .iter()
+                .filter(|(name, _)| name.as_str().starts_with("access-control-"))
+                .map(|(name, value)| format!("{name}: {value:?}"))
+                .collect();
+            assert!(
+                offending.is_empty(),
+                "{context} was served with CORS headers, which is what would let a \
+                 same-site sibling read the control plane's responses: {offending:?}"
+            );
+        }
+
+        /// A real, currently-valid session on the real database.
+        ///
+        /// Taken fresh for each authenticated probe rather than reused,
+        /// because the matrix drives `POST /api/logout` like every other
+        /// route -- with one shared session every request after that one
+        /// would quietly become a 401, and the matrix would stop testing
+        /// what it says it tests.
+        fn fresh_credentials(state: &Arc<AppState>, password: &str) -> (String, String) {
+            let result = auth::login(&state.db, "admin", password).unwrap().unwrap();
+            (result.session_token, result.csrf_token)
+        }
+
+        fn request(method: &str, uri: &str, cookie: Option<&(String, String)>) -> Request<Body> {
+            let mut builder = Request::builder()
+                .method(Method::from_bytes(method.as_bytes()).unwrap())
+                .uri(uri)
+                .header("Origin", SIBLING_ORIGIN)
+                .header("Content-Type", "application/json");
+            if let Some((session, csrf)) = cookie {
+                builder = builder
+                    .header("Cookie", format!("{SESSION_COOKIE}={session}"))
+                    .header(CSRF_HEADER, csrf);
+            }
+            builder.body(Body::from("{}")).unwrap()
+        }
+
+        /// The CORS preflight a browser sends before a cross-origin
+        /// mutating request. It arrives as a bare `OPTIONS`, which is
+        /// precisely where a CORS layer answers on the handler's behalf --
+        /// so it is crossed with every route rather than checked once.
+        fn preflight(method: &str, uri: &str) -> Request<Body> {
+            Request::builder()
+                .method(Method::OPTIONS)
+                .uri(uri)
+                .header("Origin", SIBLING_ORIGIN)
+                .header("Access-Control-Request-Method", method)
+                .header("Access-Control-Request-Headers", CSRF_HEADER)
+                .body(Body::empty())
+                .unwrap()
+        }
+
+        /// Every route, unauthenticated and authenticated, on both the real
+        /// method and its preflight.
+        ///
+        /// The unauthenticated pass is not redundant with the authenticated
+        /// one: it is where the 401s live, and an error response is exactly
+        /// where a CORS layer gets applied unconditionally -- the handler
+        /// never runs, so anything on the response came from the middleware
+        /// stack itself.
+        #[tokio::test]
+        async fn no_api_route_is_ever_served_with_a_cors_header() {
+            let (dir, state, _session, _csrf) = logged_in();
+            let password = std::fs::read_to_string(dir.path().join("ferrumd-setup-password"))
+                .unwrap()
+                .trim()
+                .to_string();
+            let mut unauthenticated_statuses = Vec::new();
+            let mut authenticated_statuses = Vec::new();
+
+            for (method, pattern, uri) in API_ROUTES {
+                let response = build_router(state.clone())
+                    .oneshot(request(method, uri, None))
+                    .await
+                    .unwrap();
+                assert_no_cors_headers(&format!("unauthenticated {method} {pattern}"), &response);
+                unauthenticated_statuses.push(response.status());
+
+                let credentials = fresh_credentials(&state, &password);
+                let response = build_router(state.clone())
+                    .oneshot(request(method, uri, Some(&credentials)))
+                    .await
+                    .unwrap();
+                assert_no_cors_headers(&format!("authenticated {method} {pattern}"), &response);
+                authenticated_statuses.push(response.status());
+
+                let response = build_router(state.clone())
+                    .oneshot(preflight(method, uri))
+                    .await
+                    .unwrap();
+                assert_no_cors_headers(
+                    &format!("OPTIONS preflight for {method} {pattern}"),
+                    &response,
+                );
+            }
+
+            // The matrix has to have really produced both a refusal and a
+            // success, or it proves only that a router answering nothing
+            // answers nothing with CORS headers.
+            assert!(
+                unauthenticated_statuses.contains(&StatusCode::UNAUTHORIZED),
+                "no 401 was produced, so the error path was never exercised: \
+                 {unauthenticated_statuses:?}"
+            );
+            assert!(
+                authenticated_statuses.iter().any(StatusCode::is_success),
+                "no route succeeded, so the happy path was never exercised: \
+                 {authenticated_statuses:?}"
+            );
+        }
+
+        /// The 500 path, separately, because it is the hardest to reach and
+        /// the easiest to leave uncovered. A session whose user row is gone
+        /// makes `session_handler` return 500 from inside the handler --
+        /// past routing, past `require_session` -- which is a different
+        /// point in the stack from every 401 above.
+        #[tokio::test]
+        async fn an_internal_error_response_carries_no_cors_header_either() {
+            let (_dir, state, session, csrf) = logged_in();
+            // rusqlite's bundled SQLite enforces foreign keys by default
+            // -- confirmed the hard way, the first version of this fixture
+            // got a real FOREIGN KEY constraint failure -- so the pragma
+            // has to come off to construct the inconsistency deliberately.
+            // The inconsistency itself is real, and is exactly the one
+            // `session_handler` documents: a live session row pointing at a
+            // user that is gone.
+            state
+                .db
+                .conn()
+                .execute_batch("PRAGMA foreign_keys = OFF; DELETE FROM users;")
+                .unwrap();
+
+            let response = build_router(state)
+                .oneshot(request("GET", "/api/session", Some(&(session, csrf))))
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "the fixture must really produce a 500, or this test proves nothing"
+            );
+            assert_no_cors_headers("the 500 from GET /api/session", &response);
+        }
+
+        /// `API_ROUTES` must list exactly what `build_router` registers.
+        ///
+        /// This is the anti-vacuity guard. An absence proof is only as wide
+        /// as the set it walks, and a hand-maintained table stops being
+        /// that set the first time somebody adds a route -- silently, and
+        /// in the direction of passing. So the pairs are re-derived from
+        /// the real source of the real function and compared.
+        #[test]
+        fn the_matrix_covers_every_api_route() {
+            let source = include_str!("main.rs");
+            let body = source
+                .split_once("fn build_router(")
+                .expect("build_router must exist")
+                .1
+                .split_once("\n}\n")
+                .expect("build_router must end")
+                .0;
+
+            let mut declared: Vec<(String, String)> = Vec::new();
+            for line in body.lines() {
+                let Some((_, rest)) = line.split_once(".route(\"") else {
+                    continue;
+                };
+                let path = rest.split_once('"').expect("a route path is quoted").0;
+                for (needle, method) in [
+                    ("get(", "GET"),
+                    ("post(", "POST"),
+                    ("put(", "PUT"),
+                    ("patch(", "PATCH"),
+                    ("delete(", "DELETE"),
+                ] {
+                    if line.contains(needle) {
+                        declared.push((method.to_string(), path.to_string()));
+                    }
+                }
+            }
+            declared.sort();
+            assert!(
+                !declared.is_empty(),
+                "the source scan found no routes at all, so the scan itself is broken"
+            );
+
+            let mut covered: Vec<(String, String)> = API_ROUTES
+                .iter()
+                .map(|(method, pattern, _)| ((*method).to_string(), (*pattern).to_string()))
+                .collect();
+            covered.sort();
+            assert_eq!(
+                declared, covered,
+                "every route build_router registers must appear in API_ROUTES"
+            );
+        }
+
+        /// And each concrete URI really does match its pattern. A typo
+        /// would send the probe to the static-file fallback instead of the
+        /// API -- and the fallback carries no CORS headers either, so
+        /// nothing above would fail.
+        #[tokio::test]
+        async fn every_probe_uri_really_reaches_its_route() {
+            let (dir, state, _session, _csrf) = logged_in();
+            let password = std::fs::read_to_string(dir.path().join("ferrumd-setup-password"))
+                .unwrap()
+                .trim()
+                .to_string();
+            for (method, pattern, uri) in API_ROUTES {
+                let credentials = fresh_credentials(&state, &password);
+                let response = build_router(state.clone())
+                    .oneshot(request(method, uri, Some(&credentials)))
+                    .await
+                    .unwrap();
+                assert_ne!(
+                    response.status(),
+                    StatusCode::NOT_FOUND,
+                    "{method} {uri} did not match {pattern}; it fell through to the \
+                     static-file fallback, so the CORS matrix never tested this route"
+                );
+            }
+        }
+    }
+
     #[test]
     fn an_empty_stored_token_is_never_a_wildcard() {
         // Defensive: a session row with an empty csrf_token must fail every

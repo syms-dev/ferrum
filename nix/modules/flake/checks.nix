@@ -797,6 +797,100 @@
           reserved = colliding;
         };
 
+      # A3/D5, leg 2: nginx emits no CORS header either.
+      #
+      # ferrumd's own test matrix cannot see this. After R13 nginx is a
+      # serving boundary in front of the daemon, and an `add_header
+      # Access-Control-Allow-Origin $http_origin;` in a location block would
+      # hand a compromised sibling exactly the read access A3 exists to
+      # deny -- with every crate test still green, because no crate test
+      # ever sees a response nginx has touched.
+      #
+      # The failure mode for an ABSENCE check is the mirror of the one that
+      # made daemon-vhost-enforced vacuous: not a key that exists when it
+      # should not, but a corpus that is empty when it should not be. A scan
+      # over nothing finds nothing. So the check proves it really read the
+      # generated config -- the daemon vhost is present, and the corpus
+      # contains directives only the real generator writes -- before it is
+      # allowed to conclude anything from finding no CORS.
+      nginxEmitsNoCorsHeaders =
+        let
+          host = ferrumLib.mkHost {
+            inherit system;
+            settings = {
+              schemaVersion = realMigrations.currentVersion;
+              proxy = { enable = true; baseDomain = "example.test"; acme.email = "a@example.test"; };
+              auth = { enable = true; adminEmail = "a@example.test"; };
+              # A catalog app alongside the daemon on purpose: the threat is
+              # a SIBLING subdomain, so a fixture with only the dashboard
+              # would not be the configuration A3 is about.
+              apps = { plex.enable = true; sonarr.enable = true; };
+            };
+            modules = [ ../../../examples/hosts/minimal/configuration.nix ];
+          };
+          nginx = host.config.services.nginx;
+          vhosts = nginx.virtualHosts;
+
+          textOf = value: if value == null then "" else value;
+
+          # Every fragment of generated nginx config, each carrying where it
+          # came from, so a finding names the exact block rather than only
+          # saying that something somewhere emits CORS.
+          vhostFragments = lib.concatLists (lib.mapAttrsToList
+            (name: vhost:
+              [{
+                where = ''services.nginx.virtualHosts."${name}".extraConfig'';
+                text = textOf (vhost.extraConfig or null);
+              }]
+              ++ lib.mapAttrsToList
+                (loc: location: {
+                  where = ''services.nginx.virtualHosts."${name}".locations."${loc}".extraConfig'';
+                  text = textOf (location.extraConfig or null);
+                })
+                (vhost.locations or { }))
+            vhosts);
+
+          # The http-level blocks matter as much as the per-vhost ones: an
+          # add_header here applies to every vhost at once, and is the
+          # cheapest possible way for this to go wrong.
+          httpFragments = [
+            { where = "services.nginx.commonHttpConfig"; text = textOf (nginx.commonHttpConfig or null); }
+            { where = "services.nginx.appendHttpConfig"; text = textOf (nginx.appendHttpConfig or null); }
+            { where = "services.nginx.httpConfig"; text = textOf (nginx.httpConfig or null); }
+          ];
+
+          fragments = vhostFragments ++ httpFragments;
+          corpus = lib.concatStringsSep "\n" (map (f: lib.toLower f.text) fragments);
+
+          # Matched on the "access-control-" prefix rather than on
+          # Allow-Origin alone, and lowercased first: nginx directives are
+          # free-form text, header names are case-insensitive, and an
+          # Allow-Credentials or Expose-Headers line is already a CORS layer
+          # somebody is part-way through wiring up.
+          emitsCors = f: lib.hasInfix "access-control-" (lib.toLower f.text);
+          offending = map (f: f.where) (builtins.filter emitsCors fragments);
+
+          daemonName = "${host.config.ferrum.daemon.subdomain}.example.test";
+          # The anti-vacuity guards.
+          scannedTheDaemonVhost = vhosts ? ${daemonName};
+          scannedASiblingApp = vhosts ? "sonarr.example.test";
+          # Directives only the real generator produces. If these are
+          # missing, the corpus is not the generated config and a clean scan
+          # means nothing.
+          scannedRealDirectives =
+            lib.hasInfix "auth_request /authelia" corpus && lib.hasInfix "proxy_pass" corpus;
+        in
+        {
+          ok = offending == [ ]
+            && scannedTheDaemonVhost
+            && scannedASiblingApp
+            && scannedRealDirectives;
+          message = "the generated nginx config does not hold A3's no-CORS invariant";
+          inherit offending scannedTheDaemonVhost scannedASiblingApp scannedRealDirectives;
+          fragmentsScanned = builtins.length fragments;
+          vhostsScanned = builtins.attrNames vhosts;
+        };
+
       # The apps are told where media lives, and told the SAME place the
       # storage module created.
       #
@@ -976,6 +1070,8 @@
         daemon-vhost-enforced = mkAssertionCheck "daemon-vhost-enforced" daemonVhostEnforced;
         reserved-subdomain-collision =
           mkAssertionCheck "reserved-subdomain-collision" reservedSubdomainCollision;
+        nginx-emits-no-cors-headers =
+          mkAssertionCheck "nginx-emits-no-cors-headers" nginxEmitsNoCorsHeaders;
         root-folders-reach-the-apps = rootFoldersReachTheApps;
         dns-record-set = dnsRecordSet;
         catalog-consistency = mkAssertionCheck "catalog-consistency" catalogConsistency;
