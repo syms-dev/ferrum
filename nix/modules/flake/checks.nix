@@ -764,6 +764,14 @@
           movedRules =
             moved.config.services.authelia.instances.main.settings.access_control.rules;
 
+          # ...and the same fixture at the IPv6 spelling of loopback, which
+          # the A5 guard blesses and which nginx cannot parse unbracketed.
+          v6 = mkProxyHost { daemon.listenAddress = "::1"; };
+          v6Pass =
+            (((v6.config.services.nginx.virtualHosts.${daemonName} or { }).locations."/"
+              or { }).proxyPass or "");
+          v6Expected = "http://[::1]:${toString daemonPort}";
+
           # A5's other half, and the one nothing in either language held:
           # that ferrumd is not ALLOWED to bind a public interface.
           # modules/lib/settings-schema.json types daemon.listenAddress as a
@@ -894,6 +902,8 @@
             ++ lib.optional
               (!(builtins.any (r: r.domain or "" == movedName) movedRules))
               "Authelia has no access_control rule for ${movedName}, so a moved dashboard is unopenable under default_policy = deny (D1/D7)"
+            ++ lib.optional (v6Pass != v6Expected)
+              "with ferrum.daemon.listenAddress = \"::1\" the daemon vhost proxies to \"${v6Pass}\", not \"${v6Expected}\" -- nginx splits a proxy_pass authority at its LAST colon, so an unbracketed IPv6 literal is read as port \"1:${toString daemonPort}\" and the WHOLE config file is refused, taking every other vhost down with it (A1/A5)"
             # A5, enforced.
             ++ map (a: "ferrum.daemon.listenAddress = \"${a}\" is refused at evaluation, and it is a loopback address -- the SSH-tunnel recovery route A5 protects is broken (A5)")
               wronglyRejected

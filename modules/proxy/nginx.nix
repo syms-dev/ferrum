@@ -128,7 +128,31 @@ let
   # is still the SAME shape -- same forceSSL, same /authelia subrequest, same
   # auth_request wiring -- because "gated exactly like a catalog app" (A2) is
   # the requirement.
-  daemonUpstream = "http://${ferrum.daemon.listenAddress}:${toString ferrum.daemon.port}";
+  #
+  # An IPv6 literal has to be bracketed on the way in. nginx splits a
+  # proxy_pass authority at its LAST colon, so the naked interpolation this
+  # line used to be rendered `proxy_pass http://::1:7788;` and nginx read the
+  # port as "1:7788": `[emerg] invalid port in upstream "::1:7788"`. That is
+  # not a hypothetical value -- modules/core/daemon.nix accepts `::1`
+  # explicitly, nix/modules/flake/checks.nix asserts it MUST be accepted
+  # (the SSH-tunnel recovery route A5 protects may be an IPv6 tunnel), and
+  # modules/lib/settings-schema.json types the option as a bare string, so
+  # ferrumd's own PUT /api/settings will write it. And nginx rejects the
+  # whole FILE, not the one vhost: every catalog app, auth.<baseDomain> and
+  # the catch-all go down together, at nginx.service start, on a host whose
+  # apply reported success. checks.nix's nginx-config-parses now runs a real
+  # `nginx -t` over every spelling daemon.nix accepts, which is the only
+  # thing that could have caught this -- the generated attrset was correct
+  # by inspection and wrong to the parser that consumes it.
+  #
+  # No "already bracketed?" branch: daemon.nix's A5 assertion refuses
+  # "[::1]" (it is neither four dot-separated octets nor the literal "::1"),
+  # so a bracketed value never reaches here to be bracketed twice.
+  daemonHost =
+    if lib.hasInfix ":" ferrum.daemon.listenAddress
+    then "[${ferrum.daemon.listenAddress}]"
+    else ferrum.daemon.listenAddress;
+  daemonUpstream = "http://${daemonHost}:${toString ferrum.daemon.port}";
 
   # A1/A5: nginx reaches the daemon, the daemon does not bind a public
   # interface. This proxies to whatever loopback address ferrumd is actually
