@@ -50,3 +50,5 @@ export { StepRail } from "./components/StepRail";
 export type { Step, StepRailProps } from "./components/StepRail";
 export { CredentialsField } from "./components/CredentialsField";
 export type { CredentialsFieldProps } from "./components/CredentialsField";
+export { RiskySetting } from "./components/RiskySetting";
+export type { RiskySettingProps } from "./components/RiskySetting";

@@ -24,6 +24,9 @@
     },
     "StepRail": {
       "cardMode": "column"
+    },
+    "RiskySetting": {
+      "cardMode": "column"
     }
   },
   "readmeHeader": ".design-sync/conventions.md"
