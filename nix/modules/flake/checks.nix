@@ -699,6 +699,19 @@
               "Authelia has no access_control rule for ${daemonName}, so default_policy = deny makes the dashboard unopenable (D1)"
             ++ lib.optional (builtins.any (r: r.policy or "" == "bypass") daemonRules)
               "Authelia's rule for ${daemonName} is policy = bypass, so the control plane is published unauthenticated (A2)"
+            # ...and every OTHER legal value of the enum is wrong too, which
+            # is why this asserts the value rather than excluding one. A rule
+            # of "existed, and was not bypass" passed cleanly with policy =
+            # "deny" -- a documented member of the enum at
+            # modules/proxy/authelia.nix, and exactly the "wired vhost,
+            # denied for everyone" non-functional ship the rule exists to
+            # prevent, since access_control.default_policy is already "deny".
+            # "two_factor" passed too, and the daemon is deliberately outside
+            # the catalog loop above that protects real apps from a
+            # two_factor lockout, so nothing else would have caught it
+            # either.
+            ++ map (r: "Authelia's rule for ${daemonName} has policy = \"${r.policy or "<unset>"}\", not \"one_factor\": the control plane must be gated exactly like a catalog app (A2/D1)")
+              (builtins.filter (r: (r.policy or "") != "one_factor") daemonRules)
             # A6/D6.
             ++ lib.optional (dashboardPublicApps != { })
               "the dashboard-only fixture has a public app, so it no longer tests the publicApps == {} path"
