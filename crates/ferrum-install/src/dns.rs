@@ -41,8 +41,12 @@
 //! 3. Let the operator believe every hostname will answer. Two caveats are
 //!    emitted verbatim -- [`SPLIT_HORIZON_CAVEAT`] and
 //!    [`daemon_record_caveat`] -- in both the dry run and the final report.
-//!    Both are fixed strings precisely so a test can assert them and a
-//!    regression cannot quietly reword one out of existence. The third
+//!    [`SPLIT_HORIZON_CAVEAT`] is a fixed string; [`daemon_record_caveat`]
+//!    is a fixed string *per state*, since R13 made what is true of
+//!    `ferrum.<domain>` depend on how the host was answered. Either way the
+//!    text is exact rather than assembled, so a test can assert the whole
+//!    of it and a regression cannot quietly reword one out of existence.
+//!    The third
 //!    case is the zone's own Cloudflare status: a zone sitting at `pending`
 //!    because the registrar's nameservers were never switched accepts every
 //!    write, answers correctly when asked directly, and resolves nowhere
@@ -90,29 +94,64 @@ pub const CREDENTIAL_LOCATION: &str =
     "on the host this credential becomes /run/secrets/acme-dns, a systemd EnvironmentFile \
      whose single line is CLOUDFLARE_DNS_API_TOKEN=<token> -- not a bare token";
 
-/// The H-01 option-C disclosure, with the real hostname substituted.
+/// What `ferrum.<baseDomain>` will actually do, for the host as answered.
 ///
-/// The owner ruled that R1 creates the `ferrum.<baseDomain>` record now and
-/// discloses honestly what it does. Without this sentence the one hostname
-/// an operator would visit first resolves and then dies with no
-/// explanation: `crates/ferrumd/src/main.rs:248-250` records that
-/// `ferrum.daemon.subdomain` is "declared but unused", and
-/// `modules/proxy/nginx.nix:132-136`'s catch-all answers that name with
-/// `return 444` -- a closed connection, not a page and not an error.
+/// **This used to be one frozen sentence, and R13 falsified it.** It said
+/// the name "will resolve, and then the connection will close with no
+/// response ... until daemon web access ships in Phase 1.7c R13". A1 is
+/// what ships that, so an installer still printing it would be telling the
+/// operator the dashboard is unreachable while building a host on which it
+/// is the first thing that works. A7 is the criterion that forbids exactly
+/// this: degrade honestly, and never describe a state the host does not
+/// have. So the caveat is now a pure function of the answered state.
+///
+/// The state that decides it is `daemonPublished` in
+/// `modules/proxy/lib.nix` -- `daemon.enable && proxy.enable && baseDomain
+/// != ""` -- plus `auth.enable` for whether the published vhost is gated.
+/// Two of those four terms are settled by this installer rather than asked
+/// about: `ferrum.daemon.enable` defaults to true and nothing here writes
+/// it, and `render.rs` emits `proxy.enable = true` exactly when a base
+/// domain was answered. `ferrum.daemon.subdomain` is likewise never asked
+/// and is [`DAEMON_SUBDOMAIN`]. That leaves the two parameters below, and
+/// an empty `base_domain` is how "no vhost at all" is spelled.
+///
+/// This is the one place where independently written Rust and Nix describe
+/// the same runtime fact, so it can drift without anything failing. If the
+/// sentence and the host ever disagree, the operator is being told
+/// something the machine does not do -- which is the entire defect A7
+/// exists to prevent.
 ///
 /// # Arguments
-/// * `base_domain` - `ferrum.proxy.baseDomain`.
+/// * `base_domain` - `ferrum.proxy.baseDomain`; empty when none was
+///   answered, which in this installer also means the proxy is off.
+/// * `auth_enabled` - `ferrum.auth.enable`, i.e. whether the operator kept
+///   single sign-on.
 ///
 /// # Returns
-/// The fixed sentence with `ferrum.<base_domain>` in it, so a test can
-/// assert the whole string for a known domain.
+/// One exact sentence per state, so a test can assert the whole of it for
+/// a known domain.
 #[must_use]
-pub fn daemon_record_caveat(base_domain: &str) -> String {
+pub fn daemon_record_caveat(base_domain: &str, auth_enabled: bool) -> String {
+    if base_domain.is_empty() {
+        return "ferrum's own web interface has no hostname on this host: with no base \
+                domain there is no vhost for it, so it stays reachable only over an SSH \
+                tunnel to its loopback port. That is expected -- it is not a failed install."
+            .to_string();
+    }
+    if auth_enabled {
+        return format!(
+            "{DAEMON_SUBDOMAIN}.{base_domain} is ferrum's own web interface, and it is \
+             published like any other app: it resolves, answers on a real certificate at \
+             https://{DAEMON_SUBDOMAIN}.{base_domain}, and asks for the single sign-on \
+             login at auth.{base_domain} before it shows you anything."
+        );
+    }
     format!(
-        "{DAEMON_SUBDOMAIN}.{base_domain} will resolve, and then the connection will close \
-         with no response: ferrum's own web interface has no vhost yet, so nginx answers \
-         that hostname by closing the connection. That is expected until daemon web access \
-         ships in Phase 1.7c R13 -- it is not a failed install."
+        "{DAEMON_SUBDOMAIN}.{base_domain} is ferrum's own web interface, and because you \
+         declined single sign-on it answers at https://{DAEMON_SUBDOMAIN}.{base_domain} \
+         with NO login in front of it. It writes secrets, rewrites this host's settings \
+         and applies system generations, so anyone who finds that hostname has this \
+         machine. You confirmed this during the install."
     )
 }
 
@@ -307,6 +346,13 @@ pub struct DryRun {
     /// every caveat -- a warning emitted somewhere else is a warning that
     /// scrolls off the top of the screen before the plan appears.
     pub zone_not_serving_yet: Option<String>,
+    /// `ferrum.auth.enable`, carried here for [`daemon_record_caveat`].
+    ///
+    /// The plan knows the base domain already, and the other two terms of
+    /// `daemonPublished` are settled by this installer -- this is the only
+    /// one it cannot derive from what it holds, so it is the only one
+    /// added. [`dry_run`] takes it straight from the SSO decision.
+    pub auth_enabled: bool,
 }
 
 impl DryRun {
@@ -504,6 +550,7 @@ pub fn dry_run(
         target: describe_target(&dns.target),
         actions,
         zone_not_serving_yet,
+        auth_enabled: answers.sso.enabled,
     })
 }
 
@@ -594,7 +641,7 @@ pub fn render(plan: &DryRun) -> String {
     out.push_str(&format!("\n  note: {SPLIT_HORIZON_CAVEAT}\n"));
     out.push_str(&format!(
         "  note: {}\n",
-        daemon_record_caveat(&plan.base_domain)
+        daemon_record_caveat(&plan.base_domain, plan.auth_enabled)
     ));
 
     // Last, and shouted, because it is the only line here that means none
@@ -1191,24 +1238,101 @@ mod tests {
         assert!(render(&plan).contains(SPLIT_HORIZON_CAVEAT));
     }
 
-    /// H-01 option C, at the first of its two emission sites: the one
-    /// hostname an operator visits first resolves and then dies, and must
-    /// say so before it happens.
+    /// A7, at the first of the caveat's two emission sites: the dry run
+    /// describes the host the operator is about to build.
+    ///
+    /// The assertion is still an exact whole-string match -- it is just no
+    /// longer the same string for every host, because R13 made the answer
+    /// depend on the answers. This covers the default: SSO kept, so the
+    /// dashboard is published and gated.
     #[test]
-    fn the_dry_run_discloses_that_the_daemon_record_resolves_into_a_closed_connection() {
+    fn the_dry_run_describes_a_published_and_gated_dashboard() {
         let fake = fake_with(serde_json::json!([]));
         let a = answers(&["plex"]);
+        assert!(a.sso.enabled, "this test's premise");
         let plan = dry_run("thesyms.ca", &a, a.dns.as_ref().unwrap(), &against(&fake)).unwrap();
         let rendered = render(&plan);
+
         assert!(
-            rendered.contains(&daemon_record_caveat("thesyms.ca")),
+            rendered.contains(&daemon_record_caveat("thesyms.ca", true)),
             "{rendered}"
         );
         assert!(
-            rendered.contains("ferrum.thesyms.ca will resolve"),
+            rendered.contains("https://ferrum.thesyms.ca"),
+            "the real reachable url, not a warning about a dead name: {rendered}"
+        );
+        assert!(
+            rendered.contains("auth.thesyms.ca"),
+            "and where the login it asks for lives: {rendered}"
+        );
+    }
+
+    /// The same site, the other published state: R13's dashboard is up, but
+    /// the operator declined single sign-on, so it is up with nothing in
+    /// front of it. Saying "it will ask you to log in" here would be the
+    /// A7 defect pointed the opposite way.
+    #[test]
+    fn the_dry_run_says_plainly_when_the_dashboard_will_be_ungated() {
+        let fake = fake_with(serde_json::json!([]));
+        let mut a = answers(&["plex"]);
+        a.sso.enabled = false;
+        let plan = dry_run("thesyms.ca", &a, a.dns.as_ref().unwrap(), &against(&fake)).unwrap();
+        let rendered = render(&plan);
+
+        assert!(
+            rendered.contains(&daemon_record_caveat("thesyms.ca", false)),
             "{rendered}"
         );
-        assert!(rendered.contains("the connection will close"), "{rendered}");
+        assert!(
+            rendered.contains("NO login"),
+            "the ungated state must be stated, not implied: {rendered}"
+        );
+        assert!(
+            !rendered.contains("single sign-on login at"),
+            "and must not claim a gate that is not there: {rendered}"
+        );
+    }
+
+    /// A7's own words -- "with no `baseDomain`, or with the proxy
+    /// disabled, there is no vhost and the UI states where it *is*
+    /// reachable rather than advertising a hostname that will not
+    /// resolve."
+    ///
+    /// Unreachable from either emission site in this installer, since both
+    /// are reached only with a domain in hand. Asserted anyway because it
+    /// is the branch that makes the function total, and a caveat that
+    /// silently interpolated an empty domain would print `ferrum.` as a
+    /// hostname.
+    #[test]
+    fn the_caveat_advertises_no_hostname_when_there_is_no_vhost() {
+        for auth in [true, false] {
+            let text = daemon_record_caveat("", auth);
+            assert_eq!(
+                text,
+                "ferrum's own web interface has no hostname on this host: with no base \
+                 domain there is no vhost for it, so it stays reachable only over an SSH \
+                 tunnel to its loopback port. That is expected -- it is not a failed install."
+            );
+            assert!(!text.contains("https://"), "no url is offered: {text}");
+            assert!(!text.contains("ferrum."), "no hostname is offered: {text}");
+        }
+    }
+
+    /// The sentence R13 falsified must be gone from every state, not
+    /// merely unused by the default one. It named a ship date, so it is
+    /// the phrase most likely to survive a careless edit.
+    #[test]
+    fn no_state_still_claims_the_dashboard_has_not_shipped() {
+        for (domain, auth) in [("thesyms.ca", true), ("thesyms.ca", false), ("", false)] {
+            let text = daemon_record_caveat(domain, auth);
+            for stale in [
+                "the connection will close",
+                "has no vhost yet",
+                "Phase 1.7c R13",
+            ] {
+                assert!(!text.contains(stale), "{stale:?} survives in: {text}");
+            }
+        }
     }
 
     /// D-11, the sharpest case in the requirement. A missing credential
@@ -1377,6 +1501,7 @@ mod tests {
             target: "A 203.0.113.7".to_string(),
             actions: Vec::new(),
             zone_not_serving_yet: None,
+            auth_enabled: true,
         };
         let rendered = render(&plan);
         assert!(rendered.contains("nothing to change"), "{rendered}");

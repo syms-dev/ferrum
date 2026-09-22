@@ -1018,9 +1018,14 @@ fn url_report(
     // concluding an install had failed because every one of these returned
     // HTTP 000 from inside the LAN while working perfectly from outside.
     lines.push(format!("\nnote: {}", dns::SPLIT_HORIZON_CAVEAT));
-    // H-01 option C: the first url above is the one an operator visits
-    // first, and it is the one that resolves into a closed connection.
-    lines.push(format!("note: {}", dns::daemon_record_caveat(domain)));
+    // A7: the first url above is the one an operator visits first, so it
+    // is the one that has to be described accurately. What is true of it
+    // depends on how this host was answered, which is why the caveat takes
+    // the SSO decision rather than being a fixed sentence.
+    lines.push(format!(
+        "note: {}",
+        dns::daemon_record_caveat(domain, answers.sso.enabled)
+    ));
 
     let contested = dns::report_lines(adoption);
     if !contested.is_empty() {
@@ -1724,22 +1729,28 @@ mod tests {
         assert!(urls < caveat, "{report}");
     }
 
-    /// H-01 option C, at the second of its two emission sites. Without it
-    /// the one hostname an operator visits first resolves and then dies
-    /// with no explanation -- `ferrum.daemon.subdomain` has no vhost and
-    /// nginx's catch-all answers it with a closed connection.
+    /// A7, at the second of the caveat's two emission sites. By the time a
+    /// hostname behaves unexpectedly the dry run is far up the scrollback
+    /// and this report is what is on screen, so it carries the same
+    /// state-accurate sentence rather than a generic one.
+    ///
+    /// `published_answers` keeps single sign-on, so this is the gated
+    /// state; the ungated and unpublished states are covered per branch in
+    /// `dns.rs`, which owns the sentence.
     ///
     /// Mutation check: delete the `daemon_record_caveat` push in
     /// `url_report` and this fails.
     #[test]
-    fn the_final_report_discloses_that_the_daemon_hostname_closes_the_connection() {
-        let report = url_report(&published_answers(), &dns::Adoption::none(), None).join("\n");
+    fn the_final_report_describes_the_daemon_hostname_as_it_will_behave() {
+        let answers = published_answers();
+        assert!(answers.sso.enabled, "this test's premise");
+        let report = url_report(&answers, &dns::Adoption::none(), None).join("\n");
         assert!(
             report.contains("https://ferrum.thesyms.ca"),
             "the url is offered: {report}"
         );
         assert!(
-            report.contains(&dns::daemon_record_caveat("thesyms.ca")),
+            report.contains(&dns::daemon_record_caveat("thesyms.ca", true)),
             "and it is qualified: {report}"
         );
     }
