@@ -1241,9 +1241,14 @@ mod tests {
     /// A7, at the first of the caveat's two emission sites: the dry run
     /// describes the host the operator is about to build.
     ///
-    /// The assertion is still an exact whole-string match -- it is just no
-    /// longer the same string for every host, because R13 made the answer
-    /// depend on the answers. This covers the default: SSO kept, so the
+    /// The first assertion is a WIRING check, and the docstring used to
+    /// call it "an exact whole-string match", which it is not: both sides
+    /// come from `daemon_record_caveat`, so it proves this site emits
+    /// whatever that function returns and cannot fail on a change to what
+    /// it returns. That is worth having -- deleting the emission is the
+    /// likely regression -- but it is not a claim about the sentence, so
+    /// the content is asserted separately, against the caveat rather than
+    /// against the render. This covers the default: SSO kept, so the
     /// dashboard is published and gated.
     #[test]
     fn the_dry_run_describes_a_published_and_gated_dashboard() {
@@ -1253,17 +1258,26 @@ mod tests {
         let plan = dry_run("thesyms.ca", &a, a.dns.as_ref().unwrap(), &against(&fake)).unwrap();
         let rendered = render(&plan);
 
-        assert!(
-            rendered.contains(&daemon_record_caveat("thesyms.ca", true)),
-            "{rendered}"
-        );
+        let caveat = daemon_record_caveat("thesyms.ca", true);
+        assert!(rendered.contains(&caveat), "{rendered}");
         assert!(
             rendered.contains("https://ferrum.thesyms.ca"),
             "the real reachable url, not a warning about a dead name: {rendered}"
         );
+        // Against the CAVEAT, not the whole render. The DNS action table
+        // printed above the caveat already contains auth.thesyms.ca -- it
+        // is one of the records being created -- so the render-wide form of
+        // this assertion was satisfied by a line it is not about, and would
+        // have passed with the caveat's own mention of the login host
+        // deleted entirely.
         assert!(
-            rendered.contains("auth.thesyms.ca"),
-            "and where the login it asks for lives: {rendered}"
+            caveat.contains("auth.thesyms.ca"),
+            "the caveat must say where the login it asks for lives: {caveat}"
+        );
+        assert!(
+            caveat.contains("asks for the single sign-on login"),
+            "and that it asks for one at all -- the symmetric counterpart to \
+             the ungated case's 'NO login': {caveat}"
         );
     }
 
