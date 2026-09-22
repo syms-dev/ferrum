@@ -13,6 +13,23 @@ let
   publicApps = proxyLib.publicApps ferrum;
   selfSignedCertDir = proxyLib.selfSignedCertDir;
 
+  # The control plane's own vhost (R13/A1). See modules/proxy/lib.nix for why
+  # the daemon is shaped like an app and why `daemonPublished` is one shared
+  # predicate rather than a condition re-spelled in three files.
+  daemonApp = proxyLib.daemonApp ferrum;
+  daemonPublished = proxyLib.daemonPublished ferrum;
+  daemonVhostName = vhostNameFor daemonApp;
+  daemonAuthGated = proxyLib.authGated ferrum daemonApp;
+
+  # A real certificate is needed for the auth vhost as soon as ANYTHING on
+  # this host is published on a real name -- a public app, or now the
+  # dashboard on its own. Without the daemon disjunct, the dashboard-only host
+  # gets a real cert on ferrum.<domain> and a SELF-SIGNED one on
+  # auth.<domain>, so the very first forward-auth redirect lands on a
+  # certificate the browser refuses: SSO would be unusable on exactly the
+  # configuration D6 exists to make work.
+  realCertsNeeded = publicApps != { } || daemonPublished;
+
   mkVhost = _: app:
     let
       vhostName = vhostNameFor app;
@@ -103,6 +120,117 @@ let
         };
       };
     };
+
+  # The daemon's vhost is hand-built rather than run through mkVhost, for the
+  # same reason the auth.<baseDomain> vhost below is: mkVhost hardcodes
+  # `http://127.0.0.1:${app.port}` as its upstream, and the daemon's listen
+  # address is an operator-settable option (ferrum.daemon.listenAddress). It
+  # is still the SAME shape -- same forceSSL, same /authelia subrequest, same
+  # auth_request wiring -- because "gated exactly like a catalog app" (A2) is
+  # the requirement.
+  daemonUpstream = "http://${ferrum.daemon.listenAddress}:${toString ferrum.daemon.port}";
+
+  # A1/A5: nginx reaches the daemon, the daemon does not bind a public
+  # interface. This proxies to whatever loopback address ferrumd is actually
+  # listening on, so the SSH-tunnel recovery route keeps working unchanged.
+  daemonAuthConfig = lib.optionalString daemonAuthGated ''
+    auth_request /authelia;
+    auth_request_set $target_url $scheme://$http_host$request_uri;
+  '';
+
+  # Deliberately NOT forwarded here, unlike a catalog app's vhost above:
+  # Remote-User / Remote-Groups / Remote-Name / Remote-Email. D4 is explicit
+  # that R13 introduces no Remote-User trust -- ferrumd keeps requiring its
+  # own session cookie on every request regardless of the Authelia outcome --
+  # and nothing in modules/core/daemon.nix or modules/apps/* has network
+  # namespace isolation, so any local process could otherwise forge those
+  # headers straight at the daemon's loopback port and skip the browser
+  # entirely. Sending headers the daemon must not believe would only invite a
+  # later change to start believing them.
+
+  # D8. crates/ferrumd/src/jobs.rs serves a long-lived SSE stream, and
+  # ferrum.apply.healthCheckTimeoutSec defaults to 120s -- well past the 60s
+  # proxy_read_timeout that recommendedProxySettings supplies. With buffering
+  # left on (also its default) nginx would additionally batch the event
+  # stream, so an apply would appear frozen and then be cut off mid-run.
+  # Both directives are set on every daemon location rather than just the
+  # stream path: the control plane has no throughput-sensitive route where
+  # buffering buys anything, and scoping it to one path only invites the next
+  # stream to be added somewhere it does not apply.
+  daemonStreamConfig = ''
+    proxy_buffering off;
+    proxy_read_timeout 300s;
+  '';
+
+  daemonVhost = {
+    # exposure is "public" (lib.nix's daemonApp), so this is the real ACME
+    # cert modules/proxy/acme.nix creates under exactly this vhost name -- the
+    # same mechanism every app uses, not a second one (A6).
+    useACMEHost = daemonVhostName;
+    forceSSL = true;
+    locations = {
+      "/authelia" = lib.mkIf daemonAuthGated {
+        extraConfig = ''
+          internal;
+          proxy_pass http://127.0.0.1:9091/api/verify;
+          proxy_pass_request_body off;
+          proxy_set_header Content-Length "";
+          proxy_set_header X-Original-URL $scheme://$http_host$request_uri;
+        '';
+      };
+
+      # D8, third leg. An expired Authelia session on an /api/ request must
+      # come back as a plain 401 the SPA's fetch() can read. The `error_page
+      # 401 =302 https://auth.<domain>/...` that the "/" location below uses
+      # -- correct for a browser NAVIGATION -- turns an XHR into an opaque
+      # cross-origin redirect instead: fetch() cannot see the status, cannot
+      # read the body, and the SPA has no way to tell "your session expired,
+      # log in again" apart from "the daemon is down".
+      "@ferrum_api_401" = lib.mkIf daemonAuthGated {
+        extraConfig = "return 401;";
+      };
+
+      "/" = {
+        proxyPass = daemonUpstream;
+        proxyWebsockets = true;
+        extraConfig = daemonStreamConfig + daemonAuthConfig
+          + lib.optionalString daemonAuthGated ''
+          error_page 401 =302 https://auth.${ferrum.proxy.baseDomain}/?rd=$target_url;
+        '';
+      };
+
+      "/api/" = {
+        proxyPass = daemonUpstream;
+        proxyWebsockets = true;
+        extraConfig = daemonStreamConfig + daemonAuthConfig
+          + lib.optionalString daemonAuthGated ''
+          error_page 401 = @ferrum_api_401;
+        '';
+      };
+    };
+  };
+
+  # D7/A8. virtualHosts is assembled below with `//`, so a later key silently
+  # WINS -- this is the jellyfin/plex failure class the catch-all vhost's own
+  # comment describes, except that here the loser would be the control plane
+  # itself. App subdomains are free-form types.str with no uniqueness
+  # constraint anywhere, so nothing but this stops an operator naming an app
+  # "ferrum" and quietly replacing the dashboard with Sonarr.
+  #
+  # The reserved set is computed, never hardcoded: ferrum.daemon.subdomain is
+  # an option, so an operator who moves the dashboard to "panel" reserves
+  # "panel" and frees "ferrum". "auth" is the literal Authelia vhost name
+  # built below, which has no option of its own.
+  #
+  # Checked for every ENABLED app rather than only the exposed ones: a
+  # colliding app at exposure = "local" is a trap armed for whenever someone
+  # publishes it, and reporting that at eval time costs nothing.
+  reservedSubdomains = [ ferrum.daemon.subdomain "auth" ];
+  reservedCollisions = lib.mapAttrsToList
+    (name: app: "ferrum.apps.${name}.subdomain = \"${app.subdomain}\"")
+    (lib.filterAttrs
+      (_: app: app.enable && lib.elem app.subdomain reservedSubdomains)
+      ferrum.apps);
 in
 lib.mkIf proxyEnabled {
   services.nginx = {
@@ -136,16 +264,32 @@ lib.mkIf proxyEnabled {
       };
     }
       // lib.listToAttrs (lib.mapAttrsToList mkVhost exposedApps)
+      // lib.optionalAttrs daemonPublished { "${daemonVhostName}" = daemonVhost; }
       // lib.optionalAttrs ferrum.auth.enable {
         "auth.${ferrum.proxy.baseDomain}" = {
           forceSSL = true;
-          useACMEHost = lib.mkIf (publicApps != { }) "auth.${ferrum.proxy.baseDomain}";
-          sslCertificate = lib.mkIf (publicApps == { }) "${selfSignedCertDir}/cert.pem";
-          sslCertificateKey = lib.mkIf (publicApps == { }) "${selfSignedCertDir}/key.pem";
+          useACMEHost = lib.mkIf realCertsNeeded "auth.${ferrum.proxy.baseDomain}";
+          sslCertificate = lib.mkIf (!realCertsNeeded) "${selfSignedCertDir}/cert.pem";
+          sslCertificateKey = lib.mkIf (!realCertsNeeded) "${selfSignedCertDir}/key.pem";
           locations."/".proxyPass = "http://127.0.0.1:9091";
         };
       };
   };
+
+  assertions = [
+    {
+      assertion = reservedCollisions == [ ];
+      message = ''
+        A catalog app claims a subdomain ferrum reserves for its control plane,
+        and would silently shadow it: ${lib.concatStringsSep "; " reservedCollisions}.
+        Reserved on this host: ${lib.concatStringsSep ", " (map (s: "\"${s}\"") reservedSubdomains)}
+        -- the first is ferrum.daemon.subdomain (the dashboard itself), the
+        second is Authelia's own vhost. Give the app a different
+        ferrum.apps.<name>.subdomain, or move the dashboard by setting
+        ferrum.daemon.subdomain.
+      '';
+    }
+  ];
 
   networking.firewall.allowedTCPPorts = [ 80 443 ];
 }
