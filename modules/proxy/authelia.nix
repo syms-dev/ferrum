@@ -88,9 +88,28 @@ lib.mkIf authEnabled {
         domain = vhostNameFor app;
         policy = app.auth.policy;
       };
+
+      # D1/A2. The control plane needs a rule of its own, because the
+      # generator above is driven by exposedApps and the daemon is not a
+      # catalog app. Without this, access_control.default_policy = "deny"
+      # above applies to ferrum.<baseDomain>, and an auth_request-wired
+      # daemon vhost then denies EVERYONE, ALWAYS -- the dashboard would be
+      # unopenable rather than merely weakly gated, which is a non-functional
+      # ship rather than a security finding.
+      #
+      # Built by calling the SAME appRule on lib.nix's synthetic daemonApp,
+      # deliberately, rather than by writing the rule shape out a second time:
+      # when that generator grows a field, the daemon gets it too instead of
+      # drifting. Appended alongside the app rules, never in place of them.
+      # No bypass rules accompany it -- daemonApp's bypassPaths is empty by
+      # design (D4), so the daemon exempts no path from the edge gate.
+      daemonRules = lib.optional
+        (proxyLib.daemonPublished ferrum)
+        (appRule null (proxyLib.daemonApp ferrum));
     in
     lib.concatLists (lib.mapAttrsToList bypassRules exposedAppsAuth)
-    ++ lib.mapAttrsToList appRule exposedAppsAuth;
+    ++ lib.mapAttrsToList appRule exposedAppsAuth
+    ++ daemonRules;
 
   systemd.tmpfiles.rules = [
     "d '${stateDir}' 0750 authelia-main authelia-main - -"
