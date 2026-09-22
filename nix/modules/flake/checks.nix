@@ -650,6 +650,8 @@
             secrets = { "acme-dns" = { }; };
           };
           dashboardCerts = dashboardOnly.config.security.acme.certs;
+          daemonCert = dashboardCerts.${daemonName} or null;
+          expectedDnsProvider = dashboardOnly.config.ferrum.proxy.acme.dnsProvider;
           dashboardPublicApps = lib.filterAttrs
             (_: app: app.enable && app.exposure == "public")
             dashboardOnly.config.ferrum.apps;
@@ -700,13 +702,36 @@
             # A6/D6.
             ++ lib.optional (dashboardPublicApps != { })
               "the dashboard-only fixture has a public app, so it no longer tests the publicApps == {} path"
-            ++ lib.optional (!(dashboardCerts ? ${daemonName}))
-              "with no public catalog app, the dashboard gets no ACME certificate and falls silently to the self-signed branch (A6/D6)";
+            # Asserting the KEY EXISTS is not enough here, and finding that
+            # out is the reason this check is mutation-tested. nginx's own
+            # module auto-creates a security.acme.certs stub for any vhost
+            # naming a useACMEHost, so with acme.nix's daemon entry deleted
+            # the key is still present -- with dnsProvider = null and
+            # environmentFile = null, i.e. a certificate that would try
+            # HTTP-01 with no credential and never issue. An existence check
+            # passed that mutation cleanly. A6 asks for the certificate to
+            # come through the SAME ACME path as every other vhost, so that
+            # is what is checked: ferrum's DNS-01 provider, and the
+            # Cloudflare token lego actually needs.
+            ++ lib.optional (daemonCert == null)
+              "with no public catalog app, the dashboard gets no ACME certificate entry at all (A6/D6)"
+            ++ lib.optional
+              (daemonCert != null && (daemonCert.dnsProvider or null) != expectedDnsProvider)
+              "the dashboard's certificate is not on ferrum's DNS-01 path -- it is nginx's bare useACMEHost stub, which would never issue (A6/D6)"
+            ++ lib.optional
+              (daemonCert != null && (daemonCert.environmentFile or null) == null)
+              "the dashboard's certificate has no environmentFile, so lego gets no Cloudflare credential (A6/D6)";
         in
         {
           ok = problems == [ ];
           message = "the generated config does not publish the control plane as R13 requires";
           inherit problems;
+          # Diagnostics, printed by mkAssertionCheck on failure: the cert
+          # findings above are otherwise very hard to read from the message
+          # alone, because the failure is a present-but-inert entry rather
+          # than a missing one.
+          dashboardCertNames = builtins.attrNames dashboardCerts;
+          daemonCertDnsProvider = if daemonCert == null then "<no entry>" else daemonCert.dnsProvider;
         };
 
       # A8/D7: the daemon's hostname is reserved, and a collision is a
