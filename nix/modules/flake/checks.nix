@@ -627,12 +627,91 @@
           hasIn = needle: hay: lib.hasInfix needle hay;
 
           # A7: no baseDomain, or no proxy, means NO vhost -- not a vhost on a
-          # hostname that will never resolve. Checked as absence of the daemon
-          # key specifically; both hosts still generate other vhosts.
-          absentWhenProxyOff =
-            (mkProxyHost { proxy = false; }).config.services.nginx.virtualHosts;
+          # hostname that will never resolve.
+          #
+          # The two halves are NOT symmetrical, and the comment that used to
+          # claim they were ("both hosts still generate other vhosts") was
+          # false for the first of them. modules/proxy/nginx.nix is wrapped in
+          # `lib.mkIf proxyEnabled`, so with the proxy off this fixture's
+          # services.nginx.virtualHosts is nixpkgs' own untouched default and
+          # holds no ferrum vhost of any kind. An `absentWhenProxyOff ?
+          # "<daemon>"` over that scans an EMPTY corpus: it passed, and it
+          # would have gone on passing with the daemon vhost emitted
+          # unconditionally. A scan over nothing finds nothing -- the same
+          # vacuity failure nginx-emits-no-cors-headers below guards against
+          # explicitly, arrived at from the other direction.
+          #
+          # So nginx is asked only what its corpus can actually answer -- the
+          # proxy module emits nothing at all here, daemon and catalog app
+          # alike -- and A7's real proxy-off assertion moves to a corpus this
+          # fixture is PROVED to have populated (proxyOffRules below).
+          #
+          # The apps carry an EXPLICIT exposure, and finding out why is what
+          # that guard was for. app-submodule.nix defaults exposure to
+          # `if proxyEnabled then "public" else "local"`, so a bare
+          # `sonarr.enable = true` silently becomes a LOCAL app once the
+          # proxy is off: exposedApps is empty, Authelia emits no rules at
+          # all, and the second corpus would have been every bit as vacuous
+          # as the nginx one. Stating the exposure keeps the generator
+          # running, so its output is a real list with a real absence in it.
+          proxyOff = mkProxyHost {
+            proxy = false;
+            apps = {
+              plex = { enable = true; exposure = "public"; };
+              sonarr = { enable = true; exposure = "public"; };
+            };
+          };
+          proxyOffVhosts = proxyOff.config.services.nginx.virtualHosts;
+          # Named rather than "everything except nginx's own default": these
+          # are the five names modules/proxy/nginx.nix generates for this
+          # fixture when the proxy IS on, so the list is exactly the thing
+          # whose absence is being claimed.
+          ferrumVhostNames = [
+            daemonName
+            "auth.example.test"
+            "plex.example.test"
+            "sonarr.example.test"
+            "_ferrum_unmatched"
+          ];
+          proxyOffFerrumVhosts = builtins.filter (n: proxyOffVhosts ? ${n}) ferrumVhostNames;
+
+          # The corpus that IS populated with the proxy off.
+          # modules/proxy/authelia.nix is wrapped in `lib.mkIf authEnabled`,
+          # NOT proxyEnabled, so a proxy-off/auth-on host really does run the
+          # access_control generator and really does emit a rule per catalog
+          # app. That makes it the place where losing daemonPublished's proxy
+          # term would be VISIBLE: Authelia would authorize a hostname with no
+          # vhost behind it (and modules/proxy/dns.nix's authRecords would
+          # publish a record for it -- asserted in dns-record-set), while
+          # nginx, switched off wholesale, says nothing either way.
+          # scannedARealAppRule is what makes the absence below a finding
+          # rather than an empty list.
+          proxyOffRules =
+            proxyOff.config.services.authelia.instances.main.settings.access_control.rules;
+          proxyOffDaemonRules = builtins.filter (r: r.domain or "" == daemonName) proxyOffRules;
+          scannedARealAppRule =
+            builtins.any (r: r.domain or "" == "sonarr.example.test") proxyOffRules;
+
+          # The no-domain half, by contrast, really does leave the proxy
+          # module running: nginx.nix gates on ferrum.proxy.enable alone, so
+          # this host generates "plex.", "sonarr.", "auth." and the catch-all,
+          # and the absence of "<daemon>." among them is a real finding.
+          # scannedTheCatchAll pins that, so the day nginx.nix grows a
+          # baseDomain gate this fails loudly instead of quietly turning into
+          # the vacuous check above.
+          #
+          # Recorded rather than fixed: baseDomain = "" is a configuration
+          # modules/proxy/acme.nix asserts against, and this check reads
+          # .config.services.nginx.virtualHosts without ever touching
+          # .config.assertions -- so the host it evaluates is one a real build
+          # would refuse. That is deliberate here. The assertion itself is
+          # reserved-subdomain-collision's business (it has the tryEval
+          # machinery for reading assertions); what A7 needs at this site is
+          # what the GENERATOR does with an empty domain, which is precisely
+          # what an unasserted eval shows.
           absentWhenNoDomain =
             (mkProxyHost { baseDomain = ""; }).config.services.nginx.virtualHosts;
+          scannedTheCatchAll = absentWhenNoDomain ? "_ferrum_unmatched";
 
           # A2/D1: the Authelia rule. Without it, default_policy = "deny"
           # applies and the auth_request wiring asserted above denies every
@@ -689,9 +768,16 @@
               "the daemon vhost's /api/ redirects a 401 instead of returning it, so the SPA sees an opaque cross-origin redirect (D8)"
             ++ lib.optional (!(hasIn "error_page 401 = @ferrum_api_401" apiLoc))
               "the daemon vhost's /api/ does not override the 401 redirect with a plain 401 (D8)"
-            # A7, both halves.
-            ++ lib.optional (absentWhenProxyOff ? ${daemonName})
-              "a daemon vhost exists with ferrum.proxy.enable = false (A7)"
+            # A7, both halves -- each preceded by the guard that keeps its
+            # absence proof from being a scan over nothing.
+            ++ lib.optional (proxyOffFerrumVhosts != [ ])
+              "ferrum.proxy.enable = false still generated nginx vhosts (${lib.concatStringsSep ", " proxyOffFerrumVhosts}): the proxy module is no longer off wholesale, so every absence claimed of this fixture has to be rebuilt (A7)"
+            ++ lib.optional (!scannedARealAppRule)
+              "the proxy-off fixture carries no Authelia rule for sonarr.example.test, so its rule list is not the generated one and finding no daemon rule in it would prove nothing (A7)"
+            ++ lib.optional (proxyOffDaemonRules != [ ])
+              "with ferrum.proxy.enable = false, Authelia still carries an access_control rule for ${daemonName} -- authorization for a vhost that does not exist (A7)"
+            ++ lib.optional (!scannedTheCatchAll)
+              "the empty-baseDomain fixture generated no _ferrum_unmatched vhost, so modules/proxy/nginx.nix did not run on it and the absence below is vacuous (A7)"
             ++ lib.optional (absentWhenNoDomain ? "${daemonSub}.")
               "a daemon vhost exists with an empty baseDomain, on a hostname that cannot resolve (A7)"
             # A2/D1.
@@ -1009,7 +1095,7 @@
           # a host with NO public app as well as on one with an app: that is
           # the configuration on which the auth record and the auth
           # certificate disagreed.
-          mkDnsHost = { auth, apps ? {
+          mkDnsHost = { auth, proxy ? true, apps ? {
             # Deliberately `lan`: this is the app that must NOT appear.
             sonarr = { enable = true; exposure = "lan"; };
             radarr.enable = true;
@@ -1018,7 +1104,7 @@
             settings = {
               schemaVersion = realMigrations.currentVersion;
               proxy = {
-                enable = true;
+                enable = proxy;
                 baseDomain = "example.invalid";
                 acme.email = "admin@example.invalid";
                 dns = {
@@ -1042,17 +1128,39 @@
             auth = true;
             apps = { sonarr = { enable = true; exposure = "lan"; }; };
           }).config.system.build.ferrumDnsConfig;
+          # The proxy-off/auth-on host, and the other half of A7.
+          #
+          # modules/proxy/authelia.nix and this file are gated differently
+          # from modules/proxy/nginx.nix -- neither is wrapped in
+          # `lib.mkIf proxyEnabled` -- so the proxy term of
+          # proxyLib.daemonPublished is the ONLY thing standing between this
+          # configuration and an auth.example.invalid record for a login page
+          # that has no vhost. Its counterpart assertion, on Authelia's own
+          # access_control rules, lives in daemon-vhost-enforced; nginx can
+          # say nothing about either, because with the proxy off its module
+          # never runs.
+          #
+          # Every app is at `lan` so publicApps == { }: with a public app
+          # present the auth record is created by the app term regardless,
+          # and the daemonPublished term would be unobservable here.
+          proxyOff = (mkDnsHost {
+            auth = true;
+            proxy = false;
+            apps = { sonarr = { enable = true; exposure = "lan"; }; };
+          }).config.system.build.ferrumDnsConfig;
         in
         pkgs.runCommand "ferrum-check-dns-record-set" { } ''
           set -eu
           with_auth=${withAuth}
           without_auth=${withoutAuth}
           dashboard_only=${dashboardOnly}
+          proxy_off=${proxyOff}
           fail() {
             echo "dns record-set check: $1" >&2
             echo "--- with auth ---" >&2; cat "$with_auth" >&2
             echo "--- without auth ---" >&2; cat "$without_auth" >&2
             echo "--- dashboard only ---" >&2; cat "$dashboard_only" >&2
+            echo "--- proxy off ---" >&2; cat "$proxy_off" >&2
             exit 1
           }
 
@@ -1094,7 +1202,23 @@
             "$dashboard_only" > /dev/null \
             || fail "the dashboard-only host has no record for the dashboard itself"
 
-          for cfg in "$with_auth" "$without_auth" "$dashboard_only"; do
+          # A7, the proxy-off half. The daemon record below is the
+          # anti-vacuity guard and nothing more: an absence found in an empty
+          # record list is not a finding, so the auth assertion is only worth
+          # anything once this document is shown to contain records at all.
+          # (That the daemon record is present on a host with no proxy is
+          # daemonRecords' own unconditional `lib.optional
+          # ferrum.daemon.dns.includeRecord` -- a known, separately-owned
+          # gap, deliberately not this check's business.)
+          ${pkgs.jq}/bin/jq -e '.records[] | select(.source == "daemon")' \
+            "$proxy_off" > /dev/null \
+            || fail "the proxy-off document has no records at all, so finding no auth record in it proves nothing"
+
+          ${pkgs.jq}/bin/jq -e '[.records[] | select(.source == "auth")] | length == 0' \
+            "$proxy_off" > /dev/null \
+            || fail "a host with ferrum.proxy.enable = false got an auth.example.invalid record -- nginx builds no vhost for it, so that publishes a name with nothing behind it (A7)"
+
+          for cfg in "$with_auth" "$without_auth" "$dashboard_only" "$proxy_off"; do
             ${pkgs.jq}/bin/jq -e '(.records | length) > 0 and all(.records[]; .proxied == false)' \
               "$cfg" > /dev/null \
               || fail "a record is proxied -- orange-cloud proxying makes every request arrive from a Cloudflare edge address"
