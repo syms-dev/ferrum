@@ -292,35 +292,113 @@
       # must match lives in Nix -- nothing connects them at compile time,
       # so a new catalog app would silently be un-installable: present on
       # a host that already has it, and absent from every new install.
-      # Same mechanism, and same one-line-literal constraint, as
-      # uiRendersEverySchemaType below.
+      # Same mechanism as uiRendersEverySchemaType below, but NOT the same
+      # one-line-literal constraint: rustfmt wraps this literal and no
+      # comment can stop it, so the reader below takes the whole
+      # declaration. See the note on `declLines`.
+      #
+      # It also asserts a second, narrower thing about the same pair of
+      # files: that every catalog app's defaultSubdomain equals its id.
+      # That is not tidiness -- it is the invariant that makes the
+      # installer's R1 DNS gate correct. crates/ferrum-install/src/dns.rs's
+      # desired_records() builds "<id>.<baseDomain>", as do main.rs's
+      # url_report and verify.rs's reachability checks, while the host
+      # itself builds "<subdomain>.<baseDomain>" via
+      # modules/proxy/lib.nix's vhostNameFor. Today those agree, but only
+      # because all seven meta.nix files happen to set the two equal. The
+      # day one of them does not, the pre-erase dry run would check a
+      # DIFFERENT record name than the apply creates: a foreign record at
+      # the real name would never be listed, never offered for adoption,
+      # and silently overwritten or stranded -- a quieter replay of the
+      # auth.thesyms.ca incident R1 exists to close. Asserting the
+      # invariant costs nothing and constrains nothing an operator can do
+      # (ferrum.apps.<id>.subdomain stays freely overridable per host; only
+      # the catalog *default* is pinned). If a future app genuinely needs a
+      # differing default, this check is the thing that stops it shipping
+      # until the installer is taught to read subdomains.
       installerOffersEveryCatalogApp =
         let
           answersSrc = builtins.readFile ../../../crates/ferrum-install/src/answers.rs;
-          declLine =
-            let hits = builtins.filter (l: lib.hasInfix "pub const CATALOG_APPS" l)
-                         (lib.splitString "\n" answersSrc);
-            in if hits == [ ] then
-                 throw "crates/ferrum-install/src/answers.rs no longer declares CATALOG_APPS on a single line that this check can read"
-               else builtins.head hits;
+          # Read from the declaration's opening line to its closing `];`,
+          # rather than from that one line alone.
+          #
+          # It used to read the single line, and answers.rs carried a comment
+          # promising to keep the literal on one. That promise was
+          # unkeepable: the seven names plus the type annotation run past
+          # rustfmt's max_width, so rustfmt wraps them one per line and the
+          # comment cannot stop it. The result was worse than a check that
+          # did not exist -- the opening line holds no quoted names at all,
+          # so `declared` was empty, every catalog app read as "missing",
+          # and the check was UNCONDITIONALLY red. A check that always fails
+          # reports nothing: it cannot distinguish the drift it was built to
+          # catch from its own breakage.
+          #
+          # A line range rather than a multi-line regex for the reason the
+          # original comment gives -- Nix's regex engine rejects the
+          # bracket-negation forms that would be needed -- but taking the
+          # range first and matching within it needs no such form.
+          declLines =
+            let
+              lines = lib.splitString "\n" answersSrc;
+              after = lib.sublist
+                (let
+                   indexed = lib.imap0 (i: l: { inherit i l; }) lines;
+                   hits = builtins.filter (e: lib.hasInfix "pub const CATALOG_APPS" e.l) indexed;
+                 in if hits == [ ] then
+                      throw "crates/ferrum-install/src/answers.rs no longer declares CATALOG_APPS in a form this check can read"
+                    else (builtins.head hits).i)
+                (builtins.length lines)
+                lines;
+              # Everything up to and including the line closing the literal.
+              # `];` is unambiguous here: it is the first one after the
+              # declaration begins.
+              take = acc: rest:
+                if rest == [ ] then
+                  throw "crates/ferrum-install/src/answers.rs declares CATALOG_APPS but this check cannot find the '];' that closes it"
+                else
+                  let head = builtins.head rest; in
+                  if lib.hasInfix "];" head then acc ++ [ head ]
+                  else take (acc ++ [ head ]) (builtins.tail rest);
+            in
+            builtins.concatStringsSep "\n" (take [ ] after);
           declared =
             map builtins.head
               (builtins.filter builtins.isList
-                (builtins.split "\"([a-z0-9-]+)\"" declLine));
+                (builtins.split "\"([a-z0-9-]+)\"" declLines));
 
-          catalogApps = builtins.attrNames (import ../../../modules/lib/catalog.nix { inherit lib; });
+          catalog = import ../../../modules/lib/catalog.nix { inherit lib; };
+          catalogApps = builtins.attrNames catalog;
           missing = builtins.filter (a: !(builtins.elem a declared)) catalogApps;
           extra = builtins.filter (a: !(builtins.elem a catalogApps)) declared;
+
+          # The installer names records, urls and reachability checks after
+          # the app id; the host names its vhost after the subdomain. See
+          # the header above for why letting those two diverge is a silent
+          # DNS defect rather than a cosmetic one.
+          renamed = builtins.filter (id: catalog.${id}.defaultSubdomain != id) catalogApps;
         in
         {
-          ok = missing == [ ] && extra == [ ];
+          ok = missing == [ ] && extra == [ ] && renamed == [ ];
           message =
             "crates/ferrum-install/src/answers.rs's CATALOG_APPS is out of step with "
             + "modules/lib/catalog.nix."
             + (lib.optionalString (missing != [ ])
                 " In the catalog but not offered by the installer: ${lib.concatStringsSep ", " missing}.")
             + (lib.optionalString (extra != [ ])
-                " Offered by the installer but not in the catalog: ${lib.concatStringsSep ", " extra}.");
+                " Offered by the installer but not in the catalog: ${lib.concatStringsSep ", " extra}.")
+            + (lib.optionalString (renamed != [ ])
+                (" These apps declare a defaultSubdomain that is not their id: "
+                  + lib.concatMapStringsSep ", "
+                      (id: "${id} -> ${catalog.${id}.defaultSubdomain}")
+                      renamed
+                  + ". The installer's pre-erase DNS gate"
+                  + " (crates/ferrum-install/src/dns.rs desired_records), its url report"
+                  + " (crates/ferrum-install/src/main.rs url_report) and its reachability"
+                  + " checks all build '<id>.<baseDomain>', while the host builds"
+                  + " '<subdomain>.<baseDomain>' (modules/proxy/lib.nix vhostNameFor)."
+                  + " Those would now plan and verify a different name than the host"
+                  + " publishes. Teach the installer to read defaultSubdomain before"
+                  + " changing this."));
         };
 
       uiRendersEverySchemaType =

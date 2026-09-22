@@ -27,6 +27,13 @@
 //!   ferrum's. The adopting write carries [`OWNERSHIP_MARKER`], so from the
 //!   next run onwards that record is simply ferrum's and takes the ordinary
 //!   `Update`/`Unchanged` path with no adoption list involved.
+//! * A desired name that also carries a record ferrum does **not** own
+//!   **beside** one it does yields [`RecordAction::SkipForeignBeside`] in
+//!   addition to that name's own action. The foreign record is still never
+//!   written to or deleted -- the variant carries no
+//!   [`ManagedRecordId`] -- but it is no longer invisible. This is the
+//!   round-robin above, already in the zone rather than created by ferrum,
+//!   and it was the one shape of it that produced no operator signal at all.
 //! * A desired name that also carries a record of a type this crate does
 //!   not model yields [`RecordAction::SkipUnmodelledType`] **in addition to**
 //!   that name's own action. Nothing is blocked by it -- the point is that
@@ -126,6 +133,30 @@ pub enum RecordAction {
         current: RecordTarget,
         /// Where ferrum would have pointed it.
         wanted: RecordTarget,
+    },
+    /// A record ferrum does **not** own shares a name -- and a type ferrum
+    /// *does* model -- with a record ferrum is publishing there.
+    ///
+    /// The sibling of [`RecordAction::SkipUnmodelledType`], and deliberately
+    /// not the same variant: that one means "ferrum has no model for this
+    /// type", this one means "ferrum could manage this record and did not
+    /// create it", and the operator's next move differs. Never blocking and
+    /// never adoptable -- it carries no [`ManagedRecordId`], so no branch of
+    /// this crate can write to or delete the record it describes.
+    ///
+    /// It exists because the alternative was silence in the one case this
+    /// module's own header calls out as the reason never to create a
+    /// duplicate: two A records at one name make Cloudflare round-robin, so
+    /// roughly half of all requests reach the wrong host and the symptom
+    /// *looks intermittent rather than broken*. A foreign record of another
+    /// type beside ferrum's was already disclosed; a foreign record of the
+    /// same type -- the worse case -- was not disclosed anywhere at all.
+    SkipForeignBeside {
+        /// The fully qualified name shared with a record ferrum manages.
+        name: String,
+        /// Where the record ferrum does not own points, so the operator can
+        /// recognise which of the two answers is theirs.
+        current: RecordTarget,
     },
     /// A record of a type ferrum does not model shares a name ferrum wants.
     ///
@@ -366,7 +397,9 @@ impl RecordJson {
 ///
 /// # Returns
 /// One action per desired name -- plus a [`RecordAction::SkipUnmodelledType`]
-/// for each record of another type sharing that name -- followed by a
+/// for each record of another type sharing that name, and a
+/// [`RecordAction::SkipForeignBeside`] for each record ferrum does not own
+/// sharing it that no other action already describes -- followed by a
 /// [`RecordAction::Delete`] for each ferrum-owned record no longer wanted.
 /// Records that are neither wanted nor ferrum's produce no action at all --
 /// they are the operator's zone, and ferrum is a guest in it.
@@ -400,6 +433,32 @@ pub fn plan(desired: &[DesiredRecord], existing: &ZoneListing) -> Vec<RecordActi
 /// unchanged -- in particular a foreign record at a name nobody adopted is
 /// still never written to, and a foreign record at a name nothing wants is
 /// still never deleted whether it was adopted or not.
+/// Appends a [`RecordAction::SkipForeignBeside`] for each record ferrum does
+/// not own that shares a wanted name with something ferrum already described.
+///
+/// A free function rather than an inline loop because both callers in
+/// [`plan_with_adoptions`] must word the disclosure identically: the operator
+/// reading the plan cannot be expected to know that "ferrum owns one here"
+/// and "ferrum adopted one here" are different code paths, and two copies of
+/// the push are two chances for one of them to be dropped.
+///
+/// # Arguments
+/// * `actions` - the plan being built, appended to in place.
+/// * `records` - the foreign records at this name that no other action
+///   already describes. Callers pass only the undescribed ones; this
+///   function does not filter.
+fn disclose_foreign_beside<'a>(
+    actions: &mut Vec<RecordAction>,
+    records: impl Iterator<Item = &'a &'a DnsRecord>,
+) {
+    for other in records {
+        actions.push(RecordAction::SkipForeignBeside {
+            name: other.name.clone(),
+            current: other.target.clone(),
+        });
+    }
+}
+
 #[must_use]
 pub fn plan_with_adoptions(
     desired: &[DesiredRecord],
@@ -477,6 +536,13 @@ pub fn plan_with_adoptions(
                         wanted: want.target.clone(),
                     }),
                 }
+                // Only the *first* foreign record became this name's action,
+                // whichever of the two it was. Every other one answers at the
+                // same name and is described by neither, so it is disclosed
+                // here -- most sharply after an Adopt, where ferrum is about
+                // to start round-robinning against a record it never
+                // mentioned.
+                disclose_foreign_beside(&mut actions, theirs.iter().skip(1));
             } else {
                 actions.push(RecordAction::Create {
                     name: want.name.clone(),
@@ -500,6 +566,12 @@ pub fn plan_with_adoptions(
                 target: want.target.clone(),
             });
         }
+
+        // Ferrum has its own record here, so nothing above described the
+        // operator's. Both answer; Cloudflare round-robins them. Disclosed
+        // for the same reason an unmodelled type beside ferrum's record is,
+        // and the plan must be able to say which of the two it is.
+        disclose_foreign_beside(&mut actions, theirs.iter());
 
         // Duplicates at a wanted name are ferrum's own mess to clear: two A
         // records for one host round-robin, so half of all requests land
@@ -714,17 +786,29 @@ mod tests {
     /// listing in. Both orders below describe the same zone, so both must
     /// produce the same plan -- and in neither may the foreign record be
     /// touched.
+    ///
+    /// It must also not be *silent* about the foreign record. Correcting
+    /// ferrum's own record here leaves two A records answering at one name,
+    /// which round-robins: this plan used to consist of the `Update` alone,
+    /// so the operator was told the name was being fixed and never told that
+    /// half the requests for it would still land somewhere else.
     #[test]
     fn a_foreign_and_a_ferrum_record_at_one_name_plan_the_same_in_either_order() {
         let mine = existing("mine", "auth.example.com", OTHER, true);
         let theirs = existing("theirs", "auth.example.com", OTHER, false);
 
-        let expected = vec![RecordAction::Update {
-            record_id: ManagedRecordId::unchecked("mine"),
-            name: "auth.example.com".to_string(),
-            current: RecordTarget::A(OTHER),
-            target: RecordTarget::A(HOST),
-        }];
+        let expected = vec![
+            RecordAction::Update {
+                record_id: ManagedRecordId::unchecked("mine"),
+                name: "auth.example.com".to_string(),
+                current: RecordTarget::A(OTHER),
+                target: RecordTarget::A(HOST),
+            },
+            RecordAction::SkipForeignBeside {
+                name: "auth.example.com".to_string(),
+                current: RecordTarget::A(OTHER),
+            },
+        ];
 
         assert_eq!(
             plan(
@@ -736,6 +820,141 @@ mod tests {
         assert_eq!(
             plan(&[want("auth.example.com")], &listing(&[theirs, mine])),
             expected
+        );
+    }
+
+    /// The disclosure must survive an already-correct record, which is the
+    /// case most likely to be read as a clean plan: ferrum's own line says
+    /// `Unchanged`, and on its own that is indistinguishable from a name
+    /// that resolves correctly every time.
+    #[test]
+    fn a_foreign_record_beside_a_correct_ferrum_record_is_still_disclosed() {
+        let zone = vec![
+            existing("mine", "plex.example.com", HOST, true),
+            existing("theirs", "plex.example.com", OTHER, false),
+        ];
+        let actions = plan(&[want("plex.example.com")], &listing(&zone));
+        assert_eq!(
+            actions,
+            vec![
+                RecordAction::Unchanged {
+                    record_id: ManagedRecordId::unchecked("mine"),
+                    name: "plex.example.com".to_string(),
+                },
+                RecordAction::SkipForeignBeside {
+                    name: "plex.example.com".to_string(),
+                    current: RecordTarget::A(OTHER),
+                },
+            ]
+        );
+    }
+
+    /// Disclosure is not permission. The new variant must carry nothing that
+    /// could reach a write: no [`ManagedRecordId`] exists for the record it
+    /// describes, so no create, update or delete can name it, and a rerun
+    /// must produce the same plan rather than converging on a takeover.
+    #[test]
+    fn a_disclosed_foreign_record_is_never_written_to_or_deleted() {
+        let zone = vec![
+            existing("mine", "plex.example.com", HOST, true),
+            existing("theirs", "plex.example.com", OTHER, false),
+        ];
+        let actions = plan(&[want("plex.example.com")], &listing(&zone));
+
+        // A4's sweep runs over every record it did not claim; the foreign
+        // one must not be swept, and no branch may have produced a write
+        // for it either.
+        assert!(
+            !actions.iter().any(|a| matches!(
+                a,
+                RecordAction::Delete { .. }
+                    | RecordAction::Update { .. }
+                    | RecordAction::Adopt { .. }
+            )),
+            "{actions:?}"
+        );
+        assert_eq!(
+            actions,
+            plan(&[want("plex.example.com")], &listing(&zone)),
+            "the plan must be idempotent, not converge on the operator's record"
+        );
+    }
+
+    /// An adoption takes over one record; any *other* foreign record at the
+    /// same name is left in place and now round-robins against the record
+    /// ferrum just took. That is the case with the largest gap between what
+    /// the operator asked for and what they get, so it cannot be silent.
+    #[test]
+    fn a_second_foreign_record_is_disclosed_when_the_first_one_is_adopted() {
+        let zone = vec![
+            existing("theirs-a", "plex.example.com", OTHER, false),
+            existing("theirs-b", "plex.example.com", OTHER, false),
+        ];
+        let adopted = AdoptedNames::recorded(&["plex.example.com"]);
+        let actions = plan_with_adoptions(&[want("plex.example.com")], &listing(&zone), &adopted);
+
+        assert!(
+            matches!(actions.first(), Some(RecordAction::Adopt { .. })),
+            "{actions:?}"
+        );
+        assert_eq!(
+            actions.get(1),
+            Some(&RecordAction::SkipForeignBeside {
+                name: "plex.example.com".to_string(),
+                current: RecordTarget::A(OTHER),
+            }),
+            "{actions:?}"
+        );
+    }
+
+    /// The two disclosures are different facts and must arrive as different
+    /// variants: one is a record ferrum could manage and did not create, the
+    /// other is a type it has no model for. An operator can delete or adopt
+    /// the first; nothing they do changes the second.
+    #[test]
+    fn a_foreign_record_and_an_unmodelled_type_are_disclosed_as_different_things() {
+        let listing = ZoneListing {
+            records: vec![
+                existing("mine", "plex.example.com", HOST, true),
+                existing("theirs", "plex.example.com", OTHER, false),
+            ],
+            unmodelled: vec![UnmodelledRecord {
+                name: "plex.example.com".to_string(),
+                record_type: "AAAA".to_string(),
+            }],
+        };
+        let actions = plan(&[want("plex.example.com")], &listing);
+
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                RecordAction::SkipUnmodelledType { record_type, .. } if record_type == "AAAA"
+            )),
+            "{actions:?}"
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, RecordAction::SkipForeignBeside { .. })),
+            "{actions:?}"
+        );
+    }
+
+    /// The disclosure is scoped to names ferrum actually wants. A record
+    /// ferrum does not own, at a name nothing publishes, is simply the
+    /// operator's zone -- reporting it would train them to ignore the block.
+    #[test]
+    fn a_foreign_record_at_an_unwanted_name_is_not_disclosed() {
+        let zone = vec![
+            existing("mine", "plex.example.com", HOST, true),
+            existing("theirs", "blog.example.com", OTHER, false),
+        ];
+        let actions = plan(&[want("plex.example.com")], &listing(&zone));
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, RecordAction::SkipForeignBeside { .. })),
+            "{actions:?}"
         );
     }
 
@@ -1051,8 +1270,12 @@ mod tests {
         );
     }
 
-    /// Adopting a name ferrum already owns a record for changes nothing: the
-    /// managed record wins and the foreign one is left where it is.
+    /// Adopting a name ferrum already owns a record for changes nothing the
+    /// operator asked for: the managed record wins, and the foreign one is
+    /// left where it is rather than taken over -- an adoption reaches the
+    /// operator's record only when ferrum has none at that name. It is
+    /// disclosed, though, because "left where it is" means it keeps
+    /// answering to half the requests for that name.
     #[test]
     fn adoption_does_not_disturb_a_name_ferrum_already_owns() {
         let zone = vec![
@@ -1066,12 +1289,18 @@ mod tests {
         );
         assert_eq!(
             actions,
-            vec![RecordAction::Update {
-                record_id: ManagedRecordId::unchecked("mine"),
-                name: "auth.example.com".to_string(),
-                current: RecordTarget::A(OTHER),
-                target: RecordTarget::A(HOST),
-            }]
+            vec![
+                RecordAction::Update {
+                    record_id: ManagedRecordId::unchecked("mine"),
+                    name: "auth.example.com".to_string(),
+                    current: RecordTarget::A(OTHER),
+                    target: RecordTarget::A(HOST),
+                },
+                RecordAction::SkipForeignBeside {
+                    name: "auth.example.com".to_string(),
+                    current: RecordTarget::A(OTHER),
+                },
+            ]
         );
     }
 

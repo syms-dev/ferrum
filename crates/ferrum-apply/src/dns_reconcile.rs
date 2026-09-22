@@ -384,6 +384,11 @@ pub enum Operation {
     /// manages. Nothing was called; the entry exists so the operator is told
     /// what else answers at that name.
     SkipUnmodelledType,
+    /// A record ferrum does not own, of a type it does model, shares a name
+    /// ferrum manages. Nothing was called. Its own word rather than
+    /// `SkipUnmodelledType`'s: an operator can remove this one, or adopt the
+    /// name, and neither is true of a type ferrum cannot manage.
+    SkipForeignBeside,
 }
 
 impl Operation {
@@ -398,6 +403,7 @@ impl Operation {
             Operation::SkipForeign => "skip (not ferrum's)",
             Operation::Adopt => "adopt (was yours, you handed it over)",
             Operation::SkipUnmodelledType => "also here (a type ferrum does not manage)",
+            Operation::SkipForeignBeside => "also here (a record ferrum does not own)",
         }
     }
 }
@@ -739,6 +745,22 @@ fn execute(
             note: Some(format!(
                 "left alone: it points at {current} and ferrum did not create it \
                  (ferrum would have pointed it at {wanted})"
+            )),
+        },
+        // Disclosure, not an outcome, and the worse half of the pair below:
+        // this record is the same type as ferrum's own at this name, so the
+        // two round-robin and the name answers correctly about half the
+        // time. A3 still forbids touching it -- the variant carries no
+        // record id to touch it with -- but an intermittent failure the
+        // report never mentioned is the shape of defect R1 exists to close.
+        RecordAction::SkipForeignBeside { name, current } => RecordReport {
+            name,
+            operation: Operation::SkipForeignBeside,
+            failure: None,
+            note: Some(format!(
+                "another record that ferrum did not create also answers at this name, \
+                 pointing at {current}. It was left exactly as it is, so some requests for \
+                 this name reach that address instead of this server"
             )),
         },
         // Disclosure, not an outcome: ferrum's own record at this name was
@@ -1219,6 +1241,54 @@ mod tests {
         );
     }
 
+    /// The quieter silent case: a record ferrum does **not** own at the same
+    /// name *and* the same type as one it does. Nothing is written to it --
+    /// that held before this test existed -- but until the plan grew a
+    /// variant for it, the apply report said only `unchanged` for that name
+    /// while Cloudflare round-robinned the two. An operator reading a clean
+    /// report then debugs a hostname that works about half the time.
+    #[test]
+    fn a_foreign_record_beside_ferrums_own_is_reported_and_never_written_to() {
+        let fake = fake_zone(serde_json::json!([
+            record_json("mine", "plex.example.com", "203.0.113.7", true),
+            record_json("theirs", "plex.example.com", "198.51.100.9", false),
+        ]));
+
+        let report = reconcile_with(
+            &parsed(&[("plex.example.com", "app:plex")]),
+            &client_for(&fake),
+            &always_matches,
+        )
+        .expect("the run completes");
+
+        assert!(
+            report.is_clean(),
+            "a disclosure must not degrade: {report:?}"
+        );
+        let disclosed = report
+            .records
+            .iter()
+            .find(|r| r.operation == Operation::SkipForeignBeside)
+            .expect("the operator's own record at this name is disclosed");
+        let note = disclosed.note.as_deref().expect("a disclosure explains");
+        assert!(note.contains("198.51.100.9"), "{note}");
+        assert!(note.contains("ferrum did not create"), "{note}");
+        assert!(
+            report
+                .records
+                .iter()
+                .any(|r| r.operation == Operation::Unchanged),
+            "ferrum's own record is still reported on its own terms: {report:?}"
+        );
+
+        for method in ["PUT", "DELETE", "POST"] {
+            assert!(
+                fake.requests().iter().all(|r| r.method != method),
+                "disclosure is not permission: no write may be made for {method}"
+            );
+        }
+    }
+
     /// The silent case: an `AAAA` at a wanted name. ferrum still creates its
     /// `A`, but the report has to say the other record is there -- otherwise
     /// the operator's IPv6-capable clients keep reaching the old host and
@@ -1466,6 +1536,41 @@ mod tests {
             round_two_requests.iter().all(|r| r.method == "GET"),
             "a converged zone must issue no create/update/delete on the next \
              run: {round_two_requests:?}"
+        );
+    }
+
+    /// `ferrum_dns::record`'s own module doc says a [`ferrum_dns::record::ZoneListing`]
+    /// "comes from `Client::list_records` or it does not exist" -- but the
+    /// type derives `Default`, and `Default::default()` is a public trait
+    /// impl regardless of the struct's fields being crate-private. Called
+    /// from this crate (a real, external consumer of `ferrum-dns`, not a
+    /// test inside that crate), it builds an empty listing with no
+    /// Cloudflare call at all, and [`ferrum_dns::record::plan`] cannot tell
+    /// it apart from a listing of a genuinely empty zone: every desired name
+    /// comes back `Create`.
+    ///
+    /// This is not reachable from any call site in this crate today --
+    /// `reconcile_with` always calls `client.list_records(&zone)` -- so it is
+    /// not a live bypass of A3/A4. It is recorded here because the
+    /// documented invariant ("no public constructor") is false, and the
+    /// ordinary Rust reflex `listing.unwrap_or_default()` on some future
+    /// error-handling path would silently reintroduce the exact failure D-01
+    /// exists to prevent: a plan computed as if the zone had nothing in it.
+    #[test]
+    fn zonelisting_default_is_a_public_constructor_the_module_doc_says_does_not_exist() {
+        let empty = ferrum_dns::record::ZoneListing::default();
+        let desired = vec![DesiredRecord {
+            name: "plex.example.com".to_string(),
+            target: RecordTarget::A(HOST),
+        }];
+        let actions = ferrum_dns::record::plan(&desired, &empty);
+        assert_eq!(actions.len(), 1);
+        assert!(
+            matches!(actions[0], RecordAction::Create { .. }),
+            "an externally-constructed empty listing plans a Create with no \
+             way to know whether a foreign record already occupies the name \
+             in the real zone: {:?}",
+            actions[0]
         );
     }
 

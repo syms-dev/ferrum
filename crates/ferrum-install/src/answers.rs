@@ -8,12 +8,16 @@ use crate::address::{self, Detected};
 use crate::prompt::PromptIo;
 use crate::sso::{self, SsoDecision};
 
-// Every app in ferrum's catalog. Must stay on ONE line: nix/modules/flake/
-// checks.nix does a line lookup against it, the same way it does for
-// forms.js's SUPPORTED_TYPES, because Nix's regex engine rejects the
-// bracket-negation forms a multi-line parse would need. That check is what
-// stops this list drifting from modules/lib/catalog.nix -- a drift whose
+// Every app in ferrum's catalog. nix/modules/flake/checks.nix reads this
+// declaration as source text -- from this line down to the `];` -- and
+// fails the build if it drifts from modules/lib/catalog.nix, a drift whose
 // symptom is an app the operator simply cannot install.
+//
+// This comment used to require the literal stay on ONE line, which rustfmt
+// does not permit at this width and duly overrode. The check read only the
+// opening line, found no names on it, and was red for every app at once --
+// so keep the *shape* readable to a text reader (one `"name",` per line,
+// closed by `];`) rather than trying to win an argument with the formatter.
 pub const CATALOG_APPS: &[&str] = &[
     "jellyfin",
     "plex",

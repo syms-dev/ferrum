@@ -33,7 +33,11 @@
 //!    did not create is [`RecordAction::SkipForeign`] and is rendered
 //!    loudly; a record that already matches is `Unchanged` and is rendered
 //!    quietly. "I am leaving this alone because it is not mine" and "this
-//!    is already right" lead to opposite operator actions.
+//!    is already right" lead to opposite operator actions. The same holds
+//!    for a foreign record sitting *beside* one of ferrum's at the same
+//!    name ([`RecordAction::SkipForeignBeside`]): ferrum's own line there
+//!    says `unchanged`, which on its own reads as a clean plan while half
+//!    the requests for that name reach a host ferrum never mentioned.
 //! 3. Let the operator believe every hostname will answer. Two caveats are
 //!    emitted verbatim -- [`SPLIT_HORIZON_CAVEAT`] and
 //!    [`daemon_record_caveat`] -- in both the dry run and the final report.
@@ -262,6 +266,27 @@ impl DryRun {
 /// and something is published -- with the daemon's own subdomain added per
 /// A1 and the owner's H-01 option-C ruling.
 ///
+/// **This is the one place that names a record before the host exists**, so
+/// it is also the one place that can name a *different* record than the
+/// host will. `modules/proxy/dns.nix` decides the same set from
+/// `modules/proxy/lib.nix`'s `vhostNameFor`, which is
+/// `<subdomain>.<baseDomain>`; the names below are `<id>.<baseDomain>`.
+/// Those agree only while every catalog app's `defaultSubdomain` equals its
+/// id, which is not left to chance: `checks.installer-offers-every-catalog-app`
+/// (`nix/modules/flake/checks.nix`, run by CI's cheap-checks job) fails the
+/// build the moment one does not. The failure that assertion prevents is
+/// specific -- the dry run would list, and offer for adoption, a name the
+/// apply never touches, so a foreign record at the *real* name would be
+/// invisible here and silently overwritten later. That is the
+/// `auth.thesyms.ca` shape of defect, one layer quieter.
+///
+/// The daemon record is unconditional here while `modules/proxy/dns.nix`
+/// gates it on `ferrum.daemon.dns.includeRecord`. They agree for every host
+/// this function can describe: that option defaults to `true`, the
+/// installer writes no `daemon` settings at all (`render::settings`), and
+/// no prompt or flag can reach it. Teaching the installer to set it means
+/// teaching this function to read it.
+///
 /// # Arguments
 /// * `base_domain` - `ferrum.proxy.baseDomain`.
 /// * `answers` - the operator's answers, for the app list and SSO choice.
@@ -463,6 +488,7 @@ fn action_name(action: &RecordAction) -> &str {
         | RecordAction::Delete { name, .. }
         | RecordAction::Adopt { name, .. }
         | RecordAction::SkipForeign { name, .. }
+        | RecordAction::SkipForeignBeside { name, .. }
         | RecordAction::SkipUnmodelledType { name, .. } => name,
     }
 }
@@ -531,6 +557,24 @@ fn render_action(action: &RecordAction, name_width: usize) -> String {
              and will not touch it.\n  {:<ACTION_WIDTH$} {:<name_width$}  it points at \
              {current}; ferrum wanted {wanted}.\n",
             "SKIPPED", "", ""
+        ),
+        // The other "also here" line, and the wording is the whole point of
+        // keeping it separate from the one below. Both say a second record
+        // answers at this name; they differ in what the operator can do
+        // about it. This one is a record ferrum *could* manage and did not
+        // create, so the reason it survives is ownership (A3) -- the
+        // operator can delete it, or re-run the installer and adopt the
+        // name. The one below is a type ferrum has no model for, which no
+        // decision here can change. Collapsing them into one sentence would
+        // tell an operator with a stray A record that ferrum cannot manage
+        // A records.
+        RecordAction::SkipForeignBeside { name, current } => format!(
+            "  {:<ACTION_WIDTH$} {name:<name_width$}  another record you own also answers \
+             here, pointing at\n  {:<ACTION_WIDTH$} {:<name_width$}  {current}. ferrum did \
+             NOT create it and will not touch it, so\n  {:<ACTION_WIDTH$} {:<name_width$}  \
+             some requests for this name will reach that address and\n  \
+             {:<ACTION_WIDTH$} {:<name_width$}  some will reach this server.\n",
+            "ALSO YOURS", "", "", "", "", "", ""
         ),
         // An extra line beside this name's own, never instead of it. The
         // case that makes it worth the noise is an existing AAAA: ferrum
@@ -873,6 +917,110 @@ mod tests {
              adopt: {:?}",
             plan.foreign()
         );
+    }
+
+    /// The case the type-based disclosure above did **not** cover: a record
+    /// ferrum does not own at the same name *and* the same type as one it
+    /// does. Nothing touches it -- A3/A4 held all along -- but until this
+    /// test the plan said only `unchanged` for that name, which is what a
+    /// hostname that resolves correctly every time also looks like. In fact
+    /// Cloudflare round-robins the two, so it resolves correctly about half
+    /// the time, and nothing ferrum printed said so.
+    #[test]
+    fn a_foreign_record_at_the_same_name_and_type_as_ferrums_is_disclosed() {
+        let fake = fake_with(serde_json::json!([
+            record("mine", "plex.thesyms.ca", "203.0.113.7", true),
+            record("theirs", "plex.thesyms.ca", "198.51.100.9", false),
+        ]));
+        let a = answers(&["plex"]);
+        let plan = dry_run("thesyms.ca", &a, a.dns.as_ref().unwrap(), &against(&fake)).unwrap();
+        let rendered = render(&plan);
+
+        assert!(
+            rendered.contains("ALSO YOURS"),
+            "the operator's other record must be visible: {rendered}"
+        );
+        assert!(
+            rendered.contains("another record you own also answers here"),
+            "the disclosure must say what it is: {rendered}"
+        );
+        assert!(
+            rendered.contains("198.51.100.9"),
+            "the operator must see where their own record points: {rendered}"
+        );
+        assert!(
+            rendered.contains("ferrum did NOT create it and will not touch it"),
+            "the reason it survives is ownership, and that must be said: {rendered}"
+        );
+        assert!(
+            rendered.contains("unchanged  plex.thesyms.ca"),
+            "ferrum's own record is still reported on its own terms: {rendered}"
+        );
+    }
+
+    /// The two "there is something else here" lines must not read as the
+    /// same sentence. One is a record an operator can delete or adopt; the
+    /// other is a type no decision of theirs can make ferrum manage.
+    /// Collapsing them would tell an operator with a stray `A` record that
+    /// ferrum cannot manage `A` records.
+    #[test]
+    fn the_two_disclosures_do_not_describe_themselves_the_same_way() {
+        let fake = fake_with(serde_json::json!([
+            record("mine", "plex.thesyms.ca", "203.0.113.7", true),
+            record("theirs", "plex.thesyms.ca", "198.51.100.9", false),
+            {
+                "id": "theirs-v6",
+                "name": "plex.thesyms.ca",
+                "type": "AAAA",
+                "content": "2001:db8::1",
+                "proxied": false,
+            },
+        ]));
+        let a = answers(&["plex"]);
+        let plan = dry_run("thesyms.ca", &a, a.dns.as_ref().unwrap(), &against(&fake)).unwrap();
+        let rendered = render(&plan);
+
+        assert!(
+            rendered.contains("a AAAA record also answers here"),
+            "the unmodelled type keeps its own wording: {rendered}"
+        );
+        assert!(
+            rendered.contains("another record you own also answers here"),
+            "the foreign record of a managed type keeps its own: {rendered}"
+        );
+        assert!(
+            rendered.contains("ferrum does not"),
+            "only the unmodelled line claims ferrum cannot manage the type: {rendered}"
+        );
+    }
+
+    /// Disclosure is not an adoption offer. A3's opt-in is for a name ferrum
+    /// **cannot publish** because the operator's record holds it; here
+    /// ferrum's own record already exists, so there is nothing to hand over
+    /// -- and widening the adoption path to reach this record would turn a
+    /// reporting gap into a permissions one.
+    #[test]
+    fn a_disclosed_foreign_record_is_not_offered_for_adoption() {
+        let fake = fake_with(serde_json::json!([
+            record("mine", "plex.thesyms.ca", "203.0.113.7", true),
+            record("theirs", "plex.thesyms.ca", "198.51.100.9", false),
+        ]));
+        let a = answers(&["plex"]);
+        let plan = dry_run("thesyms.ca", &a, a.dns.as_ref().unwrap(), &against(&fake)).unwrap();
+        assert!(
+            plan.foreign().is_empty(),
+            "nothing here is the operator's to hand over: {:?}",
+            plan.foreign()
+        );
+
+        // And therefore the gate asks nothing. A `Scripted` with no answers
+        // panics if one is requested, which is the assertion.
+        let fake = fake_with(serde_json::json!([
+            record("mine", "plex.thesyms.ca", "203.0.113.7", true),
+            record("theirs", "plex.thesyms.ca", "198.51.100.9", false),
+        ]));
+        let outcome = gate(&a, &against(&fake), &mut Scripted::new(&[])).unwrap();
+        assert_eq!(outcome, Adoption::none());
     }
 
     /// A6, at the first of its two emission sites.
