@@ -102,8 +102,21 @@ let
     (id: app: mkRecord "app:${id}" (vhostNameFor app))
     publicApps;
 
+  # Mirrors modules/proxy/acme.nix's own condition for the auth certificate
+  # -- `ferrum.auth.enable && realCertsNeeded`, where realCertsNeeded is
+  # `publicApps != { } || daemonPublished`. R13 widened the certificate side
+  # of that and left this one keyed on the app catalog, which put the two
+  # halves of the same fact back out of step: a host publishing only the
+  # dashboard, with every app at lan/local, got a valid certificate for
+  # auth.<baseDomain> and no record for it. Authelia then redirects the
+  # browser to a name that does not resolve, so nobody can log in and the
+  # dashboard R13 exists to publish is unreachable. A working certificate on
+  # a name that does not resolve is the incident this whole file exists to
+  # prevent, and it had come back one condition over.
+  daemonPublished = proxyLib.daemonPublished ferrum;
+
   authRecords = lib.optional
-    (ferrum.auth.enable && publicApps != { })
+    (ferrum.auth.enable && (publicApps != { } || daemonPublished))
     (mkRecord "auth" "auth.${baseDomain}");
 
   daemonRecords = lib.optional

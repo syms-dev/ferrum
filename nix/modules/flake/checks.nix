@@ -976,9 +976,11 @@
       #     hand an external client a self-signed handshake before nginx
       #     denies them -- publishing the very thing the LAN restriction
       #     exists to prevent.
-      #   * auth.<baseDomain> appears exactly when ferrum.auth.enable does,
-      #     mirroring acme.nix's own condition. A certificate for a name that
-      #     does not resolve is the incident R1 exists to fix.
+      #   * auth.<baseDomain> appears exactly when acme.nix issues its
+      #     certificate -- ferrum.auth.enable && (a public app OR the
+      #     published dashboard) -- because a certificate for a name that
+      #     does not resolve is the incident R1 exists to fix, and the two
+      #     conditions had already drifted apart once.
       #   * the daemon's own record is present (owner ruling H-01, option C).
       #   * EVERY record carries proxied = false (D-05). Cloudflare's orange
       #     cloud makes every request arrive from a Cloudflare edge address,
@@ -990,7 +992,15 @@
       # than the disk-hungry eval-example-hosts below.
       dnsRecordSet =
         let
-          mkDnsHost = { auth }: ferrumLib.mkHost {
+          # `apps` is a parameter because the record set has to be proven on
+          # a host with NO public app as well as on one with an app: that is
+          # the configuration on which the auth record and the auth
+          # certificate disagreed.
+          mkDnsHost = { auth, apps ? {
+            # Deliberately `lan`: this is the app that must NOT appear.
+            sonarr = { enable = true; exposure = "lan"; };
+            radarr.enable = true;
+          } }: ferrumLib.mkHost {
             inherit system;
             settings = {
               schemaVersion = realMigrations.currentVersion;
@@ -1005,25 +1015,31 @@
                 };
               };
               auth.enable = auth;
-              apps = {
-                # Deliberately `lan`: this is the app that must NOT appear.
-                sonarr = { enable = true; exposure = "lan"; };
-                radarr.enable = true;
-              };
+              inherit apps;
             };
             modules = [ ../../../examples/hosts/minimal/configuration.nix ];
           };
           withAuth = (mkDnsHost { auth = true; }).config.system.build.ferrumDnsConfig;
           withoutAuth = (mkDnsHost { auth = false; }).config.system.build.ferrumDnsConfig;
+          # The dashboard-only host: SSO on, and every catalog app left at
+          # lan, so publicApps == { }. modules/proxy/lib.nix calls this "the
+          # safest configuration available", and it is the one where an
+          # app-keyed condition silently stops describing reality.
+          dashboardOnly = (mkDnsHost {
+            auth = true;
+            apps = { sonarr = { enable = true; exposure = "lan"; }; };
+          }).config.system.build.ferrumDnsConfig;
         in
         pkgs.runCommand "ferrum-check-dns-record-set" { } ''
           set -eu
           with_auth=${withAuth}
           without_auth=${withoutAuth}
+          dashboard_only=${dashboardOnly}
           fail() {
             echo "dns record-set check: $1" >&2
             echo "--- with auth ---" >&2; cat "$with_auth" >&2
             echo "--- without auth ---" >&2; cat "$without_auth" >&2
+            echo "--- dashboard only ---" >&2; cat "$dashboard_only" >&2
             exit 1
           }
 
@@ -1047,7 +1063,25 @@
             "$with_auth" > /dev/null \
             || fail "the daemon record is missing (owner ruling H-01, option C)"
 
-          for cfg in "$with_auth" "$without_auth"; do
+          # The dashboard-only host. Its auth certificate is issued
+          # (acme.nix gates that on publicApps != { } || daemonPublished),
+          # so without the matching record Authelia redirects the browser to
+          # a hostname that does not resolve: a valid certificate on a dead
+          # name, and no way to log in to the dashboard the host exists to
+          # publish.
+          ${pkgs.jq}/bin/jq -e '[.records[] | select(.source | startswith("app:"))] | length == 0' \
+            "$dashboard_only" > /dev/null \
+            || fail "the dashboard-only fixture has a public app record, so it no longer tests the publicApps == { } case at all"
+
+          ${pkgs.jq}/bin/jq -e '.records[] | select(.source == "auth") | select(.name == "auth.example.invalid")' \
+            "$dashboard_only" > /dev/null \
+            || fail "a host that publishes only the dashboard has no auth.example.invalid record, while acme.nix issues its certificate -- Authelia would redirect the browser to a name that does not resolve"
+
+          ${pkgs.jq}/bin/jq -e '.records[] | select(.source == "daemon") | select(.name == "ferrum.example.invalid")' \
+            "$dashboard_only" > /dev/null \
+            || fail "the dashboard-only host has no record for the dashboard itself"
+
+          for cfg in "$with_auth" "$without_auth" "$dashboard_only"; do
             ${pkgs.jq}/bin/jq -e '(.records | length) > 0 and all(.records[]; .proxied == false)' \
               "$cfg" > /dev/null \
               || fail "a record is proxied -- orange-cloud proxying makes every request arrive from a Cloudflare edge address"
