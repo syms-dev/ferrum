@@ -389,6 +389,16 @@ pub enum Operation {
     /// `SkipUnmodelledType`'s: an operator can remove this one, or adopt the
     /// name, and neither is true of a type ferrum cannot manage.
     SkipForeignBeside,
+    /// Not a record at all: Cloudflare is not answering for this zone, so
+    /// every other line in the report describes a write that succeeded and
+    /// changed nothing anyone can see.
+    ///
+    /// Carried as an entry rather than a field on the report so that every
+    /// renderer already in place -- the `reconcile-dns` breakdown, the apply
+    /// disclosure stream -- shows it without being taught to. A zone
+    /// disclosure that only one of two readers prints is the defect this
+    /// variant exists to close.
+    ZoneNotServing,
 }
 
 impl Operation {
@@ -404,7 +414,30 @@ impl Operation {
             Operation::Adopt => "adopt (was yours, you handed it over)",
             Operation::SkipUnmodelledType => "also here (a type ferrum does not manage)",
             Operation::SkipForeignBeside => "also here (a record ferrum does not own)",
+            Operation::ZoneNotServing => "NOT PUBLISHED (Cloudflare is not answering for this zone)",
         }
+    }
+
+    /// Whether this operation is something the operator must be *told*
+    /// rather than something that either worked or failed.
+    ///
+    /// The distinction is load-bearing and it is the reason this method
+    /// exists rather than the callers each filtering by variant. A
+    /// disclosure is clean -- it must never degrade an apply, because a
+    /// deliberately skipped foreign record is a planned outcome and an
+    /// apply that warns forever is an apply nobody reads. But it is also
+    /// not nothing: a foreign record at an app's hostname means that app is
+    /// dead at its ferrum name, and an operator who is never told that has
+    /// a mystery instead of a fact.
+    #[must_use]
+    pub fn is_disclosure(self) -> bool {
+        matches!(
+            self,
+            Operation::SkipForeign
+                | Operation::SkipForeignBeside
+                | Operation::SkipUnmodelledType
+                | Operation::ZoneNotServing
+        )
     }
 }
 
@@ -483,6 +516,21 @@ impl ReconcileReport {
             self.records.len(),
             failed.join("; ")
         ))
+    }
+
+    /// The entries that did not fail but that the operator still has to
+    /// hear about.
+    ///
+    /// # Returns
+    /// Every clean entry whose operation [`Operation::is_disclosure`]
+    /// reports, in plan order. Empty on the ordinary run, which is what
+    /// lets a caller emit these unconditionally without adding noise.
+    #[must_use]
+    pub fn disclosures(&self) -> Vec<&RecordReport> {
+        self.records
+            .iter()
+            .filter(|r| r.failure.is_none() && r.operation.is_disclosure())
+            .collect()
     }
 
     /// Every entry, one per line, for a human running the subcommand.
@@ -639,20 +687,39 @@ pub fn reconcile_with(
         })
         .collect();
 
-    let zone = client.resolve_zone(&config.base_domain)?;
+    let resolved = client.resolve_zone(&config.base_domain)?;
+    let zone = &resolved.zone;
     // Deliberately `list_records` + `plan_with_adoptions` rather than
     // `Client::plan_records`: the latter plans with no adoptions, which is
     // the right default for every other caller and the wrong one here. The
     // listing is still the single source of truth -- ownership is re-derived
     // from it on every run, and the adopted list only widens what the plan
     // may do to names the operator named.
-    let existing = client.list_records(&zone)?;
+    let existing = client.list_records(zone)?;
     let actions = plan_with_adoptions(&desired, &existing, &AdoptedNames::recorded(&config.adopted_names));
 
-    let records = actions
+    let mut records: Vec<RecordReport> = actions
         .into_iter()
-        .map(|action| execute(client, &zone, verify, action))
+        .map(|action| execute(client, zone, verify, action))
         .collect();
+
+    // First, not last. Every line below it describes a write that will
+    // succeed, and reading those as good news is the whole failure: the
+    // zone answers ferrum correctly and answers the internet not at all.
+    // Not a failure either -- the writes really did succeed, the records
+    // really are right, and the fix is in the operator's registrar rather
+    // than on this host.
+    if let Some(detail) = resolved.advisory(&config.base_domain) {
+        records.insert(
+            0,
+            RecordReport {
+                name: resolved.zone.name.clone(),
+                operation: Operation::ZoneNotServing,
+                failure: None,
+                note: Some(detail),
+            },
+        );
+    }
 
     Ok(ReconcileReport {
         records,
@@ -872,15 +939,81 @@ pub fn reconcile_for_apply(
     toplevel: &str,
     progress: &mut crate::progress::Progress,
 ) -> Option<String> {
+    reconcile_for_apply_with(
+        toplevel,
+        progress,
+        &cloudflare_client,
+        &authoritative_verifier,
+    )
+}
+
+/// [`reconcile_for_apply`] with its two production dependencies injected.
+///
+/// The seam exists because the function above had none, and that is exactly
+/// why the defect it now fixes survived three reviews: every test asserted
+/// on the in-memory [`ReconcileReport`], and the step that decided what an
+/// operator actually sees had no test at all. The sandbox running this
+/// suite has no network, so the real client and the real `dig`-based
+/// verifier cannot appear in a test -- without this parameterisation there
+/// is nothing to drive.
+///
+/// # Arguments
+/// * `toplevel` - the system closure holding the document.
+/// * `progress` - the job stream the operator's dashboard tails.
+/// * `make_client` - how Cloudflare is reached.
+/// * `verify` - how a written record is proved to resolve.
+///
+/// # Returns
+/// The same as [`reconcile_for_apply`]: `Some(reason)` only when the apply
+/// must be degraded.
+fn reconcile_for_apply_with(
+    toplevel: &str,
+    progress: &mut crate::progress::Progress,
+    make_client: ClientFactory<'_>,
+    verify: Verifier<'_>,
+) -> Option<String> {
     let path = Path::new(toplevel).join(CONFIG_IN_CLOSURE);
     if !path.exists() {
         return None;
     }
     progress.event("dns", "reconciling the DNS records for published apps");
-    match run(&path, &cloudflare_client, &authoritative_verifier) {
+    match run(&path, make_client, verify) {
         Ok(None) => None,
-        Ok(Some(report)) => report.failure_summary(),
+        Ok(Some(report)) => {
+            disclose(&report, progress);
+            report.failure_summary()
+        }
         Err(e) => Some(format!("DNS records could not be reconciled: {e}")),
+    }
+}
+
+/// Puts the report's non-failing disclosures where an operator will see
+/// them.
+///
+/// Before this existed the apply path called `failure_summary()` and
+/// nothing else, so a foreign record at an app's hostname produced
+/// `Succeeded`, one progress line, a dead app and not one sentence saying
+/// why. The disclosures were computed correctly on every run and thrown
+/// away at the last step.
+///
+/// Two channels because there are two ways an apply is watched and they do
+/// not overlap: `progress` is the JSONL stream ferrumd tails for the
+/// dashboard, and it writes nothing at all when the run has no job id --
+/// which is precisely the hand-run `ferrum-apply apply` over SSH, where
+/// stderr is what the operator and the journal have.
+///
+/// Deliberately not folded into the returned reason: that value degrades
+/// the apply, and a planned skip is not a fault. See
+/// [`Operation::is_disclosure`].
+///
+/// # Arguments
+/// * `report` - the finished reconcile report.
+/// * `progress` - the job stream.
+fn disclose(report: &ReconcileReport, progress: &mut crate::progress::Progress) {
+    for entry in report.disclosures() {
+        let line = entry.to_string();
+        progress.event("dns-disclosure", &line);
+        eprintln!("ferrum-apply dns: {line}");
     }
 }
 
@@ -1001,6 +1134,216 @@ mod tests {
         let path = dir.path().join("acme-dns");
         fs::write(&path, content).expect("write the fixture credential");
         path
+    }
+
+    /// A fake system closure carrying the document an apply would read,
+    /// pointed at a credential file that exists.
+    ///
+    /// # Returns
+    /// The closure root, for [`reconcile_for_apply_with`]'s `toplevel`.
+    fn closure_with_document(
+        dir: &tempfile::TempDir,
+        records: &[(&str, &str)],
+    ) -> PathBuf {
+        let credential = write_credential(dir, "CLOUDFLARE_DNS_API_TOKEN=abc123\n");
+        let mut value: serde_json::Value =
+            serde_json::from_str(&config_json(records, true)).expect("the document parses");
+        value["credentialFile"] = serde_json::json!(credential);
+
+        let toplevel = dir.path().join("closure");
+        let config_path = toplevel.join(CONFIG_IN_CLOSURE);
+        fs::create_dir_all(config_path.parent().expect("a parent")).expect("mkdir");
+        fs::write(&config_path, value.to_string()).expect("write the document");
+        toplevel
+    }
+
+    /// Every `dns-disclosure` line the apply wrote to its job stream.
+    fn disclosures_written(progress_path: &Path) -> Vec<String> {
+        let raw = fs::read_to_string(progress_path).unwrap_or_default();
+        raw.lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|event| event["event"] == "dns-disclosure")
+            .map(|event| event["detail"].as_str().unwrap_or_default().to_string())
+            .collect()
+    }
+
+    // ---- the apply path's own output (not the in-memory report) ---------
+
+    /// DA-TC-01, and the reason it survived three reviews: every other
+    /// test in this file asserts on the [`ReconcileReport`] that
+    /// `reconcile_for_apply` then throws away. `is_clean` treats a skipped
+    /// foreign record as clean -- correctly, it is not a failure -- so
+    /// `failure_summary()` returns `None` and the whole disclosure went
+    /// nowhere. An operator enabling an app whose hostname is already
+    /// occupied got `Succeeded`, a dead app, and not one sentence saying
+    /// why.
+    ///
+    /// Mutation check: drop the `disclose(&report, progress)` call from
+    /// `reconcile_for_apply_with` and this test fails on the empty
+    /// disclosure list.
+    #[test]
+    fn an_apply_that_skipped_a_foreign_record_says_so_where_the_operator_can_see_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = fake_zone(serde_json::json!([record_json(
+            "r1",
+            "plex.example.com",
+            "198.51.100.9",
+            false
+        )]));
+        let toplevel = closure_with_document(&dir, &[("plex.example.com", "app:plex")]);
+        let progress_path = dir.path().join("job.jsonl");
+        let mut progress = crate::progress::Progress::to_path(&progress_path);
+
+        let degraded = reconcile_for_apply_with(
+            toplevel.to_str().expect("utf-8"),
+            &mut progress,
+            &|_| client_for(&fake),
+            &always_matches,
+        );
+
+        assert_eq!(
+            degraded, None,
+            "a record left alone on purpose is not a fault and must not degrade the apply"
+        );
+        let disclosed = disclosures_written(&progress_path);
+        assert_eq!(disclosed.len(), 1, "{disclosed:?}");
+        assert!(disclosed[0].contains("plex.example.com"), "{disclosed:?}");
+        assert!(disclosed[0].contains("198.51.100.9"), "{disclosed:?}");
+        assert!(
+            disclosed[0].contains("ferrum did not create it"),
+            "{disclosed:?}"
+        );
+    }
+
+    /// The complement, and the reason this is a disclosure channel rather
+    /// than a warning: an apply with nothing to disclose must stay silent,
+    /// or the line stops being read on the run that carries one.
+    #[test]
+    fn an_ordinary_apply_discloses_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = fake_zone(serde_json::json!([record_json(
+            "r1",
+            "plex.example.com",
+            "203.0.113.7",
+            true
+        )]));
+        let toplevel = closure_with_document(&dir, &[("plex.example.com", "app:plex")]);
+        let progress_path = dir.path().join("job.jsonl");
+        let mut progress = crate::progress::Progress::to_path(&progress_path);
+
+        assert_eq!(
+            reconcile_for_apply_with(
+                toplevel.to_str().expect("utf-8"),
+                &mut progress,
+                &|_| client_for(&fake),
+                &always_matches,
+            ),
+            None
+        );
+        assert!(disclosures_written(&progress_path).is_empty());
+    }
+
+    /// DA-TC-02 on the apply path. The install-time gate is the first line
+    /// of defence, but a host that was installed while its zone was active
+    /// and later had it moved would otherwise reconcile happily forever.
+    ///
+    /// Mutation check: make `ResolvedZone::advisory` return `None` for a
+    /// pending zone (or drop the `Operation::ZoneNotServing` insert in
+    /// `reconcile_with`) and this test fails.
+    #[test]
+    fn an_apply_into_a_zone_cloudflare_is_not_serving_says_so_rather_than_reporting_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = FakeCloudflare::start();
+        fake.script(
+            Route::get("/zones"),
+            CannedResponse::ok(serde_json::json!([{
+                "id": "z1",
+                "name": "example.com",
+                "status": "pending",
+                "name_servers": ["amber.ns.cloudflare.com"],
+            }])),
+        );
+        for _ in 0..2 {
+            fake.script(
+                Route::get("/zones/z1/dns_records"),
+                CannedResponse::ok(serde_json::json!([])),
+            );
+        }
+        fake.script(
+            Route::post("/zones/z1/dns_records"),
+            CannedResponse::ok(record_json("r1", "plex.example.com", "203.0.113.7", true)),
+        );
+
+        let toplevel = closure_with_document(&dir, &[("plex.example.com", "app:plex")]);
+        let progress_path = dir.path().join("job.jsonl");
+        let mut progress = crate::progress::Progress::to_path(&progress_path);
+
+        let degraded = reconcile_for_apply_with(
+            toplevel.to_str().expect("utf-8"),
+            &mut progress,
+            &|_| client_for(&fake),
+            &always_matches,
+        );
+
+        assert_eq!(
+            degraded, None,
+            "the records really were written; the fix is at the registrar, not on this host"
+        );
+        let disclosed = disclosures_written(&progress_path);
+        assert_eq!(disclosed.len(), 1, "{disclosed:?}");
+        assert!(disclosed[0].contains("NOT PUBLISHED"), "{disclosed:?}");
+        assert!(disclosed[0].contains("pending"), "{disclosed:?}");
+        assert!(disclosed[0].contains("registrar"), "{disclosed:?}");
+        assert!(
+            disclosed[0].contains("amber.ns.cloudflare.com"),
+            "{disclosed:?}"
+        );
+    }
+
+    /// `reconcile-dns`'s own renderer must carry the zone disclosure too:
+    /// the timer that runs it is the only thing looking at a host between
+    /// applies.
+    #[test]
+    fn the_subcommand_breakdown_also_names_a_zone_cloudflare_is_not_serving() {
+        let fake = FakeCloudflare::start();
+        fake.script(
+            Route::get("/zones"),
+            CannedResponse::ok(serde_json::json!([{
+                "id": "z1",
+                "name": "example.com",
+                "status": "moved",
+                "name_servers": ["amber.ns.cloudflare.com"],
+            }])),
+        );
+        for _ in 0..2 {
+            fake.script(
+                Route::get("/zones/z1/dns_records"),
+                CannedResponse::ok(serde_json::json!([])),
+            );
+        }
+        fake.script(
+            Route::post("/zones/z1/dns_records"),
+            CannedResponse::ok(record_json("r1", "plex.example.com", "203.0.113.7", true)),
+        );
+
+        let report = reconcile_with(
+            &parsed(&[("plex.example.com", "app:plex")]),
+            &client_for(&fake),
+            &always_matches,
+        )
+        .expect("the reconcile runs");
+
+        assert!(
+            report.is_clean(),
+            "the writes succeeded; the zone is the operator's problem, not a record failure"
+        );
+        let rendered = report.full_summary();
+        assert!(rendered.contains("NOT PUBLISHED"), "{rendered}");
+        assert!(rendered.contains("moved"), "{rendered}");
+        assert!(
+            rendered.contains("waiting does not change that"),
+            "{rendered}"
+        );
     }
 
     // ---- the document ---------------------------------------------------

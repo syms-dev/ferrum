@@ -42,11 +42,19 @@
 //!    emitted verbatim -- [`SPLIT_HORIZON_CAVEAT`] and
 //!    [`daemon_record_caveat`] -- in both the dry run and the final report.
 //!    Both are fixed strings precisely so a test can assert them and a
-//!    regression cannot quietly reword one out of existence.
+//!    regression cannot quietly reword one out of existence. The third
+//!    case is the zone's own Cloudflare status: a zone sitting at `pending`
+//!    because the registrar's nameservers were never switched accepts every
+//!    write, answers correctly when asked directly, and resolves nowhere
+//!    for the rest of the internet. That is `auth.thesyms.ca` exactly, so
+//!    this gate refuses a zone Cloudflare will never serve and shouts about
+//!    one it does not serve *yet* -- here, while the disk is still intact,
+//!    rather than in a final report that says success.
 
 use ferrum_dns::client::Client;
 use ferrum_dns::record::{DesiredRecord, RecordAction};
-use ferrum_dns::{CloudflareError, Zone};
+use ferrum_dns::zone::{ResolvedZone, ZoneService};
+use ferrum_dns::CloudflareError;
 
 use crate::answers::{Answers, ClientFactory, DnsDecision, RecordTarget};
 use crate::prompt::PromptIo;
@@ -134,6 +142,24 @@ pub enum GateError {
         /// token.
         cause: CloudflareError,
     },
+    /// Cloudflare holds the zone but will never answer for it -- it has
+    /// been moved, deleted or deactivated.
+    ///
+    /// A refusal rather than a warning for the same reason
+    /// [`CloudflareError::ZoneDelegated`] is: every write would be accepted
+    /// and not one name would resolve, and unlike a `pending` zone no
+    /// amount of waiting changes it. `pending` is deliberately *not* here:
+    /// an operator who has already switched their registrar and is waiting
+    /// for propagation has a legitimate install, so that case is disclosed
+    /// loudly in [`render`] instead of blocked.
+    ZoneNotServing {
+        /// The domain whose records could not be planned.
+        base_domain: String,
+        /// The whole operator-facing sentence, from
+        /// [`ResolvedZone::advisory`], so the installer and the apply
+        /// describe the same condition the same way.
+        detail: String,
+    },
 }
 
 impl std::fmt::Display for GateError {
@@ -163,6 +189,16 @@ impl std::fmt::Display for GateError {
                  changed, in Cloudflare or on the target. This is a refusal rather than an \
                  empty plan on purpose: a listing that failed and a zone with nothing to do \
                  look the same, and only one of them means ferrum will publish your apps."
+            ),
+            GateError::ZoneNotServing {
+                base_domain,
+                detail,
+            } => write!(
+                f,
+                "refusing to plan DNS for {base_domain}: {detail} Nothing has been changed, \
+                 in Cloudflare or on the target. This is refused rather than attempted \
+                 because the attempt would succeed: every record would be written, the \
+                 install would report success, and not one hostname would answer."
             ),
         }
     }
@@ -235,6 +271,14 @@ pub struct DryRun {
     pub target: String,
     /// The plan, exactly as [`ferrum_dns::record::plan`] computed it.
     pub actions: Vec<RecordAction>,
+    /// `Some` when Cloudflare does not serve this zone yet, carrying the
+    /// sentence [`ResolvedZone::advisory`] produced.
+    ///
+    /// Carried on the plan rather than printed at the point it is
+    /// discovered so that the one renderer the operator actually reads owns
+    /// every caveat -- a warning emitted somewhere else is a warning that
+    /// scrolls off the top of the screen before the plan appears.
+    pub zone_not_serving_yet: Option<String>,
 }
 
 impl DryRun {
@@ -391,16 +435,36 @@ pub fn dry_run(
     make_client: ClientFactory<'_>,
 ) -> Result<DryRun, GateError> {
     let client: Client = make_client(credential(answers, base_domain)?);
-    let zone: Zone = client
-        .resolve_zone(base_domain)
-        .map_err(|cause| GateError::Cloudflare {
-            base_domain: base_domain.to_string(),
-            cause,
-        })?;
+    let resolved: ResolvedZone =
+        client
+            .resolve_zone(base_domain)
+            .map_err(|cause| GateError::Cloudflare {
+                base_domain: base_domain.to_string(),
+                cause,
+            })?;
+
+    // The status split, and the reason it is a split rather than one rule:
+    // a zone Cloudflare will never serve is a decision the operator has to
+    // change, while a zone it does not serve *yet* is one they may already
+    // have changed and be waiting on. Refusing both would block a
+    // legitimate install mid-propagation; passing both silently is the
+    // defect this check exists for.
+    let zone_not_serving_yet = match resolved.status.service() {
+        ZoneService::Serving => None,
+        ZoneService::NotYetServing => resolved.advisory(base_domain),
+        ZoneService::NeverServing => {
+            return Err(GateError::ZoneNotServing {
+                base_domain: base_domain.to_string(),
+                detail: resolved
+                    .advisory(base_domain)
+                    .unwrap_or_else(|| format!("Cloudflare reports it as {}", resolved.status)),
+            })
+        }
+    };
 
     let desired = desired_records(base_domain, answers, dns);
     let actions = client
-        .plan_records(&zone, &desired)
+        .plan_records(&resolved.zone, &desired)
         .map_err(|cause| GateError::Cloudflare {
             base_domain: base_domain.to_string(),
             cause,
@@ -408,9 +472,10 @@ pub fn dry_run(
 
     Ok(DryRun {
         base_domain: base_domain.to_string(),
-        zone_name: zone.name,
+        zone_name: resolved.zone.name,
         target: describe_target(&dns.target),
         actions,
+        zone_not_serving_yet,
     })
 }
 
@@ -476,6 +541,23 @@ pub fn render(plan: &DryRun) -> String {
         "  note: {}\n",
         daemon_record_caveat(&plan.base_domain)
     ));
+
+    // Last, and shouted, because it is the only line here that means none
+    // of the rows above will do anything for anybody. Its own block rather
+    // than a third `note:` for exactly that reason: the two notes above
+    // describe a working install with a caveat, and this describes an
+    // install that publishes nothing.
+    if let Some(detail) = &plan.zone_not_serving_yet {
+        out.push('\n');
+        out.push_str("  NOT PUBLISHED YET -- Cloudflare is not answering for this domain.\n");
+        out.push_str(&format!("  {detail}\n"));
+        out.push_str(
+            "  Until that zone is active, every record above will be created correctly and\n  \
+             none of these hostnames will resolve for anyone, including you. The install\n  \
+             itself is unaffected and will finish; the names start working when the zone \
+             does.\n",
+        );
+    }
     out
 }
 
@@ -732,13 +814,25 @@ mod tests {
     /// it once for `NS` delegations and `plan_records` reads it again for
     /// the listing the plan is computed from.
     fn fake_with(records: serde_json::Value) -> FakeCloudflare {
+        fake_with_zone_status(records, "active")
+    }
+
+    /// The same fake, with Cloudflare's zone `status` set explicitly.
+    ///
+    /// The status is the one field that decides whether any of these
+    /// records will ever be seen by anybody, and it is invisible to every
+    /// other check in this crate: no `NS` record exists for the delegation
+    /// check to find, the writes all succeed, and a query aimed at
+    /// Cloudflare's own nameservers gets the right answer.
+    fn fake_with_zone_status(records: serde_json::Value, status: &str) -> FakeCloudflare {
         let fake = FakeCloudflare::start();
         fake.script(
             Route::get("/zones"),
             CannedResponse::ok(serde_json::json!([{
                 "id": "z1",
                 "name": "thesyms.ca",
-                "name_servers": ["amber.ns.cloudflare.com"],
+                "status": status,
+                "name_servers": ["amber.ns.cloudflare.com", "bob.ns.cloudflare.com"],
             }])),
         );
         fake.script(
@@ -1140,6 +1234,73 @@ mod tests {
         assert!(!message.contains(TEST_TOKEN), "never the token itself");
     }
 
+    // ---- the zone's own status (the parent incident, one door out) -----
+
+    /// The whole of this requirement, reproduced through the one door it
+    /// never checked. Zone in Cloudflare, registrar never switched, status
+    /// `pending`: resolution succeeds, the plan is correct, every write
+    /// would be accepted, and `auth.thesyms.ca` resolves for nobody. The
+    /// gate must say so here -- while the disk is intact -- not in a final
+    /// report that says success.
+    #[test]
+    fn a_pending_zone_is_shouted_about_in_the_plan_rather_than_passing_green() {
+        let fake = fake_with_zone_status(serde_json::json!([]), "pending");
+        let a = answers(&["plex"]);
+        let plan = dry_run("thesyms.ca", &a, a.dns.as_ref().unwrap(), &against(&fake))
+            .expect("a pending zone still plans -- it is a disclosure, not a refusal");
+
+        let detail = plan
+            .zone_not_serving_yet
+            .as_deref()
+            .expect("a pending zone must be carried on the plan");
+        assert!(detail.contains("pending"), "{detail}");
+
+        let rendered = render(&plan);
+        assert!(rendered.contains("NOT PUBLISHED YET"), "{rendered}");
+        assert!(rendered.contains("registrar"), "{rendered}");
+        assert!(
+            rendered.contains("amber.ns.cloudflare.com"),
+            "the operator must be told which nameservers to set: {rendered}"
+        );
+        assert!(
+            rendered.contains("none of these hostnames will resolve"),
+            "{rendered}"
+        );
+    }
+
+    /// An `active` zone is the ordinary case and must stay quiet: a caveat
+    /// printed on every install is a caveat nobody reads on the one install
+    /// that needed it.
+    #[test]
+    fn an_active_zone_adds_no_warning_at_all() {
+        let fake = fake_with(serde_json::json!([]));
+        let a = answers(&["plex"]);
+        let plan = dry_run("thesyms.ca", &a, a.dns.as_ref().unwrap(), &against(&fake))
+            .expect("an active zone plans");
+        assert_eq!(plan.zone_not_serving_yet, None);
+        assert!(!render(&plan).contains("NOT PUBLISHED YET"));
+    }
+
+    /// `deactivated` cannot become `active` by waiting, so this is the one
+    /// status shape that is refused outright -- the same reasoning as a
+    /// delegated zone, and the refusal lands before the disk is erased.
+    #[test]
+    fn a_zone_cloudflare_will_never_serve_is_refused_before_anything_is_erased() {
+        let fake = fake_with_zone_status(serde_json::json!([]), "deactivated");
+        let a = answers(&["plex"]);
+        let err = dry_run("thesyms.ca", &a, a.dns.as_ref().unwrap(), &against(&fake))
+            .expect_err("a deactivated zone publishes nothing");
+        let message = err.to_string();
+        assert!(matches!(err, GateError::ZoneNotServing { .. }), "{message}");
+        assert!(message.contains("deactivated"), "{message}");
+        assert!(message.contains("Nothing has been changed"), "{message}");
+        assert!(
+            message.contains("not one hostname would answer"),
+            "{message}"
+        );
+        assert!(!message.contains(TEST_TOKEN), "never the token itself");
+    }
+
     /// The other half of D-11's distinction: a listing that succeeded and
     /// found nothing to do says so in words, so it cannot be read as the
     /// failure above.
@@ -1150,6 +1311,7 @@ mod tests {
             zone_name: "thesyms.ca".to_string(),
             target: "A 203.0.113.7".to_string(),
             actions: Vec::new(),
+            zone_not_serving_yet: None,
         };
         let rendered = render(&plan);
         assert!(rendered.contains("nothing to change"), "{rendered}");

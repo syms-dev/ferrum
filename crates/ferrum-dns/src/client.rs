@@ -61,7 +61,7 @@ use serde::Deserialize;
 use crate::dns_query::{verify, Nameserver, PollPolicy, Verification};
 use crate::ownership::ManagedRecordId;
 use crate::record::{plan, DesiredRecord, RecordAction, RecordJson, RecordWrite, ZoneListing};
-use crate::zone::{delegation_away, Delegation, ZoneJson};
+use crate::zone::{delegation_away, Delegation, ResolvedZone, ZoneJson};
 use crate::{CloudflareError, DnsRecord, RecordTarget, Secret, Zone};
 
 /// Cloudflare's v4 API root.
@@ -205,8 +205,8 @@ impl Client {
         }
     }
 
-    /// Finds the zone that holds the base domain's records, and proves it is
-    /// authoritative for them.
+    /// Finds the zone that holds the base domain's records, and reports
+    /// whether anything written into it would actually be seen.
     ///
     /// Lists every zone the token can see and takes the longest
     /// label-aligned suffix of `base_domain` (decision D-06 -- a lookup by
@@ -215,12 +215,26 @@ impl Client {
     /// reads the zone's own `NS` records and refuses if the base domain has
     /// been delegated away.
     ///
+    /// **The return type carries [`crate::zone::ZoneStatus`] rather than a
+    /// bare [`Zone`], and that is the point of it.** A delegation is only
+    /// visible as an `NS` record *inside* the zone; the commonest way for a
+    /// zone to be unserved leaves no record at all, because the registrar
+    /// was never pointed at Cloudflare and the zone simply sits at
+    /// `pending`. Every other signal in this crate reads green in that
+    /// state -- resolution, the writes, and `verify_authoritative`, which
+    /// asks Cloudflare's own nameservers precisely because a recursive
+    /// resolver may hold a stale negative answer. Returning the status in
+    /// the same value as the zone means a caller cannot receive one without
+    /// the other. It is not an error here because the right response
+    /// differs by caller: the installer can still refuse with the disk
+    /// untouched, while a post-switch apply must not become a failure.
+    ///
     /// # Arguments
     /// * `base_domain` - `ferrum.proxy.baseDomain`.
     ///
     /// # Returns
-    /// The zone, with the authoritative nameservers R1-S3's post-apply
-    /// verification will query.
+    /// The zone -- with the authoritative nameservers R1-S3's post-apply
+    /// verification will query -- and Cloudflare's lifecycle status for it.
     ///
     /// # Errors
     /// [`CloudflareError::ZoneNotFound`] when no visible zone covers the
@@ -229,17 +243,19 @@ impl Client {
     /// accepted by the API and resolve nowhere; [`CloudflareError::Api`],
     /// [`CloudflareError::Transport`] or [`CloudflareError::Malformed`] when
     /// the listing itself fails.
-    pub fn resolve_zone(&self, base_domain: &str) -> Result<Zone, CloudflareError> {
-        let zones: Vec<Zone> = self
+    pub fn resolve_zone(&self, base_domain: &str) -> Result<ResolvedZone, CloudflareError> {
+        let zones: Vec<ResolvedZone> = self
             .list_all::<ZoneJson>("/zones", &[])?
             .into_iter()
-            .map(Zone::from)
+            .map(ResolvedZone::from)
             .collect();
-        let zone = crate::zone::select(base_domain, &zones)?;
+        let resolved = crate::zone::select(base_domain, &zones)?;
 
-        if let Some((name, nameservers)) =
-            delegation_away(base_domain, &zone, &self.list_delegations(&zone)?)
-        {
+        if let Some((name, nameservers)) = delegation_away(
+            base_domain,
+            &resolved.zone,
+            &self.list_delegations(&resolved.zone)?,
+        ) {
             return Err(CloudflareError::ZoneDelegated {
                 base_domain: base_domain.to_string(),
                 delegated_name: name,
@@ -247,7 +263,7 @@ impl Client {
             });
         }
 
-        Ok(zone)
+        Ok(resolved)
     }
 
     /// Proves, at token-collection time, that this credential can manage
@@ -675,9 +691,16 @@ mod tests {
     }
 
     fn zone_json(id: &str, name: &str) -> serde_json::Value {
+        zone_json_with_status(id, name, "active")
+    }
+
+    /// The same envelope with Cloudflare's `status` set explicitly, for the
+    /// states in which every other signal reads green and nothing resolves.
+    fn zone_json_with_status(id: &str, name: &str, status: &str) -> serde_json::Value {
         serde_json::json!({
             "id": id,
             "name": name,
+            "status": status,
             "name_servers": ["amber.ns.cloudflare.com", "bob.ns.cloudflare.com"],
         })
     }
@@ -727,16 +750,16 @@ mod tests {
         );
         script_no_delegations(&fake, "z2");
 
-        let zone = client(&fake)
+        let resolved = client(&fake)
             .resolve_zone("app.home.example.com")
             .expect("a zone is resolved");
 
         assert_eq!(
-            zone.id, "z2",
+            resolved.zone.id, "z2",
             "the zone on the second page is the correct one -- dropping that \
              page would silently pick the parent zone"
         );
-        assert_eq!(zone.nameservers.len(), 2);
+        assert_eq!(resolved.zone.nameservers.len(), 2);
         assert_eq!(fake.requests_for(&Route::get("/zones")).len(), 2);
     }
 
@@ -971,6 +994,50 @@ mod tests {
             "{}",
             requests[0].query
         );
+    }
+
+    /// The parent incident, reproduced through the door the delegation
+    /// check cannot see: the zone is in Cloudflare, the registrar was never
+    /// switched, so there is no `NS` record anywhere to catch and every
+    /// signal this crate has otherwise reads green.
+    #[test]
+    fn a_pending_zone_resolves_but_reports_that_cloudflare_is_not_serving_it_yet() {
+        let fake = FakeCloudflare::start();
+        fake.script(
+            Route::get("/zones"),
+            CannedResponse::ok(serde_json::json!([zone_json_with_status(
+                "z1",
+                "thesyms.ca",
+                "pending"
+            )])),
+        );
+        script_no_delegations(&fake, "z1");
+
+        let resolved = client(&fake)
+            .resolve_zone("thesyms.ca")
+            .expect("a pending zone still resolves -- it is a disclosure, not a refusal");
+
+        assert_eq!(resolved.status, crate::zone::ZoneStatus::Pending);
+        let advisory = resolved
+            .advisory("auth.thesyms.ca")
+            .expect("a pending zone must not pass silently");
+        assert!(advisory.contains("registrar"), "{advisory}");
+    }
+
+    #[test]
+    fn an_active_zone_resolves_with_nothing_to_disclose() {
+        let fake = FakeCloudflare::start();
+        fake.script(
+            Route::get("/zones"),
+            CannedResponse::ok(serde_json::json!([zone_json("z1", "example.com")])),
+        );
+        script_no_delegations(&fake, "z1");
+
+        let resolved = client(&fake)
+            .resolve_zone("home.example.com")
+            .expect("resolves");
+        assert_eq!(resolved.status, crate::zone::ZoneStatus::Active);
+        assert_eq!(resolved.advisory("home.example.com"), None);
     }
 
     #[test]

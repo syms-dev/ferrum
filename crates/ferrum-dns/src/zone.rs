@@ -34,6 +34,54 @@
 //! API the caller is already using, and it works from the installer's
 //! container. The complementary live check against the zone's authoritative
 //! nameservers is `verify_authoritative`, which belongs to R1-S3.
+//!
+//! **[`ZoneStatus`] is the same failure one door further out, and it is the
+//! door the original incident walked through.** [`delegation_away`] can only
+//! see an `NS` record that exists *inside* the Cloudflare zone. The
+//! commonest new-domain state produces no such record at all: the operator
+//! adds the zone to Cloudflare, never switches the registrar's nameservers,
+//! and Cloudflare reports `status: "pending"`. Zone resolution succeeds,
+//! every write succeeds, and a query aimed at the zone's own nameservers --
+//! which is what `verify_authoritative` does, deliberately, to dodge a
+//! recursive resolver's negative cache -- gets the correct answer, because
+//! Cloudflare really does hold the record. Nobody else on the internet ever
+//! asks Cloudflare, so the name resolves nowhere. That is
+//! "`auth.thesyms.ca` did not resolve while the installer reported success",
+//! reproduced exactly.
+//!
+//! So the zone's `status` is parsed rather than dropped, and carried to the
+//! caller on [`ResolvedZone`] -- a struct rather than a bare [`Zone`]
+//! specifically so a caller cannot fail to receive it. What to *do* about a
+//! non-serving status is the caller's decision rather than this crate's,
+//! because the two callers legitimately differ: the installer can still
+//! refuse while the disk is untouched, whereas a post-switch apply must
+//! never turn a completed switch into a failure. This module supplies the
+//! fact and the sentence; the policy lives where the operator is.
+//!
+//! **[`ZoneStatus`] is the same failure one door further out, and it is the
+//! door R1 originally walked through.** [`delegation_away`] can only see an
+//! `NS` record that exists *inside* the Cloudflare zone. The commonest
+//! new-domain state produces no such record at all: the operator adds the
+//! zone to Cloudflare, never switches the registrar's nameservers, and
+//! Cloudflare reports `status: "pending"`. Zone resolution succeeds, every
+//! write succeeds, and a query aimed at the zone's own nameservers -- which
+//! is what `verify_authoritative` does, deliberately, to dodge a recursive
+//! resolver's negative cache -- gets the correct answer, because Cloudflare
+//! really does hold the record. Nobody else on the internet ever asks
+//! Cloudflare, so the name resolves nowhere. That is
+//! `auth.thesyms.ca did not resolve while the installer reported success`,
+//! reproduced exactly.
+//!
+//! So the zone's `status` is parsed rather than dropped, and carried to the
+//! caller on [`ResolvedZone`] -- a struct rather than a bare [`Zone`]
+//! specifically so a caller cannot fail to receive it. What to *do* about a
+//! non-serving status is the caller's decision, not this crate's, because
+//! the two callers legitimately differ: the installer can still refuse
+//! before erasing a disk, while a post-switch apply must not turn a
+//! completed switch into a failure. This module supplies the fact and the
+//! sentence; policy lives where the operator is.
+
+use std::fmt;
 
 use serde::Deserialize;
 
@@ -51,6 +99,181 @@ pub struct Delegation {
     pub nameserver: String,
 }
 
+/// Whether a zone's Cloudflare lifecycle state means the world's resolvers
+/// will actually reach Cloudflare for it.
+///
+/// This is the question `status` is being read to answer, and it has three
+/// answers rather than two because the remedies differ: one state needs
+/// nothing, one needs waiting (or a registrar change already in flight),
+/// and one needs the operator to make a different decision entirely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ZoneService {
+    /// Cloudflare is authoritative for this zone right now.
+    Serving,
+    /// Cloudflare holds the zone but the internet is not being sent here
+    /// yet. Records written now are correct and invisible. This resolves
+    /// itself once the registrar's nameservers point at Cloudflare and the
+    /// change propagates, so it is a disclosure rather than a refusal.
+    NotYetServing,
+    /// Cloudflare will not serve this zone, and no amount of waiting
+    /// changes that. Writing records here is pointless work with a
+    /// confident success report attached.
+    NeverServing,
+}
+
+/// Cloudflare's own `status` field for a zone.
+///
+/// The variants are Cloudflare's documented values verbatim. `Unreported`
+/// and `Unrecognized` are this crate's, and they are deliberately different
+/// things: a value we have never heard of is a fact worth telling the
+/// operator about, while a *missing* field is not a fact at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ZoneStatus {
+    /// Cloudflare is authoritative: the registrar's nameservers point here.
+    Active,
+    /// The zone exists in Cloudflare and the registrar's nameservers do not
+    /// point at it yet. **This is the state the R1 incident was in.**
+    Pending,
+    /// Cloudflare is still setting the zone up; it has not reached
+    /// `Pending` yet, let alone `Active`.
+    Initializing,
+    /// The zone was active and its nameservers have since been pointed
+    /// somewhere else.
+    Moved,
+    /// The zone has been deleted from the account.
+    Deleted,
+    /// The zone has been disabled.
+    Deactivated,
+    /// Cloudflare reported a status this crate does not model. Disclosed
+    /// rather than assumed good: an unknown state is exactly the kind of
+    /// thing that turns out to mean "not serving".
+    Unrecognized(String),
+    /// The envelope carried no `status` at all.
+    ///
+    /// Treated as [`ZoneService::Serving`] on purpose. Cloudflare's live API
+    /// always sends `status`, so silence here comes from a fixture or an
+    /// intermediary, and manufacturing a warning out of it would put an
+    /// unactionable line in front of every operator -- which is how the real
+    /// warning gets skimmed past.
+    Unreported,
+}
+
+impl ZoneStatus {
+    /// Reads Cloudflare's `status` string.
+    ///
+    /// # Arguments
+    /// * `raw` - the wire value, in any case.
+    ///
+    /// # Returns
+    /// The matching variant, or [`ZoneStatus::Unrecognized`] carrying the
+    /// value as Cloudflare sent it so an operator can look it up.
+    #[must_use]
+    pub fn from_wire(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "active" => ZoneStatus::Active,
+            "pending" => ZoneStatus::Pending,
+            "initializing" => ZoneStatus::Initializing,
+            "moved" => ZoneStatus::Moved,
+            "deleted" => ZoneStatus::Deleted,
+            "deactivated" => ZoneStatus::Deactivated,
+            other => ZoneStatus::Unrecognized(other.to_string()),
+        }
+    }
+
+    /// What this status means for whether records written here resolve.
+    #[must_use]
+    pub fn service(&self) -> ZoneService {
+        match self {
+            ZoneStatus::Active | ZoneStatus::Unreported => ZoneService::Serving,
+            ZoneStatus::Pending | ZoneStatus::Initializing | ZoneStatus::Unrecognized(_) => {
+                ZoneService::NotYetServing
+            }
+            ZoneStatus::Moved | ZoneStatus::Deleted | ZoneStatus::Deactivated => {
+                ZoneService::NeverServing
+            }
+        }
+    }
+}
+
+impl fmt::Display for ZoneStatus {
+    /// Renders Cloudflare's own word, so an operator can match it against
+    /// what their dashboard shows them.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ZoneStatus::Active => f.write_str("active"),
+            ZoneStatus::Pending => f.write_str("pending"),
+            ZoneStatus::Initializing => f.write_str("initializing"),
+            ZoneStatus::Moved => f.write_str("moved"),
+            ZoneStatus::Deleted => f.write_str("deleted"),
+            ZoneStatus::Deactivated => f.write_str("deactivated"),
+            ZoneStatus::Unrecognized(raw) => write!(f, "{raw}"),
+            ZoneStatus::Unreported => f.write_str("not reported"),
+        }
+    }
+}
+
+/// A zone, together with the Cloudflare lifecycle state that decides
+/// whether anything written into it will ever be seen.
+///
+/// The two travel together rather than the status being a second lookup
+/// because the whole defect class is a caller that had the zone and never
+/// asked the question.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedZone {
+    /// The zone itself.
+    pub zone: Zone,
+    /// Cloudflare's `status` for it.
+    pub status: ZoneStatus,
+}
+
+impl ResolvedZone {
+    /// The sentence an operator needs when this zone is not serving, or
+    /// `None` when it is.
+    ///
+    /// One wording in one place, used by the installer's pre-erase gate and
+    /// by the apply's DNS step, so the same condition never gets described
+    /// two different ways to the same person.
+    ///
+    /// # Arguments
+    /// * `base_domain` - `ferrum.proxy.baseDomain`, so the sentence names
+    ///   the name that will not resolve rather than the zone apex.
+    ///
+    /// # Returns
+    /// A sentence naming the status, what it means, and the one action that
+    /// fixes it -- pointing the registrar's nameservers at the servers
+    /// Cloudflare listed, which are named inline so the operator does not
+    /// have to go and find them.
+    #[must_use]
+    pub fn advisory(&self, base_domain: &str) -> Option<String> {
+        let nameservers = if self.zone.nameservers.is_empty() {
+            "the nameservers Cloudflare lists on that zone's Overview page".to_string()
+        } else {
+            self.zone.nameservers.join(", ")
+        };
+        match self.status.service() {
+            ZoneService::Serving => None,
+            ZoneService::NotYetServing => Some(format!(
+                "Cloudflare reports the zone {} as \"{}\", not \"active\": it holds the \
+                 zone but the internet is not being sent there yet. ferrum's records will \
+                 be written correctly and {base_domain} will still resolve nowhere for \
+                 anyone, including you. Point your domain registrar's nameservers at {}, \
+                 then re-check the zone in the Cloudflare dashboard -- it flips to \
+                 \"active\" on its own once the change propagates.",
+                self.zone.name, self.status, nameservers
+            )),
+            ZoneService::NeverServing => Some(format!(
+                "Cloudflare reports the zone {} as \"{}\", so it will not answer for \
+                 {base_domain} at all. Records written here would be accepted and would \
+                 resolve nowhere, and waiting does not change that. Re-add or re-enable \
+                 the zone in the Cloudflare dashboard and point your registrar's \
+                 nameservers at {}, or choose a base domain in a zone this account \
+                 actually serves.",
+                self.zone.name, self.status, nameservers
+            )),
+        }
+    }
+}
+
 /// One zone as Cloudflare's JSON describes it.
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct ZoneJson {
@@ -61,15 +284,29 @@ pub(crate) struct ZoneJson {
     /// post-apply verification in R1-S3 has no servers to ask.
     #[serde(default, rename = "name_servers")]
     pub(crate) name_servers: Vec<String>,
+    /// Cloudflare's zone lifecycle state. Parsed as a bare string and
+    /// mapped in [`ZoneStatus::from_wire`] rather than deserialized into the
+    /// enum directly: an unknown value must become
+    /// [`ZoneStatus::Unrecognized`] and be disclosed, not fail the whole
+    /// listing and lock the operator out of a zone that works.
+    #[serde(default)]
+    pub(crate) status: Option<String>,
 }
 
-impl From<ZoneJson> for Zone {
-    /// Converts a wire zone into the crate's model.
+impl From<ZoneJson> for ResolvedZone {
+    /// Converts a wire zone into the crate's model, keeping the status.
     fn from(json: ZoneJson) -> Self {
-        Zone {
-            id: json.id,
-            name: json.name,
-            nameservers: json.name_servers,
+        let status = json
+            .status
+            .as_deref()
+            .map_or(ZoneStatus::Unreported, ZoneStatus::from_wire);
+        ResolvedZone {
+            zone: Zone {
+                id: json.id,
+                name: json.name,
+                nameservers: json.name_servers,
+            },
+            status,
         }
     }
 }
@@ -121,17 +358,17 @@ pub fn covers(domain: &str, candidate: &str) -> bool {
 ///
 /// # Returns
 /// The zone whose name is the longest label-aligned suffix of
-/// `base_domain`.
+/// `base_domain`, with the Cloudflare lifecycle status it was listed with.
 ///
 /// # Errors
 /// [`CloudflareError::ZoneNotFound`] when no visible zone covers the base
 /// domain -- which is what an operator sees when the token is scoped to a
 /// different domain, or scoped to no zone at all.
-pub fn select(base_domain: &str, zones: &[Zone]) -> Result<Zone, CloudflareError> {
+pub fn select(base_domain: &str, zones: &[ResolvedZone]) -> Result<ResolvedZone, CloudflareError> {
     zones
         .iter()
-        .filter(|zone| covers(base_domain, &zone.name))
-        .max_by_key(|zone| normalize_domain(&zone.name).len())
+        .filter(|resolved| covers(base_domain, &resolved.zone.name))
+        .max_by_key(|resolved| normalize_domain(&resolved.zone.name).len())
         .cloned()
         .ok_or_else(|| CloudflareError::ZoneNotFound {
             base_domain: base_domain.to_string(),
@@ -185,11 +422,21 @@ mod tests {
         }
     }
 
+    /// A listed zone Cloudflare is already serving, which is what every
+    /// selection test is about. Status-specific behaviour gets its own
+    /// fixtures below.
+    fn listed(name: &str) -> ResolvedZone {
+        ResolvedZone {
+            zone: zone(name),
+            status: ZoneStatus::Active,
+        }
+    }
+
     #[test]
     fn an_apex_base_domain_resolves_to_its_own_zone() {
-        let zones = vec![zone("example.com"), zone("other.net")];
+        let zones = vec![listed("example.com"), listed("other.net")];
         assert_eq!(
-            select("example.com", &zones).expect("a zone").name,
+            select("example.com", &zones).expect("a zone").zone.name,
             "example.com"
         );
     }
@@ -199,18 +446,24 @@ mod tests {
     /// a correctly scoped token for it.
     #[test]
     fn a_subdomain_base_domain_resolves_to_its_parent_zone() {
-        let zones = vec![zone("example.com")];
+        let zones = vec![listed("example.com")];
         assert_eq!(
-            select("home.example.com", &zones).expect("a zone").name,
+            select("home.example.com", &zones)
+                .expect("a zone")
+                .zone
+                .name,
             "example.com"
         );
     }
 
     #[test]
     fn the_longest_matching_zone_wins_over_its_parent() {
-        let zones = vec![zone("example.com"), zone("home.example.com")];
+        let zones = vec![listed("example.com"), listed("home.example.com")];
         assert_eq!(
-            select("app.home.example.com", &zones).expect("a zone").name,
+            select("app.home.example.com", &zones)
+                .expect("a zone")
+                .zone
+                .name,
             "home.example.com",
             "records written into the parent would be shadowed by the \
              delegation to the child and resolve to nothing"
@@ -219,7 +472,7 @@ mod tests {
 
     #[test]
     fn a_zone_that_is_only_a_string_suffix_does_not_match() {
-        let zones = vec![zone("example.com")];
+        let zones = vec![listed("example.com")];
         let error = select("notexample.com", &zones).expect_err("not a label-aligned suffix");
         assert_eq!(
             error,
@@ -231,14 +484,14 @@ mod tests {
 
     #[test]
     fn no_visible_zone_names_the_base_domain_in_the_error() {
-        let zones = vec![zone("somewhere-else.net")];
+        let zones = vec![listed("somewhere-else.net")];
         let error = select("example.com", &zones).expect_err("no zone covers it");
         assert!(error.to_string().contains("example.com"), "{error}");
     }
 
     #[test]
     fn zone_matching_ignores_case_and_a_trailing_dot() {
-        let zones = vec![zone("Example.COM.")];
+        let zones = vec![listed("Example.COM.")];
         assert!(select("home.example.com", &zones).is_ok());
     }
 
@@ -337,12 +590,14 @@ mod tests {
         let json: ZoneJson = serde_json::from_value(serde_json::json!({
             "id": "z1",
             "name": "example.com",
+            "status": "active",
             "name_servers": ["amber.ns.cloudflare.com", "bob.ns.cloudflare.com"],
         }))
         .expect("a Cloudflare-shaped zone parses");
-        let model: Zone = json.into();
-        assert_eq!(model.id, "z1");
-        assert_eq!(model.nameservers.len(), 2);
+        let model: ResolvedZone = json.into();
+        assert_eq!(model.zone.id, "z1");
+        assert_eq!(model.zone.nameservers.len(), 2);
+        assert_eq!(model.status, ZoneStatus::Active);
     }
 
     #[test]
@@ -350,6 +605,129 @@ mod tests {
         let json: ZoneJson =
             serde_json::from_value(serde_json::json!({ "id": "z1", "name": "example.com" }))
                 .expect("a provisioning zone parses");
-        assert!(Zone::from(json).nameservers.is_empty());
+        assert!(ResolvedZone::from(json).zone.nameservers.is_empty());
+    }
+
+    /// The single most common new-domain state, and the one the whole of
+    /// this requirement exists for: the zone is in Cloudflare, the
+    /// registrar still points somewhere else, and every other signal --
+    /// zone resolution, the record writes, a query aimed at Cloudflare's
+    /// own nameservers -- comes back green while nothing resolves for
+    /// anyone.
+    #[test]
+    fn a_pending_zone_envelope_is_parsed_as_pending_and_not_serving() {
+        let json: ZoneJson = serde_json::from_value(serde_json::json!({
+            "id": "z1",
+            "name": "thesyms.ca",
+            "status": "pending",
+            "name_servers": ["amber.ns.cloudflare.com", "bob.ns.cloudflare.com"],
+        }))
+        .expect("a pending zone parses");
+        let resolved: ResolvedZone = json.into();
+        assert_eq!(resolved.status, ZoneStatus::Pending);
+        assert_eq!(resolved.status.service(), ZoneService::NotYetServing);
+    }
+
+    #[test]
+    fn a_pending_zone_tells_the_operator_to_switch_the_registrars_nameservers() {
+        let resolved = ResolvedZone {
+            zone: Zone {
+                id: "z1".to_string(),
+                name: "thesyms.ca".to_string(),
+                nameservers: vec![
+                    "amber.ns.cloudflare.com".to_string(),
+                    "bob.ns.cloudflare.com".to_string(),
+                ],
+            },
+            status: ZoneStatus::Pending,
+        };
+        let advisory = resolved
+            .advisory("auth.thesyms.ca")
+            .expect("a pending zone is disclosed");
+        assert!(advisory.contains("pending"), "{advisory}");
+        assert!(advisory.contains("auth.thesyms.ca"), "{advisory}");
+        assert!(advisory.contains("registrar"), "{advisory}");
+        assert!(advisory.contains("amber.ns.cloudflare.com"), "{advisory}");
+        assert!(advisory.contains("resolve nowhere"), "{advisory}");
+    }
+
+    #[test]
+    fn an_active_zone_has_nothing_to_disclose() {
+        let resolved = ResolvedZone {
+            zone: zone("example.com"),
+            status: ZoneStatus::Active,
+        };
+        assert_eq!(resolved.advisory("home.example.com"), None);
+    }
+
+    /// A status of `moved`, `deleted` or `deactivated` cannot become
+    /// `active` by waiting, so the remedy sentence must not tell the
+    /// operator to wait.
+    #[test]
+    fn a_terminal_status_is_never_serving_and_says_waiting_will_not_help() {
+        for status in [
+            ZoneStatus::Moved,
+            ZoneStatus::Deleted,
+            ZoneStatus::Deactivated,
+        ] {
+            assert_eq!(status.service(), ZoneService::NeverServing, "{status}");
+            let resolved = ResolvedZone {
+                zone: zone("example.com"),
+                status,
+            };
+            let advisory = resolved
+                .advisory("home.example.com")
+                .expect("a terminal status is disclosed");
+            assert!(
+                advisory.contains("waiting does not change that"),
+                "{advisory}"
+            );
+        }
+    }
+
+    /// An unknown status is Cloudflare telling us something; refusing the
+    /// whole listing over it would lock an operator out of a zone that may
+    /// well work, and assuming it is fine is the defect this parses for.
+    #[test]
+    fn an_unknown_status_is_disclosed_rather_than_assumed_good_or_fatal() {
+        let status = ZoneStatus::from_wire("Some-Future-State");
+        assert_eq!(
+            status,
+            ZoneStatus::Unrecognized("some-future-state".to_string())
+        );
+        assert_eq!(status.service(), ZoneService::NotYetServing);
+        assert_eq!(status.to_string(), "some-future-state");
+    }
+
+    /// Cloudflare's live API always sends `status`. Silence comes from a
+    /// fixture or an intermediary, and a warning invented from silence is
+    /// the one that trains operators to skim past the real one.
+    #[test]
+    fn an_absent_status_is_not_turned_into_a_warning() {
+        let json: ZoneJson =
+            serde_json::from_value(serde_json::json!({ "id": "z1", "name": "example.com" }))
+                .expect("a zone with no status parses");
+        let resolved: ResolvedZone = json.into();
+        assert_eq!(resolved.status, ZoneStatus::Unreported);
+        assert_eq!(resolved.advisory("example.com"), None);
+    }
+
+    #[test]
+    fn every_status_cloudflare_documents_is_recognised() {
+        for (raw, expected) in [
+            ("active", ZoneStatus::Active),
+            ("pending", ZoneStatus::Pending),
+            ("initializing", ZoneStatus::Initializing),
+            ("moved", ZoneStatus::Moved),
+            ("deleted", ZoneStatus::Deleted),
+            ("deactivated", ZoneStatus::Deactivated),
+        ] {
+            assert_eq!(ZoneStatus::from_wire(raw), expected, "{raw}");
+            assert_eq!(
+                ZoneStatus::from_wire(&raw.to_uppercase()),
+                expected,
+                "{raw}"
+            );
+        }
     }
 }
