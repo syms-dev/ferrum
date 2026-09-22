@@ -922,7 +922,7 @@ mod tests {
     fn a_single_data_disk_is_mounted_at_the_media_root() {
         let mut a = approved(Firmware::Uefi);
         a.all_devices.retain(|d| d.name != "sdc"); // leave one data disk
-        let f = render(&answers(), &a, &keys(), "9656ab2").unwrap();
+        let f = render(&answers(), &a, &keys(), "535acdf").unwrap();
         let m = &f["custom/media.nix"];
         assert!(m.contains(&format!("fileSystems.\"{MEDIA_ROOT}\"")), "{m}");
         assert!(
@@ -949,7 +949,7 @@ mod tests {
             dev("sdc", "/dev/disk/by-id/ata-DATA_2", Some("ext4")),
         ];
         a.device = a.all_devices[0].clone();
-        let f = render(&answers(), &a, &keys(), "9656ab2").unwrap();
+        let f = render(&answers(), &a, &keys(), "535acdf").unwrap();
         let m = &f["custom/media.nix"];
         assert!(m.contains("/mnt/ferrum-disk-0"), "{m}");
         assert!(m.contains("/mnt/ferrum-disk-1"), "{m}");
@@ -980,7 +980,7 @@ mod tests {
     /// fails.
     #[test]
     fn data_disks_are_mounted_from_the_partition_not_the_disk() {
-        let f = render(&answers(), &approved(Firmware::Uefi), &keys(), "9656ab2").unwrap();
+        let f = render(&answers(), &approved(Firmware::Uefi), &keys(), "535acdf").unwrap();
         let m = &f["custom/media.nix"];
         assert!(
             m.contains("/dev/disk/by-id/ata-DATA_1-part1"),
@@ -1004,7 +1004,7 @@ mod tests {
                 c.by_id = None;
             }
         }
-        let err = render(&answers(), &a, &keys(), "9656ab2")
+        let err = render(&answers(), &a, &keys(), "535acdf")
             .expect_err("no stable partition path must be refused");
         let msg = err.to_string();
         assert!(msg.contains("by-id"), "{msg}");
@@ -1066,7 +1066,7 @@ mod tests {
     /// this fails.
     #[test]
     fn the_generated_repo_ignores_the_operators_own_files() {
-        let f = render(&answers(), &approved(Firmware::Uefi), &keys(), "9656ab2").unwrap();
+        let f = render(&answers(), &approved(Firmware::Uefi), &keys(), "535acdf").unwrap();
         let ignore = f
             .get(".gitignore")
             .expect("without this, `git add -A` commits them and .git ships to the host");
@@ -1097,7 +1097,7 @@ mod tests {
              than this repository is tested against"
         );
 
-        let f = render(&answers(), &approved(Firmware::Uefi), &keys(), "9656ab2").unwrap();
+        let f = render(&answers(), &approved(Firmware::Uefi), &keys(), "535acdf").unwrap();
         assert!(
             f["flake.nix"].contains(&format!("github:nix-community/disko/{DISKO_REV}")),
             "{}",
@@ -1752,9 +1752,9 @@ mod tests {
 
     #[test]
     fn the_ferrum_input_is_pinned_to_a_revision_not_a_branch() {
-        let f = render(&answers(), &approved(Firmware::Uefi), &keys(), "9656ab2").unwrap();
+        let f = render(&answers(), &approved(Firmware::Uefi), &keys(), "535acdf").unwrap();
         assert!(
-            f["flake.nix"].contains("github:syms-dev/ferrum/9656ab2"),
+            f["flake.nix"].contains("github:syms-dev/ferrum/535acdf"),
             "{}",
             f["flake.nix"]
         );

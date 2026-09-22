@@ -1573,7 +1573,7 @@ mod tests {
                 &answers,
                 &adoption_approved(),
                 &["ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAreal me@mac".to_string()],
-                "9656ab2",
+                "535acdf",
                 &adoption,
             )
             .expect("the repository renders");

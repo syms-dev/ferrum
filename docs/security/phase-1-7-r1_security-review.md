@@ -1,13 +1,13 @@
 # Security review — Phase 1.7 R1 (ferrum manages its own Cloudflare DNS records)
 
-**Gate: Security Clear. Verdict at HEAD `df14a8a`: CLEAR.** (At `a9df8ed` it was BLOCKED on one
-Medium, SEC-M1; the fix landed in `df14a8a` and `policy-validator` re-checked it — see the
+**Gate: Security Clear. Verdict at HEAD `079e2a8`: CLEAR.** (At `0b6abc4` it was BLOCKED on one
+Medium, SEC-M1; the fix landed in `079e2a8` and `policy-validator` re-checked it — see the
 recheck section at the end.)
 Scanners run in parallel: `secret-scanner`, `dependency-scanner`, `owasp-reviewer`,
 `policy-validator`. `pentest-scanner` not applicable (no dynamic-pentest scope requested, no
 authorized non-production target).
 
-Diff reviewed: `git diff 227298a..a9df8ed` scoped to `crates/ferrum-dns`,
+Diff reviewed: `git diff 339da0a..0b6abc4` scoped to `crates/ferrum-dns`,
 `crates/ferrum-apply/src`, `crates/ferrum-install/src`, `crates/Cargo.{toml,lock}`,
 `modules/proxy`, `modules/core/options.nix`, `modules/default.nix`, `nix/pkgs/ferrum-apply`,
 `nix/modules/flake/checks.nix` — 34 files, +13578/-331.
@@ -90,7 +90,7 @@ own. Both mints (`claim`, `adopt_by_operator`) are `pub(crate)`; the only public
 ## A sub-scanner claim the reviewer overrode — recorded because it matters
 `owasp-reviewer` reported `ureq` as a **new** dependency and therefore a hard stop needing the
 owner's sign-off. **That is wrong**, and the security reviewer overrode it on evidence:
-`git show 227298a:crates/Cargo.lock:665` shows `ureq` already resolved via the pre-existing
+`git show 339da0a:crates/Cargo.lock:665` shows `ureq` already resolved via the pre-existing
 `ferrum-reconcile` crate. The only lockfile change is the new `ferrum-dns` workspace-member block
 plus two dependency edges. **No third-party package was added or bumped; no dependency-approval gate
 is triggered.** A scanner being confidently wrong, caught and corrected with a command rather than
@@ -107,7 +107,7 @@ no way to produce. That verification is owed when the SEC-M1 fix lands.
 
 ---
 
-# Recheck at `df14a8a` — SEC-M1 RESOLVED, SEC-L1 RESOLVED
+# Recheck at `079e2a8` — SEC-M1 RESOLVED, SEC-L1 RESOLVED
 
 `policy-validator` re-dispatched alone, as the aggregating reviewer specified (SEC-M1 was entirely
 its finding). Security cycle 1 of the 2-cycle budget; a second cycle was not needed.
@@ -173,11 +173,11 @@ then check `/var/lib/ferrum/state/dns-updater-last-success` has a fresh mtime.
 
 ---
 
-# Delta review at `8a33569` (`df14a8a..8a33569`) — SECURITY CLEAR
+# Delta review at `8534190` (`079e2a8..8534190`) — SECURITY CLEAR
 
-Four commits since the recheck: `b71dd60` settings-schema + drift check · `b3b7eb2` foreign-record
-disclosure + catalog-subdomain invariant · `aa904ad` Cloudflare zone-status parsing + apply-path
-disclosures · `8a33569` threading the zone warning to the final report. 10 files, +2067/−129.
+Four commits since the recheck: `e06bcfa` settings-schema + drift check · `2430c42` foreign-record
+disclosure + catalog-subdomain invariant · `cc2a18a` Cloudflare zone-status parsing + apply-path
+disclosures · `8534190` threading the zone warning to the final report. 10 files, +2067/−129.
 
 **Delta: 0 Critical · 0 High · 0 Medium · 2 Low · 3 Cosmetic.**
 **Whole feature, cumulative open: 0 Critical · 0 High · 0 Medium · Low and Cosmetic only.**
@@ -186,7 +186,7 @@ disclosures · `8a33569` threading the zone warning to the final report. 10 file
 `secret-scanner` (three new operator-facing output surfaces), `owasp-reviewer` (new untrusted-input
 parsing, a new `RecordAction` touching the ownership guard, new logging, a new CI step),
 `policy-validator` (the `PUT /api/settings` input-validation contract gained three nested objects).
-**`dependency-scanner` skipped, justified:** `git diff df14a8a..8a33569 -- crates/Cargo.lock` is
+**`dependency-scanner` skipped, justified:** `git diff 079e2a8..8534190 -- crates/Cargo.lock` is
 empty and no `Cargo.toml` appears in the delta — nothing for it to find beyond the full-R1
 `cargo-audit` already recorded above. Running it anyway would have been ceremony.
 
@@ -222,7 +222,7 @@ number is past its file's `#[cfg(test)]`. A production binary cannot be pointed 
 ## New findings — all Low or Cosmetic, none blocking
 | ID | Sev | Where | What |
 |---|---|---|---|
-| OWASP-001 | Low | `crates/ferrum-dns/src/record.rs:411-463` | `b3b7eb2` inserted `disclose_foreign_beside` **between `plan_with_adoptions`'s doc comment and the function it documents**, so the adoption-boundary security invariant now renders against the wrong function. Worth fixing promptly — it documents the sole path to `ManagedRecordId` adoption. |
+| OWASP-001 | Low | `crates/ferrum-dns/src/record.rs:411-463` | `2430c42` inserted `disclose_foreign_beside` **between `plan_with_adoptions`'s doc comment and the function it documents**, so the adoption-boundary security invariant now renders against the wrong function. Worth fixing promptly — it documents the sole path to `ManagedRecordId` adoption. |
 | OWASP-002 | Low (A09) | `crates/ferrum-apply/src/dns_reconcile.rs:1016` | `eprintln!` writes Cloudflare-sourced text to stderr with no control-character stripping; a value containing `\n` could forge a journald line. The JSONL sibling is already safe by construction (`serde_json::json!` escapes). Low-value: the source is TLS-authenticated data for the operator's own zone, and anyone who can inject here already controls it. |
 | OWASP-003 | Cosmetic | `zone.rs:145-156` | `from_wire`'s docstring says `Unrecognized` carries the value "as Cloudflare sent it"; it carries the trimmed+lowercased value. |
 | OWASP-004 | Cosmetic | `zone.rs:264-270` | Comment says an unknown status is disclosed rather than failing the listing — true for an unknown *string*, but a non-string `status` still fails deserialization. |

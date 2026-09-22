@@ -115,9 +115,9 @@ Static assets are served **unauthenticated**; the APIs behind them are not. The 
 
 `GET /api/generations` needs `journal::list` and `generations::{correlate, is_rollbackable, GenerationInfo}`, which today are private modules of the `ferrum-apply` **binary** crate and therefore not importable. Both are already written, already tested, and — tellingly — already carry `#[allow(dead_code)]` comments naming their intended future consumer: *"used when listing all generations, e.g. a future ferrumd-facing API"* and *"kept for a future `list-generations` consumer."* This phase is that consumer arriving.
 
-Extraction follows the `ferrum-secrets` precedent exactly (Phase 1.5a, `8f4e7f7`): move `journal.rs` and `generations.rs` into a new `crates/ferrum-state` library crate **with their existing tests moved intact**, and have `ferrum-apply` depend on it. Known risk 3 of the 1.5a spec applies unchanged and is the thing most likely to go wrong here: this is a refactor of shipped, reviewed, production-tested code, and the test coverage must survive the move rather than being quietly dropped in it. The `#[allow(dead_code)]` attributes come *off* the items this phase genuinely uses — leaving them on would hide a real future regression.
+Extraction follows the `ferrum-secrets` precedent exactly (Phase 1.5a, `b652684`): move `journal.rs` and `generations.rs` into a new `crates/ferrum-state` library crate **with their existing tests moved intact**, and have `ferrum-apply` depend on it. Known risk 3 of the 1.5a spec applies unchanged and is the thing most likely to go wrong here: this is a refactor of shipped, reviewed, production-tested code, and the test coverage must survive the move rather than being quietly dropped in it. The `#[allow(dead_code)]` attributes come *off* the items this phase genuinely uses — leaving them on would hide a real future regression.
 
-`Cargo.lock` must be regenerated for the new workspace member. This has bitten this repo twice before (`f86c90f`, `402c8be`), both times as a CI failure after the fact.
+`Cargo.lock` must be regenerated for the new workspace member. This has bitten this repo twice before (`df4ba83`, `447fff2`), both times as a CI failure after the fact.
 
 ### Journal directory readability
 

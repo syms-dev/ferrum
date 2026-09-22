@@ -819,7 +819,7 @@ authorized one bounded revision covering exactly three findings.
    rather than `--set`.
 3. **OBS-1 — the Cloudflare DNS-01 token (R3 A8).** Raised by the panel and
    deliberately parked as out-of-scope for the recheck, because it predates
-   generation 2 — it follows from `9656ab2`, "Publish apps by default". Folded
+   generation 2 — it follows from `535acdf`, "Publish apps by default". Folded
    in here because it is the same class and the same fix conversation: with
    `exposure` defaulting to `public`, the **default install path** trips
    `modules/proxy/acme.nix:52`, so an installer that never asks for the token
