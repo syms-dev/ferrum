@@ -16,6 +16,17 @@
       # rather than each importing (or worse, hardcoding) their own.
       realMigrations = import ../../../modules/lib/migrations.nix { inherit lib; };
 
+      # The exact set modules/core/daemon.nix's A5 assertion accepts, named
+      # once because two checks below have to agree about it and a drift
+      # between them is silent: daemonVhostEnforced asserts every one of
+      # these is LEGAL, and nginxConfigParses asserts nginx can actually
+      # parse the config each one generates. An accept-set is a claim about
+      # every downstream consumer, so widening it owes a test per value at
+      # each -- which is how `::1` came to be blessed by the guard and
+      # rejected by nginx (`proxy_pass http://::1:7788` -> [emerg] invalid
+      # port) with both halves of the tree green.
+      acceptedLoopbackSpellings = [ "127.0.0.1" "127.0.0.2" "::1" ];
+
       exampleHosts = {
         minimal = ferrumLib.mkHost {
           inherit system;
@@ -766,6 +777,9 @@
 
           # ...and the same fixture at the IPv6 spelling of loopback, which
           # the A5 guard blesses and which nginx cannot parse unbracketed.
+          # nginxConfigParses below settles that with a real `nginx -t`; this
+          # pins the exact string cheaply, at evaluation, so the regression
+          # is named here rather than only inside a parser's error message.
           v6 = mkProxyHost { daemon.listenAddress = "::1"; };
           v6Pass =
             (((v6.config.services.nginx.virtualHosts.${daemonName} or { }).locations."/"
@@ -802,9 +816,10 @@
           # Not just 127.0.0.1: the recovery route A5 protects is an SSH
           # tunnel to wherever ferrumd listens, so every loopback spelling
           # has to keep working or the assertion is a regression dressed as
-          # a control.
+          # a control. The same list drives nginxConfigParses below, which
+          # is what makes "accepted" mean "the generated config loads".
           wronglyRejected = builtins.filter (a: loopbackFailuresFor a != [ ])
-            [ "127.0.0.1" "127.0.0.2" "::1" ];
+            acceptedLoopbackSpellings;
           wronglyAccepted = builtins.filter (a: loopbackFailuresFor a == [ ])
             [ "0.0.0.0" "192.168.1.10" "::" "127.0.0.1.example.test" ];
           # Refused too, but for a different reason, and carrying its own
@@ -972,6 +987,129 @@
           dashboardCertNames = builtins.attrNames dashboardCerts;
           daemonCertDnsProvider = if daemonCert == null then "<no entry>" else daemonCert.dnsProvider;
         };
+
+      # The one check in this file that asks nginx, rather than asking Nix
+      # what it told nginx.
+      #
+      # Every other proxy check above asserts the GENERATOR's output: an
+      # attrset, read by Nix, one layer short of the thing that actually
+      # breaks a host. `proxy_pass http://::1:7788;` is a well-formed Nix
+      # string, a correct-looking attrset value, and a fatal nginx config --
+      # nginx splits the authority at its LAST colon and reports `[emerg]
+      # invalid port in upstream "::1:7788"`. It then refuses the WHOLE
+      # file, so plex, sonarr, auth.<baseDomain> and the catch-all go down
+      # with the dashboard, at nginx.service start, on a host whose apply
+      # reported success. Nothing in this repository had ever rendered the
+      # config, so the defect was invisible to `nix flake check` and visible
+      # only to the operator.
+      #
+      # nixpkgs' own services.nginx.validateConfigFile does not close this:
+      # it runs `gixy`, a security linter, over the text. It never invokes
+      # nginx's parser.
+      #
+      # Run for every address modules/core/daemon.nix accepts, because an
+      # accept-set is a claim about every downstream consumer and this is
+      # the consumer that was making a different claim.
+      nginxConfigParses =
+        let
+          hostFor = addr: ferrumLib.mkHost {
+            inherit system;
+            settings = {
+              schemaVersion = realMigrations.currentVersion;
+              proxy = { enable = true; baseDomain = "example.test"; acme.email = "a@example.test"; };
+              auth = { enable = true; adminEmail = "a@example.test"; };
+              apps = { plex.enable = true; sonarr.enable = true; };
+              daemon.listenAddress = addr;
+            };
+            modules = [ ../../../examples/hosts/minimal/configuration.nix ];
+          };
+          # The generated UNIT, not the config path read out of it in Nix: a
+          # string pulled out with builtins.match would carry no store
+          # reference, and the file would not exist in the sandbox. Taking
+          # the unit as a build input brings its whole closure -- nginx.conf
+          # and the nginx package ExecStart names -- along with it.
+          reference = hostFor "127.0.0.1";
+          daemonVhostName = "${reference.config.ferrum.daemon.subdomain}.example.test";
+          daemonPort = toString reference.config.ferrum.daemon.port;
+          probes = map (addr: { inherit addr; unit = (hostFor addr).config.systemd.units."nginx.service".unit; })
+            acceptedLoopbackSpellings;
+        in
+        pkgs.runCommand "ferrum-check-nginx-config-parses"
+          { nativeBuildInputs = [ pkgs.openssl ]; }
+          ''
+            set -eu
+
+            fail() {
+              echo "nginx-config-parses: $1" >&2
+              exit 1
+            }
+
+            # nginx opens every certificate named in the file during `-t`,
+            # and the real paths are /var/lib/acme/<name>/..., which exist
+            # only on a deployed host after a real ACME order. A throwaway
+            # self-signed pair stands in for them. Nothing else in the file
+            # is rewritten -- in particular every proxy_pass reaches the
+            # parser exactly as modules/proxy/nginx.nix wrote it, which is
+            # the whole point of the exercise.
+            openssl req -x509 -newkey rsa:2048 -noenc -keyout key.pem -out cert.pem \
+              -days 1 -subj /CN=example.test > openssl.log 2>&1 \
+              || { cat openssl.log >&2; fail "could not generate a stand-in certificate"; }
+
+            ${lib.concatMapStrings (p: ''
+              addr=${lib.escapeShellArg p.addr}
+              unit=${p.unit}/nginx.service
+
+              # Both halves come out of the unit, so this tests the exact
+              # binary systemd will exec on the exact file it will hand it,
+              # rather than a reconstruction that could drift from either.
+              execstart=$(grep -m1 '^ExecStart=' "$unit" | cut -d= -f2-)
+              bin=$(printf '%s' "$execstart" | cut -d' ' -f1)
+              cfg=$(printf '%s' "$execstart" | grep -o -- "-c '[^']*'" | cut -d"'" -f2)
+
+              case "$bin" in
+                /nix/store/*/bin/nginx) ;;
+                *) fail "nginx.service's ExecStart does not name an nginx binary ($bin) -- this check no longer knows what it is testing" ;;
+              esac
+              case "$cfg" in
+                /nix/store/*) ;;
+                *) fail "nginx.service's ExecStart does not pass a store config path (-c $cfg) -- services.nginx.enableReload is probably on, and the file under test is now /etc/nginx/nginx.conf, which this check cannot see" ;;
+              esac
+
+              # Anti-vacuity, in that order: a config with no daemon vhost
+              # at all would parse perfectly and prove nothing about the
+              # upstream this check exists to exercise. These locate the
+              # corpus; nginx's own parser below is the assertion.
+              grep -q "server_name ${daemonVhostName}" "$cfg" \
+                || fail "the config generated for listenAddress=$addr has no ${daemonVhostName} vhost, so parsing it says nothing about the daemon upstream"
+              grep -q "proxy_pass http://.*:${daemonPort};" "$cfg" \
+                || fail "the config generated for listenAddress=$addr has no proxy_pass to the daemon's port ${daemonPort}, so parsing it says nothing about the daemon upstream"
+
+              # The pid path and the access log join the certificates for
+              # the same reason: `nginx -t` really opens /run/nginx/nginx.pid
+              # and the compiled-in /var/log/nginx/access.log, and a build
+              # sandbox has neither directory. Every edit here is about a
+              # file the HOST would have and this sandbox does not. None of
+              # them touches a directive whose parse is under test -- the
+              # proxy_pass lines reach the parser byte-for-byte as
+              # modules/proxy/nginx.nix wrote them, which the mutation test
+              # in this commit's message demonstrates.
+              sed -e "s|ssl_certificate .*|ssl_certificate $PWD/cert.pem;|" \
+                  -e "s|ssl_certificate_key .*|ssl_certificate_key $PWD/key.pem;|" \
+                  -e "s|ssl_trusted_certificate .*|ssl_trusted_certificate $PWD/cert.pem;|" \
+                  -e "s|^pid .*|pid $PWD/nginx.pid;|" \
+                  -e "s|^http {|http {\n\taccess_log off;|" \
+                  "$cfg" > test.conf
+
+              mkdir -p prefix/logs
+              "$bin" -p "$PWD/prefix" -t -c "$PWD/test.conf" > nginx.log 2>&1 || {
+                cat nginx.log >&2
+                fail "ferrum.daemon.listenAddress = \"$addr\" is accepted by modules/core/daemon.nix and produces an nginx config nginx itself refuses (above). nginx rejects the whole FILE, so this takes every vhost on the host down at nginx.service start -- after a successful apply. Start at modules/proxy/nginx.nix's daemonUpstream."
+              }
+              echo "nginx-config-parses: $addr ok"
+            '') probes}
+
+            echo ok > $out
+          '';
 
       # A8/D7: the daemon's hostname is reserved, and a collision is a
       # configuration error reported at EVALUATION time.
@@ -1403,6 +1541,7 @@
       checks = {
         auth-model-enforced = mkAssertionCheck "auth-model-enforced" authModelEnforced;
         daemon-vhost-enforced = mkAssertionCheck "daemon-vhost-enforced" daemonVhostEnforced;
+        nginx-config-parses = nginxConfigParses;
         reserved-subdomain-collision =
           mkAssertionCheck "reserved-subdomain-collision" reservedSubdomainCollision;
         nginx-emits-no-cors-headers =

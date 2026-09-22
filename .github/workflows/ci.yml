@@ -45,6 +45,7 @@ jobs:
             .#checks.x86_64-linux.installer-offers-every-catalog-app \
             .#checks.x86_64-linux.settings-schema-covers-every-option \
             .#checks.x86_64-linux.auth-model-enforced \
+            .#checks.x86_64-linux.nginx-config-parses \
             .#checks.x86_64-linux.dns-record-set \
             .#checks.x86_64-linux.root-folders-reach-the-apps \
             .#checks.x86_64-linux.migration-mechanism \
