@@ -1360,8 +1360,15 @@ mod tests {
                 if trimmed.starts_with("//") || trimmed.starts_with("\"") {
                     continue;
                 }
+                // Case-INSENSITIVE, because HTTP header names are
+                // (RFC 9110 5.1) and Rust spells them lowercase by
+                // convention -- `headers().get("remote-user")` reads the
+                // same header the table names in Title-Case, and a scan
+                // that only matched the table's own spelling would miss
+                // the way the code would most likely be written.
+                let haystack = line.to_ascii_lowercase();
                 for header in FORWARD_AUTH_HEADERS {
-                    if line.contains(header) {
+                    if haystack.contains(&header.to_ascii_lowercase()) {
                         found.push(format!("{name}:{}: {}", number + 1, line.trim()));
                     }
                 }
@@ -1374,6 +1381,39 @@ mod tests {
         );
     }
 
+    /// The module a `mod`/`pub mod`/`pub(crate) mod` line declares, if it
+    /// declares one.
+    ///
+    /// Visibility is not part of what makes a line a module declaration,
+    /// but the first version of this matched `mod ` alone -- so the day
+    /// somebody wrote `pub mod`, the new module would have vanished from
+    /// `declared` and the guard below would have gone on passing while
+    /// the file escaped the forward-auth scan entirely. A completeness
+    /// check with a blind spot is worse than none, because it is believed.
+    ///
+    /// Only column-zero lines count, which is what keeps a `mod ` inside a
+    /// comment or a string from being read as a declaration, and an inline
+    /// `mod tests {` out (it has no trailing semicolon and no file).
+    fn module_declared_on(line: &str) -> Option<&str> {
+        if line.starts_with(char::is_whitespace) {
+            return None;
+        }
+        let mut tokens = line.split_whitespace();
+        let name = match tokens.next()? {
+            "mod" => tokens.next()?,
+            // `pub`, `pub(crate)`, `pub(super)`, `pub(in path)` -- all of
+            // them declare a module just as loudly.
+            visibility if visibility.starts_with("pub") => {
+                if tokens.next()? != "mod" {
+                    return None;
+                }
+                tokens.next()?
+            }
+            _ => return None,
+        };
+        name.strip_suffix(';')
+    }
+
     /// Keeps `CRATE_SOURCES` complete: it must list exactly the modules
     /// `main.rs` declares, so a new module cannot be added to the crate and
     /// silently escape the scan above.
@@ -1381,7 +1421,7 @@ mod tests {
     fn the_source_scan_covers_every_module() {
         let declared: Vec<String> = include_str!("main.rs")
             .lines()
-            .filter_map(|line| line.strip_prefix("mod ")?.strip_suffix(';'))
+            .filter_map(module_declared_on)
             .map(|name| format!("{name}.rs"))
             .collect();
         assert!(!declared.is_empty(), "the mod declarations must really have been found");
@@ -1394,6 +1434,23 @@ mod tests {
             declared, scanned,
             "CRATE_SOURCES must list every module main.rs declares, in order"
         );
+    }
+
+    /// The shapes `module_declared_on` has to recognise, and the ones it
+    /// must not. This is here because the recogniser is the whole of the
+    /// guard above: the assertion it feeds cannot tell a module that does
+    /// not exist from one it failed to read.
+    #[test]
+    fn a_module_declaration_is_recognised_whatever_its_visibility() {
+        assert_eq!(module_declared_on("mod auth;"), Some("auth"));
+        assert_eq!(module_declared_on("pub mod auth;"), Some("auth"));
+        assert_eq!(module_declared_on("pub(crate) mod auth;"), Some("auth"));
+        // Not declarations: an inline module, an indented line (which in
+        // this crate means it is inside something else), a use, and prose.
+        assert_eq!(module_declared_on("mod tests {"), None);
+        assert_eq!(module_declared_on("    mod nested;"), None);
+        assert_eq!(module_declared_on("use auth::mod;"), None);
+        assert_eq!(module_declared_on("// mod auth;"), None);
     }
 
     /// A3/D5 -- the absence of CORS, enforced.
@@ -1655,6 +1712,41 @@ mod tests {
                 .split_once("\n}\n")
                 .expect("build_router must end")
                 .0;
+
+            // The derivation below reads exactly one shape: a literal
+            // `.route("<path>", <method>(...))`. Every other way of
+            // registering a route -- a path constant, a loop over a table,
+            // a helper that returns a Router, a nested or merged router
+            // built somewhere this scan cannot see -- would shrink
+            // `declared` and `covered` TOGETHER and keep passing, which is
+            // the one failure this guard exists to make impossible. So the
+            // shapes it cannot read are refused outright: a refactor into
+            // one of them fails here, loudly, and teaching the scan the new
+            // shape is the price of making it.
+            assert_eq!(
+                body.matches(".route(").count(),
+                body.matches(".route(\"").count(),
+                "build_router registers a route whose path is not a string \
+                 literal, so the scan below cannot see it"
+            );
+            for unreadable in [".nest(", ".route_service(", "for ", "while "] {
+                assert!(
+                    !body.contains(unreadable),
+                    "build_router now contains {unreadable:?}, which can \
+                     register routes this scan cannot derive; teach the \
+                     scan that shape before using it"
+                );
+            }
+            // `.merge(x)` is fine only when x is built inside this function,
+            // where its own `.route(` lines are part of what gets scanned.
+            for merged in body.split(".merge(").skip(1) {
+                let name = merged.split(')').next().expect("a merge has an argument");
+                assert!(
+                    body.contains(&format!("let {name} =")),
+                    "build_router merges {name:?}, which is built outside the \
+                     scanned body, so its routes are invisible here"
+                );
+            }
 
             let mut declared: Vec<(String, String)> = Vec::new();
             for line in body.lines() {
