@@ -1375,26 +1375,8 @@ mod tests {
         let mut found = Vec::new();
         for (name, source) in CRATE_SOURCES {
             for (number, line) in source.lines().enumerate() {
-                // The test module names these headers on purpose, in the
-                // FORWARD_AUTH_HEADERS table and in the prose explaining
-                // why they are not trusted. Skipping the crate's own
-                // documentation of the rule is not a loophole in it: a real
-                // read is `headers().get(...)`, not a string in a comment.
-                let trimmed = line.trim_start();
-                if trimmed.starts_with("//") || trimmed.starts_with("\"") {
-                    continue;
-                }
-                // Case-INSENSITIVE, because HTTP header names are
-                // (RFC 9110 5.1) and Rust spells them lowercase by
-                // convention -- `headers().get("remote-user")` reads the
-                // same header the table names in Title-Case, and a scan
-                // that only matched the table's own spelling would miss
-                // the way the code would most likely be written.
-                let haystack = line.to_ascii_lowercase();
-                for header in FORWARD_AUTH_HEADERS {
-                    if haystack.contains(&header.to_ascii_lowercase()) {
-                        found.push(format!("{name}:{}: {}", number + 1, line.trim()));
-                    }
+                if let Some(header) = forward_auth_header_named_on(line) {
+                    found.push(format!("{name}:{}: {header}: {}", number + 1, line.trim()));
                 }
             }
         }
@@ -1403,6 +1385,99 @@ mod tests {
             "ferrumd must never trust a forward-auth identity header (D4); found:\n{}",
             found.join("\n")
         );
+    }
+
+    /// The forward-auth header a line names, if it names one.
+    ///
+    /// Split out of the scan above so the recogniser can be exercised
+    /// directly, for the same reason `module_declared_on` was: the scan it
+    /// feeds asserts an ABSENCE, and an absence-finder with a broken
+    /// matcher reports the same clean result as a codebase that really is
+    /// clean. The matcher could have been replaced wholesale -- or by
+    /// something that matches nothing at all -- and the only signal would
+    /// have been a green test.
+    ///
+    /// # Arguments
+    /// * `line` - one source line, exactly as written.
+    ///
+    /// # Returns
+    /// The matched entry of `FORWARD_AUTH_HEADERS`, or `None` for a line
+    /// that names none -- including this crate's own documentation of the
+    /// rule, which names them all on purpose.
+    fn forward_auth_header_named_on(line: &str) -> Option<&'static str> {
+        // The test module names these headers deliberately, in the
+        // FORWARD_AUTH_HEADERS table and in the prose explaining why they
+        // are not trusted. Skipping the crate's own documentation of the
+        // rule is not a loophole in it: a real read is
+        // `headers().get(...)`, not a string in a comment.
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("//") || trimmed.starts_with('"') {
+            return None;
+        }
+        // Case-INSENSITIVE, because HTTP header names are (RFC 9110 5.1)
+        // and Rust spells them lowercase by convention --
+        // `headers().get("remote-user")` reads the same header the table
+        // names in Title-Case, and a scan that only matched the table's own
+        // spelling would miss the way the code would most likely be
+        // written.
+        let haystack = line.to_ascii_lowercase();
+        FORWARD_AUTH_HEADERS
+            .iter()
+            .copied()
+            .find(|header| haystack.contains(&header.to_ascii_lowercase()))
+    }
+
+    /// Lines the recogniser must match, and lines it must not.
+    ///
+    /// A table rather than inline arguments, for a reason peculiar to this
+    /// guard: the scan reads main.rs too, so a fixture written inline
+    /// would be a line of THIS file naming a forward-auth header outside a
+    /// comment -- and the scan would dutifully report its own positive
+    /// control as a violation. It did, on the first run. Each entry here
+    /// sits on its own line beginning with a quote, which is the same
+    /// exemption the FORWARD_AUTH_HEADERS table above already relies on.
+    const READS_A_HEADER: &[&str] = &[
+        "let who = headers.get(\"remote-user\");",
+        "headers.get(\"Remote-Email\")",
+        "headers.get(\"X-Remote-Groups\")",
+        "HeaderName::from_static(\"REMOTE-NAME\")",
+    ];
+
+    /// The crate's own documentation of the rule, and ordinary code.
+    const NAMES_NO_HEADER: &[&str] = &[
+        "// Remote-User is never trusted here",
+        "    \"Remote-User\",",
+        "let session = require_session(&req)?;",
+    ];
+
+    /// The positive control the scan above had none of.
+    ///
+    /// Every assertion that recogniser feeds is "nothing matched", so
+    /// without this the matcher itself is untested: it could return `None`
+    /// unconditionally and the guard would go on reporting a clean crate
+    /// forever. Modelled on
+    /// `a_module_declaration_is_recognised_whatever_its_visibility` below,
+    /// which exists for exactly the same reason.
+    ///
+    /// `is_some`, not the matched entry: the table's own entries overlap
+    /// ("Remote-Groups" is a substring of "X-Remote-Groups"), so which one
+    /// is reported first is an ordering detail, while whether anything is
+    /// reported at all is the contract.
+    #[test]
+    fn a_forward_auth_header_read_is_recognised_however_it_is_spelled() {
+        for line in READS_A_HEADER {
+            assert!(
+                forward_auth_header_named_on(line).is_some(),
+                "the scan's matcher misses a real read: {line}"
+            );
+        }
+        for line in NAMES_NO_HEADER {
+            assert_eq!(
+                forward_auth_header_named_on(line),
+                None,
+                "the scan's matcher reports a violation that is not one: {line}"
+            );
+        }
     }
 
     /// The module a `mod`/`pub mod`/`pub(crate) mod` line declares, if it
