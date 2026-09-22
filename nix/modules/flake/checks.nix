@@ -764,6 +764,42 @@
           movedRules =
             moved.config.services.authelia.instances.main.settings.access_control.rules;
 
+          # A5's other half, and the one nothing in either language held:
+          # that ferrumd is not ALLOWED to bind a public interface.
+          # modules/lib/settings-schema.json types daemon.listenAddress as a
+          # bare string, so ferrum's own web UI can write "0.0.0.0" into
+          # settings.json; modules/core/daemon.nix now refuses that at
+          # evaluation, and this is what proves the refusal is real in both
+          # directions.
+          #
+          # Same builtins.tryEval + message-scoping idiom as
+          # reservedSubdomainCollision below, and scoped for the same
+          # non-negotiable reason: these fixtures carry other failing
+          # assertions (the example host's placeholder secrets have no
+          # *-apikey-raw.sops counterparts), so an unscoped version would
+          # report every host as rejected and would pass identically with
+          # the assertion deleted. The phrase matched is kept on ONE line of
+          # daemon.nix's message for the same reason it is in that check:
+          # an infix spanning a multi-line Nix string's line break never
+          # matches.
+          loopbackFailuresFor = addr:
+            let
+              probe = builtins.tryEval (
+                builtins.filter (m: lib.hasInfix "is not a loopback address" m)
+                  (map (a: a.message)
+                    (builtins.filter (a: !a.assertion)
+                      (mkProxyHost { daemon.listenAddress = addr; }).config.assertions)));
+            in
+            if probe.success then probe.value else [ "evaluation threw" ];
+          # Not just 127.0.0.1: the recovery route A5 protects is an SSH
+          # tunnel to wherever ferrumd listens, so every loopback spelling
+          # has to keep working or the assertion is a regression dressed as
+          # a control.
+          wronglyRejected = builtins.filter (a: loopbackFailuresFor a != [ ])
+            [ "127.0.0.1" "127.0.0.2" "::1" ];
+          wronglyAccepted = builtins.filter (a: loopbackFailuresFor a == [ ])
+            [ "0.0.0.0" "192.168.1.10" "::" "127.0.0.1.example.test" ];
+
           # A2/D1: the Authelia rule. Without it, default_policy = "deny"
           # applies and the auth_request wiring asserted above denies every
           # request forever -- the dashboard would not be weakly protected, it
@@ -858,6 +894,11 @@
             ++ lib.optional
               (!(builtins.any (r: r.domain or "" == movedName) movedRules))
               "Authelia has no access_control rule for ${movedName}, so a moved dashboard is unopenable under default_policy = deny (D1/D7)"
+            # A5, enforced.
+            ++ map (a: "ferrum.daemon.listenAddress = \"${a}\" is refused at evaluation, and it is a loopback address -- the SSH-tunnel recovery route A5 protects is broken (A5)")
+              wronglyRejected
+            ++ map (a: "ferrum.daemon.listenAddress = \"${a}\" evaluates cleanly, so ferrumd may be told to bind an interface the world can reach with nginx and Authelia bypassed entirely (A5)")
+              wronglyAccepted
             # A2/D1.
             ++ lib.optional (daemonRules == [ ])
               "Authelia has no access_control rule for ${daemonName}, so default_policy = deny makes the dashboard unopenable (D1)"

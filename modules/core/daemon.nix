@@ -10,8 +10,55 @@
 { config, lib, pkgs, ... }:
 let
   ferrum = config.ferrum;
+
+  listenAddress = ferrum.daemon.listenAddress;
+  # 127.0.0.0/8 by its first octet, plus the two other spellings of the
+  # same thing. Split rather than prefix-matched so that "127.0.0.1.example"
+  # -- a string that starts with "127." and is not an address at all -- is
+  # not quietly admitted.
+  octets = lib.splitString "." listenAddress;
+  listenIsLoopback =
+    (builtins.length octets == 4 && builtins.head octets == "127")
+    || listenAddress == "::1"
+    || listenAddress == "localhost";
 in
 lib.mkIf ferrum.daemon.enable {
+  assertions = [
+    {
+      # A5, enforced rather than merely described.
+      #
+      # modules/lib/settings-schema.json types daemon.listenAddress as a
+      # bare { "type": "string" }, and ferrumd's own PUT /api/settings
+      # validates against that schema -- so the web UI could write
+      # "0.0.0.0" into /etc/ferrum/settings.json, the next apply would
+      # build cleanly, and the daemon would come up on every interface
+      # with Authelia and nginx bypassed entirely. Nothing in either
+      # language said otherwise: changing the default in
+      # crates/ferrumd/src/main.rs left all 103 of that crate's tests
+      # green, and no Nix check varied the option at all.
+      #
+      # Caught here, at evaluation, because that is the last moment it is
+      # cheap. ferrumd itself cannot refuse the value it is handed: by the
+      # time the process reads FERRUMD_LISTEN_ADDRESS the host is built and
+      # the generation is being activated, so the only thing it could do is
+      # fail to start -- which takes the UI away instead of protecting it.
+      assertion = listenIsLoopback;
+      message = ''
+        ferrum.daemon.listenAddress = "${listenAddress}" is not a loopback address.
+        ferrumd holds this host's settings, its secrets API and its system
+        generations, and the only login in front of it is Authelia, in nginx
+        (modules/proxy/nginx.nix). Binding anything else puts the control
+        plane on the network with that gate bypassed.
+
+        Publishing the dashboard is what ferrum.daemon.subdomain and
+        ferrum.proxy are for: nginx reaches ferrumd over loopback and gates
+        it there. Set ferrum.daemon.listenAddress to 127.0.0.1 (or another
+        127.0.0.0/8 address, or ::1), and reach the UI from elsewhere either
+        through the proxy or over an SSH tunnel to that port.
+      '';
+    }
+  ];
+
   users.users.ferrum = {
     isSystemUser = true;
     group = "ferrum";

@@ -579,11 +579,35 @@ async fn main() -> anyhow::Result<()> {
 
     let app = build_router(state);
 
-    let listen_address = std::env::var("FERRUMD_LISTEN_ADDRESS").unwrap_or_else(|_| "127.0.0.1".to_string());
+    let listen_address =
+        std::env::var("FERRUMD_LISTEN_ADDRESS").unwrap_or_else(|_| default_listen_address().into());
     let port: u16 = std::env::var("FERRUMD_PORT").ok().and_then(|v| v.parse().ok()).unwrap_or(7788);
     let listener = tokio::net::TcpListener::bind(format!("{listen_address}:{port}")).await?;
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+/// The address ferrumd binds when `FERRUMD_LISTEN_ADDRESS` names none.
+///
+/// A named function rather than a literal inside `main`'s
+/// `unwrap_or_else`, and the reason is the whole of its value: in there it
+/// was unreachable from a test, so A5's headline guarantee -- ferrumd
+/// keeps listening on loopback, and *publishing* the dashboard means
+/// nginx reaches it there rather than the daemon binding a public
+/// interface -- was asserted by nothing at all. Changing the literal to
+/// `0.0.0.0` left all 103 tests in this crate green.
+///
+/// This owns only the default. The value an operator sets reaches this
+/// process as `FERRUMD_LISTEN_ADDRESS` (`modules/core/daemon.nix`) and
+/// replaces it outright, so the other half of A5 is a NixOS assertion in
+/// that file -- there is no point re-checking here a value this process
+/// has no power to refuse: it would fail at `bind` with the host already
+/// built and the UI already gone.
+///
+/// # Returns
+/// The default bind address, as a string `TcpListener::bind` accepts.
+fn default_listen_address() -> &'static str {
+    "127.0.0.1"
 }
 
 /// Real request-level tests for the CSRF gate, driven through the real
@@ -1451,6 +1475,27 @@ mod tests {
         assert_eq!(module_declared_on("    mod nested;"), None);
         assert_eq!(module_declared_on("use auth::mod;"), None);
         assert_eq!(module_declared_on("// mod auth;"), None);
+    }
+
+    /// A5, on the half this crate owns.
+    ///
+    /// Asserted as a PROPERTY, not as the literal string: a test that only
+    /// restates the constant passes on any edit that changes both, which
+    /// is the shape of nearly every guard this phase has had to replace.
+    /// What A5 requires is not this particular address but that ferrumd
+    /// never *defaults* to an interface the world can reach -- so the
+    /// assertion is `is_loopback`, and the parse is load-bearing too: the
+    /// value goes straight to `TcpListener::bind`, so a hostname here
+    /// would be a runtime failure on a host that has already been built.
+    #[test]
+    fn the_default_bind_address_is_loopback() {
+        let address: std::net::IpAddr = default_listen_address()
+            .parse()
+            .expect("the default must be a literal address: it is fed straight to TcpListener::bind");
+        assert!(
+            address.is_loopback(),
+            "ferrumd must not default to binding a public interface (A5); got {address}"
+        );
     }
 
     /// A3/D5 -- the absence of CORS, enforced.
