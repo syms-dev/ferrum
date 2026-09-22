@@ -1473,6 +1473,26 @@ mod tests {
             (result.session_token, result.csrf_token)
         }
 
+        /// A real session paired with a CSRF token that is not the one the
+        /// session row holds.
+        ///
+        /// This is the only way to reach `require_session`'s FORBIDDEN
+        /// branch, which D5 leg 1 names alongside 401 and 500. Without it
+        /// the matrix drives every authenticated request with a VALID
+        /// token, so the 403 return is never on any response the CORS
+        /// assertion sees -- and 403 is the refusal a browser's
+        /// cross-origin attempt actually earns, since the attacker can
+        /// send the cookie but cannot read the token.
+        fn forged_csrf(state: &Arc<AppState>, password: &str) -> (String, String) {
+            let (session, csrf) = fresh_credentials(state, password);
+            assert_ne!(csrf, FORGED_CSRF_TOKEN, "the forged token must differ");
+            (session, FORGED_CSRF_TOKEN.to_string())
+        }
+
+        /// Not a real token, and deliberately not empty: an empty header
+        /// is already covered by `an_empty_stored_token_is_never_a_wildcard`.
+        const FORGED_CSRF_TOKEN: &str = "not-the-session-csrf-token";
+
         fn request(method: &str, uri: &str, cookie: Option<&(String, String)>) -> Request<Body> {
             let mut builder = Request::builder()
                 .method(Method::from_bytes(method.as_bytes()).unwrap())
@@ -1502,14 +1522,17 @@ mod tests {
                 .unwrap()
         }
 
-        /// Every route, unauthenticated and authenticated, on both the real
-        /// method and its preflight.
+        /// Every route, unauthenticated, authenticated, and authenticated
+        /// with a forged CSRF token, on both the real method and its
+        /// preflight.
         ///
-        /// The unauthenticated pass is not redundant with the authenticated
-        /// one: it is where the 401s live, and an error response is exactly
-        /// where a CORS layer gets applied unconditionally -- the handler
-        /// never runs, so anything on the response came from the middleware
-        /// stack itself.
+        /// The three passes are not redundant, because each one is refused
+        /// at a different point in the stack, and a CORS layer applied
+        /// unconditionally shows up on whichever of them the handler never
+        /// reaches. The unauthenticated pass is where the 401s live; the
+        /// forged-CSRF pass is where the 403s live (D5 leg 1 names both,
+        /// and the 500 has its own test below); the authenticated pass is
+        /// the one where the handler really runs.
         #[tokio::test]
         async fn no_api_route_is_ever_served_with_a_cors_header() {
             let (dir, state, _session, _csrf) = logged_in();
@@ -1519,6 +1542,7 @@ mod tests {
                 .to_string();
             let mut unauthenticated_statuses = Vec::new();
             let mut authenticated_statuses = Vec::new();
+            let mut forged_csrf_statuses = Vec::new();
 
             for (method, pattern, uri) in API_ROUTES {
                 let response = build_router(state.clone())
@@ -1535,6 +1559,17 @@ mod tests {
                     .unwrap();
                 assert_no_cors_headers(&format!("authenticated {method} {pattern}"), &response);
                 authenticated_statuses.push(response.status());
+
+                let forged = forged_csrf(&state, &password);
+                let response = build_router(state.clone())
+                    .oneshot(request(method, uri, Some(&forged)))
+                    .await
+                    .unwrap();
+                assert_no_cors_headers(
+                    &format!("session-with-forged-CSRF {method} {pattern}"),
+                    &response,
+                );
+                forged_csrf_statuses.push(response.status());
 
                 let response = build_router(state.clone())
                     .oneshot(preflight(method, uri))
@@ -1553,6 +1588,15 @@ mod tests {
                 unauthenticated_statuses.contains(&StatusCode::UNAUTHORIZED),
                 "no 401 was produced, so the error path was never exercised: \
                  {unauthenticated_statuses:?}"
+            );
+            // And the same for the 403. `require_session` only reaches
+            // FORBIDDEN on a mutating method, so this passing depends on
+            // API_ROUTES still containing one -- which is exactly what the
+            // assertion says when it fails.
+            assert!(
+                forged_csrf_statuses.contains(&StatusCode::FORBIDDEN),
+                "no 403 was produced, so the CSRF-refusal path D5 names was \
+                 never exercised: {forged_csrf_statuses:?}"
             );
             assert!(
                 authenticated_statuses.iter().any(StatusCode::is_success),
