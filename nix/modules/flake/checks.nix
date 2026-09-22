@@ -582,6 +582,221 @@
           inherit problems;
         };
 
+      # R13: the control plane is actually published, actually gated, and
+      # actually absent when it should be.
+      #
+      # Like authModelEnforced above, this reads the GENERATED config -- the
+      # nginx virtualHosts, the Authelia access_control rules and the
+      # security.acme.certs entries a real host ends up with -- not the
+      # metadata that is supposed to produce them. That distinction is the
+      # entire point here: ferrum.daemon.subdomain has existed and been
+      # described as the daemon's hostname since Phase 1.5, while nothing
+      # anywhere turned it into a vhost. An assertion over the option would
+      # have passed the whole time.
+      daemonVhostEnforced =
+        let
+          mkProxyHost =
+            { proxy ? true
+            , baseDomain ? "example.test"
+            , apps ? { plex.enable = true; sonarr.enable = true; }
+            , secrets ? { }
+            }: ferrumLib.mkHost {
+              inherit system;
+              settings = {
+                schemaVersion = realMigrations.currentVersion;
+                proxy = { enable = proxy; inherit baseDomain; acme.email = "a@example.test"; };
+                auth = { enable = true; adminEmail = "a@example.test"; };
+                inherit apps secrets;
+              };
+              modules = [ ../../../examples/hosts/minimal/configuration.nix ];
+            };
+
+          published = mkProxyHost { };
+          daemonSub = published.config.ferrum.daemon.subdomain;
+          daemonPort = published.config.ferrum.daemon.port;
+          daemonAddr = published.config.ferrum.daemon.listenAddress;
+          daemonName = "${daemonSub}.example.test";
+          vhosts = published.config.services.nginx.virtualHosts;
+          daemonV = vhosts.${daemonName} or null;
+          # `or { }` rather than `or null` so a missing location degrades to an
+          # empty config string and produces a specific "directive missing"
+          # problem, instead of throwing before any of them are reported.
+          locOf = loc: (daemonV.locations.${loc} or { }).extraConfig or "";
+          rootLoc = locOf "/";
+          apiLoc = locOf "/api/";
+          hasIn = needle: hay: lib.hasInfix needle hay;
+
+          # A7: no baseDomain, or no proxy, means NO vhost -- not a vhost on a
+          # hostname that will never resolve. Checked as absence of the daemon
+          # key specifically; both hosts still generate other vhosts.
+          absentWhenProxyOff =
+            (mkProxyHost { proxy = false; }).config.services.nginx.virtualHosts;
+          absentWhenNoDomain =
+            (mkProxyHost { baseDomain = ""; }).config.services.nginx.virtualHosts;
+
+          # A2/D1: the Authelia rule. Without it, default_policy = "deny"
+          # applies and the auth_request wiring asserted above denies every
+          # request forever -- the dashboard would not be weakly protected, it
+          # would be unopenable. A rule whose policy is "bypass" is the
+          # opposite failure and is rejected just as hard.
+          rules = published.config.services.authelia.instances.main.settings.access_control.rules;
+          daemonRules = builtins.filter (r: r.domain or "" == daemonName) rules;
+
+          # A6/D6: the dashboard-only host. Every catalog app is deliberately
+          # "local", so publicApps == { } and every pre-R13 ACME branch was
+          # false. This is the configuration that silently got no certificate.
+          dashboardOnly = mkProxyHost {
+            apps = { plex = { enable = true; exposure = "local"; }; };
+            secrets = { "acme-dns" = { }; };
+          };
+          dashboardCerts = dashboardOnly.config.security.acme.certs;
+          daemonCert = dashboardCerts.${daemonName} or null;
+          expectedDnsProvider = dashboardOnly.config.ferrum.proxy.acme.dnsProvider;
+          dashboardPublicApps = lib.filterAttrs
+            (_: app: app.enable && app.exposure == "public")
+            dashboardOnly.config.ferrum.apps;
+
+          problems =
+            lib.optional (daemonV == null)
+              "no vhost generated at ${daemonName}: ferrum.daemon.subdomain is still decorative (A1)"
+            # A1: it must reach the daemon where the daemon actually listens,
+            # not a hardcoded 127.0.0.1 that a changed listenAddress breaks.
+            ++ lib.optional
+              (daemonV != null
+                && (daemonV.locations."/".proxyPass or "") != "http://${daemonAddr}:${toString daemonPort}")
+              "the daemon vhost's / does not proxy to ferrum.daemon.listenAddress:port (A1/A5)"
+            # A2: gated exactly like a catalog app, on BOTH locations. /api/
+            # is the one a compromised sibling would aim at.
+            ++ lib.optional (!(hasIn "auth_request /authelia" rootLoc))
+              "the daemon vhost's / is NOT behind forward-auth: the control plane is published unauthenticated (A2)"
+            ++ lib.optional (!(hasIn "auth_request /authelia" apiLoc))
+              "the daemon vhost's /api/ is NOT behind forward-auth (A2)"
+            ++ lib.optional (daemonV != null && (daemonV.locations."/authelia" or null) == null)
+              "the daemon vhost has no /authelia subrequest location, so auth_request has nothing to call (A2)"
+            # D8, leg 1 and 2. jobs.rs's SSE stream outlives the 60s
+            # proxy_read_timeout recommendedProxySettings supplies, and gets
+            # batched by the buffering it also leaves on.
+            ++ lib.optional (!(hasIn "proxy_buffering off" apiLoc))
+              "the daemon vhost's /api/ leaves proxy_buffering on, so the job SSE stream is batched (D8)"
+            ++ lib.optional (!(hasIn "proxy_read_timeout 300s" apiLoc))
+              "the daemon vhost's /api/ does not raise proxy_read_timeout above apply.healthCheckTimeoutSec, so a long apply is cut off (D8)"
+            # D8, leg 3. A browser navigation should redirect to Authelia; an
+            # XHR must not, or the SPA cannot tell an expired session from a
+            # dead daemon.
+            ++ lib.optional (!(hasIn "error_page 401 =302 https://auth.example.test" rootLoc))
+              "the daemon vhost's / does not redirect an unauthenticated navigation to Authelia (A2)"
+            ++ lib.optional (hasIn "=302" apiLoc)
+              "the daemon vhost's /api/ redirects a 401 instead of returning it, so the SPA sees an opaque cross-origin redirect (D8)"
+            ++ lib.optional (!(hasIn "error_page 401 = @ferrum_api_401" apiLoc))
+              "the daemon vhost's /api/ does not override the 401 redirect with a plain 401 (D8)"
+            # A7, both halves.
+            ++ lib.optional (absentWhenProxyOff ? ${daemonName})
+              "a daemon vhost exists with ferrum.proxy.enable = false (A7)"
+            ++ lib.optional (absentWhenNoDomain ? "${daemonSub}.")
+              "a daemon vhost exists with an empty baseDomain, on a hostname that cannot resolve (A7)"
+            # A2/D1.
+            ++ lib.optional (daemonRules == [ ])
+              "Authelia has no access_control rule for ${daemonName}, so default_policy = deny makes the dashboard unopenable (D1)"
+            ++ lib.optional (builtins.any (r: r.policy or "" == "bypass") daemonRules)
+              "Authelia's rule for ${daemonName} is policy = bypass, so the control plane is published unauthenticated (A2)"
+            # A6/D6.
+            ++ lib.optional (dashboardPublicApps != { })
+              "the dashboard-only fixture has a public app, so it no longer tests the publicApps == {} path"
+            # Asserting the KEY EXISTS is not enough here, and finding that
+            # out is the reason this check is mutation-tested. nginx's own
+            # module auto-creates a security.acme.certs stub for any vhost
+            # naming a useACMEHost, so with acme.nix's daemon entry deleted
+            # the key is still present -- with dnsProvider = null and
+            # environmentFile = null, i.e. a certificate that would try
+            # HTTP-01 with no credential and never issue. An existence check
+            # passed that mutation cleanly. A6 asks for the certificate to
+            # come through the SAME ACME path as every other vhost, so that
+            # is what is checked: ferrum's DNS-01 provider, and the
+            # Cloudflare token lego actually needs.
+            ++ lib.optional (daemonCert == null)
+              "with no public catalog app, the dashboard gets no ACME certificate entry at all (A6/D6)"
+            ++ lib.optional
+              (daemonCert != null && (daemonCert.dnsProvider or null) != expectedDnsProvider)
+              "the dashboard's certificate is not on ferrum's DNS-01 path -- it is nginx's bare useACMEHost stub, which would never issue (A6/D6)"
+            ++ lib.optional
+              (daemonCert != null && (daemonCert.environmentFile or null) == null)
+              "the dashboard's certificate has no environmentFile, so lego gets no Cloudflare credential (A6/D6)";
+        in
+        {
+          ok = problems == [ ];
+          message = "the generated config does not publish the control plane as R13 requires";
+          inherit problems;
+          # Diagnostics, printed by mkAssertionCheck on failure: the cert
+          # findings above are otherwise very hard to read from the message
+          # alone, because the failure is a present-but-inert entry rather
+          # than a missing one.
+          dashboardCertNames = builtins.attrNames dashboardCerts;
+          daemonCertDnsProvider = if daemonCert == null then "<no entry>" else daemonCert.dnsProvider;
+        };
+
+      # A8/D7: the daemon's hostname is reserved, and a collision is a
+      # configuration error reported at EVALUATION time.
+      #
+      # Same builtins.tryEval idiom as journalDirCollision above, and scoped
+      # to this assertion's own message for the same non-negotiable reason:
+      # these hosts carry other failing assertions (the example host's
+      # placeholder secrets have no *-apikey-raw.sops counterparts), so an
+      # unscoped version would report every host as "rejected" and would pass
+      # identically with the assertion deleted.
+      reservedSubdomainCollision =
+        let
+          hostWith = appSubdomain: ferrumLib.mkHost {
+            inherit system;
+            settings = {
+              schemaVersion = realMigrations.currentVersion;
+              proxy = { enable = true; baseDomain = "example.test"; acme.email = "a@example.test"; };
+              auth = { enable = true; adminEmail = "a@example.test"; };
+              apps = {
+                plex.enable = true;
+                sonarr = { enable = true; }
+                  // lib.optionalAttrs (appSubdomain != null) { subdomain = appSubdomain; };
+              };
+            };
+            modules = [ ../../../examples/hosts/minimal/configuration.nix ];
+          };
+
+          failuresFor = appSubdomain:
+            let
+              probe = builtins.tryEval (
+                # Must be a phrase the assertion keeps on ONE line: the
+                # message is a multi-line Nix string, so an infix spanning its
+                # line break never matches and the check reports every host as
+                # "not rejected". Caught exactly that way while writing this.
+                builtins.filter (m: lib.hasInfix "reserves for its control plane" m)
+                  (map (a: a.message)
+                    (builtins.filter (a: !a.assertion) (hostWith appSubdomain).config.assertions))
+              );
+            in
+            if probe.success then probe.value else [ "evaluation threw" ];
+
+          # Read off the host rather than hardcoded, so this still tests the
+          # right thing if the default subdomain ever changes -- and so it
+          # fails loudly if someone hardcodes "ferrum" in the assertion
+          # instead of reading the option (D7 is explicit about that).
+          daemonSub = (hostWith null).config.ferrum.daemon.subdomain;
+          colliding = [ daemonSub "auth" ];
+
+          defaultFailures = failuresFor null;
+          notRejected = builtins.filter (s: failuresFor s == [ ]) colliding;
+
+          # The message has to be actionable: an operator who hits this needs
+          # to know WHICH app and WHICH name, or the assertion is a riddle.
+          collisionMessages = failuresFor daemonSub;
+          namesTheApp = builtins.any (m: lib.hasInfix "ferrum.apps.sonarr.subdomain" m) collisionMessages;
+          namesTheReservedName = builtins.any (m: lib.hasInfix "\"${daemonSub}\"" m) collisionMessages;
+        in
+        {
+          ok = defaultFailures == [ ] && notRejected == [ ] && namesTheApp && namesTheReservedName;
+          message = "the reserved-subdomain assertion does not protect the control plane's hostname";
+          inherit defaultFailures notRejected namesTheApp namesTheReservedName;
+          reserved = colliding;
+        };
+
       # The apps are told where media lives, and told the SAME place the
       # storage module created.
       #
@@ -758,6 +973,9 @@
     {
       checks = {
         auth-model-enforced = mkAssertionCheck "auth-model-enforced" authModelEnforced;
+        daemon-vhost-enforced = mkAssertionCheck "daemon-vhost-enforced" daemonVhostEnforced;
+        reserved-subdomain-collision =
+          mkAssertionCheck "reserved-subdomain-collision" reservedSubdomainCollision;
         root-folders-reach-the-apps = rootFoldersReachTheApps;
         dns-record-set = dnsRecordSet;
         catalog-consistency = mkAssertionCheck "catalog-consistency" catalogConsistency;
