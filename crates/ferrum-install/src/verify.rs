@@ -119,6 +119,23 @@ pub fn service_checks() -> Vec<Check> {
 /// unauthenticated request returns a redirect. One line and one round trip,
 /// and it is the earliest signal that would catch an app published with no
 /// login at all.
+///
+/// The control plane is asserted alongside them, and separately from them.
+/// `crate::sso::apps_left_open` cannot see it -- ferrumd is not a catalog
+/// app -- which is the defect this phase has now found in four modules in
+/// a row, including in `unauthenticated_checks` directly below. Its vhost
+/// exists because the proxy does, not because any app was selected, so the
+/// predicate is `crate::sso::daemon_published` and the assertion is the
+/// same one a gated app gets.
+///
+/// # Arguments
+/// * `domain` - `ferrum.proxy.baseDomain`.
+/// * `apps` - the published catalog apps.
+/// * `sso_enabled` - whether Authelia is in front of anything at all.
+///
+/// # Returns
+/// One check per gated surface, or none when SSO was declined -- in which
+/// case [`unauthenticated_checks`] owns the inverted assertion.
 pub fn auth_checks(domain: &str, apps: &[String], sso_enabled: bool) -> Vec<Check> {
     if !sso_enabled {
         return Vec::new();
@@ -136,6 +153,13 @@ pub fn auth_checks(domain: &str, apps: &[String], sso_enabled: bool) -> Vec<Chec
         command: url(format!("https://auth.{domain}/")),
         expect: "200".into(),
     }];
+    if crate::sso::daemon_published(Some(domain)) {
+        checks.push(Check {
+            what: "the ferrum dashboard redirects to authentication",
+            command: url(format!("https://{}.{domain}/", crate::dns::DAEMON_SUBDOMAIN)),
+            expect: "302".into(),
+        });
+    }
     for app in crate::sso::apps_left_open(apps) {
         checks.push(Check {
             what: "the app redirects to authentication",
@@ -154,18 +178,47 @@ pub fn auth_checks(domain: &str, apps: &[String], sso_enabled: bool) -> Vec<Chec
 /// Returning no checks at all for the decline path -- as an earlier version
 /// did -- meant the one configuration the operator had to type a phrase to
 /// reach was the only one verified by nothing.
+///
+/// **The same sentence was true one surface further in, and the docstring
+/// above was describing it without noticing.** This mapped over
+/// `crate::sso::apps_left_open` alone, and ferrumd is not a catalog app, so
+/// the control plane -- the one thing on this host that writes secrets,
+/// rewrites `settings.json` and applies generations -- was the single
+/// published surface the declined-SSO path left open AND never verified.
+/// `crate::sso::daemon_published` is the predicate `sso.rs`,
+/// `preflight.rs` and `dns.rs` already consult for it; consulting it here
+/// too is what makes all four agree.
+///
+/// # Arguments
+/// * `domain` - `ferrum.proxy.baseDomain`.
+/// * `apps` - the published catalog apps.
+///
+/// # Returns
+/// One check per surface left open, each asserting a direct answer rather
+/// than a redirect.
 pub fn unauthenticated_checks(domain: &str, apps: &[String]) -> Vec<Check> {
-    crate::sso::apps_left_open(apps)
-        .into_iter()
-        .map(|app| Check {
-            what: "the app answers directly, as the operator accepted",
-            command: format!(
-                "curl -sS -o /dev/null -w '%{{http_code}}' {}",
-                crate::collect::sh_quote(&format!("https://{app}.{domain}/"))
-            ),
-            expect: "200".into(),
-        })
-        .collect()
+    let answers_directly = |host: String| Check {
+        what: "the app answers directly, as the operator accepted",
+        command: format!(
+            "curl -sS -o /dev/null -w '%{{http_code}}' {}",
+            crate::collect::sh_quote(&format!("https://{host}/"))
+        ),
+        expect: "200".into(),
+    };
+
+    let mut checks: Vec<Check> = Vec::new();
+    if crate::sso::daemon_published(Some(domain)) {
+        checks.push(Check {
+            what: "the ferrum dashboard answers directly, as the operator accepted",
+            ..answers_directly(format!("{}.{domain}", crate::dns::DAEMON_SUBDOMAIN))
+        });
+    }
+    checks.extend(
+        crate::sso::apps_left_open(apps)
+            .into_iter()
+            .map(|app| answers_directly(format!("{app}.{domain}"))),
+    );
+    checks
 }
 
 /// Asserts every data disk the operator kept is still mounted with the
@@ -239,7 +292,10 @@ pub fn data_disk_checks(kept: &[&Device]) -> Vec<Check> {
 /// # Arguments
 /// * `domain` - `ferrum.proxy.baseDomain`.
 /// * `apps` - the published apps, used when there is no auth host.
-/// * `sso_enabled` - whether `auth.<domain>` exists to be asked.
+/// * `sso_enabled` - whether `auth.<domain>` exists to be asked. With no
+///   auth host and no app, the dashboard's own hostname is asked for: it is
+///   published whenever the proxy is, so "nothing is published" stopped
+///   being true at R13.
 /// * `dns` - the operator's record decision. `None`, or a `CNAME`, yields
 ///   no checks: A8 is about the static address ferrum writes, and under a
 ///   `CNAME` ferrum states no address to prove.
@@ -264,12 +320,21 @@ pub fn external_reachability_checks(
 
     // The auth host when there is one: it is the hostname every *arr
     // redirects to, so an operator who can reach nothing else still has to
-    // reach this. Otherwise the first published app -- some published
-    // hostname must exist for the address to be worth proving at all.
+    // reach this. Otherwise the first published app.
+    //
+    // And failing both, the dashboard -- which was the whole of the gap
+    // here. `!sso_enabled && apps.is_empty()` returned no check at all, on
+    // the grounds that no hostname was published; after R13 that is simply
+    // untrue. `ferrum.<domain>` is published because the proxy is, so a
+    // host that selected no app and declined SSO still has exactly one name
+    // whose reachability is worth proving, and it is the only one the
+    // operator will actually visit.
     let host = if sso_enabled {
         format!("auth.{domain}")
     } else if let Some(app) = apps.first() {
         format!("{app}.{domain}")
+    } else if crate::sso::daemon_published(Some(domain)) {
+        format!("{}.{domain}", crate::dns::DAEMON_SUBDOMAIN)
     } else {
         return Vec::new();
     };
@@ -811,6 +876,67 @@ mod tests {
         );
     }
 
+    /// R13/A2, at the site that verifies the finished machine.
+    ///
+    /// The apps are checked through `sso::apps_left_open`, which is a
+    /// function of the catalog -- and ferrumd is not a catalog app. So
+    /// until this existed, the installer confirmed every *arr was behind a
+    /// login and never once asked whether the dashboard was, on a host
+    /// where the dashboard is the surface that writes secrets and applies
+    /// generations.
+    #[test]
+    fn the_dashboard_is_checked_for_its_login_like_every_other_surface() {
+        let c = auth_checks("thesyms.ca", &["sonarr".into()], true);
+        let dashboard = c
+            .iter()
+            .find(|c| c.command.contains("ferrum.thesyms.ca"))
+            .expect("the control plane is verified too");
+        assert_eq!(
+            dashboard.expect, "302",
+            "a 200 here would mean the dashboard is published with no login"
+        );
+        // And it is not merely the auth host under another name.
+        assert!(c.iter().any(|c| c.command.contains("auth.thesyms.ca")));
+        assert!(c.iter().any(|c| c.command.contains("sonarr.thesyms.ca")));
+    }
+
+    /// The same surface on the path the operator had to type a phrase to
+    /// reach -- and the one this module's own docstring already described
+    /// happening somewhere else.
+    ///
+    /// Declining SSO leaves the control plane open. Verifying every app it
+    /// left open while never verifying the control plane it left open is
+    /// exactly the inversion `unauthenticated_checks` exists to prevent,
+    /// applied to everything except the most dangerous surface.
+    #[test]
+    fn declining_sso_still_verifies_the_control_plane_it_left_open() {
+        let c = unauthenticated_checks("thesyms.ca", &["sonarr".into(), "plex".into()]);
+        let dashboard = c
+            .iter()
+            .find(|c| c.command.contains("ferrum.thesyms.ca"))
+            .expect("the control plane is verified too");
+        assert_eq!(
+            dashboard.expect, "200",
+            "a redirect would mean SSO is on after all"
+        );
+        assert!(
+            dashboard.what.contains("as the operator accepted"),
+            "the report has to say this was consented to, not that it is fine: {}",
+            dashboard.what
+        );
+
+        // A host with no app at all is the sharpest case: before this, it
+        // produced no checks whatsoever while publishing the dashboard.
+        let alone = unauthenticated_checks("thesyms.ca", &[]);
+        assert_eq!(
+            alone.len(),
+            1,
+            "{:?}",
+            alone.iter().map(|c| &c.command).collect::<Vec<_>>()
+        );
+        assert!(alone[0].command.contains("ferrum.thesyms.ca"));
+    }
+
     #[test]
     fn remote_urls_are_shell_quoted_at_the_sink() {
         let c = auth_checks("d.com", &["sonarr".into()], true);
@@ -1110,10 +1236,33 @@ mod tests {
                 .is_empty(),
             "a CNAME delegates the address, so ferrum states none to prove"
         );
+        // No third case here any more, and its removal is the point. It
+        // asserted that a host with no app and no SSO "has no hostname to
+        // ask for" -- which R13 falsified: `ferrum.d.com` is published
+        // because the proxy is. See
+        // `a_dashboard_only_host_still_proves_its_address_reaches_it`.
+    }
+
+    /// A8 on the configuration the old code returned nothing for: SSO
+    /// declined, no app selected, and `ferrum.<domain>` published anyway.
+    ///
+    /// That combination was not hypothetical -- it is the smallest thing
+    /// this installer can build with a domain -- and it was the one where
+    /// the only published hostname went unprobed, because the host
+    /// selection was written when the control plane had no vhost.
+    #[test]
+    fn a_dashboard_only_host_still_proves_its_address_reaches_it() {
+        let checks =
+            external_reachability_checks("thesyms.ca", &[], false, Some(&dns_a("203.0.113.10")));
+        assert_eq!(checks.len(), 1, "{checks:?}");
+        assert_eq!(checks[0].host, "ferrum.thesyms.ca");
+        assert_eq!(checks[0].address, Ipv4Addr::new(203, 0, 113, 10));
+        // Still one probe, not one per surface: the question is whether
+        // traffic to this address arrives here, and it is asked once.
         assert!(
-            external_reachability_checks("d.com", &[], false, Some(&dns_a("203.0.113.10")))
-                .is_empty(),
-            "a host publishing nothing has no hostname to ask for"
+            checks[0].request().contains("Host: ferrum.thesyms.ca\r\n"),
+            "{:?}",
+            checks[0].request()
         );
     }
 
