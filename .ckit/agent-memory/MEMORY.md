@@ -16,6 +16,7 @@ when" hook and follow it.
 <!-- - [Title](debugging/filename.md) — one-line description | applies when: ... -->
 
 ### Project Patterns
+- [A requirement born of "reported success while it did not work" must end in a mechanical check](patterns/requirements-born-of-false-success-need-a-post-check.md) — verify the outcome from a vantage point that could have disagreed, and make a background corrector's staleness visible | applies when: writing or reviewing a ferrum spec whose originating incident was a false success
 <!-- - [Title](patterns/filename.md) — one-line description | applies when: ... -->
 
 ### API & Integration
