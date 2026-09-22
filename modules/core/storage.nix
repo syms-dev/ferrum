@@ -46,6 +46,41 @@ let
   # ferrum.daemon.enable = false, where the ferrum group does not exist at
   # all and naming it here would fail tmpfiles at boot.
   ferrumdGroup = if config.ferrum.daemon.enable then "ferrum" else "root";
+
+  # The TRaSH layout, under ONE root. downloads and media are siblings
+  # inside mediaDir rather than separate mounts, because the *arrs import by
+  # hardlinking and a hardlink cannot cross a filesystem. The old layout put
+  # downloads on the OS disk while media lived on the data disks, so imports
+  # degraded to copies -- silently, and invisibly until a library was large
+  # enough for the duplication to show.
+  trashSubdirs =
+    [ "torrents" "usenet" "usenet/incomplete" "usenet/complete" "media" ]
+    ++ lib.concatMap
+      (cat: [ "torrents/${cat}" "usenet/complete/${cat}" "media/${cat}" ])
+      [ "movies" "tv" "music" "books" ];
+
+  # WHERE THE TREE IS CREATED, and why it is not just mediaDir.
+  #
+  # With a pool, mediaDir is a mergerfs mount and `category.create=epmfs`
+  # means "existing path, most free space": a branch is only a candidate for
+  # a new file if it ALREADY HAS the parent directory. Creating the tree
+  # THROUGH the mount therefore creates it on exactly one branch -- the
+  # first mkdir picks one, and every mkdir under it has only that branch as
+  # a candidate.
+  #
+  # Reproduced against real mergerfs with these options: two empty branches,
+  # tree created through the pool, and the whole tree landed on d1 while d0
+  # got nothing. A new show then wrote to d1. Adding a third empty disk left
+  # it with zero entries -- permanently, because it never has the path.
+  #
+  # So a fresh multi-disk install put the entire library on one disk, and a
+  # disk added later was inert. Creating the tree on each BRANCH makes every
+  # branch a candidate, which is what lets epmfs balance by free space and
+  # what makes an added disk usable. Without a pool, mediaDir is the real
+  # directory and is the only root there is.
+  pool = cfg.pool;
+  pooled = pool.enable && pool.branches != [ ];
+  treeRoots = if pooled then pool.branches ++ [ cfg.mediaDir ] else [ cfg.mediaDir ];
 in
 {
   config = {
@@ -84,17 +119,8 @@ in
       "d ${cfg.mediaDir} 0775 root ${cfg.mediaGroup} - -"
     ]
     ++ lib.concatMap
-      (sub: [ "d ${cfg.mediaDir}/${sub} 0775 root ${cfg.mediaGroup} - -" ])
-      ([
-        "torrents"
-        "usenet"
-        "usenet/incomplete"
-        "usenet/complete"
-        "media"
-      ]
-      ++ lib.concatMap
-        (cat: [ "torrents/${cat}" "usenet/complete/${cat}" "media/${cat}" ])
-        [ "movies" "tv" "music" "books" ])
+      (root: map (sub: "d ${root}/${sub} 0775 root ${cfg.mediaGroup} - -") trashSubdirs)
+      treeRoots
     ++ [
       "d ${cfg.journalDir} 0750 root ${ferrumdGroup} - -"
     ];
