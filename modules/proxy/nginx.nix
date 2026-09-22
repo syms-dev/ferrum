@@ -147,7 +147,12 @@ let
   #
   # No "already bracketed?" branch: daemon.nix's A5 assertion refuses
   # "[::1]" (it is neither four dot-separated octets nor the literal "::1"),
-  # so a bracketed value never reaches here to be bracketed twice.
+  # so a bracketed value never reaches here to be bracketed twice. That is
+  # a claim about a DIFFERENT module, so it is asserted rather than trusted:
+  # nix/modules/flake/checks.nix's wronglyAcceptedBracketed fails
+  # daemon-vhost-enforced the moment A5 is widened to admit "[::1]", which
+  # is the edit that would otherwise make this line emit
+  # `proxy_pass http://[[::1]]:7788` and take every vhost on the host down.
   daemonHost =
     if lib.hasInfix ":" ferrum.daemon.listenAddress
     then "[${ferrum.daemon.listenAddress}]"

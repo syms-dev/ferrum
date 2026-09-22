@@ -16,9 +16,15 @@
       # rather than each importing (or worse, hardcoding) their own.
       realMigrations = import ../../../modules/lib/migrations.nix { inherit lib; };
 
-      # The exact set modules/core/daemon.nix's A5 assertion accepts, named
-      # once because two checks below have to agree about it and a drift
-      # between them is silent: daemonVhostEnforced asserts every one of
+      # One representative per equivalence class modules/core/daemon.nix's
+      # A5 assertion accepts -- NOT the exact accepted set, which is not a
+      # list at all: listenIsLoopback admits any four dot-separated octets
+      # whose first is "127", i.e. the whole of 127.0.0.0/8, plus the single
+      # literal "::1". So 127.0.0.1 is the default, 127.0.0.2 is here to
+      # prove that class is a range rather than one blessed string, and ::1
+      # is the only accepted spelling outside it. Named once because two
+      # checks below have to agree about it and a drift between them is
+      # silent: daemonVhostEnforced asserts every one of
       # these is LEGAL, and nginxConfigParses asserts nginx can actually
       # parse the config each one generates. An accept-set is a claim about
       # every downstream consumer, so widening it owes a test per value at
@@ -831,6 +837,20 @@
           # first (modules/core/daemon.nix says so at length).
           wronglyAcceptedNames = builtins.filter (a: loopbackFailuresFor a == [ ])
             [ "localhost" ];
+          # And the third refusal, which until now only a COMMENT claimed.
+          # modules/proxy/nginx.nix brackets any listenAddress containing a
+          # colon, unconditionally, and says in as many words that it needs
+          # no "already bracketed?" branch because A5 refuses "[::1]" so one
+          # can never arrive. That was true, and nothing asserted it: adding
+          # the one obvious clause to listenIsLoopback leaves
+          # daemon-vhost-enforced, nginx-config-parses and
+          # auth-model-enforced all green while the generated config becomes
+          # `proxy_pass http://[[::1]]:7788` -- `[emerg] invalid host in
+          # upstream`, and nginx refuses the whole FILE, so every vhost on
+          # the host is down at nginx.service start after an apply that
+          # reported success. This is that comment, made load-bearing.
+          wronglyAcceptedBracketed = builtins.filter (a: loopbackFailuresFor a == [ ])
+            [ "[::1]" ];
 
           # A2/D1: the Authelia rule. Without it, default_policy = "deny"
           # applies and the auth_request wiring asserted above denies every
@@ -935,6 +955,8 @@
               wronglyAccepted
             ++ map (a: "ferrum.daemon.listenAddress = \"${a}\" evaluates cleanly, and it is a NAME rather than a literal -- nginx resolves it at config load and load-balances across every address it yields, while ferrumd's TcpListener::bind takes only the first, so roughly half the dashboard's requests hit a port nothing is listening on. An intermittent 502 with no cause in either program's log (A5)")
               wronglyAcceptedNames
+            ++ map (a: "ferrum.daemon.listenAddress = \"${a}\" evaluates cleanly, and it is an ALREADY-BRACKETED IPv6 literal -- modules/proxy/nginx.nix brackets any address containing a colon unconditionally, with no \"already bracketed?\" branch, because this refusal is what guarantees one never arrives. Accepting it renders `proxy_pass http://[[::1]]:7788`, which nginx rejects as an invalid host, refusing the WHOLE config file: every vhost on the host down at nginx.service start, after an apply that reported success (A5)")
+              wronglyAcceptedBracketed
             # A2/D1.
             ++ lib.optional (daemonRules == [ ])
               "Authelia has no access_control rule for ${daemonName}, so default_policy = deny makes the dashboard unopenable (D1)"
