@@ -600,13 +600,24 @@
             , baseDomain ? "example.test"
             , apps ? { plex.enable = true; sonarr.enable = true; }
             , secrets ? { }
+              # Every fixture in this check took ferrum.daemon.* at its
+              # defaults, and three separate holes lived in that gap: the
+              # daemon.enable term of daemonPublished could be deleted with
+              # both this check and dns-record-set still green; the
+              # proxyPass assertion below compared two expressions built
+              # from the same defaulted constants, so substituting the
+              # literal "http://127.0.0.1:7788" passed; and A5's loopback
+              # clause had no Nix-side guard at all. A fixture that never
+              # moves an option cannot tell a value being READ from a value
+              # being ASSUMED.
+            , daemon ? { }
             }: ferrumLib.mkHost {
               inherit system;
               settings = {
                 schemaVersion = realMigrations.currentVersion;
                 proxy = { enable = proxy; inherit baseDomain; acme.email = "a@example.test"; };
                 auth = { enable = true; adminEmail = "a@example.test"; };
-                inherit apps secrets;
+                inherit apps secrets daemon;
               };
               modules = [ ../../../examples/hosts/minimal/configuration.nix ];
             };
@@ -713,6 +724,46 @@
             (mkProxyHost { baseDomain = ""; }).config.services.nginx.virtualHosts;
           scannedTheCatchAll = absentWhenNoDomain ? "_ferrum_unmatched";
 
+          # ferrum.daemon.enable = false: the operator who does not want the
+          # control plane on this box at all. daemonPublished's first term is
+          # the only thing that expresses it, and nothing varied it -- so the
+          # term could be deleted outright with every check still green,
+          # leaving a host that runs no ferrumd advertising a vhost, an
+          # Authelia rule and a certificate for one.
+          #
+          # scannedASiblingVhost is the guard: the proxy is ON here, so this
+          # fixture really does generate vhosts, and the daemon's absence
+          # among them is a finding rather than an empty corpus.
+          daemonOff = mkProxyHost { daemon.enable = false; };
+          daemonOffVhosts = daemonOff.config.services.nginx.virtualHosts;
+          daemonOffRules =
+            daemonOff.config.services.authelia.instances.main.settings.access_control.rules;
+          scannedASiblingVhost = daemonOffVhosts ? "sonarr.example.test";
+
+          # ...and the host that MOVES the daemon. Every one of these three
+          # values is a default in modules/core/options.nix, which is what
+          # made the assertions that read them unfalsifiable: a check whose
+          # expected value is computed from the same default it is checking
+          # passes whether the module consulted the option or hardcoded the
+          # literal. The expectations below are written out by hand for that
+          # reason, and they are deliberately values nothing else in the tree
+          # uses.
+          movedAddress = "127.0.0.2";
+          movedPort = 9999;
+          movedSub = "panel";
+          moved = mkProxyHost {
+            daemon = {
+              listenAddress = movedAddress;
+              port = movedPort;
+              subdomain = movedSub;
+            };
+          };
+          movedName = "${movedSub}.example.test";
+          movedVhosts = moved.config.services.nginx.virtualHosts;
+          movedV = movedVhosts.${movedName} or null;
+          movedRules =
+            moved.config.services.authelia.instances.main.settings.access_control.rules;
+
           # A2/D1: the Authelia rule. Without it, default_policy = "deny"
           # applies and the auth_request wiring asserted above denies every
           # request forever -- the dashboard would not be weakly protected, it
@@ -780,6 +831,33 @@
               "the empty-baseDomain fixture generated no _ferrum_unmatched vhost, so modules/proxy/nginx.nix did not run on it and the absence below is vacuous (A7)"
             ++ lib.optional (absentWhenNoDomain ? "${daemonSub}.")
               "a daemon vhost exists with an empty baseDomain, on a hostname that cannot resolve (A7)"
+            # daemonPublished's first term, which nothing else varies.
+            ++ lib.optional (!scannedASiblingVhost)
+              "the daemon.enable = false fixture generated no sonarr.example.test vhost, so its proxy config is not the generated one and the absences below are vacuous"
+            ++ lib.optional (daemonOffVhosts ? ${daemonName})
+              "a daemon vhost exists with ferrum.daemon.enable = false, advertising a dashboard this host does not run"
+            ++ lib.optional
+              (builtins.any (r: r.domain or "" == daemonName) daemonOffRules)
+              "Authelia carries an access_control rule for ${daemonName} with ferrum.daemon.enable = false"
+            ++ lib.optional
+              ((daemonOff.config.security.acme.certs.${daemonName} or null) != null)
+              "an ACME certificate is issued for ${daemonName} with ferrum.daemon.enable = false -- a real Let's Encrypt order for a name nothing serves"
+            # A1/A5/D7 against options that have actually MOVED. The
+            # expected strings are literals on purpose: the assertions above
+            # derive theirs from the same host they are checking, so they
+            # cannot tell a module reading the option from one hardcoding
+            # the default.
+            ++ lib.optional (movedV == null)
+              "ferrum.daemon.subdomain = \"${movedSub}\" produced no vhost at ${movedName}: the daemon's hostname is hardcoded, not read (D7)"
+            ++ lib.optional (movedVhosts ? "ferrum.example.test")
+              "moving ferrum.daemon.subdomain left a vhost behind at ferrum.example.test (D7)"
+            ++ lib.optional
+              (movedV != null
+                && (movedV.locations."/".proxyPass or "") != "http://${movedAddress}:${toString movedPort}")
+              "with ferrum.daemon.listenAddress = ${movedAddress} and port = ${toString movedPort}, the vhost still proxies elsewhere -- nginx reaches a daemon that is not listening there (A1/A5)"
+            ++ lib.optional
+              (!(builtins.any (r: r.domain or "" == movedName) movedRules))
+              "Authelia has no access_control rule for ${movedName}, so a moved dashboard is unopenable under default_policy = deny (D1/D7)"
             # A2/D1.
             ++ lib.optional (daemonRules == [ ])
               "Authelia has no access_control rule for ${daemonName}, so default_policy = deny makes the dashboard unopenable (D1)"
