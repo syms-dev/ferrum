@@ -71,7 +71,12 @@ pub fn check_attr_matches_hostname(files: &Files, hostname: &str) -> anyhow::Res
     Ok(())
 }
 
-/// R9 A3: refuses to publish an app that nothing will authenticate.
+/// R9 A3: refuses to publish anything that nothing will authenticate.
+///
+/// "Anything" is not only the catalog: since R13 gave ferrumd a vhost,
+/// `ferrum.<baseDomain>` is published whenever the proxy is, so the control
+/// plane is checked here alongside the apps. The version that checked apps
+/// alone let a Plex+Jellyfin host pass with its dashboard wide open.
 ///
 /// This reads **`settings.stage2.json`**, deliberately, not the Nix
 /// evaluation the rest of Tier 1 is built on. Stage 1 has `apps: {}`, so
@@ -80,7 +85,8 @@ pub fn check_attr_matches_hostname(files: &Files, hostname: &str) -> anyhow::Res
 /// once fire.
 ///
 /// # Errors
-/// Names every app that would be published unauthenticated.
+/// Names everything that would be published unauthenticated, apps and
+/// control plane alike, and what the operator did confirm.
 pub fn check_published_apps_are_authenticated(
     files: &Files,
     accepted_for: &[String],
@@ -119,10 +125,39 @@ pub fn check_published_apps_are_authenticated(
         .and_then(serde_json::Value::as_object)
         .map(|m| m.keys().cloned().collect())
         .unwrap_or_default();
-    let open = crate::sso::apps_left_open(&apps);
+
+    // The control plane is not a catalog app, so `apps_left_open` cannot
+    // see it -- and an early return on an empty app list is how a
+    // Plex+Jellyfin host that declined SSO got its consent to publish
+    // ferrum.<baseDomain> asked for, recorded, and then never checked.
+    // `daemon_published` is the same predicate sso.rs consults before it
+    // asks for that consent; calling it again here rather than respelling
+    // the condition is what keeps the ask and the enforcement from
+    // drifting apart. It is deliberately not keyed on `auth.enable` --
+    // that term is already settled above.
+    let mut open = crate::sso::apps_left_open(&apps);
+    let daemon_open = crate::sso::daemon_published(
+        doc.get("proxy")
+            .and_then(|p| p.get("baseDomain"))
+            .and_then(serde_json::Value::as_str),
+    );
+    if daemon_open {
+        open.push(crate::dns::DAEMON_SUBDOMAIN);
+    }
     if open.is_empty() {
         return Ok(());
     }
+    // The daemon's entry is a subdomain label, not an app name, so the
+    // refusal says which one it is rather than leaving the operator to
+    // look for an app they never selected.
+    let daemon_note = if daemon_open {
+        format!(
+            " ({} is ferrum's own control plane, published because the proxy is.)",
+            crate::dns::DAEMON_SUBDOMAIN
+        )
+    } else {
+        String::new()
+    };
     // Consent covers the exact list the operator was shown, and nothing
     // else. Comparing sorted sets rather than trusting a boolean is what
     // stops consent for [sonarr] silently covering a later-added
@@ -146,16 +181,16 @@ pub fn check_published_apps_are_authenticated(
         .collect();
     if !granted.is_empty() && !newly_open.is_empty() {
         anyhow::bail!(
-            "these apps would be published with no authentication and are NOT \
+            "these would be published with no authentication and are NOT \
              covered by what you confirmed: {}. You confirmed: {}. Nothing has \
-             been changed.",
+             been changed.{daemon_note}",
             newly_open.join(", "),
             granted.join(", ")
         );
     }
     anyhow::bail!(
-        "these apps would be published with no authentication: {}. The operator \
-         did not confirm that. Nothing has been changed.",
+        "these would be published with no authentication: {}. The operator \
+         did not confirm that. Nothing has been changed.{daemon_note}",
         open.join(", ")
     );
 }
@@ -283,14 +318,70 @@ mod tests {
         assert!(err.contains("Nothing has been changed"), "{err}");
     }
 
-    /// Plex and Jellyfin carry their own login.
+    /// Plex and Jellyfin carry their own login, so neither is ever named --
+    /// but the host still publishes ferrum's own control plane, which is
+    /// what the consent below covers.
     #[test]
     fn apps_with_their_own_login_are_not_flagged() {
         check_published_apps_are_authenticated(
             &files(published(&["plex", "jellyfin"], false), "h"),
-            &[],
+            &[crate::dns::DAEMON_SUBDOMAIN.to_string()],
         )
         .unwrap();
+    }
+
+    /// The exact host the early return used to wave through: two apps that
+    /// carry their own login, SSO declined, and no recorded consent for the
+    /// control plane.
+    ///
+    /// `apps_left_open` returns nothing here, because the control plane is
+    /// not a catalog app. If `check_published_apps_are_authenticated` goes
+    /// back to returning early on that empty list, this install proceeds
+    /// with ferrum.<baseDomain> -- PUT /api/settings, POST /api/secrets/:name,
+    /// POST /api/jobs -- reachable to anyone who finds the hostname, having
+    /// asked the operator for consent it then never read. So this test is
+    /// the enforcement half of R9 A3, and it must fail if that early return
+    /// is restored.
+    #[test]
+    fn the_control_plane_is_refused_even_when_no_app_is_left_open() {
+        let err = check_published_apps_are_authenticated(
+            &files(published(&["plex", "jellyfin"], false), "h"),
+            &[],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains(crate::dns::DAEMON_SUBDOMAIN), "{err}");
+        assert!(err.contains("control plane"), "{err}");
+        assert!(err.contains("Nothing has been changed"), "{err}");
+        assert!(!err.contains("plex") && !err.contains("jellyfin"), "{err}");
+    }
+
+    /// Consent for the apps does not stretch to the control plane.
+    ///
+    /// This is the same scoping the app list already had, applied to the
+    /// one thing that is published whether or not any app was selected --
+    /// so an operator who confirmed "sonarr" cannot be held to have
+    /// confirmed the dashboard.
+    #[test]
+    fn app_consent_does_not_cover_the_control_plane() {
+        let err = check_published_apps_are_authenticated(
+            &files(published(&["sonarr"], false), "h"),
+            &["sonarr".to_string()],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("NOT covered"), "{err}");
+        assert!(err.contains(crate::dns::DAEMON_SUBDOMAIN), "{err}");
+    }
+
+    /// And with no base domain there is no published control plane to
+    /// check -- the other half of `daemon_published`, so that this guard
+    /// cannot be satisfied by a constant.
+    #[test]
+    fn an_empty_base_domain_publishes_no_control_plane() {
+        let mut doc = published(&["plex"], false);
+        doc["proxy"]["baseDomain"] = serde_json::json!("");
+        check_published_apps_are_authenticated(&files(doc, "h"), &[]).unwrap();
     }
 
     #[test]
@@ -309,7 +400,11 @@ mod tests {
         stage1["apps"] = serde_json::json!({});
         let mut f = Files::new();
         f.insert("settings.stage2.json".into(), stage1.to_string());
-        check_published_apps_are_authenticated(&f, &[]).unwrap();
+        // The control plane is published here regardless of the app list,
+        // so its consent is supplied to isolate the dimension this test is
+        // about: whether any APP is found.
+        let daemon_consent = [crate::dns::DAEMON_SUBDOMAIN.to_string()];
+        check_published_apps_are_authenticated(&f, &daemon_consent).unwrap();
 
         // ...whereas the real stage-2 document does fire.
         let mut f2 = Files::new();
@@ -317,11 +412,15 @@ mod tests {
             "settings.stage2.json".into(),
             published(&["sonarr"], false).to_string(),
         );
-        assert!(check_published_apps_are_authenticated(&f2, &[]).is_err());
+        assert!(check_published_apps_are_authenticated(&f2, &daemon_consent).is_err());
 
         // ...unless the operator passed R9 A2's typed confirmation, which
         // is the only way the decline path can ever complete an install.
-        check_published_apps_are_authenticated(&f2, &["sonarr".to_string()]).unwrap();
+        check_published_apps_are_authenticated(
+            &f2,
+            &["sonarr".to_string(), crate::dns::DAEMON_SUBDOMAIN.to_string()],
+        )
+        .unwrap();
     }
 
     #[test]
@@ -350,13 +449,19 @@ mod tests {
             );
             m
         };
+        // Every grant here also carries the control plane, which this
+        // fixture publishes; `app_consent_does_not_cover_the_control_plane`
+        // is the test for that dimension.
+        let daemon = || crate::dns::DAEMON_SUBDOMAIN.to_string();
+
         // Granted for sonarr, and sonarr is what is published: fine.
-        check_published_apps_are_authenticated(&f(&["sonarr"]), &["sonarr".into()]).unwrap();
+        check_published_apps_are_authenticated(&f(&["sonarr"]), &["sonarr".into(), daemon()])
+            .unwrap();
 
         // qbittorrent appears afterwards. It writes files anywhere.
         let err = check_published_apps_are_authenticated(
             &f(&["sonarr", "qbittorrent"]),
-            &["sonarr".into()],
+            &["sonarr".into(), daemon()],
         )
         .unwrap_err()
         .to_string();
@@ -368,7 +473,7 @@ mod tests {
         // a superset of what is actually being published.
         check_published_apps_are_authenticated(
             &f(&["sonarr"]),
-            &["qbittorrent".into(), "sonarr".into()],
+            &["qbittorrent".into(), "sonarr".into(), daemon()],
         )
         .unwrap();
     }
