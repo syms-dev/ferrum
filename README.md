@@ -125,6 +125,33 @@ ssh <host> sudo cat /var/lib/authelia-main/authelia-setup-password
 
 Log in at `https://auth.<ferrum.proxy.baseDomain>/`, then change the password from Authelia's own UI — the setup file is never regenerated or deleted automatically once `users_database.yml` exists, so treat it as sensitive until you remove it by hand.
 
+### Reaching the dashboard when the proxy or Authelia is broken
+
+ferrumd keeps listening on loopback (`ferrum.daemon.listenAddress`, `127.0.0.1` by default) whether or not it is published. Publishing means nginx reaches it, not that it binds a public interface — so the SSH tunnel remains the recovery route for exactly the situation where you need the UI most: the proxy is down, Authelia will not start, or a bad certificate has made `ferrum.<baseDomain>` unusable.
+
+```bash
+ssh -L 7788:127.0.0.1:7788 <host>
+```
+
+Then browse **`http://127.0.0.1:7788`** (or `http://localhost:7788`).
+
+Forward to the **loopback address specifically**. The session cookie is `Secure`, and a browser will only store and send a `Secure` cookie over plain HTTP when the origin is *potentially trustworthy* — which, under [W3C Secure Contexts](https://www.w3.org/TR/secure-contexts/), `127.0.0.1` and `localhost` are and a LAN address such as `192.168.1.10` is not. So a tunnel forwarded to a LAN IP will log you out on every request: the browser drops the cookie, and it is correct to do so.
+
+That is expected behaviour, not a bug, and the fix is to use the loopback address — **not** to drop `Secure` from the cookie. Weakening it would re-open the attack it exists to close (below), to save one word in an SSH command.
+
+### What Authelia does and does not defend
+
+Authelia's session cookie is issued for the whole base domain (`session.domain = ferrum.proxy.baseDomain`, `modules/proxy/authelia.nix`). That is what makes single sign-on single: log in once at `auth.<baseDomain>` and every app under that domain accepts you.
+
+The consequence is worth stating plainly, because the natural assumption is the opposite one. **Authelia defends the control plane against the unauthenticated stranger from the internet, and against nothing else.** A *compromised app already behind the same SSO* — a sonarr with a remote-code-execution bug, say — makes requests to `ferrum.<baseDomain>` that carry that same domain-wide cookie, so they pass nginx's `auth_request` exactly as a legitimate browser's would. Authelia is not a boundary between two apps on one base domain; it never was.
+
+Two things, and only these two, stand between a compromised sibling app and this host's settings, secrets and system generations:
+
+- **ferrumd serves no CORS headers at all.** No `Access-Control-Allow-Origin` means a script running on `sonarr.<baseDomain>` cannot *read* any response it provokes from `ferrum.<baseDomain>`. This is enforced by a test that fails if such a header ever appears, rather than by the fact that nobody has added one.
+- **The session cookie is `__Host-ferrumd_session`, with `Secure`, `HttpOnly`, `SameSite=Strict` and `Path=/`.** `SameSite=Strict` stops a sibling origin's requests from carrying it; `HttpOnly` stops script from reading it; and the `__Host-` prefix makes browsers reject any version of that cookie sent with a `Domain` attribute — which is what stops a compromised sibling from *planting* a session cookie for the whole base domain and having ferrumd honour it.
+
+ferrumd also requires its own valid session on every request regardless of what Authelia concluded; it trusts no `Remote-User` header. Nothing on this host runs in a network namespace that would stop a local process from talking straight to `127.0.0.1:7788`, so a header set by nginx would be a header any compromised app could forge.
+
 ## Development
 
 See the design doc's "Dev loop" section for the intended setup (an aarch64 dev VM plus a real x86_64 test target provisioned via `nixos-anywhere`).
