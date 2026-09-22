@@ -1755,6 +1755,44 @@ mod tests {
         );
     }
 
+    /// The same site, the other published state -- and the gap the test
+    /// above could not see.
+    ///
+    /// `the_final_report_describes_the_daemon_hostname_as_it_will_behave`
+    /// asserts only the gated state, so replacing `answers.sso.enabled`
+    /// with a literal `true` in `url_report` left every test in this crate
+    /// green. An operator who declined single sign-on would then be told,
+    /// on the last screen of the install, that the dashboard "asks for the
+    /// single sign-on login at auth.<domain>" -- A7's defect pointed the
+    /// wrong way, at the emission site this function's own docstring calls
+    /// the one still on screen when a hostname misbehaves.
+    ///
+    /// `dns.rs` owns the sentence and covers each of its branches; what is
+    /// covered here is that THIS site passes the real answer through.
+    #[test]
+    fn the_final_report_says_plainly_when_the_dashboard_will_be_ungated() {
+        let mut answers = published_answers();
+        answers.sso.enabled = false;
+        let report = url_report(&answers, &dns::Adoption::none(), None).join("\n");
+
+        assert!(
+            report.contains(&dns::daemon_record_caveat("thesyms.ca", false)),
+            "{report}"
+        );
+        assert!(
+            report.contains("NO login"),
+            "the ungated state must be stated, not implied: {report}"
+        );
+        assert!(
+            !report.contains("single sign-on login at"),
+            "and must not claim a gate that is not there: {report}"
+        );
+        assert!(
+            !report.contains("sign-in "),
+            "there is no sign-in url on a host with no Authelia: {report}"
+        );
+    }
+
     /// A3's decline, surfaced where the operator will actually see it
     /// rather than in a log line from before the disk was erased.
     #[test]
