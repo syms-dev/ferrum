@@ -16,7 +16,17 @@
 //! So SSO is on by default here, and turning it off costs a second,
 //! deliberately different confirmation that names what is about to be
 //! exposed.
+//!
+//! **The apps are not the only thing exposed.** Phase 1.7c R13 gave
+//! ferrum's own control plane a vhost, so `ferrum.<baseDomain>` is now
+//! published on a real certificate whenever the proxy is -- independently
+//! of which apps were selected. Everything below therefore evaluates the
+//! control plane separately from the catalog (see [`daemon_published`]),
+//! because the version that did not was able to tell an operator "nothing
+//! would be left open" about a host whose settings, secrets and system
+//! generations were reachable to anyone who found the hostname.
 
+use crate::dns::DAEMON_SUBDOMAIN;
 use crate::prompt::{confirm_exact, PromptIo};
 
 /// Apps that ship their own login and are therefore not left open by an
@@ -51,6 +61,51 @@ pub fn apps_left_open(apps: &[String]) -> Vec<&str> {
         .filter(|a| !APPS_WITH_OWN_LOGIN.contains(a))
         .collect()
 }
+
+/// Whether this host will publish ferrum's own control plane on a real
+/// hostname: the installer's side of `daemonPublished` in
+/// `modules/proxy/lib.nix`.
+///
+/// That predicate is `daemon.enable && proxy.enable && baseDomain != ""`,
+/// and this installer settles the first two terms rather than asking about
+/// them. `ferrum.daemon.enable` defaults to true in
+/// `modules/core/options.nix` and nothing here ever writes it; `render.rs`
+/// emits `proxy.enable = true` exactly when a base domain was answered. So
+/// the only term left to evaluate is the base domain.
+///
+/// It is still spelled out as a predicate rather than folded into its one
+/// caller, for two reasons. It is the join point where independently
+/// written Rust and Nix describe the same runtime fact and can silently
+/// drift, so it is worth being able to point at. And if a later question
+/// ever turns the proxy or the daemon off, there is exactly one place that
+/// has to learn about it.
+///
+/// Note what this is NOT keyed on: the app selection. That is the whole of
+/// D2 -- the control plane is published because the proxy is, not because
+/// any app was chosen.
+///
+/// # Arguments
+/// * `base_domain` - `ferrum.proxy.baseDomain` as answered, if any.
+///
+/// # Returns
+/// `true` when `ferrum.<base_domain>` will be a real, published vhost.
+#[must_use]
+pub fn daemon_published(base_domain: Option<&str>) -> bool {
+    base_domain.is_some_and(|d| !d.is_empty())
+}
+
+/// The control plane's state-changing routes, listed literally in the
+/// decline warning rather than summarised.
+///
+/// "The dashboard would have no login" reads like a lost convenience.
+/// These three write secrets, rewrite this host's `settings.json`, and
+/// apply system generations, so the warning names them and lets the
+/// operator draw the conclusion. They are served by `crates/ferrumd`.
+pub const DAEMON_OPEN_ROUTES: &[&str] = &[
+    "PUT /api/settings",
+    "POST /api/secrets/:name",
+    "POST /api/jobs",
+];
 
 /// Rejects an address Authelia would refuse or that is obviously a typo.
 ///
@@ -120,7 +175,16 @@ pub fn decide(
 
     if !wants_sso {
         let open = apps_left_open(apps);
-        if open.is_empty() {
+        // D2. This used to be answered from `open` alone, and that answer
+        // stopped being true the moment R13 gave the control plane a vhost:
+        // an operator selecting only the two apps that carry their own
+        // login was told "nothing would be left open" about a host whose
+        // ferrum.<domain> was going up on a real Let's Encrypt certificate
+        // behind one password. The control plane is published because the
+        // proxy is, so it is evaluated independently of the selection.
+        let daemon_open = daemon_published(Some(domain));
+
+        if open.is_empty() && !daemon_open {
             io.say(
                 "\nNo app you selected relies on ferrum for authentication, so \
                  nothing would be left open. Continuing without single sign-on.",
@@ -132,26 +196,59 @@ pub fn decide(
             });
         }
 
-        io.say(&format!(
-            "\nThese will be published on {domain} with NO login:\n  {}\n\n\
-             Anyone who finds the hostname can use them. qbittorrent and \
-             sabnzbd can write files anywhere the service can reach.",
-            open.join("\n  ")
-        ));
+        // One list and one confirmation covering all of it. Consent here is
+        // scoped to exactly what the operator was shown (see
+        // `unauthenticated_accepted_for`), so the control plane has to
+        // appear both in what is printed and in what is recorded. A second
+        // separate gate for the daemon would be a second unscoped grant,
+        // which is the bypass the scoping exists to prevent.
+        let mut shown: Vec<String> = open.iter().map(|a| (*a).to_string()).collect();
+
+        if !open.is_empty() {
+            io.say(&format!(
+                "\nThese will be published on {domain} with NO login:\n  {}\n\n\
+                 Anyone who finds the hostname can use them. qbittorrent and \
+                 sabnzbd can write files anywhere the service can reach.",
+                open.join("\n  ")
+            ));
+        }
+
+        if daemon_open {
+            shown.push(DAEMON_SUBDOMAIN.to_string());
+            io.say(&format!(
+                "\nferrum's own control plane will be published on {domain} with \
+                 NO login:\n  {DAEMON_SUBDOMAIN}.{domain}\n\n\
+                 It is not one of the apps above, and selecting fewer apps does \
+                 not remove it -- it is published because the proxy is. Anyone \
+                 who finds that hostname can call:\n  {}\n\n\
+                 Those write secrets, rewrite this host's settings, and apply \
+                 system generations. That is control of the machine, not access \
+                 to a media library.",
+                DAEMON_OPEN_ROUTES.join("\n  ")
+            ));
+        }
+
         let confirmed = confirm_exact(
             io,
             &format!("Type '{PUBLISH_UNAUTHENTICATED_PHRASE}' to continue anyway:"),
             PUBLISH_UNAUTHENTICATED_PHRASE,
         )?;
         if !confirmed {
+            // Selecting fewer apps is only a real remedy when an app is
+            // what is open; it does nothing about the control plane.
+            let remedy = if open.is_empty() {
+                "."
+            } else {
+                ", or select fewer apps."
+            };
             anyhow::bail!(
                 "not confirmed -- nothing has been changed. Re-run and answer \
-                 yes to single sign-on, or select fewer apps."
+                 yes to single sign-on{remedy}"
             );
         }
         return Ok(SsoDecision {
             enabled: false,
-            unauthenticated_accepted_for: open.iter().map(|a| a.to_string()).collect(),
+            unauthenticated_accepted_for: shown,
             admin_email: None,
         });
     }
@@ -231,13 +328,20 @@ mod tests {
         assert_eq!(io.asked.len(), 2, "expected a second confirmation");
         assert_eq!(
             d.unauthenticated_accepted_for,
-            vec!["sonarr", "sabnzbd"],
+            vec!["sonarr", "sabnzbd", "ferrum"],
             "consent must record WHICH apps were shown, not merely that it \
-             was given -- an unscoped bit silently covers apps added later"
+             was given -- an unscoped bit silently covers apps added later. \
+             The control plane is on the end because D2 made it one of the \
+             things shown."
         );
     }
 
     /// Consent is only recorded when it was actually given.
+    ///
+    /// The case that used to sit in the middle here -- declining with only
+    /// plex selected, recording nothing -- moved to
+    /// `declining_with_only_self_login_apps_still_gates_on_the_control_plane`
+    /// when D2 established that that host does leave something open.
     #[test]
     fn consent_is_not_recorded_on_any_other_path() {
         let mut io = Scripted::new(&["", "a@b.co"]);
@@ -245,15 +349,6 @@ mod tests {
             .unwrap()
             .unauthenticated_accepted_for
             .is_empty());
-
-        let mut io = Scripted::new(&["n"]);
-        assert!(
-            decide(Some("d.com"), &apps(&["plex"]), &mut io)
-                .unwrap()
-                .unauthenticated_accepted_for
-                .is_empty(),
-            "nothing was left open, so nothing was consented to"
-        );
 
         let mut io = Scripted::new(&[]);
         assert!(decide(None, &apps(&["sonarr"]), &mut io)
@@ -302,14 +397,97 @@ mod tests {
         assert!(err.contains("nothing has been changed"), "{err}");
     }
 
-    /// R9 A5: these two carry their own login, so declining with only
-    /// those selected leaves nothing open and needs no second gate.
+    /// R9 A5 still holds about the apps themselves: neither of these is
+    /// left open by an absent Authelia, so neither appears in the warning.
     #[test]
-    fn apps_with_their_own_login_do_not_trigger_the_second_gate() {
-        let mut io = Scripted::new(&["n"]);
+    fn apps_with_their_own_login_are_never_listed_as_left_open() {
+        assert!(apps_left_open(&apps(&["plex", "jellyfin"])).is_empty());
+    }
+
+    /// D2, and the exact host the planning panel's premortem named as the
+    /// likeliest way R13 fails in the field.
+    ///
+    /// This is the one selection where every catalog app carries its own
+    /// login, so the pre-R13 installer said "nothing would be left open"
+    /// and asked nothing further -- while publishing ferrum.<domain>, which
+    /// writes secrets and applies system generations, on a real Let's
+    /// Encrypt certificate behind a single password.
+    ///
+    /// Mutation check: make the control plane invisible to the gate again
+    /// -- replace the `daemon_published(Some(domain))` call in `decide`
+    /// with `false` -- and this test fails, because the scripted answers
+    /// run out at a gate that no longer happens.
+    #[test]
+    fn declining_with_only_self_login_apps_still_gates_on_the_control_plane() {
+        let mut io = Scripted::new(&["n", PUBLISH_UNAUTHENTICATED_PHRASE]);
         let d = decide(Some("thesyms.ca"), &apps(&["plex", "jellyfin"]), &mut io).unwrap();
+
         assert!(!d.enabled);
-        assert_eq!(io.asked.len(), 1, "no second gate was needed");
+        assert_eq!(io.asked.len(), 2, "the second gate must still be asked");
+
+        let t = io.transcript();
+        assert!(
+            !t.contains("nothing would be left open"),
+            "the sentence that is now false must not be printed:\n{t}"
+        );
+        assert!(
+            t.contains("ferrum.thesyms.ca"),
+            "the control plane must be named by hostname:\n{t}"
+        );
+        assert_eq!(
+            d.unauthenticated_accepted_for,
+            vec!["ferrum"],
+            "consent is scoped to what was shown, and the control plane was \
+             what was shown"
+        );
+    }
+
+    /// The warning has to be specific enough to be alarming. "No login on
+    /// the dashboard" reads like a lost convenience; these three routes
+    /// read like what they are.
+    #[test]
+    fn the_control_plane_warning_names_its_state_changing_routes() {
+        let mut io = Scripted::new(&["n", PUBLISH_UNAUTHENTICATED_PHRASE]);
+        decide(Some("thesyms.ca"), &apps(&["plex"]), &mut io).unwrap();
+        let t = io.transcript();
+        for route in DAEMON_OPEN_ROUTES {
+            assert!(t.contains(route), "{route} missing from the warning:\n{t}");
+        }
+    }
+
+    /// Both kinds of exposure, one list, ONE confirmation. A second gate
+    /// for the control plane would be a second unscoped grant.
+    #[test]
+    fn open_apps_and_the_control_plane_share_a_single_confirmation() {
+        let mut io = Scripted::new(&["n", PUBLISH_UNAUTHENTICATED_PHRASE]);
+        let d = decide(
+            Some("thesyms.ca"),
+            &apps(&["sonarr", "qbittorrent", "plex"]),
+            &mut io,
+        )
+        .unwrap();
+
+        assert_eq!(io.asked.len(), 2, "exactly one confirmation, not two");
+        let t = io.transcript();
+        for named in ["sonarr", "qbittorrent", "ferrum.thesyms.ca"] {
+            assert!(t.contains(named), "{named} missing:\n{t}");
+        }
+        assert_eq!(
+            d.unauthenticated_accepted_for,
+            vec!["sonarr", "qbittorrent", "ferrum"],
+            "everything shown is recorded, and nothing else is"
+        );
+    }
+
+    /// The other side of D2's predicate, and the branch whose behaviour is
+    /// deliberately unchanged: with no base domain the proxy is never
+    /// enabled, so the control plane is not published and the question
+    /// genuinely does not arise.
+    #[test]
+    fn the_control_plane_is_not_published_without_a_base_domain() {
+        assert!(!daemon_published(None));
+        assert!(!daemon_published(Some("")));
+        assert!(daemon_published(Some("thesyms.ca")));
     }
 
     #[test]
