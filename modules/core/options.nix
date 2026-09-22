@@ -426,13 +426,13 @@ in
           Whether ferrum's DNS management creates a record for the daemon's
           own subdomain above.
 
-          On by default, honestly: ferrumd has no vhost yet, so nginx's
-          catch-all answers this hostname with a closed connection until
-          daemon web access ships -- a name that resolves and then dies,
-          rather than a clean NXDOMAIN. That was the deliberate choice (the
-          record the operator will want exists the moment the UI does, and
-          the installer says so out loud); this option is here so reversing
-          it is one line rather than a redesign.
+          On by default. That default was taken while ferrumd had no vhost,
+          when the record resolved to nginx's catch-all and a closed
+          connection; the reasoning was that the record the operator will
+          want should exist the moment the UI does. Phase 1.7c R13 shipped
+          that UI, so the name now resolves to the dashboard itself. This
+          option remains so that turning the record off is one line rather
+          than a redesign.
         '';
       };
     };

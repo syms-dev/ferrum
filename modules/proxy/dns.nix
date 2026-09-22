@@ -27,13 +27,14 @@
 #     this requirement exists to fix (auth.thesyms.ca).
 #
 #   * the daemon's own <ferrum.daemon.subdomain>.<baseDomain>, on by default
-#     (owner ruling H-01, option C). ferrumd has no vhost yet, so
-#     nginx.nix's _ferrum_unmatched catch-all answers this name with
-#     `return 444` -- a resolving hostname that closes the connection --
-#     until Phase 1.7c R13 ships daemon web access. That is disclosed to the
-#     operator rather than avoided, and ferrum.daemon.dns.includeRecord
-#     exists so the ruling is a one-line change if it is ever revisited.
-#     Standing up a daemon vhost is R13's work, explicitly not this file's.
+#     (owner ruling H-01, option C). This record was created for a year
+#     before there was anything behind it -- nginx.nix's _ferrum_unmatched
+#     catch-all answered the name with `return 444`, a resolving hostname
+#     that closed the connection -- and the ruling was to create it anyway
+#     and disclose it. Phase 1.7c R13 ended that: nginx.nix now builds a
+#     real vhost for the daemon, so this record points at the dashboard.
+#     ferrum.daemon.dns.includeRecord remains, so turning it off is still a
+#     one-line change.
 #
 #   * ferrum.proxy.dns.adoptedNames carried through verbatim (A3). ferrum
 #     never overwrites a record it did not create; a name in this list is the
