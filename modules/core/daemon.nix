@@ -17,10 +17,21 @@ let
   # -- a string that starts with "127." and is not an address at all -- is
   # not quietly admitted.
   octets = lib.splitString "." listenAddress;
+  # "localhost" is deliberately NOT here, and it is the one spelling that
+  # looks safest. It is a NAME, so the two consumers of this option resolve
+  # it differently and neither is wrong: nginx resolves it once at config
+  # load and load-balances across every address /etc/hosts offers -- on a
+  # stock host that is ::1 AND 127.0.0.1 -- while ferrumd's
+  # TcpListener::bind (crates/ferrumd/src/main.rs:585) takes the FIRST
+  # address its resolver returns and binds only that one. Measured:
+  # "localhost:7788".to_socket_addrs() yields [[::1]:7788, 127.0.0.1:7788],
+  # so nginx sends roughly half the dashboard's requests at a port nothing
+  # is listening on. That is an intermittent 502 whose cause is in neither
+  # program's logs -- strictly worse than the clean refusal an operator gets
+  # from any other name, and the reason this accepts literals only.
   listenIsLoopback =
     (builtins.length octets == 4 && builtins.head octets == "127")
-    || listenAddress == "::1"
-    || listenAddress == "localhost";
+    || listenAddress == "::1";
 in
 lib.mkIf ferrum.daemon.enable {
   assertions = [
@@ -55,6 +66,11 @@ lib.mkIf ferrum.daemon.enable {
         it there. Set ferrum.daemon.listenAddress to 127.0.0.1 (or another
         127.0.0.0/8 address, or ::1), and reach the UI from elsewhere either
         through the proxy or over an SSH tunnel to that port.
+
+        This wants a literal, so "localhost" is refused too even though it
+        resolves to one. nginx load-balances across every address the name
+        resolves to and ferrumd binds only the first, so that spelling costs
+        you intermittent 502s instead of a clean failure.
       '';
     }
   ];

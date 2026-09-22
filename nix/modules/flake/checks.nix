@@ -807,6 +807,15 @@
             [ "127.0.0.1" "127.0.0.2" "::1" ];
           wronglyAccepted = builtins.filter (a: loopbackFailuresFor a == [ ])
             [ "0.0.0.0" "192.168.1.10" "::" "127.0.0.1.example.test" ];
+          # Refused too, but for a different reason, and carrying its own
+          # message for that reason -- "the world can reach it" is simply
+          # untrue of localhost, and a guard that reports the wrong cause
+          # sends the next operator to the wrong file. It is refused because
+          # it is a NAME: nginx resolves it at config load and balances
+          # across every address it yields, while ferrumd binds only the
+          # first (modules/core/daemon.nix says so at length).
+          wronglyAcceptedNames = builtins.filter (a: loopbackFailuresFor a == [ ])
+            [ "localhost" ];
 
           # A2/D1: the Authelia rule. Without it, default_policy = "deny"
           # applies and the auth_request wiring asserted above denies every
@@ -909,6 +918,8 @@
               wronglyRejected
             ++ map (a: "ferrum.daemon.listenAddress = \"${a}\" evaluates cleanly, so ferrumd may be told to bind an interface the world can reach with nginx and Authelia bypassed entirely (A5)")
               wronglyAccepted
+            ++ map (a: "ferrum.daemon.listenAddress = \"${a}\" evaluates cleanly, and it is a NAME rather than a literal -- nginx resolves it at config load and load-balances across every address it yields, while ferrumd's TcpListener::bind takes only the first, so roughly half the dashboard's requests hit a port nothing is listening on. An intermittent 502 with no cause in either program's log (A5)")
+              wronglyAcceptedNames
             # A2/D1.
             ++ lib.optional (daemonRules == [ ])
               "Authelia has no access_control rule for ${daemonName}, so default_policy = deny makes the dashboard unopenable (D1)"
