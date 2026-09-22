@@ -1173,7 +1173,7 @@
           # a host with NO public app as well as on one with an app: that is
           # the configuration on which the auth record and the auth
           # certificate disagreed.
-          mkDnsHost = { auth, proxy ? true, apps ? {
+          mkDnsHost = { auth, proxy ? true, daemon ? { }, apps ? {
             # Deliberately `lan`: this is the app that must NOT appear.
             sonarr = { enable = true; exposure = "lan"; };
             radarr.enable = true;
@@ -1192,7 +1192,7 @@
                 };
               };
               auth.enable = auth;
-              inherit apps;
+              inherit apps daemon;
             };
             modules = [ ../../../examples/hosts/minimal/configuration.nix ];
           };
@@ -1226,6 +1226,17 @@
             proxy = false;
             apps = { sonarr = { enable = true; exposure = "lan"; }; };
           }).config.system.build.ferrumDnsConfig;
+          # ferrum.daemon.dns.includeRecord = false, which had no fixture at
+          # all. Creating the daemon record is the owner's H-01 option-C
+          # ruling and this option is the documented one-line way back out of
+          # it, so "it remains, so turning the record off is still a one-line
+          # change" was a claim about behaviour that nothing exercised.
+          # radarr stays public so the document still has a record in it: an
+          # absence found in an empty list is not a finding.
+          recordExcluded = (mkDnsHost {
+            auth = true;
+            daemon.dns.includeRecord = false;
+          }).config.system.build.ferrumDnsConfig;
         in
         pkgs.runCommand "ferrum-check-dns-record-set" { } ''
           set -eu
@@ -1233,12 +1244,14 @@
           without_auth=${withoutAuth}
           dashboard_only=${dashboardOnly}
           proxy_off=${proxyOff}
+          record_excluded=${recordExcluded}
           fail() {
             echo "dns record-set check: $1" >&2
             echo "--- with auth ---" >&2; cat "$with_auth" >&2
             echo "--- without auth ---" >&2; cat "$without_auth" >&2
             echo "--- dashboard only ---" >&2; cat "$dashboard_only" >&2
             echo "--- proxy off ---" >&2; cat "$proxy_off" >&2
+            echo "--- record excluded ---" >&2; cat "$record_excluded" >&2
             exit 1
           }
 
@@ -1296,7 +1309,18 @@
             "$proxy_off" > /dev/null \
             || fail "a host with ferrum.proxy.enable = false got an auth.example.invalid record -- nginx builds no vhost for it, so that publishes a name with nothing behind it (A7)"
 
-          for cfg in "$with_auth" "$without_auth" "$dashboard_only" "$proxy_off"; do
+          # ferrum.daemon.dns.includeRecord = false, the only behaviour that
+          # option has. The radarr assertion first, for the same reason as
+          # above: it proves this document has records at all.
+          ${pkgs.jq}/bin/jq -e '.records[] | select(.source == "app:radarr")' \
+            "$record_excluded" > /dev/null \
+            || fail "the includeRecord = false document has no records at all, so finding no daemon record in it proves nothing"
+
+          ${pkgs.jq}/bin/jq -e '[.records[] | select(.source == "daemon")] | length == 0' \
+            "$record_excluded" > /dev/null \
+            || fail "ferrum.daemon.dns.includeRecord = false still produced a daemon record -- the documented one-line way to opt out of the H-01 ruling does nothing"
+
+          for cfg in "$with_auth" "$without_auth" "$dashboard_only" "$proxy_off" "$record_excluded"; do
             ${pkgs.jq}/bin/jq -e '(.records | length) > 0 and all(.records[]; .proxied == false)' \
               "$cfg" > /dev/null \
               || fail "a record is proxied -- orange-cloud proxying makes every request arrive from a Cloudflare edge address"
