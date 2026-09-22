@@ -156,7 +156,10 @@ pub fn auth_checks(domain: &str, apps: &[String], sso_enabled: bool) -> Vec<Chec
     if crate::sso::daemon_published(Some(domain)) {
         checks.push(Check {
             what: "the ferrum dashboard redirects to authentication",
-            command: url(format!("https://{}.{domain}/", crate::dns::DAEMON_SUBDOMAIN)),
+            command: url(format!(
+                "https://{}.{domain}/",
+                crate::dns::DAEMON_SUBDOMAIN
+            )),
             expect: "302".into(),
         });
     }

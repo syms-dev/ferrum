@@ -1564,9 +1564,9 @@ mod tests {
     /// would be a runtime failure on a host that has already been built.
     #[test]
     fn the_default_bind_address_is_loopback() {
-        let address: std::net::IpAddr = default_listen_address()
-            .parse()
-            .expect("the default must be a literal address: it is fed straight to TcpListener::bind");
+        let address: std::net::IpAddr = default_listen_address().parse().expect(
+            "the default must be a literal address: it is fed straight to TcpListener::bind",
+        );
         assert!(
             address.is_loopback(),
             "ferrumd must not default to binding a public interface (A5); got {address}"
