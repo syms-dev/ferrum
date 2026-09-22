@@ -57,29 +57,6 @@
 //! refuse while the disk is untouched, whereas a post-switch apply must
 //! never turn a completed switch into a failure. This module supplies the
 //! fact and the sentence; the policy lives where the operator is.
-//!
-//! **[`ZoneStatus`] is the same failure one door further out, and it is the
-//! door R1 originally walked through.** [`delegation_away`] can only see an
-//! `NS` record that exists *inside* the Cloudflare zone. The commonest
-//! new-domain state produces no such record at all: the operator adds the
-//! zone to Cloudflare, never switches the registrar's nameservers, and
-//! Cloudflare reports `status: "pending"`. Zone resolution succeeds, every
-//! write succeeds, and a query aimed at the zone's own nameservers -- which
-//! is what `verify_authoritative` does, deliberately, to dodge a recursive
-//! resolver's negative cache -- gets the correct answer, because Cloudflare
-//! really does hold the record. Nobody else on the internet ever asks
-//! Cloudflare, so the name resolves nowhere. That is
-//! `auth.thesyms.ca did not resolve while the installer reported success`,
-//! reproduced exactly.
-//!
-//! So the zone's `status` is parsed rather than dropped, and carried to the
-//! caller on [`ResolvedZone`] -- a struct rather than a bare [`Zone`]
-//! specifically so a caller cannot fail to receive it. What to *do* about a
-//! non-serving status is the caller's decision, not this crate's, because
-//! the two callers legitimately differ: the installer can still refuse
-//! before erasing a disk, while a post-switch apply must not turn a
-//! completed switch into a failure. This module supplies the fact and the
-//! sentence; policy lives where the operator is.
 
 use std::fmt;
 

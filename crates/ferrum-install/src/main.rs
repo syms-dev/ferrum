@@ -127,11 +127,22 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
     // rule so it is unit-testable rather than implicit here.
     let reached = state::effective_reached(&resume);
     // `adoption` carries R1 A3's decision from the pre-erase gate all the
-    // way to the final report. A resume never re-runs that gate -- it never
-    // re-asks anything -- so it carries an empty outcome, and the report
-    // then says nothing about names it did not ask about rather than
-    // inventing a state it cannot know.
-    let (mut answers, approved, adoption) = if asked_fresh {
+    // way to the final report, and `zone_not_serving_yet` carries the other
+    // half of what that gate learned: whether Cloudflare answers for this
+    // domain at all. Both are needed at the end, not only at the gate --
+    // the URL list is the last thing on screen, and a pending zone means
+    // not one line of it resolves. A resume never re-runs that gate -- it
+    // never re-asks anything -- so it carries an empty outcome, and the
+    // report then says nothing about a state it did not check rather than
+    // inventing one.
+    let (
+        mut answers,
+        approved,
+        dns::GateOutcome {
+            adoption,
+            zone_not_serving_yet,
+        },
+    ) = if asked_fresh {
         plan_install(&pre)?
     } else {
         recover_plan(&pre)?
@@ -342,7 +353,13 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
     state::write(&pre.host_dir, &st)?;
 
     report_external_reachability(&answers);
-    final_report(&pre, &answers, &evidence, &adoption)?;
+    final_report(
+        &pre,
+        &answers,
+        &evidence,
+        &adoption,
+        zone_not_serving_yet.as_deref(),
+    )?;
     Ok(())
 }
 
@@ -511,11 +528,12 @@ fn report_preconditions(pre: &preconditions::Preconditions, fresh: bool) {
 /// same lesson about the same window.
 ///
 /// # Returns
-/// The answers, the approved disk, and what the operator decided about the
-/// DNS names ferrum does not own.
+/// The answers, the approved disk, and the gate's whole outcome -- what the
+/// operator decided about the DNS names ferrum does not own, and whether
+/// Cloudflare is serving the zone yet.
 fn plan_install(
     pre: &preconditions::Preconditions,
-) -> anyhow::Result<(answers::Answers, confirm::Approved, dns::Adoption)> {
+) -> anyhow::Result<(answers::Answers, confirm::Approved, dns::GateOutcome)> {
     let (devices, efi_present) = inventory_phase(pre)?;
     let mut io = prompt::stdio();
     // R1 A8: the address is found ON THE TARGET, over the same SSH path
@@ -528,7 +546,7 @@ fn plan_install(
 
     // Still pre-destructive: a refusal here costs a re-run, and every later
     // moment is a worse one to learn that ferrum cannot publish a record.
-    let adoption = dns::gate(&answers, &answers::cloudflare_client, &mut io)?;
+    let gate_outcome = dns::gate(&answers, &answers::cloudflare_client, &mut io)?;
 
     recheck(pre, &approved)?;
     let path = pre.host_dir.join("install-inventory.json");
@@ -540,7 +558,7 @@ fn plan_install(
         approved.firmware,
         path.display()
     );
-    Ok((answers, approved, adoption))
+    Ok((answers, approved, gate_outcome))
 }
 
 /// The resume half: recover what was decided, never re-ask.
@@ -548,12 +566,13 @@ fn plan_install(
 /// The DNS gate is deliberately absent here. It is a pre-erase decision and
 /// a resume runs after the erase, so re-asking would invite a different
 /// answer against a half-installed machine -- the same reason the disk
-/// question is not re-asked. The returned [`dns::Adoption`] is therefore
+/// question is not re-asked. The returned [`dns::GateOutcome`] is therefore
 /// empty, and the final report stays silent about names this run never put
-/// to the operator rather than asserting a state it cannot know.
+/// to the operator, and about a zone status this run never looked up,
+/// rather than asserting a state it cannot know.
 fn recover_plan(
     pre: &preconditions::Preconditions,
-) -> anyhow::Result<(answers::Answers, confirm::Approved, dns::Adoption)> {
+) -> anyhow::Result<(answers::Answers, confirm::Approved, dns::GateOutcome)> {
     let mut approved: confirm::Approved = serde_json::from_str(&std::fs::read_to_string(
         pre.host_dir.join("install-inventory.json"),
     )?)?;
@@ -579,7 +598,7 @@ fn recover_plan(
     let stage2 = std::fs::read_to_string(pre.host_dir.join("settings.stage2.json"))?;
     let hostname = read_hostname(&pre.host_dir)?;
     let answers = answers::from_stage2(&stage2, &hostname)?;
-    Ok((answers, approved, dns::Adoption::none()))
+    Ok((answers, approved, dns::GateOutcome::none()))
 }
 
 fn read_hostname(dir: &std::path::Path) -> anyhow::Result<String> {
@@ -958,19 +977,36 @@ fn report_external_reachability(answers: &answers::Answers) {
 /// # Arguments
 /// * `answers` - for the base domain, the SSO choice and the app list.
 /// * `adoption` - R1 A3's outcome, appended as named unreachable apps.
+/// * `zone_not_serving_yet` - the pre-erase gate's zone-status finding,
+///   emitted **above** the urls rather than below them: this is the one
+///   caveat that disqualifies every line in the list, so the operator has
+///   to read it before the names, not after.
 ///
 /// # Returns
 /// The lines to print, or none at all for a host with no base domain --
 /// which publishes nothing, so there is no URL and no caveat to qualify.
-fn url_report(answers: &answers::Answers, adoption: &dns::Adoption) -> Vec<String> {
+fn url_report(
+    answers: &answers::Answers,
+    adoption: &dns::Adoption,
+    zone_not_serving_yet: Option<&str>,
+) -> Vec<String> {
     let Some(domain) = answers.base_domain.as_deref() else {
         return Vec::new();
     };
 
-    let mut lines = vec![
+    let mut lines = Vec::new();
+    // First, because the alternative is the install's last screen offering
+    // a list of hostnames that resolve for nobody with nothing qualifying
+    // them -- which is R1's originating incident, restated by an installer
+    // that had already worked out the answer and then threw it away.
+    if let Some(detail) = zone_not_serving_yet {
+        lines.push(String::new());
+        lines.extend(dns::not_published_yet_lines(detail));
+    }
+    lines.extend([
         "\nurls:".to_string(),
         format!("  ferrum        https://{}.{domain}", dns::DAEMON_SUBDOMAIN),
-    ];
+    ]);
     if answers.sso.enabled {
         lines.push(format!("  sign-in       https://auth.{domain}"));
     }
@@ -1012,18 +1048,22 @@ fn url_report(answers: &answers::Answers, adoption: &dns::Adoption) -> Vec<Strin
 ///   **named unreachable app**, because the alternative -- a line in a log
 ///   the operator scrolled past before the install began -- is how that
 ///   fact turns into an unexplained failure hours later.
+/// * `zone_not_serving_yet` - the gate's zone-status finding, for exactly
+///   the same reason and one door further out: a zone Cloudflare does not
+///   serve yet makes **every** hostname below unreachable, not just one.
 fn final_report(
     pre: &preconditions::Preconditions,
     answers: &answers::Answers,
     evidence: &preflight::Evidence,
     adoption: &dns::Adoption,
+    zone_not_serving_yet: Option<&str>,
 ) -> anyhow::Result<()> {
     println!("\n{}", "=".repeat(64));
     println!("{} is installed.", answers.hostname);
     println!("{}", "=".repeat(64));
     println!("\nproof: {}", evidence.describe());
 
-    for line in url_report(answers, adoption) {
+    for line in url_report(answers, adoption, zone_not_serving_yet) {
         println!("{line}");
     }
 
@@ -1526,7 +1566,9 @@ mod tests {
                     .expect("the fake accepts the test token"),
             );
 
-            let adoption = dns::gate(&answers, &client, &mut io).expect("the gate runs");
+            let adoption = dns::gate(&answers, &client, &mut io)
+                .expect("the gate runs")
+                .adoption;
             let files = render::render_with_adoption(
                 &answers,
                 &adoption_approved(),
@@ -1672,7 +1714,7 @@ mod tests {
     /// fails. Neither covers the other.
     #[test]
     fn the_final_report_carries_the_split_horizon_caveat_verbatim() {
-        let report = url_report(&published_answers(), &dns::Adoption::none()).join("\n");
+        let report = url_report(&published_answers(), &dns::Adoption::none(), None).join("\n");
         assert!(report.contains(dns::SPLIT_HORIZON_CAVEAT), "{report}");
         // Immediately after the urls block, where A6 places it.
         let urls = report.find("urls:").expect("the url block is present");
@@ -1691,7 +1733,7 @@ mod tests {
     /// `url_report` and this fails.
     #[test]
     fn the_final_report_discloses_that_the_daemon_hostname_closes_the_connection() {
-        let report = url_report(&published_answers(), &dns::Adoption::none()).join("\n");
+        let report = url_report(&published_answers(), &dns::Adoption::none(), None).join("\n");
         assert!(
             report.contains("https://ferrum.thesyms.ca"),
             "the url is offered: {report}"
@@ -1714,10 +1756,59 @@ mod tests {
                 wanted: "203.0.113.7".to_string(),
             }],
         };
-        let report = url_report(&published_answers(), &adoption).join("\n");
+        let report = url_report(&published_answers(), &adoption, None).join("\n");
         assert!(report.contains("NOT reachable"), "{report}");
         assert!(report.contains("plex.thesyms.ca"), "{report}");
         assert!(report.contains("198.51.100.9"), "{report}");
+    }
+
+    /// The zone's own status, at the **second** of its two emission sites.
+    ///
+    /// The dry run already shouts about a `pending` zone, and that is not
+    /// enough: it is printed before the disk is erased and is far up the
+    /// scrollback by the time the install finishes. What is left on screen
+    /// is this list of hostnames -- none of which resolve for anyone --
+    /// and until this test existed nothing qualified them. That is R1's
+    /// originating incident ("auth.thesyms.ca did not resolve after the
+    /// install, while the installer reported success") restated by an
+    /// installer that had worked the answer out and then dropped it.
+    ///
+    /// Mutation check: delete the `not_published_yet_lines` extend in
+    /// `url_report` and this test fails; delete the one in `dns::render`
+    /// and `dns::tests::a_pending_zone_is_shouted_about_in_the_plan_rather\
+    /// _than_passing_green` fails. Neither covers the other.
+    #[test]
+    fn the_final_report_says_the_hostnames_do_not_resolve_yet_before_listing_them() {
+        let detail = "Cloudflare reports this zone as pending -- point your registrar at \
+                      amber.ns.cloudflare.com.";
+        let report = url_report(&published_answers(), &dns::Adoption::none(), Some(detail));
+        let joined = report.join("\n");
+
+        assert!(joined.contains("NOT PUBLISHED YET"), "{joined}");
+        assert!(joined.contains(detail), "the advisory is carried: {joined}");
+        assert!(
+            joined.contains("none of these hostnames will resolve"),
+            "{joined}"
+        );
+
+        // Above the list, not below it. A caveat printed after the urls is
+        // read after the operator has already copied one into a browser.
+        let warning = joined
+            .find("NOT PUBLISHED YET")
+            .expect("the warning is present");
+        let urls = joined.find("urls:").expect("the url block is present");
+        assert!(
+            warning < urls,
+            "the warning must precede the urls: {joined}"
+        );
+    }
+
+    /// The ordinary case stays quiet. A caveat printed on every install is
+    /// a caveat nobody reads on the one install that needed it.
+    #[test]
+    fn a_serving_zone_adds_no_warning_to_the_final_report() {
+        let report = url_report(&published_answers(), &dns::Adoption::none(), None).join("\n");
+        assert!(!report.contains("NOT PUBLISHED YET"), "{report}");
     }
 
     /// A host with no base domain publishes nothing, so there is no url
@@ -1727,6 +1818,6 @@ mod tests {
         let answers =
             answers::from_stage2(&serde_json::json!({ "apps": {} }).to_string(), "saltbox")
                 .expect("the stage-2 document is well formed");
-        assert!(url_report(&answers, &dns::Adoption::none()).is_empty());
+        assert!(url_report(&answers, &dns::Adoption::none(), None).is_empty());
     }
 }

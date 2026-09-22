@@ -259,6 +259,34 @@ impl Adoption {
     }
 }
 
+/// Everything the pre-erase gate learned that the final report still needs.
+///
+/// [`Adoption`] alone was not enough, and the missing half is the point:
+/// it carries what the *operator* decided, while a zone Cloudflare does
+/// not serve yet is a fact about the zone that no answer at the gate can
+/// change. Left behind on the [`DryRun`] that fact is printed once, before
+/// the disk is erased, and then discarded -- so the last screen of a
+/// successful install lists URLs that resolve for nobody, with nothing
+/// qualifying them. That is R1's originating incident restated, which is
+/// why the value has to come *out* of the gate rather than stop at it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GateOutcome {
+    /// What the operator decided about the names ferrum does not own.
+    pub adoption: Adoption,
+    /// `Some` when Cloudflare is not serving this zone yet, carrying the
+    /// sentence [`ResolvedZone::advisory`] produced.
+    pub zone_not_serving_yet: Option<String>,
+}
+
+impl GateOutcome {
+    /// The outcome for a run with no gate at all: a host with no base
+    /// domain, or a resume, which never re-asks and never re-checks.
+    #[must_use]
+    pub fn none() -> Self {
+        Self::default()
+    }
+}
+
 /// A computed plan for one zone.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DryRun {
@@ -479,6 +507,33 @@ pub fn dry_run(
     })
 }
 
+/// The block that says none of ferrum's hostnames resolve yet.
+///
+/// A shared function for the same reason [`SPLIT_HORIZON_CAVEAT`] is a
+/// shared constant: this text is emitted twice -- once in the dry run and
+/// once in the final report -- and two copies of it are two things a later
+/// edit can reword apart.
+///
+/// # Arguments
+/// * `detail` - the sentence [`ResolvedZone::advisory`] produced, naming
+///   the status and the nameservers the registrar has to be pointed at.
+///
+/// # Returns
+/// Unindented lines; each caller indents them to suit its own block.
+#[must_use]
+pub fn not_published_yet_lines(detail: &str) -> Vec<String> {
+    vec![
+        "NOT PUBLISHED YET -- Cloudflare is not answering for this domain.".to_string(),
+        detail.to_string(),
+        "Until that zone is active, every record ferrum manages will be created correctly"
+            .to_string(),
+        "and none of these hostnames will resolve for anyone, including you. The install"
+            .to_string(),
+        "itself is unaffected and will finish; the names start working when the zone does."
+            .to_string(),
+    ]
+}
+
 /// Renders a target the way the operator stated it, type included.
 fn describe_target(target: &RecordTarget) -> String {
     match target {
@@ -549,14 +604,9 @@ pub fn render(plan: &DryRun) -> String {
     // install that publishes nothing.
     if let Some(detail) = &plan.zone_not_serving_yet {
         out.push('\n');
-        out.push_str("  NOT PUBLISHED YET -- Cloudflare is not answering for this domain.\n");
-        out.push_str(&format!("  {detail}\n"));
-        out.push_str(
-            "  Until that zone is active, every record above will be created correctly and\n  \
-             none of these hostnames will resolve for anyone, including you. The install\n  \
-             itself is unaffected and will finish; the names start working when the zone \
-             does.\n",
-        );
+        for line in not_published_yet_lines(detail) {
+            out.push_str(&format!("  {line}\n"));
+        }
     }
     out
 }
@@ -683,7 +733,9 @@ fn render_action(action: &RecordAction, name_width: usize) -> String {
 /// * `io` - the question-and-answer channel with the operator.
 ///
 /// # Returns
-/// What was adopted and what was declined, for the final report.
+/// A [`GateOutcome`]: what was adopted, what was declined, and whether
+/// Cloudflare answers for this zone yet -- all three for the final report,
+/// which is the screen still on-screen when a hostname does not work.
 ///
 /// # Errors
 /// A [`GateError`], which aborts the install while the target is still
@@ -693,18 +745,26 @@ pub fn gate(
     answers: &Answers,
     make_client: ClientFactory<'_>,
     io: &mut impl PromptIo,
-) -> anyhow::Result<Adoption> {
+) -> anyhow::Result<GateOutcome> {
     let (Some(base_domain), Some(dns)) = (answers.base_domain.as_deref(), answers.dns.as_ref())
     else {
-        return Ok(Adoption::none());
+        return Ok(GateOutcome::none());
     };
 
     let plan = dry_run(base_domain, answers, dns, make_client)?;
     io.say(&render(&plan));
 
+    // Taken on *every* path out, including the one that asks the operator
+    // nothing: a zone Cloudflare does not serve yet is exactly as fatal to
+    // the URL list whether or not a single name is contested.
+    let zone_not_serving_yet = plan.zone_not_serving_yet.clone();
+
     let foreign = plan.foreign();
     if foreign.is_empty() {
-        return Ok(Adoption::none());
+        return Ok(GateOutcome {
+            adoption: Adoption::none(),
+            zone_not_serving_yet,
+        });
     }
 
     io.say(
@@ -713,7 +773,7 @@ pub fn gate(
          the last moment it\ncan be made, because nothing on the target has been erased yet.",
     );
 
-    let mut outcome = Adoption::none();
+    let mut adoption = Adoption::none();
     for record in foreign {
         io.say(&format!(
             "\n  {} points at {} and ferrum wanted {}.\n\n    \
@@ -729,12 +789,15 @@ pub fn gate(
             record.name
         ))?;
         if answer.eq_ignore_ascii_case("adopt") {
-            outcome.adopted.push(record);
+            adoption.adopted.push(record);
         } else {
-            outcome.declined.push(record);
+            adoption.declined.push(record);
         }
     }
-    Ok(outcome)
+    Ok(GateOutcome {
+        adoption,
+        zone_not_serving_yet,
+    })
 }
 
 /// The lines the final report prints about names ferrum does not own.
@@ -1113,7 +1176,9 @@ mod tests {
             record("mine", "plex.thesyms.ca", "203.0.113.7", true),
             record("theirs", "plex.thesyms.ca", "198.51.100.9", false),
         ]));
-        let outcome = gate(&a, &against(&fake), &mut Scripted::new(&[])).unwrap();
+        let outcome = gate(&a, &against(&fake), &mut Scripted::new(&[]))
+            .unwrap()
+            .adoption;
         assert_eq!(outcome, Adoption::none());
     }
 
@@ -1330,7 +1395,9 @@ mod tests {
         let a = answers(&["plex"]);
         let mut io = Scripted::new(&[""]);
 
-        let outcome = gate(&a, &against(&fake), &mut io).expect("the gate runs");
+        let outcome = gate(&a, &against(&fake), &mut io)
+            .expect("the gate runs")
+            .adoption;
 
         assert_eq!(
             outcome.declined,
@@ -1362,7 +1429,7 @@ mod tests {
             )]));
             let a = answers(&["plex"]);
             let mut io = Scripted::new(&[answer]);
-            let outcome = gate(&a, &against(&fake), &mut io).unwrap();
+            let outcome = gate(&a, &against(&fake), &mut io).unwrap().adoption;
             assert_eq!(outcome.adopted.is_empty(), !adopted, "answer {answer:?}");
             assert_eq!(outcome.declined.is_empty(), adopted, "answer {answer:?}");
         }
@@ -1377,7 +1444,9 @@ mod tests {
         let a = answers(&["plex"]);
         let mut io = Scripted::new(&[]);
 
-        let outcome = gate(&a, &against(&fake), &mut io).expect("no question to ask");
+        let outcome = gate(&a, &against(&fake), &mut io)
+            .expect("no question to ask")
+            .adoption;
         assert_eq!(outcome, Adoption::none());
         assert!(io.asked.is_empty(), "{:?}", io.asked);
         assert!(
@@ -1397,7 +1466,7 @@ mod tests {
         let mut io = Scripted::new(&[]);
         assert_eq!(
             gate(&a, &crate::answers::cloudflare_client, &mut io).unwrap(),
-            Adoption::none()
+            GateOutcome::none()
         );
         assert!(io.asked.is_empty());
         assert!(io.said.is_empty());
