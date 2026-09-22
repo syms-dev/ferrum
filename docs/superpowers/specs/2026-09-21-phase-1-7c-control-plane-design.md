@@ -131,3 +131,156 @@ only one pipeline run may be active per checkout.
 
   This is a deliberate exposure decision and should be revisited if the same-site mitigations ever
   weaken — not silently inherited.
+
+---
+
+## Developer Documentation — R13 implementation (post-panel)
+
+Added after the blind planning panel and Engineering Manager adjudication of pipeline run
+`31491fa3`. This section is **additive**: every acceptance criterion above, the out-of-scope
+paragraph, and the answered OQ1 are unchanged and remain the settled contract. What follows states
+*how* to implement them, because the panel's unanimous finding was not that the criteria are wrong
+but that the obvious implementation of several of them is. Each decision carries a `[P-xx]`
+back-reference to the panel finding that produced it; the finding register is at
+`.ckit/state/evidence/phase-1-7c-r13-panel-register.md` and the adjudication at
+`.ckit/state/evidence/phase-1-7c-r13-em-decision.md`.
+
+### D0 — the daemon is a synthetic, non-catalog "app-shaped" value
+Four mechanisms take a catalog app as their unit and silently exclude the daemon:
+`modules/proxy/authelia.nix:73-93` (`access_control.rules` from `exposedApps`),
+`crates/ferrum-install/src/sso.rs:47-53` (`apps_left_open`),
+`modules/proxy/acme.nix:137-146` (`security.acme.certs` over `publicApps`),
+and `modules/proxy/nginx.nix:16` / `modules/proxy/lib.nix:14-29` (`mkVhost` / `authGated`).
+Do NOT patch each independently — that reproduces the failure class the panel found four times.
+Construct one synthetic value satisfying all four call sites. It is an internal value, NOT a new
+operator-facing option, so `modules/lib/settings-schema.json` does not change:
+
+    daemonApp = {
+      subdomain   = ferrum.daemon.subdomain;   # already exists
+      port        = ferrum.daemon.port;        # 7788
+      exposure    = "public";                  # real cert + public listener (A1, A6)
+      auth.policy = "one_factor";              # forward-auth gated exactly like a catalog app (A2)
+      auth.bypassPaths = [ ];                  # the daemon exempts no path from the edge gate
+    }
+
+Mirrors the existing precedent of hand-building the `auth.${baseDomain}` vhost outside `exposedApps`.
+
+### D1 — Authelia rule for the daemon (A2) [P-01]
+`access_control.default_policy = "deny"` (`authelia.nix:55`) + rules built only from `exposedApps`
+means an `auth_request`-wired daemon vhost with no rule denies EVERYONE, always — a non-functional
+ship. Add a dedicated `access_control.rules` entry for `daemonApp` alongside (never instead of) the
+app-driven rules, using the identical rule shape so it stays in sync as that generator evolves.
+
+### D2 — the unauthenticated-publish consent gate must see the daemon (A1/A2/Out-of-scope) [P-02]
+`sso.rs:47-53` and `:122-128` compute "nothing would be left open" purely from the catalog selection.
+After R13 an operator selecting only Plex+Jellyfin and declining SSO publishes the control plane on a
+real certificate behind one password while being told the opposite. Ruling:
+1. Always evaluate whether `proxy.enable && baseDomain != ""` holds, independent of app selection.
+2. When it holds and SSO was declined, replace the "nothing would be left open" sentence with one
+   naming the control plane and its concrete unauthenticated routes (`PUT /api/settings`,
+   `POST /api/secrets/:name`, `POST /api/jobs`), and require the explicit additional confirmation
+   already used for apps left open — extended to cover this case, not special-cased separately.
+3. When the predicate does not hold, current behaviour is correct and unchanged.
+
+### D3 — cookie name hardening (A4) [P-03]
+A compromised sibling can return `Set-Cookie: ferrumd_session=X; Domain=<baseDomain>; Path=/` from its
+own server response; `HttpOnly` blocks JS reads, not `Set-Cookie` headers, and RFC 6265 leaves the
+choice between two same-named cookies unspecified while `main.rs:199` does a single `cookies.get`.
+Rename to `__Host-ferrumd_session`: browsers reject any `__Host-` cookie carrying a `Domain`
+attribute (and require `Secure` + `Path=/`), which structurally prevents the attack. Update every
+reference — `main.rs:52-56`, `main.rs:199`, and the tests at `main.rs:600-690`.
+
+### D4 — auth composition: ferrumd's session stays authoritative (A2/A4) [P-04]
+ferrumd continues to require its own valid session cookie on EVERY request regardless of Authelia's
+`auth_request` outcome. R13 introduces NO `Remote-User` trust, and the servarr native-login-disable
+pattern is explicitly NOT applied to the daemon. Reason: neither `modules/core/daemon.nix` nor any
+unit in `modules/apps/*` has network-namespace isolation, so any local process — a compromised or
+SSRF'd catalog app — could otherwise forge `Remote-User` straight at `127.0.0.1:7788`, bypassing the
+browser and every same-site mitigation. Header trust, if ever wanted, needs a compensating control
+(Unix socket, or a secret only nginx can set) as its own separate change.
+
+### D5 — CORS-absence test design (A3) [P-05]
+A conforming CORS layer ECHOES the request `Origin`, emitting no `Access-Control-Allow-Origin` when
+the request carries none — and every existing ferrumd test builds Origin-less requests, so a naive
+header-absence assertion passes VACUOUSLY against exactly the reflected-origin configuration
+`main.rs:268-273` names as fatal. After R13 the serving boundary is also nginx, which no crate test
+observes. A3 is not covered until all three hold:
+1. Every `/api/*` route, including 401/403/500 responses, exercised with
+   `Origin: https://sonarr.<baseDomain>` on both a simple request and an `OPTIONS` preflight
+   (with `Access-Control-Request-Method`), asserting no `Access-Control-*` header appears.
+2. A companion assertion over the GENERATED nginx config that no vhost ever emits
+   `Access-Control-Allow-Origin`, following the `auth-model-enforced` pattern.
+3. A negative control: the same suite run against a deliberately CORS-enabled build MUST fail.
+
+### D6 — ACME gating independent of `publicApps` (A6) [P-06]
+`acme.nix:137-145` builds certs over `publicApps` only, and the `acme.email` (:48) and DNS-01
+credential (:52) assertions are gated the same way. An operator publishing only the dashboard with
+every app at `lan`/`local` — the safest configuration available — gets no cert and silently falls to
+the self-signed branch with no assertion firing. Gate the daemon's cert entry and those assertions on
+`daemon.enable && proxy.enable && baseDomain != ""`, OR'd in independently of `publicApps`. This names
+A6's unstated precondition; it reuses the identical `security.acme.certs` shape, not a second mechanism.
+
+### D7 — reserved-subdomain set (A8) [P-07]
+`nginx.nix:132-147` merges vhosts with `//` so a later key silently wins — the jellyfin/plex failure
+class. App subdomains are free-form `types.str` with no uniqueness assertion anywhere. One eval-time
+assertion compares every app's configured subdomain against the reserved set
+**{ the current value of `ferrum.daemon.subdomain`, the literal `"auth"` }** — never a hardcoded
+`"ferrum"`. A collision fails evaluation naming the colliding app and the reserved name.
+
+### D8 — SSE proxying (A1/A5) [P-08]
+`jobs.rs:204-229` is a long-lived SSE stream and `apply.healthCheckTimeoutSec` defaults to 120s,
+exceeding the `proxy_read_timeout 60s` that `recommendedProxySettings` supplies with `proxy_buffering`
+left on. Separately `nginx.nix:100`'s `error_page 401 =302 https://auth.<domain>/...` turns an
+expired-Authelia SPA `fetch()` into an opaque cross-origin redirect. The daemon vhost location block:
+1. sets `proxy_buffering off` (or emits `X-Accel-Buffering: no` on the SSE path);
+2. sets `proxy_read_timeout` comfortably above the longest apply (e.g. 300s);
+3. overrides the site-wide `error_page 401 =302` for the `/api/` prefix so an expired edge session
+   returns a plain `401` the SPA can detect.
+
+### D9 — installer caveat becomes state-dependent (A7) [P-09]
+`crates/ferrum-install/src/dns.rs:110-117`'s `daemon_record_caveat()` is a frozen string asserting the
+name "will resolve, and then the connection will close with no response ... until daemon web access
+ships in Phase 1.7c R13", asserted verbatim by tests at ~1191/1204/1453. Once A1 ships that is false.
+`dns.rs` is IN SCOPE for A7. Make the caveat a pure function of
+`{ proxy.enable, baseDomain, daemon.subdomain, auth.enable }`: when the answered configuration will
+actually produce a reachable, correctly-gated vhost, state the real reachable URL; otherwise retain
+language scoped to the actual reason. Replace the frozen-string tests with per-state assertions, one
+per branch, each still an exact match.
+
+### D10 — Secure cookie and the SSH tunnel (A4/A5) [P-10, adjudicated]
+`http://127.0.0.1` and `http://localhost` are potentially-trustworthy origins under W3C Secure
+Contexts, implemented uniformly by every major browser: a `Secure` cookie is stored and sent there
+over plain HTTP. A4 and A5 are compatible as written; no code or criterion changes.
+Operational note to carry into the recovery instructions: the tunnel must forward to the LOOPBACK
+address specifically (`ssh -L 7788:127.0.0.1:7788 <host>`, then browse `http://127.0.0.1:7788`), not a
+LAN IP. A non-loopback origin is not potentially-trustworthy and will correctly refuse the cookie —
+that is expected, and must not be "fixed" by weakening A4.
+
+### D11 — Authelia's actual defensive scope (advisory) [P-11]
+`authelia.nix:56` sets `session.domain = ferrum.proxy.baseDomain`, so the SSO cookie is domain-wide
+and a compromised sibling app's requests to `ferrum.<domain>` already carry it and pass `auth_request`.
+Authelia defends against the unauthenticated internet stranger ONLY. A3 and A4 are the sole defence
+against a compromised sibling app. Keep this explicit in any security writeup so Authelia is never
+mistaken for load-bearing against the spec's own named threat.
+
+### D12 — shared lockout table (advisory, backlog) [P-12]
+`auth.rs:72-88` keys lockout on username in a shared table, so a sustained same-site attack holding
+`admin` locked also locks the SSH-tunnel recovery route. Not required for R13; backlog candidate for a
+per-listener exemption.
+
+### D13 — only `Secure` is new (implementation note) [P-13]
+`main.rs:52-56` already sets `SameSite=Strict`. A4's "rather than Lax" describes the end state, not a
+diff. The only new cookie attribute is `Secure`, plus the D3 rename.
+
+### Spec traceability
+| Criterion | Approach | Files |
+|---|---|---|
+| A1 | D0 synthetic value -> `mkVhost`; gated on `proxy.enable && baseDomain` | `modules/proxy/nginx.nix` |
+| A2 | D1 + D4 | `modules/proxy/authelia.nix`, `crates/ferrumd/src/main.rs` |
+| A3 | D5 test matrix | `crates/ferrumd/src/main.rs`, `nix/modules/flake/checks.nix` |
+| A4 | D3 + D13 + D10 | `crates/ferrumd/src/main.rs` |
+| A5 | D10, D12 (non-blocking) | `crates/ferrumd/src/auth.rs` |
+| A6 | D6 | `modules/proxy/acme.nix` |
+| A7 | D9 | `crates/ferrum-install/src/dns.rs` |
+| A8 | D7 | eval-time assertions module |
+| Out-of-scope policy | D2 | `crates/ferrum-install/src/sso.rs` |
