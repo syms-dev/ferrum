@@ -172,6 +172,50 @@ fn publication_matches_auth(proposed: &Value) -> Result<(), String> {
     Ok(())
 }
 
+/// Replaces `path`'s contents with `content` atomically: a temp file in the
+/// same directory, then a rename over the destination.
+///
+/// M2. This used to be a bare `tokio::fs::write`, which opens the
+/// destination with `O_TRUNC` -- so the real settings.json is length 0 on
+/// disk before any of the new document is written, for every write,
+/// regardless of how small the document is. Two things fall into that
+/// window:
+///
+/// * An apply's `builtins.fromJSON` read of this same file
+///   (`ferrum-install/src/render.rs:394`) gets an empty or partial
+///   document and fails evaluation with a parse error -- against a file
+///   that is complete and valid by the time an operator goes to look at it.
+/// * A crash inside the window leaves the file **permanently** empty.
+///   Startup's `check_settings_writable` only opens the file, so it still
+///   passes and ferrumd starts; `GET /api/settings` then 500s on the
+///   unparseable document, so the UI cannot repair what it cannot load,
+///   and every apply fails at eval. The only way out is hand-editing over
+///   SSH, which is the failure mode this project exists to remove.
+///
+/// `rename(2)` within one filesystem is atomic: a reader holds either the
+/// old complete document or the new one, never a partial, and a crash
+/// leaves whichever of the two was current. The temp file is a sibling
+/// rather than in `/tmp` precisely so the rename stays within one
+/// filesystem -- across a mount boundary it would fail with `EXDEV`.
+///
+/// Same shape as `ferrum-apply`'s own intent write
+/// (`crates/ferrum-apply/src/rollback.rs:63-64`), deliberately: this
+/// project already had one correct answer to this and did not need a
+/// second.
+///
+/// # Arguments
+/// * `path` - the destination file, replaced wholesale.
+/// * `content` - the complete document to leave there.
+///
+/// # Errors
+/// Any I/O failure writing the temp file or renaming it into place. On
+/// either, the destination still holds its previous contents.
+async fn write_settings(path: &std::path::Path, content: &str) -> std::io::Result<()> {
+    let tmp = path.with_extension("json.tmp");
+    tokio::fs::write(&tmp, content).await?;
+    tokio::fs::rename(&tmp, path).await
+}
+
 pub async fn put_settings(
     State(_state): State<Arc<AppState>>,
     axum::Extension(crate::SessionUsername(username)): axum::Extension<crate::SessionUsername>,
@@ -206,7 +250,7 @@ pub async fn put_settings(
     };
     let path = settings_path();
     let content = serde_json::to_string_pretty(&proposed).unwrap();
-    match tokio::fs::write(&path, content).await {
+    match write_settings(&path, &content).await {
         Ok(()) => {
             audit_write("success", "");
             StatusCode::OK.into_response()
@@ -721,6 +765,82 @@ mod tests {
         assert!(
             message.contains("schema validation"),
             "the shape error must be the one reported: {message}"
+        );
+    }
+
+    /// M2. A reader of settings.json must never see a document that is not
+    /// a whole document.
+    ///
+    /// This is not a hypothetical concurrency worry. `builtins.fromJSON`
+    /// reads this exact file during an apply
+    /// (`ferrum-install/src/render.rs:394`), and a read landing inside the
+    /// window a truncating write opens gets an empty or half file and dies
+    /// with a parse error against a file that looks perfectly fine by the
+    /// time anyone goes to look at it.
+    ///
+    /// The window belongs to `O_TRUNC`, not to the size of the payload:
+    /// `tokio::fs::write` opens the destination truncating, so the file is
+    /// length 0 on disk before a single byte of the new document is
+    /// written, however small that document is. A reader polling across a
+    /// few hundred writes hits it comfortably. With a temp-file-and-rename
+    /// the window does not exist at any size, because the destination inode
+    /// is only ever swapped for one that is already complete -- so this
+    /// test cannot fail on the fixed code rather than merely tending not to.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_concurrent_reader_never_sees_a_half_written_settings_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let document = serde_json::json!({
+            "secrets": { "example": "value" },
+            "proxy": { "enable": true, "baseDomain": "example.test" },
+        });
+        let content = serde_json::to_string_pretty(&document).unwrap();
+        let expected_len = content.len();
+
+        // Seed it, so "the file is absent" is never a legitimate reading and
+        // every observation below is of a file that genuinely exists.
+        write_settings(&path, &content).await.unwrap();
+
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let torn = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let reader = {
+            let (path, stop, torn) = (path.clone(), stop.clone(), torn.clone());
+            std::thread::spawn(move || {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    match std::fs::read_to_string(&path) {
+                        // A short read is the tear itself; a read that is
+                        // full-length but unparseable would be one too.
+                        Ok(raw) => {
+                            if raw.len() != expected_len {
+                                torn.lock().unwrap().push(format!("{} bytes", raw.len()));
+                            } else if serde_json::from_str::<Value>(&raw).is_err() {
+                                torn.lock().unwrap().push("full length but not valid JSON".to_string());
+                            }
+                        }
+                        // The destination vanishing is a tear of its own: an
+                        // apply reading it here fails outright.
+                        Err(e) => torn.lock().unwrap().push(format!("unreadable: {e}")),
+                    }
+                }
+            })
+        };
+
+        for _ in 0..500 {
+            write_settings(&path, &content).await.unwrap();
+            tokio::task::yield_now().await;
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        reader.join().unwrap();
+
+        let torn = torn.lock().unwrap();
+        assert!(
+            torn.is_empty(),
+            "settings.json was observed in {} non-whole state(s) -- first few: {:?}. \
+             A reader that catches this window gets a parse error on a file that is \
+             intact by the time it is inspected, and a crash inside it leaves the file \
+             permanently empty with no way to repair it from the UI",
+            torn.len(),
+            &torn[..torn.len().min(5)]
         );
     }
 }
