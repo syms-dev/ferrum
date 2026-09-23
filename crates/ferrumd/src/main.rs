@@ -343,13 +343,14 @@ async fn change_password_handler(
             )
                 .into_response()
         }
+        // SEC-09, and the same treatment L-03 gave `login_handler`: the
+        // error text can name a filesystem path or a database internal, so
+        // it goes to the journal where an operator can read it, and the
+        // caller gets a fixed string.
         Err(e) => {
+            eprintln!("ferrumd: password change failed: {e:#}");
             audit::record("password-change", "error", &user, &client, "daemon fault");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to change the password: {e}"),
-            )
-                .into_response()
+            (StatusCode::INTERNAL_SERVER_ERROR, "failed to change the password").into_response()
         }
     }
 }
@@ -1539,6 +1540,46 @@ mod tests {
         );
     }
 
+    /// SEC-09. The 500 on this route used to carry `e.to_string()`, which
+    /// on the reachable failure below names the stored hash's own contents.
+    ///
+    /// Reached for real rather than mocked: a corrupt `password_hash`
+    /// column is exactly what `change_password` turns into an `Err`, and it
+    /// is the one 500 on this route a test can actually provoke.
+    #[tokio::test]
+    async fn a_daemon_fault_on_the_password_route_returns_no_internal_detail() {
+        let (_dir, state, session, csrf) = logged_in();
+        // After the login above, so the login itself still had a real hash.
+        state
+            .db
+            .conn()
+            .execute(
+                "UPDATE users SET password_hash = 'not-a-phc-string' WHERE username = 'admin'",
+                [],
+            )
+            .unwrap();
+
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/api/password")
+            .header("Cookie", format!("{SESSION_COOKIE}={session}"))
+            .header(CSRF_HEADER, &csrf)
+            .header("Content-Type", "application/json")
+            .body(Body::from(
+                r#"{"current_password":"anything","new_password":"new"}"#.to_string(),
+            ))
+            .unwrap();
+        let response = build_router(state).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8_lossy(&bytes).to_string();
+        assert!(!body.is_empty(), "the caller still needs to be told something failed");
+        assert!(
+            !body.contains("not-a-phc-string") && !body.contains("corrupt"),
+            "a 500 must not describe the daemon's internal state: {body}"
+        );
+    }
 
     /// AC25 -- the READ route is behind the session gate too.
     ///
