@@ -33,7 +33,11 @@
       "additionalProperties": false,
       "properties": {
         "enable": { "type": "boolean" },
-        "baseDomain": { "type": "string" },
+        "baseDomain": {
+          "type": "string",
+          "pattern": "^([A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*)?$",
+          "description": "A DNS name, or empty for a host that publishes nothing. Pattern-constrained because modules/proxy/nginx.nix interpolates this into server_name, into an ACME certificate name, and into an error_page redirect target: an unconstrained string here is an nginx directive the settings API can write. Mirrors modules/lib/hostnames.nix's dnsName, which enforces the same thing at evaluation."
+        },
         "acme": {
           "type": "object",
           "additionalProperties": false,
@@ -115,8 +119,16 @@
       "properties": {
         "enable": { "type": "boolean" },
         "port": { "type": "integer" },
-        "listenAddress": { "type": "string" },
-        "subdomain": { "type": "string" },
+        "listenAddress": {
+          "type": "string",
+          "pattern": "^(127\\.(0|[1-9][0-9]?|1[0-9][0-9]|2[0-4][0-9]|25[0-5])\\.(0|[1-9][0-9]?|1[0-9][0-9]|2[0-4][0-9]|25[0-5])\\.(0|[1-9][0-9]?|1[0-9][0-9]|2[0-4][0-9]|25[0-5])|::1)$",
+          "description": "A loopback address literal, and nothing else. Tighter than the NixOS option's own type on purpose: modules/core/daemon.nix's A5 assertion refuses a non-loopback address at evaluation, but by then the value is already in settings.json and the operator's next apply fails. Refusing it here refuses the WRITE. It is also the injection boundary -- this value is interpolated into proxy_pass, and a real nginx accepted, and served, the directive smuggled through an unconstrained string here."
+        },
+        "subdomain": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*$",
+          "description": "A DNS label, non-empty. Same reasoning as proxy.baseDomain above; mirrors modules/lib/hostnames.nix's dnsLabel."
+        },
         "dns": {
           "type": "object",
           "additionalProperties": false,

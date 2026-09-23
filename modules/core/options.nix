@@ -12,6 +12,11 @@ let
 
   catalog = import ../lib/catalog.nix { inherit lib; };
 
+  # The three options below that nginx reads as syntax rather than as data.
+  # See modules/lib/hostnames.nix for the injection this refuses and why the
+  # constraint lives in one file instead of at each option.
+  hostnames = import ../lib/hostnames.nix { inherit lib; };
+
   appsType = import ../lib/app-submodule.nix {
     inherit lib catalog;
     stateRoot = config.ferrum.storage.stateDir;
@@ -180,7 +185,10 @@ in
       enable = mkEnableOption "the ferrum reverse proxy (nginx + ACME)";
 
       baseDomain = mkOption {
-        type = types.str;
+        # Not types.str: this lands in server_name, in an ACME certificate
+        # name, and in modules/proxy/nginx.nix's `error_page 401 =302
+        # https://auth.${baseDomain}/...`, and the settings API can write it.
+        type = hostnames.dnsName;
         default = "";
         example = "home.example.com";
       };
@@ -410,11 +418,14 @@ in
         default = 7788;
       };
       listenAddress = mkOption {
-        type = types.str;
+        # A character-set bound only -- whether the value is a LOOPBACK
+        # address is modules/core/daemon.nix's A5 assertion, which owns the
+        # long operator-facing message. See modules/lib/hostnames.nix.
+        type = hostnames.addressLiteral;
         default = "127.0.0.1";
       };
       subdomain = mkOption {
-        type = types.str;
+        type = hostnames.dnsLabel;
         default = "ferrum";
         description = "Hostname label under ferrum.proxy.baseDomain for the daemon's own web UI -- same mechanism as every app's own subdomain option, just not tied to the catalog since the daemon isn't a catalog app.";
       };

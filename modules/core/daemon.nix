@@ -17,6 +17,28 @@ let
   # -- a string that starts with "127." and is not an address at all -- is
   # not quietly admitted.
   octets = lib.splitString "." listenAddress;
+  # Each part must be a NUMBER, and that is not a detail. Until this
+  # function existed the guard checked only how many parts there were and
+  # what the first one said, which made it a shape heuristic rather than an
+  # address parse -- and the difference was exploitable. Split
+  # `127.0.0.1 ; return 200 "pwned" ; #` on "." and you get four parts whose
+  # head is "127", so the old predicate accepted it; modules/proxy/nginx.nix
+  # then interpolated the whole string into proxy_pass, real nginx parsed
+  # the result with EXIT 0, and the control plane's own vhost answered
+  # `HTTP/1.1 200` with the attacker's body. Proved end to end, with a real
+  # nginx, before this line was written.
+  #
+  # builtins.match anchors implicitly -- it matches the WHOLE string or
+  # returns null -- which is the property doing the work here: no suffix
+  # after a valid number can survive, whether it starts with a space, a
+  # semicolon or a newline.
+  #
+  # Leading zeros are refused rather than tolerated because "127.010.0.1" is
+  # read as decimal by some resolvers and octal by others, and an address
+  # whose meaning depends on who parses it has no place in a guard whose
+  # entire job is that two programs agree on one.
+  isOctet = part:
+    builtins.match "0|[1-9][0-9]{0,2}" part != null && lib.toInt part <= 255;
   # "localhost" is deliberately NOT here, and it is the one spelling that
   # looks safest. It is a NAME, so the two consumers of this option resolve
   # it differently and neither is wrong: nginx resolves it once at config
@@ -30,7 +52,9 @@ let
   # program's logs -- strictly worse than the clean refusal an operator gets
   # from any other name, and the reason this accepts literals only.
   listenIsLoopback =
-    (builtins.length octets == 4 && builtins.head octets == "127")
+    (builtins.length octets == 4
+      && builtins.head octets == "127"
+      && builtins.all isOctet octets)
     || listenAddress == "::1";
 in
 lib.mkIf ferrum.daemon.enable {

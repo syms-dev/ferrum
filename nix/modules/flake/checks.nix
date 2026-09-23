@@ -828,6 +828,33 @@
             acceptedLoopbackSpellings;
           wronglyAccepted = builtins.filter (a: loopbackFailuresFor a == [ ])
             [ "0.0.0.0" "192.168.1.10" "::" "127.0.0.1.example.test" ];
+          # The same guard, asked the adversarial question instead of the
+          # careless one. Every value above is an operator misconfiguring a
+          # box. These are an attacker holding the settings API, which is a
+          # write path that really exists: modules/lib/settings-schema.json
+          # typed listenAddress as a bare string, so `PUT /api/settings`
+          # chose the bytes that modules/proxy/nginx.nix then interpolates
+          # into proxy_pass with no quoting of any kind.
+          #
+          # The first payload was proved end to end against a real nginx
+          # before this line was written. The pre-parse guard split it on
+          # "." into [ "127" "0" "0" "1 ; return 200 \"pwned\" ; #" ], found
+          # four parts whose head is "127", and accepted it; nginx then read
+          #   proxy_pass http://127.0.0.1 ; return 200 "pwned" ; #:7788;
+          # with EXIT 0 -- the injected `return` live, the trailing `#`
+          # swallowing only the `:7788;` behind it. A shape heuristic is not
+          # an address parse, and nginx's parser cannot tell you so, because
+          # what comes out the other side is valid nginx.
+          #
+          # The second is the newline spelling of the same attack. `;` is not
+          # nginx's only directive separator, and an anchored pattern whose
+          # `$` is the multiline kind stops at the line break and blesses
+          # everything after it.
+          wronglyAcceptedInjection = builtins.filter (a: loopbackFailuresFor a == [ ])
+            [
+              "127.0.0.1 ; return 200 \"pwned\" ; #"
+              "127.0.0.1\nreturn 200 \"pwned\";"
+            ];
           # Refused too, but for a different reason, and carrying its own
           # message for that reason -- "the world can reach it" is simply
           # untrue of localhost, and a guard that reports the wrong cause
@@ -953,6 +980,8 @@
               wronglyRejected
             ++ map (a: "ferrum.daemon.listenAddress = \"${a}\" evaluates cleanly, so ferrumd may be told to bind an interface the world can reach with nginx and Authelia bypassed entirely (A5)")
               wronglyAccepted
+            ++ map (a: "ferrum.daemon.listenAddress = \"${a}\" evaluates cleanly, and it is not an address at all -- it is an nginx DIRECTIVE, smuggled through an option the settings API can write and interpolated unquoted into proxy_pass by modules/proxy/nginx.nix. The rendered config parses (EXIT 0, proved against a real nginx), so nothing downstream refuses it: whatever the payload says, the control plane's own vhost now says too (A5)")
+              wronglyAcceptedInjection
             ++ map (a: "ferrum.daemon.listenAddress = \"${a}\" evaluates cleanly, and it is a NAME rather than a literal -- nginx resolves it at config load and load-balances across every address it yields, while ferrumd's TcpListener::bind takes only the first, so roughly half the dashboard's requests hit a port nothing is listening on. An intermittent 502 with no cause in either program's log (A5)")
               wronglyAcceptedNames
             ++ map (a: "ferrum.daemon.listenAddress = \"${a}\" evaluates cleanly, and it is an ALREADY-BRACKETED IPv6 literal -- modules/proxy/nginx.nix brackets any address containing a colon unconditionally, with no \"already bracketed?\" branch, because this refusal is what guarantees one never arrives. Accepting it renders `proxy_pass http://[[::1]]:7788`, which nginx rejects as an invalid host, refusing the WHOLE config file: every vhost on the host down at nginx.service start, after an apply that reported success (A5)")

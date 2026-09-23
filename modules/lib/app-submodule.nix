@@ -10,6 +10,7 @@
 { lib, catalog, stateRoot, proxyEnabled ? false }:
 let
   inherit (lib) mkOption mkEnableOption types;
+  hostnames = import ./hostnames.nix { inherit lib; };
 in
 types.attrsOf (types.submodule ({ name, ... }:
   let
@@ -27,7 +28,14 @@ types.attrsOf (types.submodule ({ name, ... }:
       };
 
       subdomain = mkOption {
-        type = types.str;
+        # Same constraint, same reason, as ferrum.daemon.subdomain: this is
+        # interpolated straight into server_name by modules/proxy/nginx.nix
+        # via proxyLib.vhostNameFor. It is reachable from the settings API
+        # even though the daemon's is now pattern-checked in
+        # modules/lib/settings-schema.json, because that schema still defers
+        # on the shape of `apps` entirely -- so for this option the module
+        # system is the ONLY check there is.
+        type = hostnames.dnsLabel;
         default = meta.defaultSubdomain;
         description = "Hostname label under ferrum.proxy.baseDomain.";
       };
