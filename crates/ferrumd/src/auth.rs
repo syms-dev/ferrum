@@ -420,6 +420,16 @@ pub fn login(
         return Ok(LoginOutcome::Throttled);
     }
 
+    // `QueryReturnedNoRows` -- and ONLY that -- means "no such user". Every
+    // other rusqlite error is a real fault and propagates, which is what
+    // `LoginOutcome`'s doc above means by reserving `Err` for "the daemon
+    // genuinely failed". A blanket `.ok()` here collapsed an unreadable
+    // database (SQLITE_IOERR off a failing disk, SQLITE_CORRUPT, a
+    // half-applied migration) into the absent-user branch, so an operator
+    // holding the CORRECT password was answered 401 and audited as
+    // `outcome=failure detail="bad credentials"` -- the one report that
+    // guarantees they look for the problem somewhere it is not. Same shape
+    // as `validate_session` below and `jobs::summarize`.
     let row: Option<(i64, String)> = db
         .conn()
         .query_row(
@@ -427,7 +437,14 @@ pub fn login(
             rusqlite::params![username],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
-        .ok();
+        .map(Some)
+        .or_else(|e| {
+            if matches!(e, rusqlite::Error::QueryReturnedNoRows) {
+                Ok(None)
+            } else {
+                Err(anyhow::Error::from(e))
+            }
+        })?;
 
     let succeeded = match &row {
         Some((_, hash)) => {
@@ -636,6 +653,11 @@ pub fn change_password(
         return Ok(PasswordChangeOutcome::Throttled);
     }
 
+    // As in `login`: only `QueryReturnedNoRows` means the row is absent.
+    // With a blanket `.ok()` the branch below fired on an unreadable
+    // database too, so its comment -- which promises the row has vanished --
+    // was asserting something the code had not established, and the
+    // operator was told their correct current password was wrong.
     let stored: Option<String> = db
         .conn()
         .query_row(
@@ -643,7 +665,14 @@ pub fn change_password(
             rusqlite::params![user_id],
             |row| row.get(0),
         )
-        .ok();
+        .map(Some)
+        .or_else(|e| {
+            if matches!(e, rusqlite::Error::QueryReturnedNoRows) {
+                Ok(None)
+            } else {
+                Err(anyhow::Error::from(e))
+            }
+        })?;
     // An authenticated session whose user row has vanished is not a wrong
     // password, but it is also not something to hand a 500 for: there is
     // nothing to rotate, and refusing is the only safe answer.
@@ -1497,5 +1526,78 @@ mod tests {
             "the same password hashed twice must differ -- a fresh salt per rotation"
         );
         assert!(login(&db, "admin", "same-value", &test_client()).unwrap().session().is_some());
+    }
+
+    /// Makes the `users` table unreadable without deleting a single row.
+    ///
+    /// Renaming rather than dropping is deliberate: the rows still exist, so
+    /// the account genuinely still has its correct password, and any answer
+    /// of "your credentials are bad" is a statement the database is in no
+    /// position to make. What SQLite raises here is a plain
+    /// `SqliteFailure`/`no such table` -- categorically NOT
+    /// `QueryReturnedNoRows` -- which is precisely the distinction the fixed
+    /// code turns on, and the one a bare `.ok()` erases. It stands in for
+    /// the faults that actually happen on an appliance: `SQLITE_IOERR` off a
+    /// failing disk, `SQLITE_CORRUPT`, or a migration that got half applied.
+    fn break_the_users_table(db: &Db) {
+        db.conn().execute_batch("ALTER TABLE users RENAME TO users_moved_away").unwrap();
+    }
+
+    /// M1. A database that cannot be read must never be reported as a wrong
+    /// password.
+    ///
+    /// The operator holds the correct credential; with the read collapsed
+    /// into `None` they are told it is wrong, the audit log agrees with the
+    /// lie (`outcome=failure detail="bad credentials"`), and nothing
+    /// anywhere says the database is broken. `LoginOutcome`'s own
+    /// documentation reserves `Err` for "the daemon genuinely failed" --
+    /// this is that case, so this is the outcome it has to produce.
+    #[test]
+    fn a_login_against_a_broken_database_is_an_error_not_bad_credentials() {
+        let (_dir, db, password, _user_id) = bootstrapped();
+        break_the_users_table(&db);
+        let result = login(&db, "admin", &password, &test_client());
+        assert!(
+            result.is_err(),
+            "a failed read of the users table must surface as Err so the handler answers 500; \
+             reporting the operator's CORRECT password as bad credentials sends them hunting \
+             for a password problem that does not exist"
+        );
+    }
+
+    /// M1, the same swallow in `change_password`.
+    ///
+    /// Its absent-user branch carries a comment claiming the row has
+    /// vanished. A broken read reaches that branch too, and the caller is
+    /// told their current password is wrong.
+    #[test]
+    fn a_rotation_against_a_broken_database_is_an_error_not_a_wrong_password() {
+        let (_dir, db, password, user_id) = bootstrapped();
+        break_the_users_table(&db);
+        let result = change_password(&db, user_id, &password, "new-password", KEPT_SESSION, &test_client());
+        assert!(
+            result.is_err(),
+            "a failed read of the users table must surface as Err, not as WrongPassword: the \
+             comment on that branch promises it means the user row vanished, and a caller told \
+             their correct password is wrong has no way to learn otherwise"
+        );
+    }
+
+    /// The other half of M1: the branch the `.ok()` was standing in for is
+    /// still reached, by the error that really does mean "no such row".
+    ///
+    /// Without this, a fix could pass the two tests above by propagating
+    /// everything, turning a genuinely absent user into a 500 -- and
+    /// `login` would then answer a probe for a nonexistent username with a
+    /// different status than a wrong password, which is the account-
+    /// enumeration oracle SEC-07's constant-time branch exists to close.
+    #[test]
+    fn an_absent_user_is_still_bad_credentials_rather_than_an_error() {
+        let (_dir, db, _password, _user_id) = bootstrapped();
+        let result = login(&db, "no-such-operator", "whatever", &test_client());
+        assert!(
+            matches!(result.unwrap(), LoginOutcome::BadCredentials),
+            "QueryReturnedNoRows is the expected outcome for an unknown username, not a fault"
+        );
     }
 }
