@@ -69,8 +69,10 @@ Last updated at HEAD `288f2b3`, branch `grounding-and-install-path`. Nothing pus
       - **Lands with item 11** (confirm the SSH-tunnel route in a real browser), which is the
         acceptance test for exactly this.
 
-- [ ] **3. Push the branch and open the PR.** 141+ commits, no upstream set. Needs your explicit
-      go-ahead — this is the only step that leaves your machine.
+- [x] **3. Push the branch and open the PR.** DONE — **PR #4**:
+      https://github.com/syms-dev/ferrum/pull/4 (base `main`, 240 files, ~53k insertions).
+      The harness denies `git push` to the agent ("Out-of-Place Publication"), so the owner runs
+      the push; the PR picks up new commits automatically.
 
 ## Phase 2 — Bugs that affect a real host
 
@@ -154,9 +156,15 @@ Last updated at HEAD `288f2b3`, branch `grounding-and-install-path`. Nothing pus
       had become false — so the sweep carries real risk. Rubric plus a handful of real
       before-and-afters, including one load-bearing comment, before touching the codebase.
 - [ ] **13. De-verbose the comments**, via the `humanize` skill (which runs `humanizer` first).
-- [ ] **14. Remove AI mentions from the working tree.** 8 tracked files, none of them source:
-      `AGENTS.md`, `README.claude-sdlc.md`, `.design-sync/NOTES.md`, `.gitignore`, and four
-      spec/plan docs.
+- [x] **14. Remove AI mentions from the working tree.** DONE. Most vanished with their files —
+      see item 19; the two were one decision. The five that remained were in real design docs and
+      were **reworded, not deleted**, because each carried meaning the vendor name was incidental
+      to: a design tool's brand, two rule-file paths, a voice-guide path. The attribution decision
+      in `phase-1-9-ship-it-design.md` keeps its **full** record — the 226/186 inventory, the
+      approval date, the commitment — with the name generalised, since deleting it would erase
+      the audit trail of a decision the project made deliberately and still honours.
+      **Two remain on purpose:** `.gitignore` must name `.claude/` in order to ignore it, and
+      this file is the live checklist — review it last, not while writing against it.
 - [ ] **15. Decide on git history.** 6 commit messages contain a mention. Editing them means
       rewriting history, which is destructive and has already invalidated a pipeline ledger here
       once. Separate decision from the working tree.
@@ -167,9 +175,19 @@ Last updated at HEAD `288f2b3`, branch `grounding-and-install-path`. Nothing pus
 
 ## Phase 6 — Housekeeping before anyone looks
 
-- [ ] **18. Remove the run's git worktrees.** Several remain under `.claude/worktrees/`.
-- [ ] **19. Decide what `.gitignore` should do with `.claude/`.** It currently ignores the whole
-      directory, so claude-kit's "committed" agent-memory store is not committed.
+- [x] **18. Remove the run's git worktrees.** DONE — 16 removed, 1 left (the repo itself).
+      **Checking merge status first was not a formality.** `r13-fixes` held **4 unmerged commits**
+      that deleting its worktree would have destroyed; see item 7. All 15 branch refs are kept,
+      so nothing is unrecoverable even now.
+- [x] **19. What `.gitignore` should do with `.claude/`.** DECIDED + DONE: **the build
+      pipeline does not ship in the thing being built.** 21 files untracked — the `.ckit/` tree,
+      a stray skill under the otherwise-ignored `.claude/`, `AGENTS.md`, `README.claude-sdlc.md`,
+      `.design-sync/NOTES.md`. Verified first that none is referenced by CI, the flake, any module
+      or any crate. All still exist on disk and the hooks reading them are unaffected.
+      Two would have been actively misleading in public: `stack-catalog.snapshot.yaml` records
+      python/fastapi/postgres for a repo with **zero `.py` files**, and the agent-memory store is
+      a running commentary on the project's own mistakes. `CLAUDE.md` was never tracked, so the
+      top-level agent config was already local-only; this makes the rest consistent.
 - [ ] **20. Fix `stack-catalog.snapshot.yaml`** — diagnosed 2026-09-23, less harmful than it
       looks, but the residue is real. `.ckit/config/` (the live one the hooks read) records
       **react · typescript · python · fastapi · postgres** for a project that is Rust + Nix with
