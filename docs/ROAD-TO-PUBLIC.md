@@ -143,7 +143,7 @@ Last updated at HEAD `288f2b3`, branch `grounding-and-install-path`. Nothing pus
         have passed with the defect fully present; only the length floor caught it.
 
 - [ ] **6. R14.**
-- [ ] **7. The three R13 deferred tickets.**
+- [x] **7. The three R13 deferred tickets.** ALL THREE DONE 2026-09-23.
       - ~~`modules/proxy/dns.nix` `daemonRecords` never consults `daemon.enable`, so a daemon-off
         host still gets a DNS record for a hostname nginx closes. **Whoever fixes this must also
         update `checks.nix`'s anti-vacuity guard, which currently depends on it staying
@@ -168,9 +168,22 @@ Last updated at HEAD `288f2b3`, branch `grounding-and-install-path`. Nothing pus
         prose for the four sentences R13 falsified, with
         `the_stale_claim_scan_really_reads_comments_and_only_comments` as its positive control.
         Mutation-proved: the old paragraph makes it **exit 101**.
-      - `examples/hosts/minimal` does not evaluate — two reasons now (missing `acme-dns`, plus the
-        auth-off assertion). This is the config a new operator copies, so it matters more than its
-        severity suggests.
+      - ~~`examples/hosts/minimal` does not evaluate.~~ **DONE 2026-09-23 — zero failing
+        assertions, proved by evaluating `config.assertions` directly.** It had **five**, not two,
+        and the reason it kept failing while keeping its name is that it was not minimal: it
+        published seven apps on a real domain, the same shape as `examples/hosts/template`.
+        - **Three** were the committed servarr secrets, fixed by **deleting** them — the remedy
+          those assertions themselves print. They were encrypted to an age recipient nobody
+          cloning the repo has, so the template looked like a working starting point and was not.
+        - **Two** were one fact in two messages. Exposure defaults to `public` whenever the proxy
+          is on, so six apps were published; publishing needs a certificate, which needs a
+          Cloudflare token that cannot be committed. Declaring the secret without shipping it only
+          moves the failure from "not declared" to "declared but the file is missing".
+        - **Fix: make the name true.** Every app moves to `lan`, the dashboard stays unpublished
+          — a line only expressible because `daemon.publish` now exists — so no certificate and
+          no secret are needed. The proxy stays **on**, so the example still demonstrates nginx
+          and the lan allow rules rather than switching the interesting part off to pass a check.
+          Publishing is what `template` is for, and it already carries that shape.
 
 ## Phase 3 — The dashboard people will actually see
 
