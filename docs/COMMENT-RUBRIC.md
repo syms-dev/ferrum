@@ -133,3 +133,37 @@ Every clause false since R13. Already fixed and now guarded. **This is what the 
    condense?
 3. Rules 6–8 are the subjective ones. File-by-file, or are you happy for them to run repo-wide once
    the rubric is agreed?
+
+
+---
+
+## Falsity pass — first sweep done 2026-09-23, and it came back nearly clean
+
+The pass agreed above was run as detection only (no edits, because another change was in flight
+on the same files). The result is worth recording, because it changes what item 13 is actually for.
+
+**Scanned:**
+
+| Class | Pattern | Result |
+|---|---|---|
+| R13-falsified claims | `no vhost`, `declared but unused`, `loopback-only`, `return 444` | **clean** — swept during the `r13-fixes` salvage; every remaining hit checked and correct |
+| Time-relative claims | `today`, `currently`, `not yet`, `for now`, `once X exists`, `will be` | 20 hits, **0 false** |
+| Now-constrained values | `unconstrained`, `no pattern`, `free string`, `not validated`, `unschema'd` | 3 hits, **0 false** |
+
+**Two verified individually rather than by eye**, being the most falsifiable:
+
+- `crates/ferrum-apply/src/dns_reconcile.rs:1895` — *"not reachable from any call site in this
+  crate today — `reconcile_with` always calls `client.list_records(&zone)`"*. **True**:
+  `reconcile_with` still calls it (`:698`), and the only `ZoneListing::default()` uses are in
+  tests. This is a deliberately-recorded discrepancy, not rot — keep it.
+- `nix/modules/flake/checks.nix:483` — *"unschema'd since the mergerfs work"*. **True as history**,
+  and written in the past tense as a record of why the check exists. Keep.
+
+Most `today`/`currently` hits are not claims that can rot at all: *"where the record points today"*
+means the current DNS value, not an assertion about the code.
+
+**What this means for item 13.** The falsity class was the one with the track record, and the R13
+run has already burned through it — four found, four fixed, two now pinned by guards. So the
+remaining work is the *style* pass, which is the subjective part with no mechanical check behind
+it. That is an argument for the file-by-file pacing already agreed, and against treating item 13
+as urgent: the dangerous class is closed, and what is left is verbose-but-true.
