@@ -1,5 +1,6 @@
 mod auth;
 mod catalog;
+mod client_addr;
 mod db;
 mod dbus;
 mod generations;
@@ -90,17 +91,23 @@ where
 
 async fn login_handler(
     State(state): State<Arc<AppState>>,
+    peer: Option<axum::extract::ConnectInfo<std::net::SocketAddr>>,
     cookies: Cookies,
+    headers: axum::http::HeaderMap,
     Json(req): Json<LoginRequest>,
 ) -> impl IntoResponse {
-    let outcome =
-        run_blocking(move || auth::login(&state.db, &req.username, &req.password)).await;
+    let client = client_addr::ClientAddr::resolve(peer.map(|p| p.0), &headers);
+    let throttle_key = client.throttle_key();
+    let outcome = run_blocking(move || {
+        auth::login(&state.db, &req.username, &req.password, &throttle_key)
+    })
+    .await;
     let outcome = match outcome {
         Ok(outcome) => outcome,
         Err(status) => return status.into_response(),
     };
     match outcome {
-        Ok(Some(result)) => {
+        Ok(auth::LoginOutcome::Success(result)) => {
             let mut cookie = Cookie::new(SESSION_COOKIE, result.session_token);
             cookie.set_http_only(true);
             cookie.set_same_site(tower_cookies::cookie::SameSite::Strict);
@@ -109,8 +116,21 @@ async fn login_handler(
             cookies.add(cookie);
             (StatusCode::OK, Json(LoginResponse { csrf_token: result.csrf_token })).into_response()
         }
-        Ok(None) => StatusCode::UNAUTHORIZED.into_response(),
-        Err(e) => (StatusCode::TOO_MANY_REQUESTS, e.to_string()).into_response(),
+        Ok(auth::LoginOutcome::BadCredentials) => StatusCode::UNAUTHORIZED.into_response(),
+        Ok(auth::LoginOutcome::Throttled) => (
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many failed login attempts -- try again shortly",
+        )
+            .into_response(),
+        // L-03. This arm used to be 429 carrying `e.to_string()`, so a
+        // database fault answered with the wrong status AND spilled its
+        // internal detail -- on the one unauthenticated endpoint the
+        // internet can reach. The detail goes to the journal, where an
+        // operator can read it and a caller cannot.
+        Err(e) => {
+            eprintln!("ferrumd: login failed: {e:#}");
+            (StatusCode::INTERNAL_SERVER_ERROR, "login failed").into_response()
+        }
     }
 }
 
@@ -638,7 +658,15 @@ async fn main() -> anyhow::Result<()> {
         std::env::var("FERRUMD_LISTEN_ADDRESS").unwrap_or_else(|_| default_listen_address().into());
     let port: u16 = std::env::var("FERRUMD_PORT").ok().and_then(|v| v.parse().ok()).unwrap_or(7788);
     let listener = tokio::net::TcpListener::bind(format!("{listen_address}:{port}")).await?;
-    axum::serve(listener, app).await?;
+    // `into_make_service_with_connect_info` is what makes the real socket
+    // peer available to handlers. Without it `ConnectInfo` never resolves,
+    // every request looks like it came from nowhere, and both the login
+    // throttle and the audit log lose the only address they can trust.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }
 
@@ -678,6 +706,11 @@ mod tests {
     use axum::http::{Method, Request, StatusCode};
     use tower::ServiceExt as _;
 
+    /// One source address, for tests that drive `auth::login` directly and
+    /// are not about the throttle. Real callers get this from
+    /// `ClientAddr::throttle_key`.
+    const TEST_CLIENT: &str = "peer:127.0.0.1";
+
     /// A real database with a real user, plus a real login producing a real
     /// session cookie and its real paired CSRF token.
     fn logged_in() -> (tempfile::TempDir, Arc<AppState>, String, String) {
@@ -685,7 +718,7 @@ mod tests {
         let db = db::Db::open(&dir.path().join("test.db")).unwrap();
         auth::ensure_first_user(&db, dir.path()).unwrap();
         let password = std::fs::read_to_string(dir.path().join("ferrumd-setup-password")).unwrap();
-        let result = auth::login(&db, "admin", password.trim()).unwrap().unwrap();
+        let result = auth::login(&db, "admin", password.trim(), TEST_CLIENT).unwrap().session().unwrap();
         let state = Arc::new(AppState { db, job_running: Mutex::new(false) });
         (dir, state, result.session_token, result.csrf_token)
     }
@@ -716,6 +749,111 @@ mod tests {
             builder = builder.header(CSRF_HEADER, csrf);
         }
         builder.body(Body::empty()).unwrap()
+    }
+
+    /// L-03. A throttled login is the ONLY thing that may answer 429, and it
+    /// must answer with a fixed string.
+    ///
+    /// The old arm returned 429 with `e.to_string()` for every `Err` from
+    /// `auth::login`, so a database fault -- a corrupt hash, an unreadable
+    /// file, a disk full -- came back as "too many requests" carrying its own
+    /// internal detail, on the one unauthenticated endpoint the internet can
+    /// reach. The enum is what makes the arms separable; this pins that the
+    /// handler really uses it.
+    #[tokio::test]
+    async fn a_throttled_login_is_429_with_no_internal_detail() {
+        let (dir, state, _session, _csrf) = logged_in();
+        let password = std::fs::read_to_string(dir.path().join("ferrumd-setup-password")).unwrap();
+
+        let attempt = |body: String| {
+            let router = build_router(state.clone());
+            async move {
+                router
+                    .oneshot(
+                        Request::builder()
+                            .method(Method::POST)
+                            .uri("/api/login")
+                            .header("Content-Type", "application/json")
+                            .body(Body::from(body))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap()
+            }
+        };
+        let wrong =
+            serde_json::json!({ "username": "admin", "password": "wrong" }).to_string();
+
+        // Five real failures put this source over the limit. They are 401 --
+        // "wrong password" is not "too many requests".
+        for _ in 0..5 {
+            assert_eq!(attempt(wrong.clone()).await.status(), StatusCode::UNAUTHORIZED);
+        }
+
+        let throttled = attempt(wrong).await;
+        assert_eq!(throttled.status(), StatusCode::TOO_MANY_REQUESTS);
+        let body = axum::body::to_bytes(throttled.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert_eq!(body, "too many failed login attempts -- try again shortly");
+
+        // And the throttle really is per-source rather than per-account: the
+        // correct password from this same source is still refused (that is
+        // the cooldown), but nothing here is a 500 or leaks a path.
+        assert!(
+            !body.contains('/'),
+            "the 429 body must not carry a filesystem path: {body}"
+        );
+        let correct = serde_json::json!({ "username": "admin", "password": password.trim() })
+            .to_string();
+        assert_eq!(attempt(correct).await.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    /// L-03's real defect, driven by a real fault rather than described.
+    ///
+    /// A corrupt stored hash makes `auth::login` return `Err`. That arm used
+    /// to answer **429 carrying `e.to_string()`**, so this exact fault told
+    /// an unauthenticated caller "too many requests" -- the wrong status
+    /// entirely -- and handed them the daemon's own internal error text.
+    /// It must be a 500 with a fixed body.
+    #[tokio::test]
+    async fn a_daemon_fault_during_login_is_500_and_leaks_no_detail() {
+        let (_dir, state, _session, _csrf) = logged_in();
+        state
+            .db
+            .conn()
+            .execute(
+                "UPDATE users SET password_hash = 'not-a-valid-argon2-hash' WHERE username = 'admin'",
+                [],
+            )
+            .unwrap();
+
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/login")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "username": "admin", "password": "anything" })
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "a corrupt stored hash is a daemon fault, not a rate limit"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert_eq!(body, "login failed");
+        assert!(
+            !body.contains("corrupt") && !body.contains("argon2"),
+            "the internal detail must go to the journal, not to the caller: {body}"
+        );
     }
 
     /// C-01's actual property: expensive blocking work inside a handler must
@@ -889,7 +1027,7 @@ mod tests {
     async fn the_session_endpoint_returns_this_sessions_token_not_another() {
         let (_dir, state, _session, csrf) = logged_in();
         let password = std::fs::read_to_string(_dir.path().join("ferrumd-setup-password")).unwrap();
-        let other = auth::login(&state.db, "admin", password.trim()).unwrap().unwrap();
+        let other = auth::login(&state.db, "admin", password.trim(), TEST_CLIENT).unwrap().session().unwrap();
         assert_ne!(other.csrf_token, csrf, "two real logins, two real tokens");
 
         let request = Request::builder()
@@ -963,9 +1101,7 @@ mod tests {
         // session.
         let password =
             std::fs::read_to_string(_dir.path().join("ferrumd-setup-password")).unwrap();
-        let other = auth::login(&state.db, "admin", password.trim())
-            .unwrap()
-            .unwrap();
+        let other = auth::login(&state.db, "admin", password.trim(), TEST_CLIENT).unwrap().session().unwrap();
         assert_ne!(other.csrf_token, _csrf);
         let response = sentinel_router(state)
             .oneshot(guarded_request(Method::PUT, &session, Some(&other.csrf_token)))
@@ -1104,9 +1240,9 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK, "a correct current password must be accepted");
 
-        assert!(auth::login(&state.db, "admin", "the-new-one").unwrap().is_some());
+        assert!(auth::login(&state.db, "admin", "the-new-one", TEST_CLIENT).unwrap().session().is_some());
         assert!(
-            auth::login(&state.db, "admin", &old).unwrap().is_none(),
+            auth::login(&state.db, "admin", &old, TEST_CLIENT).unwrap().session().is_none(),
             "the old password must really stop working"
         );
     }
@@ -1129,10 +1265,10 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
         assert!(
-            auth::login(&state.db, "admin", &old).unwrap().is_some(),
+            auth::login(&state.db, "admin", &old, TEST_CLIENT).unwrap().session().is_some(),
             "the real password must still work after a refused rotation"
         );
-        assert!(auth::login(&state.db, "admin", "attempted").unwrap().is_none());
+        assert!(auth::login(&state.db, "admin", "attempted", TEST_CLIENT).unwrap().session().is_none());
     }
 
     #[tokio::test]
@@ -1147,7 +1283,7 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert!(auth::login(&state.db, "admin", old.trim()).unwrap().is_some());
+        assert!(auth::login(&state.db, "admin", old.trim(), TEST_CLIENT).unwrap().session().is_some());
     }
 
     /// AC25 -- the READ route is behind the session gate too.
@@ -1515,6 +1651,7 @@ mod tests {
         ("main.rs", include_str!("main.rs")),
         ("auth.rs", include_str!("auth.rs")),
         ("catalog.rs", include_str!("catalog.rs")),
+        ("client_addr.rs", include_str!("client_addr.rs")),
         ("db.rs", include_str!("db.rs")),
         ("dbus.rs", include_str!("dbus.rs")),
         ("generations.rs", include_str!("generations.rs")),
@@ -1805,7 +1942,7 @@ mod tests {
         /// would quietly become a 401, and the matrix would stop testing
         /// what it says it tests.
         fn fresh_credentials(state: &Arc<AppState>, password: &str) -> (String, String) {
-            let result = auth::login(&state.db, "admin", password).unwrap().unwrap();
+            let result = auth::login(&state.db, "admin", password, TEST_CLIENT).unwrap().session().unwrap();
             (result.session_token, result.csrf_token)
         }
 

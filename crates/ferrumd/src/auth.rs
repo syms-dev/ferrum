@@ -73,25 +73,121 @@ pub struct LoginResult {
     pub csrf_token: String,
 }
 
-/// Real argon2id verification against the stored hash, with rate limiting
-/// checked BEFORE the (comparatively expensive) hash verification runs --
-/// a locked-out username never even reaches argon2, so a lockout can't
-/// itself become a CPU-exhaustion vector.
-pub fn login(db: &Db, username: &str, password: &str) -> anyhow::Result<Option<LoginResult>> {
+/// What a login attempt actually was.
+///
+/// Three outcomes rather than `Option` plus a stringly-typed error, because
+/// the handler has to map them to three different status codes and the old
+/// shape made that impossible: "throttled" arrived as an `anyhow::Error`,
+/// indistinguishable from a database failure, so `login_handler` answered
+/// **429 with the raw error text** for both -- the wrong status for a real
+/// fault, and internal detail on the one unauthenticated endpoint reachable
+/// from the internet (L-03). Making the expected outcomes values leaves
+/// `Err` meaning only "the daemon genuinely failed".
+pub enum LoginOutcome {
+    Success(LoginResult),
+    /// No such user, or the password did not verify.
+    BadCredentials,
+    /// This source has failed too often too recently.
+    Throttled,
+}
+
+impl LoginOutcome {
+    /// The session this attempt produced, if it produced one.
+    ///
+    /// Collapses the two non-success outcomes, so a caller that only needs
+    /// "did this log in?" does not have to match all three. The handler does
+    /// NOT use this -- it must tell a wrong password from a throttle to pick
+    /// a status code, which is the whole reason the enum exists. Which is
+    /// also why it is `cfg(test)`: every production caller needs all three
+    /// outcomes, so a non-test use of this would be a bug rather than a
+    /// convenience.
+    #[cfg(test)]
+    pub fn session(self) -> Option<LoginResult> {
+        match self {
+            LoginOutcome::Success(result) => Some(result),
+            LoginOutcome::BadCredentials | LoginOutcome::Throttled => None,
+        }
+    }
+}
+
+/// How far back failures are counted when deciding to throttle a source.
+const PRUNE_AFTER_SECS: i64 = RATE_LIMIT_WINDOW_SECS;
+
+/// Real argon2id verification against the stored hash, throttled PER SOURCE
+/// ADDRESS rather than per username.
+///
+/// The username key was a remote denial of service, and the reason is worth
+/// stating plainly: the throttle denied the *correct* password too, and the
+/// key was a value the attacker chose. Anyone on the internet could hold the
+/// sole `admin` account locked out indefinitely, at one attempt per 60s,
+/// without ever knowing a credential. The lockout was the attack.
+///
+/// Keyed on the source address instead, an attacker can only ever throttle
+/// themselves. The operator at a different address is unaffected, so the
+/// remote lockout is not mitigated but gone -- there is no longer a key a
+/// third party can push the operator's requests into. A *global* limit was
+/// considered and rejected for the same reason in stronger form: it would
+/// let one attacker lock out everybody.
+///
+/// The username is still recorded on every attempt. It is evidence for the
+/// audit log, and no longer a gate.
+///
+/// The check still runs BEFORE argon2, which is the one thing worth keeping
+/// from the original design: verification is deliberately expensive, so a
+/// throttled source must not be able to make the daemon do it. That does
+/// mean a throttled source is refused even with the right password -- but it
+/// is a 60-second cooldown on the source's own address, self-clearing, and
+/// unreachable by anyone else. For a single-operator appliance that is the
+/// right trade: an operator who mistypes five times waits a minute, where
+/// before a stranger could lock them out for as long as they cared to.
+///
+/// # Arguments
+/// * `db` - the open database.
+/// * `username` - the submitted username, recorded but never a throttle key.
+/// * `password` - the submitted password.
+/// * `throttle_key` - the caller's source identity, from
+///   `ClientAddr::throttle_key`. Never anything the caller can choose: see
+///   `client_addr.rs` for why the address behind nginx is trustworthy and
+///   `X-Forwarded-For` is not.
+///
+/// # Errors
+/// A database failure, a corrupt stored hash, or an RNG failure. Never a
+/// wrong password and never a throttle -- both of those are `Ok`.
+pub fn login(
+    db: &Db,
+    username: &str,
+    password: &str,
+    throttle_key: &str,
+) -> anyhow::Result<LoginOutcome> {
+    // Bounded here rather than by a timer: `login_attempts` is pure throttle
+    // state with no value once it ages out, and before this the table grew
+    // without limit on attacker-chosen usernames -- an unauthenticated remote
+    // write primitive against the daemon's own disk. Pruning at the one place
+    // that inserts keeps it self-limiting with nothing to schedule.
+    db.conn().execute(
+        "DELETE FROM login_attempts WHERE attempted_at < ?1",
+        rusqlite::params![now() - PRUNE_AFTER_SECS],
+    )?;
+
     let window_start = now() - RATE_LIMIT_WINDOW_SECS;
     let recent_failures: i64 = db.conn().query_row(
-        "SELECT count(*) FROM login_attempts WHERE username = ?1 AND succeeded = 0 AND attempted_at > ?2",
-        rusqlite::params![username, window_start],
+        "SELECT count(*) FROM login_attempts WHERE ip = ?1 AND succeeded = 0 AND attempted_at > ?2",
+        rusqlite::params![throttle_key, window_start],
         |row| row.get(0),
     )?;
     if recent_failures >= MAX_FAILURES_PER_WINDOW {
-        let last_attempt: i64 = db.conn().query_row(
-            "SELECT max(attempted_at) FROM login_attempts WHERE username = ?1",
-            rusqlite::params![username],
+        // `max` over an empty set is NULL, which is why this reads as an
+        // Option rather than an i64: pruning can remove every row for a
+        // source between the count above and this lookup.
+        let last_attempt: Option<i64> = db.conn().query_row(
+            "SELECT max(attempted_at) FROM login_attempts WHERE ip = ?1",
+            rusqlite::params![throttle_key],
             |row| row.get(0),
         )?;
-        if now() - last_attempt < LOCKOUT_SECS {
-            anyhow::bail!("too many failed login attempts -- try again shortly");
+        if let Some(last_attempt) = last_attempt {
+            if now() - last_attempt < LOCKOUT_SECS {
+                return Ok(LoginOutcome::Throttled);
+            }
         }
     }
 
@@ -114,12 +210,12 @@ pub fn login(db: &Db, username: &str, password: &str) -> anyhow::Result<Option<L
     };
 
     db.conn().execute(
-        "INSERT INTO login_attempts (username, attempted_at, succeeded) VALUES (?1, ?2, ?3)",
-        rusqlite::params![username, now(), succeeded as i64],
+        "INSERT INTO login_attempts (username, attempted_at, succeeded, ip) VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params![username, now(), succeeded as i64, throttle_key],
     )?;
 
     if !succeeded {
-        return Ok(None);
+        return Ok(LoginOutcome::BadCredentials);
     }
     let (user_id, _) = row.expect("succeeded implies row was Some");
 
@@ -130,7 +226,7 @@ pub fn login(db: &Db, username: &str, password: &str) -> anyhow::Result<Option<L
         rusqlite::params![session_token, user_id, csrf_token, now(), now() + SESSION_LIFETIME_SECS],
     )?;
 
-    Ok(Some(LoginResult { session_token, csrf_token }))
+    Ok(LoginOutcome::Success(LoginResult { session_token, csrf_token }))
 }
 
 /// Everything `require_session` needs about a session, from ONE lookup.
@@ -265,6 +361,14 @@ mod tests {
     use super::*;
     use crate::db::Db;
 
+    /// One source address, for the tests that are not about the throttle.
+    /// Real callers get this from `ClientAddr::throttle_key`.
+    const TEST_CLIENT: &str = "peer:127.0.0.1";
+
+    /// A second, different source -- the whole point of M-02 is that these
+    /// two cannot affect each other.
+    const OTHER_CLIENT: &str = "x-real-ip:203.0.113.7";
+
     #[test]
     fn ensure_first_user_is_idempotent() {
         let dir = tempfile::tempdir().unwrap();
@@ -284,8 +388,11 @@ mod tests {
         ensure_first_user(&db, dir.path()).unwrap();
         let password = std::fs::read_to_string(dir.path().join("ferrumd-setup-password")).unwrap();
         let password = password.trim();
-        let result = login(&db, "admin", password).unwrap();
-        assert!(result.is_some(), "login with the real generated password must succeed");
+        let result = login(&db, "admin", password, TEST_CLIENT).unwrap();
+        assert!(
+            result.session().is_some(),
+            "login with the real generated password must succeed"
+        );
     }
 
     #[test]
@@ -293,20 +400,132 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open(&dir.path().join("test.db")).unwrap();
         ensure_first_user(&db, dir.path()).unwrap();
-        let result = login(&db, "admin", "definitely-wrong").unwrap();
-        assert!(result.is_none());
+        let result = login(&db, "admin", "definitely-wrong", TEST_CLIENT).unwrap();
+        assert!(result.session().is_none());
     }
 
     #[test]
-    fn login_locks_out_after_five_failures_within_the_window() {
+    fn login_throttles_a_source_after_five_failures_within_the_window() {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open(&dir.path().join("test.db")).unwrap();
         ensure_first_user(&db, dir.path()).unwrap();
         for _ in 0..5 {
-            let _ = login(&db, "admin", "wrong").unwrap();
+            let _ = login(&db, "admin", "wrong", TEST_CLIENT).unwrap();
         }
-        let result = login(&db, "admin", "wrong");
-        assert!(result.is_err(), "the 6th attempt within the window must be rejected outright, not just fail auth");
+        // Ok(Throttled), NOT Err: the handler maps this to 429 and a real
+        // database failure to 500. Collapsing them is L-03, where a database
+        // error answered 429 carrying its own text.
+        assert!(
+            matches!(
+                login(&db, "admin", "wrong", TEST_CLIENT).unwrap(),
+                LoginOutcome::Throttled
+            ),
+            "the 6th attempt from one source within the window must be throttled outright"
+        );
+    }
+
+    /// M-02's headline property, and the reason the key changed.
+    ///
+    /// The throttle used to be keyed on the submitted USERNAME, so any
+    /// remote caller could burn five attempts against `admin` and hold the
+    /// only account on the appliance locked out -- the lockout denied the
+    /// correct password too, so this was a complete, unauthenticated denial
+    /// of service, renewable forever at one attempt per 60s.
+    ///
+    /// Keyed on the source address, the attacker throttles nobody but
+    /// themselves.
+    #[test]
+    fn one_source_cannot_lock_out_another() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("test.db")).unwrap();
+        ensure_first_user(&db, dir.path()).unwrap();
+        let password = std::fs::read_to_string(dir.path().join("ferrumd-setup-password")).unwrap();
+        let password = password.trim();
+
+        // The attacker, from their own address, burns well past the limit
+        // against the real operator's username.
+        for _ in 0..20 {
+            let _ = login(&db, "admin", "wrong", OTHER_CLIENT).unwrap();
+        }
+        assert!(
+            matches!(
+                login(&db, "admin", "wrong", OTHER_CLIENT).unwrap(),
+                LoginOutcome::Throttled
+            ),
+            "the attacker must have throttled THEMSELVES"
+        );
+
+        // The operator, from a different address, logs in with the correct
+        // password and is completely unaffected.
+        assert!(
+            login(&db, "admin", password, TEST_CLIENT).unwrap().session().is_some(),
+            "a remote attacker must NOT be able to lock the operator out of their own appliance"
+        );
+    }
+
+    /// The other half of M-02: `login_attempts` grew without limit on
+    /// attacker-chosen usernames, so an unauthenticated caller could write
+    /// to the daemon's disk indefinitely. Rows older than the window carry
+    /// no throttle meaning, so they are deleted at the one place that
+    /// inserts them.
+    #[test]
+    fn login_attempts_older_than_the_window_are_pruned() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("test.db")).unwrap();
+        ensure_first_user(&db, dir.path()).unwrap();
+
+        // Rows far older than the window, as a flood of distinct usernames
+        // would have left behind.
+        let stale = now() - PRUNE_AFTER_SECS - 3600;
+        for i in 0..50 {
+            db.conn()
+                .execute(
+                    "INSERT INTO login_attempts (username, attempted_at, succeeded, ip) \
+                     VALUES (?1, ?2, 0, ?3)",
+                    rusqlite::params![format!("victim-{i}"), stale, OTHER_CLIENT],
+                )
+                .unwrap();
+        }
+        let before: i64 = db
+            .conn()
+            .query_row("SELECT count(*) FROM login_attempts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(before, 50, "the stale rows must really have been inserted");
+
+        let _ = login(&db, "admin", "wrong", TEST_CLIENT).unwrap();
+
+        let remaining: i64 = db
+            .conn()
+            .query_row(
+                "SELECT count(*) FROM login_attempts WHERE attempted_at = ?1",
+                rusqlite::params![stale],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(remaining, 0, "every row older than the window must have been pruned");
+    }
+
+    /// Pruning must not quietly discard the rows the throttle is currently
+    /// counting -- a prune that took everything would make the throttle
+    /// unreachable, which looks identical to a working one until somebody
+    /// actually attacks it.
+    #[test]
+    fn pruning_keeps_the_attempts_the_throttle_still_needs() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("test.db")).unwrap();
+        ensure_first_user(&db, dir.path()).unwrap();
+        for _ in 0..5 {
+            let _ = login(&db, "admin", "wrong", TEST_CLIENT).unwrap();
+        }
+        let fresh: i64 = db
+            .conn()
+            .query_row(
+                "SELECT count(*) FROM login_attempts WHERE ip = ?1",
+                rusqlite::params![TEST_CLIENT],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(fresh, 5, "recent attempts must survive the prune");
     }
 
     #[test]
@@ -325,7 +544,7 @@ mod tests {
         let db = Db::open(&dir.path().join("test.db")).unwrap();
         ensure_first_user(&db, dir.path()).unwrap();
         let password = std::fs::read_to_string(dir.path().join("ferrumd-setup-password")).unwrap();
-        let result = login(&db, "admin", password.trim()).unwrap().unwrap();
+        let result = login(&db, "admin", password.trim(), TEST_CLIENT).unwrap().session().unwrap();
         let session = validate_session(&db, &result.session_token).unwrap().unwrap();
         let admin_id: i64 = db
             .conn()
@@ -341,7 +560,7 @@ mod tests {
         let db = Db::open(&dir.path().join("test.db")).unwrap();
         ensure_first_user(&db, dir.path()).unwrap();
         let password = std::fs::read_to_string(dir.path().join("ferrumd-setup-password")).unwrap();
-        let login_result = login(&db, "admin", password.trim()).unwrap().unwrap();
+        let login_result = login(&db, "admin", password.trim(), TEST_CLIENT).unwrap().session().unwrap();
         assert!(validate_session(&db, &login_result.session_token).unwrap().is_some());
         logout(&db, &login_result.session_token).unwrap();
         assert!(validate_session(&db, &login_result.session_token).unwrap().is_none());
@@ -394,11 +613,11 @@ mod tests {
         let (_dir, db, password, user_id) = bootstrapped();
         assert!(!change_password(&db, user_id, "wrong", "attempted-new").unwrap());
         assert!(
-            login(&db, "admin", &password).unwrap().is_some(),
+            login(&db, "admin", &password, TEST_CLIENT).unwrap().session().is_some(),
             "the original password must still work after a refused rotation"
         );
         assert!(
-            login(&db, "admin", "attempted-new").unwrap().is_none(),
+            login(&db, "admin", "attempted-new", TEST_CLIENT).unwrap().session().is_none(),
             "the password the refused call proposed must never have been set"
         );
     }
@@ -421,11 +640,11 @@ mod tests {
         // login path rather than by inspecting the hash: the new password
         // works and the old one does not.
         assert!(
-            login(&db, "admin", "a-real-new-password").unwrap().is_some(),
+            login(&db, "admin", "a-real-new-password", TEST_CLIENT).unwrap().session().is_some(),
             "a real login with the new password must succeed"
         );
         assert!(
-            login(&db, "admin", &password).unwrap().is_none(),
+            login(&db, "admin", &password, TEST_CLIENT).unwrap().session().is_none(),
             "the OLD password must stop working -- otherwise the rotation added a credential rather than replacing one"
         );
     }
@@ -436,7 +655,7 @@ mod tests {
         let result = change_password(&db, user_id, &password, "");
         assert!(result.is_err(), "an empty new password is the absence of a credential, not a weak one");
         assert!(
-            login(&db, "admin", &password).unwrap().is_some(),
+            login(&db, "admin", &password, TEST_CLIENT).unwrap().session().is_some(),
             "the rejection must have changed nothing"
         );
     }
@@ -459,6 +678,6 @@ mod tests {
             first, second,
             "the same password hashed twice must differ -- a fresh salt per rotation"
         );
-        assert!(login(&db, "admin", "same-value").unwrap().is_some());
+        assert!(login(&db, "admin", "same-value", TEST_CLIENT).unwrap().session().is_some());
     }
 }

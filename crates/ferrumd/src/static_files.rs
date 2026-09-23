@@ -142,11 +142,20 @@ pub fn serve_from(root: &Path, uri_path: &str) -> Response {
                     // The file resolved but could not be read: a real fault,
                     // not a miss, so it must not fall through to index.html
                     // and look like a routing outcome.
-                    Err(e) => (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("could not read {}: {e}", resolved.display()),
-                    )
-                        .into_response(),
+                    //
+                    // L-03. The body used to name the resolved path, which
+                    // handed an unauthenticated caller the absolute location
+                    // of $FERRUM_UI_DIR on the host. The operator still needs
+                    // that detail to fix it, so it goes to the journal rather
+                    // than being dropped.
+                    Err(e) => {
+                        eprintln!("ferrumd: could not read {}: {e}", resolved.display());
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "could not read the requested file",
+                        )
+                            .into_response()
+                    }
                 };
             }
             // Resolved OUTSIDE the root: a traversal attempt, however it was
