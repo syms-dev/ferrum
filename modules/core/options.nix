@@ -195,7 +195,12 @@ in
 
       acme = {
         email = mkOption {
-          type = types.str;
+          # Not types.str: nixpkgs' security.acme escapes this properly for
+          # lego and then interpolates the same value raw inside a
+          # single-quoted shell word in the renewal script it generates, so
+          # a `'` here is command execution in acme-<cert>.service. See
+          # modules/lib/hostnames.nix, which carries the rendered proof.
+          type = hostnames.emailAddress;
           default = "";
         };
         dnsProvider = mkOption {

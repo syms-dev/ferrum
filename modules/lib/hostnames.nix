@@ -147,4 +147,41 @@ in
   # intended: none of them is a prefix, and an operator-supplied regex is
   # the thing above that this type exists to refuse.
   locationPath = lib.types.strMatching "/[A-Za-z0-9._~%/-]*";
+
+  # ferrum.proxy.acme.email, and this one was found by the sweep the
+  # SEC-01/SEC-02 fixes triggered rather than by the finding that prompted
+  # them. It is the only value in this file whose sink is a SHELL, not a
+  # config grammar.
+  #
+  # nixpkgs' security.acme passes the address to lego through
+  # lib.escapeShellArgs, which is safe, and then interpolates the SAME value
+  # raw inside a single-quoted word in the renewal script it generates
+  # (nixos/modules/security/acme/default.nix):
+  #
+  #   [ -n "$(find accounts -name '${data.email}.key')" ]
+  #
+  # A `'` closes that word. Rendered, control and payload one character
+  # apart, read out of the two generated scripts rather than reasoned about:
+  #
+  #   find accounts -name 'a@example.test.key')" ]; then
+  #   find accounts -name 'a'@example.test.key')" ]; then
+  #
+  # so `a'; <command>; '` runs <command> in acme-<cert>.service, as the
+  # `acme` user, on every renewal. nixpkgs types the option types.str and
+  # ferrum typed it types.str too, while modules/lib/settings-schema.json
+  # typed it {"type":"string"} with no pattern -- an authenticated settings
+  # write chose those bytes.
+  #
+  # The empty string stays legal: it is the option's default, and
+  # modules/proxy/acme.nix is what decides an address is REQUIRED (only when
+  # a real certificate is needed) and says so in an operator-facing message.
+  # Same split as addressLiteral and daemon.nix's A5 assertion.
+  #
+  # Narrower than RFC 5322's atext, deliberately. The exotic local-part
+  # characters it omits -- ' ` " \ $ ; and whitespace among them -- are
+  # exactly the shell-significant ones, and a Let's Encrypt contact address
+  # that needs them does not exist in practice. `+` is kept because
+  # ops+ferrum@example.com is a real thing operators do.
+  emailAddress = lib.types.strMatching
+    "([A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(\\.[A-Za-z0-9-]+)*)?";
 }

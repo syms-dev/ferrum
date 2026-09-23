@@ -42,7 +42,11 @@
           "type": "object",
           "additionalProperties": false,
           "properties": {
-            "email": { "type": "string" },
+            "email": {
+              "type": "string",
+              "pattern": "^([A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(\\.[A-Za-z0-9-]+)*)?$",
+              "description": "The Let's Encrypt contact address, or empty on a host that needs no real certificate. Pattern-constrained because nixpkgs' security.acme interpolates this value raw inside a single-quoted shell word in the renewal script it generates -- `find accounts -name '${email}.key'` -- so a single quote here is command execution in acme-<cert>.service, as the acme user, on every renewal. Mirrors modules/lib/hostnames.nix's emailAddress, which enforces the same thing at evaluation."
+            },
             "dnsProvider": { "type": "string", "enum": ["cloudflare"] },
             "credentialSecret": { "type": "string" },
             "staging": { "type": "boolean" }
@@ -152,6 +156,11 @@
         "type": "object",
         "additionalProperties": true,
         "properties": {
+          "subdomain": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*$",
+            "description": "A DNS label, non-empty. Same reasoning and same pattern as daemon.subdomain above; mirrors modules/lib/hostnames.nix's dnsLabel, which has typed this option since the previous cycle. Restated HERE because until now the apps node deferred entirely, so the evaluation-time type refused the value only AFTER ferrumd had already written it to settings.json -- leaving the operator with a saved setting and an apply that fails. The schema is what refuses the WRITE."
+          },
           "auth": {
             "type": "object",
             "additionalProperties": true,

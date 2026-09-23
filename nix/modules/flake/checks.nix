@@ -652,11 +652,15 @@
               # this value MOVES, and a fixture that never moves an option
               # cannot tell a value being read from a value being assumed.
             , trustedNetworks ? null
+              # The ACME contact address, which reaches a generated SHELL
+              # word rather than a config directive. Same reason as above:
+              # the fixture has to be able to MOVE it.
+            , acmeEmail ? "a@example.test"
             }: ferrumLib.mkHost {
               inherit system;
               settings = {
                 schemaVersion = realMigrations.currentVersion;
-                proxy = { enable = proxy; inherit baseDomain; acme.email = "a@example.test"; }
+                proxy = { enable = proxy; inherit baseDomain; acme.email = acmeEmail; }
                   // lib.optionalAttrs (trustedNetworks != null) { inherit trustedNetworks; };
                 auth = { enable = auth; adminEmail = "a@example.test"; };
                 inherit apps secrets daemon;
@@ -921,6 +925,45 @@
           # reported success. This is that comment, made load-bearing.
           wronglyAcceptedBracketed = builtins.filter (a: loopbackFailuresFor a == [ ])
             [ "[::1]" ];
+
+          # The sweep's own finding, and the only sink in this check whose
+          # consumer is a SHELL rather than a config parser.
+          # ferrum.proxy.acme.email was types.str with an unconstrained
+          # schema node. nixpkgs' security.acme escapes it correctly for
+          # lego and then interpolates the SAME value raw inside a
+          # single-quoted word in the renewal script:
+          #
+          #   [ -n "$(find accounts -name '${data.email}.key')" ]
+          #
+          # Rendered, one character apart, read out of the two generated
+          # scripts:
+          #
+          #   find accounts -name 'a@example.test.key')" ]; then
+          #   find accounts -name 'a'@example.test.key')" ]; then
+          #
+          # so the payload below runs a command in acme-<cert>.service as
+          # the acme user on every renewal.
+          acmeEmailAccepted = email:
+            let
+              probe = builtins.tryEval (
+                let v = (mkProxyHost { acmeEmail = email; }).config.security.acme.defaults.email;
+                in builtins.deepSeq v v);
+            in
+            probe.success;
+
+          # The control. The empty string is load-bearing -- it is the
+          # option's default, and modules/proxy/acme.nix is what decides an
+          # address is required, in a message this type must not swallow --
+          # and a plus-addressed contact is a real thing operators use.
+          wronglyRejectedEmail = builtins.filter (e: !(acmeEmailAccepted e))
+            [ "" "a@example.test" "ops+ferrum@example.co.uk" "first.last@sub.example.test" ];
+          wronglyAcceptedEmail = builtins.filter acmeEmailAccepted
+            [
+              "a'@example.test"
+              "a'; touch /tmp/pwned; '@example.test"
+              "a b@example.test"
+              "a$(id)@example.test"
+            ];
 
           # SEC-08. The /authelia subrequest must tell Authelia who is
           # knocking. It writes its own proxy_pass inside extraConfig, so
@@ -1298,6 +1341,11 @@
               autheliaSubrequestsScanned
             ++ map (m: "${m}. The /authelia block writes its own proxy_pass inside extraConfig, so nixpkgs' recommendedProxySettings adds no proxy_set_header include to it, and nginx REPLACES an inherited set rather than extending it. Authelia therefore sees every verification request as coming from nginx's own loopback connection: its log attributes every attempt to 127.0.0.1, and its regulation counts one global bucket instead of one per source, so an attacker anywhere is indistinguishable from the operator at home (SEC-08)")
               missingClientHeaders
+            # The sweep's finding.
+            ++ map (e: "ferrum.proxy.acme.email = \"${e}\" evaluates cleanly, and it is not an address -- nixpkgs' security.acme interpolates it raw inside a single-quoted shell word in the renewal script it generates (`find accounts -name '<email>.key'`), so a quote here closes that word and the rest runs as a COMMAND in acme-<cert>.service, as the acme user, on every renewal. lego's own arguments are escaped; this second use of the same value is not. Settings-API writable")
+              wronglyAcceptedEmail
+            ++ map (e: "ferrum.proxy.acme.email = \"${e}\" is refused at evaluation, and it is a legitimate contact address. The empty string in particular is the option's DEFAULT and the sentinel modules/proxy/acme.nix tests to produce its own operator-facing \"Let's Encrypt requires a real contact address\" message -- refusing it here would replace that explanation with a pattern mismatch, and would break every host that needs no real certificate")
+              wronglyRejectedEmail
             # A2/D1.
             ++ lib.optional (daemonRules == [ ])
               "Authelia has no access_control rule for ${daemonName}, so default_policy = deny makes the dashboard unopenable (D1)"
