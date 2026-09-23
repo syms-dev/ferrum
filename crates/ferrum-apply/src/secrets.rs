@@ -21,12 +21,7 @@ const SERVARR_APPS: &[&str] = &["sonarr", "radarr", "prowlarr"];
 /// missing/unreadable host key can't break `ferrum-apply apply` on a host
 /// that doesn't need this mechanism.
 pub fn ensure_all(secrets_dir: &Path, pubkey_path: &Path, apps: &[&str]) -> anyhow::Result<()> {
-    let missing: Vec<&str> = apps
-        .iter()
-        .copied()
-        .filter(|app| SERVARR_APPS.contains(app))
-        .filter(|app| !secrets_dir.join(format!("{app}-apikey.sops")).exists())
-        .collect();
+    let missing = apps_needing_an_apikey(secrets_dir, apps);
     if missing.is_empty() {
         return Ok(());
     }
@@ -51,6 +46,45 @@ pub fn ensure_all(secrets_dir: &Path, pubkey_path: &Path, apps: &[&str]) -> anyh
         encrypt_and_write(&format!("{key}\n"), &recipient, &raw_dest)?;
     }
     Ok(())
+}
+
+/// Which servarr apps still need a key generated.
+///
+/// **The guard checks BOTH artifacts, not just the first one written.**
+/// `ensure_all` writes `<app>-apikey.sops` and then
+/// `<app>-apikey-raw.sops`; keying the guard on the first meant a run
+/// killed between the two `encrypt_and_write` calls short-circuited on
+/// every later apply and never produced the second. That is not a cosmetic
+/// gap: the raw copy is the only form Recyclarr's `_secret` mechanism and
+/// the reconciler's API calls can use, and it is named as a `sopsFile`, so
+/// `nix build` asserts on it at eval time -- the host could not build a
+/// generation again, and the guard guaranteed it never would.
+///
+/// An app missing either file is regenerated from scratch rather than
+/// repaired, because the existing key cannot be read back: it is encrypted
+/// to the host and this process has no way to decrypt it. Rotating is safe
+/// precisely because the incomplete state is unbuildable -- the generation
+/// carrying the old key never activated, so nothing is running with it.
+/// Both files are rewritten together, so the two can still never drift.
+///
+/// Split out of `ensure_all` so the decision can be asserted on without an
+/// age recipient or an `ssh-to-age` binary.
+///
+/// # Arguments
+/// * `secrets_dir` - where the `.sops` files live.
+/// * `apps` - the enabled apps; non-servarr apps are never candidates.
+///
+/// # Returns
+/// The servarr apps missing either artifact, in the order given.
+fn apps_needing_an_apikey<'a>(secrets_dir: &Path, apps: &[&'a str]) -> Vec<&'a str> {
+    apps.iter()
+        .copied()
+        .filter(|app| SERVARR_APPS.contains(app))
+        .filter(|app| {
+            !secrets_dir.join(format!("{app}-apikey.sops")).exists()
+                || !secrets_dir.join(format!("{app}-apikey-raw.sops")).exists()
+        })
+        .collect()
 }
 
 /// Ensures Authelia's two required secrets (jwtSecretFile,
@@ -93,9 +127,47 @@ pub fn ensure_first_authelia_user(
     }
     let password = random_secret_value()?;
     let hash = argon2id_hash(&password)?;
-    let content = render_users_database(&hash, admin_email);
+    write_first_user(state_dir, &hash, &password, admin_email)
+}
+
+/// The two writes, split out of `ensure_first_authelia_user` so their order
+/// can be asserted without an `authelia` binary on PATH -- `argon2id_hash`
+/// shells out to one, which is the same reason `render_users_database` was
+/// split out.
+///
+/// **The operator-facing file is written FIRST, and that order is the whole
+/// point of this function.** `users_database.yml` is the idempotence guard,
+/// and it has to stay the guard: it is the authoritative "a user exists"
+/// marker, and an operator who has read and deleted the setup password must
+/// not have their password reset by the next apply. But it used to be
+/// written first, so a run killed between the two writes left the guard in
+/// place while the generated password existed only in the RAM of a process
+/// about to exit. Every later apply short-circuited, the plaintext was
+/// gone, and the operator could never log into Authelia at all -- the
+/// installer's report just said "(could not read ...)". Of the three guards
+/// in this file that had this shape, this was the one whose second artifact
+/// could not be regenerated without changing it, so checking both artifacts
+/// was not an option here; ordering is.
+///
+/// Writing the password first means the guard file is never created unless
+/// the password that opens it has already landed, so an interrupted run
+/// leaves no guard and the next apply retries cleanly.
+///
+/// # Arguments
+/// * `state_dir` - Authelia's state directory.
+/// * `hash` - the argon2id PHC string for `password`.
+/// * `password` - the generated one-time plaintext.
+/// * `admin_email` - the first user's address.
+///
+/// # Errors
+/// When either file cannot be created or written.
+fn write_first_user(
+    state_dir: &Path,
+    hash: &str,
+    password: &str,
+    admin_email: &str,
+) -> anyhow::Result<()> {
     std::fs::create_dir_all(state_dir)?;
-    std::fs::write(&users_db, content)?;
 
     // Opened at mode 0o400 from the moment of creation (via OpenOptions),
     // not write-then-chmod -- the old write()-then-chmod() sequence left a
@@ -111,6 +183,14 @@ pub fn ensure_first_authelia_user(
         .mode(0o400)
         .open(&setup_file)?;
     f.write_all(format!("{password}\n").as_bytes())?;
+    // Flushed and closed before the guard file is written, so "the password
+    // is on disk" is true and not merely buffered when the guard appears.
+    f.flush()?;
+    drop(f);
+
+    let users_db = state_dir.join("users_database.yml");
+    let content = render_users_database(hash, admin_email);
+    std::fs::write(&users_db, content)?;
     Ok(())
 }
 
@@ -220,7 +300,7 @@ pub fn ensure_sabnzbd_apikey(
     port: u16,
 ) -> anyhow::Result<()> {
     let ini_path = state_dir.join("sabnzbd.ini");
-    if ini_path.exists() {
+    if !sabnzbd_needs_bootstrap(state_dir, secrets_dir) {
         return Ok(());
     }
     let key = random_hex_key()?;
@@ -234,6 +314,34 @@ pub fn ensure_sabnzbd_apikey(
     let dest = secrets_dir.join("sabnzbd-apikey.sops");
     encrypt_and_write(&format!("{key}\n"), &recipient, &dest)?;
     Ok(())
+}
+
+/// Whether SABnzbd still needs its bootstrap ini and encrypted key.
+///
+/// **Checks BOTH artifacts.** `ensure_sabnzbd_apikey` writes `sabnzbd.ini`
+/// and then `sabnzbd-apikey.sops`; keying the guard on the ini alone meant
+/// a run killed between the two short-circuited on every later apply and
+/// never produced the `.sops` file. It is named as a `sopsFile`, so `nix
+/// build` asserts on it at eval time and the host cannot build a generation
+/// until it exists.
+///
+/// Both are rewritten together when either is missing. The key could in
+/// principle be recovered from the ini, which holds it in plaintext, but
+/// regenerating is simpler and equally safe: the incomplete state is
+/// unbuildable, so SABnzbd never started with the old key.
+///
+/// Split out of `ensure_sabnzbd_apikey` so the decision can be asserted on
+/// without an age recipient or an `ssh-to-age` binary.
+///
+/// # Arguments
+/// * `state_dir` - where `sabnzbd.ini` is written.
+/// * `secrets_dir` - where `sabnzbd-apikey.sops` is written.
+///
+/// # Returns
+/// `true` when either artifact is missing.
+fn sabnzbd_needs_bootstrap(state_dir: &Path, secrets_dir: &Path) -> bool {
+    !state_dir.join("sabnzbd.ini").exists()
+        || !secrets_dir.join("sabnzbd-apikey.sops").exists()
 }
 
 /// Shells out to Authelia's own `authelia crypto hash generate argon2`
@@ -290,6 +398,121 @@ mod tests {
             })
             .map(|line| line.trim().trim_end_matches(':'))
             .collect()
+    }
+
+    // -----------------------------------------------------------------
+    // Idempotence guards: each function writes two artifacts, and a kill
+    // between the two writes must not make every later apply short-circuit
+    // past the one that never got written.
+    // -----------------------------------------------------------------
+
+    /// `<app>-apikey-raw.sops` missing means the run died between the two
+    /// `encrypt_and_write` calls, and the app must be regenerated.
+    ///
+    /// The bare-value copy is what Recyclarr's `_secret` mechanism and the
+    /// reconciler's own API calls read; the `KEY=VALUE` copy is unusable to
+    /// either. Worse, the missing file is named as a `sopsFile`, so `nix
+    /// build` asserts on it at eval time -- the host cannot build a
+    /// generation again until it exists, and the guard guaranteed it never
+    /// would.
+    #[test]
+    fn an_app_missing_only_its_raw_key_still_needs_generating() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("sonarr-apikey.sops"), "x").unwrap();
+        assert_eq!(
+            apps_needing_an_apikey(dir.path(), &["sonarr"]),
+            vec!["sonarr"],
+            "the second artifact was never written, so this is not done"
+        );
+    }
+
+    /// The mirror case, for completeness: the env-file copy missing while
+    /// the raw copy exists is the same interrupted run seen from the other
+    /// side.
+    #[test]
+    fn an_app_missing_only_its_env_key_still_needs_generating() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("sonarr-apikey-raw.sops"), "x").unwrap();
+        assert_eq!(apps_needing_an_apikey(dir.path(), &["sonarr"]), vec!["sonarr"]);
+    }
+
+    /// And the guard must still short-circuit when the work really is done,
+    /// or "regenerate when incomplete" becomes "rotate every key on every
+    /// apply".
+    #[test]
+    fn an_app_with_both_artifacts_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("sonarr-apikey.sops"), "x").unwrap();
+        std::fs::write(dir.path().join("sonarr-apikey-raw.sops"), "x").unwrap();
+        assert!(apps_needing_an_apikey(dir.path(), &["sonarr"]).is_empty());
+        // ...and a non-servarr app is never a candidate at all.
+        assert!(apps_needing_an_apikey(dir.path(), &["plex", "jellyfin"]).is_empty());
+    }
+
+    /// `sabnzbd.ini` present without `sabnzbd-apikey.sops` is the same
+    /// interrupted run, and leaves a `sopsFile` that `nix build` asserts on
+    /// missing forever.
+    #[test]
+    fn sabnzbd_missing_only_its_encrypted_key_still_needs_bootstrapping() {
+        let state = tempfile::tempdir().unwrap();
+        let secrets = tempfile::tempdir().unwrap();
+        std::fs::write(state.path().join("sabnzbd.ini"), "[misc]\n").unwrap();
+        assert!(sabnzbd_needs_bootstrap(state.path(), secrets.path()));
+    }
+
+    #[test]
+    fn sabnzbd_with_both_artifacts_is_left_alone() {
+        let state = tempfile::tempdir().unwrap();
+        let secrets = tempfile::tempdir().unwrap();
+        std::fs::write(state.path().join("sabnzbd.ini"), "[misc]\n").unwrap();
+        std::fs::write(secrets.path().join("sabnzbd-apikey.sops"), "x").unwrap();
+        assert!(!sabnzbd_needs_bootstrap(state.path(), secrets.path()));
+    }
+
+    /// The Authelia password is the one value here that cannot be
+    /// regenerated without CHANGING it, so its guard cannot simply check
+    /// both artifacts: `users_database.yml` must stay authoritative, or a
+    /// second apply resets an operator's already-changed password.
+    ///
+    /// The fix is ordering. The operator-facing file is written FIRST, so
+    /// the guard file is never created unless the password that opens it
+    /// has already landed. This test makes the password write fail -- by
+    /// occupying its path with a directory -- and asserts the guard file
+    /// was not created, which is the property that lets the next apply
+    /// retry cleanly.
+    ///
+    /// Under the old order the guard file was written first, so this exact
+    /// failure left `users_database.yml` on disk with the password existing
+    /// only in the RAM of a process that was about to exit: every later
+    /// apply short-circuited, and the operator could never log into
+    /// Authelia. The installer's own report said "(could not read ...)".
+    #[test]
+    fn a_failed_password_write_does_not_leave_the_guard_file_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        // Occupy the password path with a directory, so opening it for
+        // writing fails with EISDIR.
+        std::fs::create_dir(dir.path().join("authelia-setup-password")).unwrap();
+
+        let err = write_first_user(dir.path(), A_REAL_HASH, "s3cret", "admin@example.test");
+        assert!(err.is_err(), "the password write must fail in this setup");
+        assert!(
+            !dir.path().join("users_database.yml").exists(),
+            "the guard file must not survive a run that never delivered the \
+             password -- it is what stops the next apply from retrying"
+        );
+    }
+
+    /// ...and the successful path still writes both, so the ordering fix
+    /// cannot be satisfied by never writing the guard file.
+    #[test]
+    fn a_successful_first_user_writes_both_artifacts() {
+        let dir = tempfile::tempdir().unwrap();
+        write_first_user(dir.path(), A_REAL_HASH, "s3cret", "admin@example.test").unwrap();
+        assert!(dir.path().join("users_database.yml").exists());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("authelia-setup-password")).unwrap(),
+            "s3cret\n"
+        );
     }
 
     /// The headline property: `users_database.yml` decides who may log in,
@@ -427,18 +650,31 @@ mod tests {
         assert!(result.is_ok(), "should short-circuit when both files already exist: {result:?}");
     }
 
+    /// This test set up only `sabnzbd.ini` -- the half-complete state left
+    /// by a run killed between the two writes -- and asserted the function
+    /// short-circuits on it. That assertion was the defect, not the
+    /// contract: short-circuiting there is exactly what left
+    /// `sabnzbd-apikey.sops` missing forever. It now sets up BOTH
+    /// artifacts, which is the same technique its sibling
+    /// `ensure_all_is_idempotent_when_both_files_exist` was already using
+    /// one screen above.
     #[test]
-    fn ensure_sabnzbd_apikey_is_idempotent_when_ini_already_exists() {
+    fn ensure_sabnzbd_apikey_is_idempotent_when_both_artifacts_exist() {
         let dir = tempfile::tempdir().unwrap();
         let state_dir = dir.path().join("state");
         std::fs::create_dir_all(&state_dir).unwrap();
         std::fs::write(state_dir.join("sabnzbd.ini"), "[misc]\napi_key = existing\n").unwrap();
+        std::fs::write(dir.path().join("sabnzbd-apikey.sops"), "existing\n").unwrap();
         let nonexistent_pubkey = dir.path().join("no-such-key.pub");
         let result = ensure_sabnzbd_apikey(&state_dir, dir.path(), &nonexistent_pubkey, 8080);
         assert!(result.is_ok(), "should short-circuit before touching the host key: {result:?}");
-        assert!(!dir.path().join("sabnzbd-apikey.sops").exists());
         let content = std::fs::read_to_string(state_dir.join("sabnzbd.ini")).unwrap();
         assert_eq!(content, "[misc]\napi_key = existing\n", "must not overwrite an existing ini");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("sabnzbd-apikey.sops")).unwrap(),
+            "existing\n",
+            "nor the encrypted key beside it"
+        );
     }
 
     #[test]
