@@ -98,13 +98,17 @@ async fn login_handler(
     Json(req): Json<LoginRequest>,
 ) -> impl IntoResponse {
     let client = client_addr::ClientAddr::resolve(peer.map(|p| p.0), &headers);
-    let throttle_key = client.throttle_key();
     // The submitted username is audited, so a failed attempt records WHICH
     // account was tried. `audit::record` escapes it -- it is caller-supplied
     // and could otherwise forge a log line.
     let username = req.username.clone();
+    // The whole `ClientAddr`, not a pre-derived key string: the throttle
+    // needs both of its axes (client_addr.rs, SEC-03), and handing it the
+    // one value the audit line also uses keeps the two from disagreeing
+    // about who this was.
+    let throttled_as = client.clone();
     let outcome = run_blocking(move || {
-        auth::login(&state.db, &req.username, &req.password, &throttle_key)
+        auth::login(&state.db, &req.username, &req.password, &throttled_as)
     })
     .await;
     let outcome = match outcome {
@@ -290,6 +294,7 @@ async fn change_password_handler(
         audit::record("password-change", "failure", &user, &client, "empty new password");
         return (StatusCode::BAD_REQUEST, "the new password must not be empty").into_response();
     }
+    let throttled_as = client.clone();
     let outcome = run_blocking(move || {
         auth::change_password(
             &state.db,
@@ -297,6 +302,7 @@ async fn change_password_handler(
             &req.current_password,
             &req.new_password,
             &token,
+            &throttled_as,
         )
     })
     .await;
@@ -305,7 +311,7 @@ async fn change_password_handler(
         Err(status) => return status.into_response(),
     };
     match outcome {
-        Ok(true) => {
+        Ok(auth::PasswordChangeOutcome::Changed) => {
             audit::record(
                 "password-change",
                 "success",
@@ -315,7 +321,7 @@ async fn change_password_handler(
             );
             StatusCode::OK.into_response()
         }
-        Ok(false) => {
+        Ok(auth::PasswordChangeOutcome::WrongPassword) => {
             audit::record(
                 "password-change",
                 "failure",
@@ -325,13 +331,26 @@ async fn change_password_handler(
             );
             (StatusCode::UNAUTHORIZED, "the current password is incorrect").into_response()
         }
-        Err(e) => {
-            audit::record("password-change", "error", &user, &client, "daemon fault");
+        // SEC-06. Same status and same shape as the login throttle's 429,
+        // carrying no internal detail: this endpoint is an oracle on
+        // `current_password` and an unbounded argon2 handle, and neither
+        // nginx's `limit_req` nor anything else covered it.
+        Ok(auth::PasswordChangeOutcome::Throttled) => {
+            audit::record("password-change", "denied", &user, &client, "source throttled");
             (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to change the password: {e}"),
+                StatusCode::TOO_MANY_REQUESTS,
+                "too many failed attempts -- try again shortly",
             )
                 .into_response()
+        }
+        // SEC-09, and the same treatment L-03 gave `login_handler`: the
+        // error text can name a filesystem path or a database internal, so
+        // it goes to the journal where an operator can read it, and the
+        // caller gets a fixed string.
+        Err(e) => {
+            eprintln!("ferrumd: password change failed: {e:#}");
+            audit::record("password-change", "error", &user, &client, "daemon fault");
+            (StatusCode::INTERNAL_SERVER_ERROR, "failed to change the password").into_response()
         }
     }
 }
@@ -830,10 +849,12 @@ mod tests {
     use axum::http::{Method, Request, StatusCode};
     use tower::ServiceExt as _;
 
-    /// One source address, for tests that drive `auth::login` directly and
-    /// are not about the throttle. Real callers get this from
-    /// `ClientAddr::throttle_key`.
-    const TEST_CLIENT: &str = "peer:127.0.0.1";
+    /// One source, for tests that drive `auth::login` directly and are not
+    /// about the throttle. A real `ClientAddr`, because that is what the
+    /// throttle derives both of its axes from.
+    fn test_client() -> client_addr::ClientAddr {
+        client_addr::ClientAddr::Direct("127.0.0.1".parse().unwrap())
+    }
 
     /// A real database with a real user, plus a real login producing a real
     /// session cookie and its real paired CSRF token.
@@ -842,7 +863,7 @@ mod tests {
         let db = db::Db::open(&dir.path().join("test.db")).unwrap();
         auth::ensure_first_user(&db, dir.path()).unwrap();
         let password = std::fs::read_to_string(dir.path().join("ferrumd-setup-password")).unwrap();
-        let result = auth::login(&db, "admin", password.trim(), TEST_CLIENT).unwrap().session().unwrap();
+        let result = auth::login(&db, "admin", password.trim(), &test_client()).unwrap().session().unwrap();
         let state = Arc::new(AppState { db, job_running: Mutex::new(false) });
         (dir, state, result.session_token, result.csrf_token)
     }
@@ -1234,7 +1255,7 @@ mod tests {
     async fn the_session_endpoint_returns_this_sessions_token_not_another() {
         let (_dir, state, _session, csrf) = logged_in();
         let password = std::fs::read_to_string(_dir.path().join("ferrumd-setup-password")).unwrap();
-        let other = auth::login(&state.db, "admin", password.trim(), TEST_CLIENT).unwrap().session().unwrap();
+        let other = auth::login(&state.db, "admin", password.trim(), &test_client()).unwrap().session().unwrap();
         assert_ne!(other.csrf_token, csrf, "two real logins, two real tokens");
 
         let request = Request::builder()
@@ -1308,7 +1329,7 @@ mod tests {
         // session.
         let password =
             std::fs::read_to_string(_dir.path().join("ferrumd-setup-password")).unwrap();
-        let other = auth::login(&state.db, "admin", password.trim(), TEST_CLIENT).unwrap().session().unwrap();
+        let other = auth::login(&state.db, "admin", password.trim(), &test_client()).unwrap().session().unwrap();
         assert_ne!(other.csrf_token, _csrf);
         let response = sentinel_router(state)
             .oneshot(guarded_request(Method::PUT, &session, Some(&other.csrf_token)))
@@ -1447,9 +1468,9 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK, "a correct current password must be accepted");
 
-        assert!(auth::login(&state.db, "admin", "the-new-one", TEST_CLIENT).unwrap().session().is_some());
+        assert!(auth::login(&state.db, "admin", "the-new-one", &test_client()).unwrap().session().is_some());
         assert!(
-            auth::login(&state.db, "admin", &old, TEST_CLIENT).unwrap().session().is_none(),
+            auth::login(&state.db, "admin", &old, &test_client()).unwrap().session().is_none(),
             "the old password must really stop working"
         );
     }
@@ -1472,10 +1493,10 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
         assert!(
-            auth::login(&state.db, "admin", &old, TEST_CLIENT).unwrap().session().is_some(),
+            auth::login(&state.db, "admin", &old, &test_client()).unwrap().session().is_some(),
             "the real password must still work after a refused rotation"
         );
-        assert!(auth::login(&state.db, "admin", "attempted", TEST_CLIENT).unwrap().session().is_none());
+        assert!(auth::login(&state.db, "admin", "attempted", &test_client()).unwrap().session().is_none());
     }
 
     #[tokio::test]
@@ -1490,7 +1511,74 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert!(auth::login(&state.db, "admin", old.trim(), TEST_CLIENT).unwrap().session().is_some());
+        assert!(auth::login(&state.db, "admin", old.trim(), &test_client()).unwrap().session().is_some());
+    }
+
+    /// SEC-06, through the real route.
+    ///
+    /// `/api/password` had no rate limit at either layer: nginx's
+    /// `limit_req` covers the login path only, and ferrumd's own throttle
+    /// did not reach here. So an authenticated caller held an unbounded
+    /// argon2 handle and an unthrottled oracle on `current_password`.
+    #[tokio::test]
+    async fn the_password_route_starts_refusing_a_caller_that_keeps_guessing() {
+        let (_dir, state, session, csrf) = logged_in();
+        let guess = r#"{"current_password":"not-it","new_password":"attempted"}"#;
+
+        for attempt in 1..=5 {
+            let status = post_password(state.clone(), &session, Some(&csrf), guess).await;
+            assert_eq!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "guess {attempt} should still be a plain refusal"
+            );
+        }
+        assert_eq!(
+            post_password(state.clone(), &session, Some(&csrf), guess).await,
+            StatusCode::TOO_MANY_REQUESTS,
+            "an authenticated caller must not get unlimited guesses at the current password"
+        );
+    }
+
+    /// SEC-09. The 500 on this route used to carry `e.to_string()`, which
+    /// on the reachable failure below names the stored hash's own contents.
+    ///
+    /// Reached for real rather than mocked: a corrupt `password_hash`
+    /// column is exactly what `change_password` turns into an `Err`, and it
+    /// is the one 500 on this route a test can actually provoke.
+    #[tokio::test]
+    async fn a_daemon_fault_on_the_password_route_returns_no_internal_detail() {
+        let (_dir, state, session, csrf) = logged_in();
+        // After the login above, so the login itself still had a real hash.
+        state
+            .db
+            .conn()
+            .execute(
+                "UPDATE users SET password_hash = 'not-a-phc-string' WHERE username = 'admin'",
+                [],
+            )
+            .unwrap();
+
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/api/password")
+            .header("Cookie", format!("{SESSION_COOKIE}={session}"))
+            .header(CSRF_HEADER, &csrf)
+            .header("Content-Type", "application/json")
+            .body(Body::from(
+                r#"{"current_password":"anything","new_password":"new"}"#.to_string(),
+            ))
+            .unwrap();
+        let response = build_router(state).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8_lossy(&bytes).to_string();
+        assert!(!body.is_empty(), "the caller still needs to be told something failed");
+        assert!(
+            !body.contains("not-a-phc-string") && !body.contains("corrupt"),
+            "a 500 must not describe the daemon's internal state: {body}"
+        );
     }
 
     /// AC25 -- the READ route is behind the session gate too.
@@ -2154,7 +2242,7 @@ mod tests {
         /// would quietly become a 401, and the matrix would stop testing
         /// what it says it tests.
         fn fresh_credentials(state: &Arc<AppState>, password: &str) -> (String, String) {
-            let result = auth::login(&state.db, "admin", password, TEST_CLIENT).unwrap().session().unwrap();
+            let result = auth::login(&state.db, "admin", password, &test_client()).unwrap().session().unwrap();
             (result.session_token, result.csrf_token)
         }
 

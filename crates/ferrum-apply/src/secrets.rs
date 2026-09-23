@@ -93,9 +93,7 @@ pub fn ensure_first_authelia_user(
     }
     let password = random_secret_value()?;
     let hash = argon2id_hash(&password)?;
-    let content = format!(
-        "users:\n  admin:\n    disabled: false\n    displayname: \"Admin\"\n    password: \"{hash}\"\n    email: \"{admin_email}\"\n    groups:\n      - admins\n"
-    );
+    let content = render_users_database(&hash, admin_email);
     std::fs::create_dir_all(state_dir)?;
     std::fs::write(&users_db, content)?;
 
@@ -114,6 +112,85 @@ pub fn ensure_first_authelia_user(
         .open(&setup_file)?;
     f.write_all(format!("{password}\n").as_bytes())?;
     Ok(())
+}
+
+/// Renders Authelia's `users_database.yml`.
+///
+/// Split out of `ensure_first_authelia_user` so the document can be tested
+/// without an `authelia` binary on PATH -- `argon2id_hash` shells out to
+/// one, so the only way to exercise the file this function decides the
+/// contents of was to have Authelia installed. That is also why the
+/// injection below went unnoticed: the rendering had no test at all.
+///
+/// THIS FILE DECIDES WHO MAY LOG IN. Authelia's file auth backend reads it
+/// to answer that question for every gated app on the host and for ferrum's
+/// own control plane, so a value that can add a key to it can add an
+/// administrator. It used to be built by `format!`, with `admin_email`
+/// interpolated raw inside a quoted scalar; a value carrying a `"` and a
+/// newline closed the scalar and wrote a second user:
+///
+///     a@example.test"\n  attacker:\n    groups:\n      - admins
+///
+/// A replacement `password:` hash is the same move, which is the version
+/// that does not need the attacker to already hold a credential.
+///
+/// ESCAPING, NOT SERIALIZATION, AND THE DIFFERENCE IS DELIBERATE. There is
+/// no YAML serializer anywhere in this workspace's dependency tree -- not in
+/// `ferrum-apply`, not transitively, confirmed against `crates/Cargo.lock`
+/// -- and adding one is a decision for the owner rather than for this fix.
+/// So the block structure below is still assembled by hand, and only the
+/// SCALARS go through a real serializer.
+///
+/// `serde_json` is that serializer, and it is not a pun: YAML 1.2 is a
+/// superset of JSON, and JSON's escape set (`\"`, `\\`, `\b`, `\f`, `\n`,
+/// `\r`, `\t`, `\uXXXX`) is a subset of YAML 1.2's double-quoted escape
+/// set, so a JSON string literal IS a valid YAML double-quoted scalar. That
+/// means the escaping is done by a library that is already trusted with
+/// this repository's settings documents, rather than by an escape table
+/// written here that somebody has to keep correct.
+///
+/// The security property is narrow and worth stating exactly, because it is
+/// what makes the residue tolerable: breaking OUT of a double-quoted scalar
+/// requires terminating it, which requires an unescaped `"` or a trailing
+/// `\`, and `serde_json` escapes both unconditionally. A value can
+/// therefore still make this document unparseable -- an exotic Unicode line
+/// separator would -- but it cannot add a key to it. Unparseable is a
+/// failed apply, which is fail-closed; a second `admins` member is not.
+///
+/// Emitting the whole document as JSON would be true serialization and was
+/// considered. It is rejected because it changes the on-disk shape of a
+/// file an external daemon parses, and this workspace cannot run Authelia
+/// to check that it still reads it -- `argon2id_hash`'s own shell-out is
+/// the reason. Changing a format on the strength of "a superset should
+/// accept it" is the kind of claim this project requires evidence for.
+///
+/// The `password` field is escaped too, though `argon2id_hash` produces a
+/// PHC string that needs none. A value that is safe only because its
+/// current producer validates it is precisely the arrangement that produced
+/// this finding.
+///
+/// # Arguments
+/// * `hash` - the argon2id PHC string for the generated password.
+/// * `admin_email` - the operator's address, from `ferrum.auth.adminEmail`.
+///
+/// # Returns
+/// The complete file contents, ending in a newline.
+fn render_users_database(hash: &str, admin_email: &str) -> String {
+    format!(
+        "users:\n  admin:\n    disabled: false\n    displayname: {}\n    password: {}\n    email: {}\n    groups:\n      - admins\n",
+        yaml_scalar("Admin"),
+        yaml_scalar(hash),
+        yaml_scalar(admin_email),
+    )
+}
+
+/// One value, rendered as a quoted scalar that cannot be broken out of.
+///
+/// `serde_json::Value::String` rather than `serde_json::to_string`, so that
+/// "this cannot fail" is structural instead of an `expect` a reader has to
+/// take on trust: `Value`'s `Display` is infallible.
+fn yaml_scalar(value: &str) -> String {
+    serde_json::Value::String(value.to_string()).to_string()
 }
 
 /// Bootstraps SABnzbd's own api_key, which -- unlike the servarr apps --
@@ -190,6 +267,117 @@ fn argon2id_hash(password: &str) -> anyhow::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A real argon2id PHC string, shaped exactly as `argon2id_hash`
+    /// returns one. A literal rather than a call, because that function
+    /// shells out to the `authelia` binary.
+    const A_REAL_HASH: &str =
+        "$argon2id$v=19$m=65536,t=3,p=4$c29tZXNhbHR2YWx1ZQ$RdescudvJCsgt3ub+b+dWRWJTmaaJObG";
+
+    /// The user keys the rendered document actually declares.
+    ///
+    /// A user key sits at exactly two spaces of indent and ends in a colon;
+    /// `groups:` and the other fields sit at four and are excluded. This is
+    /// deliberately structural rather than a substring search for
+    /// "attacker": an escaped payload still CONTAINS that text, on the one
+    /// line of the quoted scalar holding it, and a test that looked for the
+    /// text alone would fail on a correctly-escaped document.
+    fn user_keys(document: &str) -> Vec<&str> {
+        document
+            .lines()
+            .filter(|line| {
+                line.starts_with("  ") && !line.starts_with("   ") && line.ends_with(':')
+            })
+            .map(|line| line.trim().trim_end_matches(':'))
+            .collect()
+    }
+
+    /// The headline property: `users_database.yml` decides who may log in,
+    /// so no value reaching it may add a key to it.
+    ///
+    /// The payload is the one from the security review, which produced a
+    /// second `admins` member against the `format!` this replaced.
+    #[test]
+    fn an_admin_email_cannot_add_a_second_user_to_the_authelia_database() {
+        let payload = "a@example.test\"\n  attacker:\n    groups:\n      - admins";
+        let document = render_users_database(A_REAL_HASH, payload);
+        assert_eq!(
+            user_keys(&document),
+            vec!["admin"],
+            "the email field added a user to the file that decides who may log in:\n{document}"
+        );
+        assert_eq!(
+            document.lines().filter(|l| l.trim() == "- admins").count(),
+            1,
+            "exactly one account may be an admin:\n{document}"
+        );
+    }
+
+    /// The same move through `password:`, which is the version that does
+    /// not need the attacker to hold a credential first -- it replaces the
+    /// hash rather than adding a user beside it.
+    ///
+    /// `argon2id_hash` cannot currently produce such a value. The field is
+    /// escaped anyway: "safe because its producer validates it" is the
+    /// arrangement that produced this finding.
+    #[test]
+    fn a_password_hash_cannot_rewrite_the_document_around_it() {
+        let payload = "$argon2id$fake\"\n  attacker:\n    password: \"$argon2id$mine";
+        let document = render_users_database(payload, "admin@example.test");
+        assert_eq!(user_keys(&document), vec!["admin"], "{document}");
+    }
+
+    /// Escaping that handles the quote but not the backslash is the classic
+    /// half-fix: a value ending in `\` makes the NEXT character an escape,
+    /// so the closing quote stops closing anything and the scalar runs on
+    /// into the structure below it.
+    #[test]
+    fn a_trailing_backslash_cannot_swallow_the_closing_quote() {
+        let payload = "a@example.test\\";
+        let document = render_users_database(A_REAL_HASH, payload);
+        assert!(
+            document.contains(r#""a@example.test\\""#),
+            "a backslash must be escaped as well as the quote:\n{document}"
+        );
+        assert_eq!(user_keys(&document), vec!["admin"], "{document}");
+    }
+
+    /// A bare newline with no quote, which cannot close the scalar but must
+    /// still not reach the file as a real line break -- inside a quoted
+    /// scalar YAML would fold it, so the document would parse differently
+    /// from the value that was supplied.
+    #[test]
+    fn a_control_character_never_reaches_the_file_raw() {
+        let document = render_users_database(A_REAL_HASH, "a@example.test\nb\tc");
+        let email_line = document
+            .lines()
+            .find(|line| line.trim_start().starts_with("email:"))
+            .expect("the document must still have an email field");
+        assert!(email_line.contains("\\n") && email_line.contains("\\t"), "{email_line}");
+        assert_eq!(
+            document.lines().count(),
+            8,
+            "the document must keep its eight lines whatever the value contained:\n{document}"
+        );
+    }
+
+    /// The other direction. An escaper that mangled ordinary input would
+    /// pass every test above while breaking every real host, so the exact
+    /// bytes for a normal address are pinned -- including that this is
+    /// still the same document Authelia was already being given.
+    #[test]
+    fn an_ordinary_address_renders_the_document_authelia_already_reads() {
+        let document = render_users_database(A_REAL_HASH, "admin@example.test");
+        assert_eq!(
+            document,
+            format!(
+                "users:\n  admin:\n    disabled: false\n    displayname: \"Admin\"\n    \
+                 password: \"{A_REAL_HASH}\"\n    email: \"admin@example.test\"\n    \
+                 groups:\n      - admins\n"
+            ),
+            "the rendering changed for an ordinary address"
+        );
+    }
 
     #[test]
     fn ensure_all_only_touches_servarr_apps() {

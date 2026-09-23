@@ -40,7 +40,8 @@ impl Db {
                 username TEXT NOT NULL,
                 attempted_at INTEGER NOT NULL,
                 succeeded INTEGER NOT NULL,
-                ip TEXT NOT NULL DEFAULT ''
+                ip TEXT NOT NULL DEFAULT '',
+                peer TEXT NOT NULL DEFAULT ''
             );
             ",
         )?;
@@ -48,6 +49,17 @@ impl Db {
         // exists, so a host provisioned before these columns were added
         // would keep the old shape and fail on the first query naming one.
         Self::add_column_if_missing(&conn, "login_attempts", "ip", "TEXT NOT NULL DEFAULT ''")?;
+        // SEC-03. `ip` holds a key derived from a value the caller can
+        // choose; `peer` holds the trust domain it cannot
+        // (client_addr.rs's `peer_key`). Both are needed, and they are
+        // separate columns rather than one composite string because the
+        // throttle asks two different questions of them -- "how often has
+        // THIS key failed" and "how many DISTINCT keys has this peer failed
+        // under". The default of '' is correct for rows written before this
+        // column existed: they are pruned within five minutes anyway, and an
+        // empty peer groups them together rather than attributing them to a
+        // real one.
+        Self::add_column_if_missing(&conn, "login_attempts", "peer", "TEXT NOT NULL DEFAULT ''")?;
         Self::add_column_if_missing(&conn, "sessions", "last_seen_at", "INTEGER NOT NULL DEFAULT 0")?;
         // A session that predates the idle timeout has no last_seen_at, and
         // the column default of 0 would read as "idle since 1970" -- logging

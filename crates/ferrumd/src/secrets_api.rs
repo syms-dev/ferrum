@@ -46,29 +46,40 @@ fn write_secret_blocking(name: &str, plaintext: &str) -> (StatusCode, String) {
         Ok(false) => {
             return (StatusCode::BAD_REQUEST, format!("'{name}' is not declared in ferrum.secrets"))
         }
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to check ferrum.secrets: {e}"),
-            )
-        }
+        Err(e) => return internal("failed to check ferrum.secrets", &e),
     }
 
     let recipient = match ferrum_secrets::host_age_recipient(&host_key_pub()) {
         Ok(r) => r,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to derive host age recipient: {e}"),
-            )
-        }
+        Err(e) => return internal("failed to derive the host age recipient", &e),
     };
 
     let dest = secrets_dir().join(format!("{name}.sops"));
     match ferrum_secrets::encrypt_and_write(plaintext, &recipient, &dest) {
         Ok(()) => (StatusCode::OK, String::new()),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("failed to write secret: {e}")),
+        Err(e) => internal("failed to write the secret", &e),
     }
+}
+
+/// A 500 whose detail goes to the journal and not to the caller (SEC-09).
+///
+/// Every failure in this file carries a filesystem path -- the settings
+/// file, the host key, the destination under `secrets_dir` -- because that
+/// is what the operations are. Those paths were being returned in the
+/// response body, which hands a caller a map of the one directory on this
+/// host that exists to hold secrets. The operator still needs the detail to
+/// fix it, so it goes where an operator can read it and a caller cannot:
+/// `login_handler` already got exactly this treatment under L-03.
+///
+/// # Arguments
+/// * `summary` - the fixed, caller-safe description of what failed.
+/// * `error` - the real error, journalled with its full cause chain.
+///
+/// # Returns
+/// The status and body for the handler to send back.
+fn internal(summary: &str, error: &anyhow::Error) -> (StatusCode, String) {
+    eprintln!("ferrumd: {summary}: {error:#}");
+    (StatusCode::INTERNAL_SERVER_ERROR, summary.to_string())
 }
 
 pub async fn write_secret(
@@ -108,5 +119,65 @@ pub async fn write_secret(
             audit_write("error", "blocking task failed");
             status.into_response()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// SEC-09. Both 500 paths in this file fail on a FILE, so their errors
+    /// name one -- the settings document, the host key, the destination
+    /// under the secrets directory. Returning that to the caller hands them
+    /// a map of the one directory on this host that exists to hold secrets.
+    ///
+    /// Driven through `write_secret_blocking` rather than asserted against
+    /// the helper, so it is the real wiring that is pinned: a future branch
+    /// that formats its own error in would not be caught by a test of
+    /// `internal` alone.
+    ///
+    /// One test covering both branches rather than two, because they set
+    /// the same process-wide environment variable and would otherwise race
+    /// each other under the test harness's parallelism.
+    #[test]
+    fn a_failing_secret_write_never_returns_a_filesystem_path_to_the_caller() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Branch 1: the settings document cannot be read at all.
+        let absent_settings = dir.path().join("no-such-settings.json");
+        std::env::set_var("FERRUM_SETTINGS_PATH", &absent_settings);
+        let (status, body) = write_secret_blocking("cloudflare-token", "value");
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_no_path_leaked(&body, &absent_settings.to_string_lossy());
+
+        // Branch 2: settings are readable and declare the secret, but the
+        // host key the recipient is derived from is missing.
+        let settings = dir.path().join("settings.json");
+        std::fs::write(
+            &settings,
+            serde_json::json!({ "secrets": { "cloudflare-token": {} } }).to_string(),
+        )
+        .unwrap();
+        let absent_key = dir.path().join("no-such-host-key.pub");
+        std::env::set_var("FERRUM_SETTINGS_PATH", &settings);
+        std::env::set_var("FERRUM_HOST_KEY_PUB", &absent_key);
+        let (status, body) = write_secret_blocking("cloudflare-token", "value");
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_no_path_leaked(&body, &absent_key.to_string_lossy());
+    }
+
+    /// Asserts a response body says what failed without saying where.
+    ///
+    /// Checks the specific path AND the separator, because the tempdir
+    /// prefix alone would not catch a body that leaked a different absolute
+    /// path -- `secrets_dir()`'s default, say, which is exactly the one
+    /// worth not disclosing.
+    fn assert_no_path_leaked(body: &str, path: &str) {
+        assert!(!body.is_empty(), "the caller still needs to be told something failed");
+        assert!(!body.contains(path), "the failing path reached the caller: {body}");
+        assert!(
+            !body.contains('/'),
+            "a 500 body from the secrets API must carry no filesystem path: {body}"
+        );
     }
 }

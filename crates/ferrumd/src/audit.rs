@@ -21,6 +21,15 @@
 //    nothing here takes a token at all. `SessionToken` exists as its own
 //    type in main.rs partly so it is visible when one is being handled.
 //
+// A THIRD RULE, added by SEC-03: A FORGEABLE FIELD IS LABELLED AS ONE.
+//    `client=` is the address the request claims to come from, and on this
+//    host any local process can claim anything (see client_addr.rs). So the
+//    line also carries `peer=`, the socket address ferrumd really observed,
+//    and `client_source=x-real-ip-claimed` rather than `x-real-ip`. An
+//    operator reading the journal can then see that the two disagree,
+//    instead of reading a forged address as though it had been verified.
+//    A log that overstates what it knows is worse than one that says less.
+//
 // 2. EVERY UNTRUSTED FIELD IS ESCAPED. The username on a login line is
 //    whatever the caller put in the JSON body, and serde will happily hand
 //    back a String containing a newline -- so an attacker could log in as
@@ -60,9 +69,10 @@ pub fn record(event: &str, outcome: &str, user: &str, client: &ClientAddr, detai
 fn format_line(event: &str, outcome: &str, user: &str, client: &ClientAddr, detail: &str) -> String {
     format!(
         "ferrumd audit: event={event} outcome={outcome} user={user:?} client={} \
-         client_source={} detail={detail:?}",
+         client_source={} peer={} detail={detail:?}",
         client.address(),
         client.source(),
+        client.peer(),
     )
 }
 
@@ -75,7 +85,9 @@ mod tests {
     #[test]
     fn the_line_names_every_field_it_promises() {
         let line = format_line("login", "success", "admin", &loopback(), "");
-        for field in ["event=", "outcome=", "user=", "client=", "client_source=", "detail="] {
+        for field in
+            ["event=", "outcome=", "user=", "client=", "client_source=", "peer=", "detail="]
+        {
             assert!(line.contains(field), "missing {field} in: {line}");
         }
     }
@@ -103,13 +115,44 @@ mod tests {
 
     #[test]
     fn a_proxied_client_is_labelled_as_proxied_and_a_direct_one_is_not() {
-        let proxied = ClientAddr::Proxied("203.0.113.7".parse().unwrap());
-        let line = format_line("login", "success", "admin", &proxied, "");
+        let line = format_line("login", "success", "admin", &proxied(), "");
         assert!(line.contains("client=203.0.113.7"), "{line}");
-        assert!(line.contains("client_source=x-real-ip"), "{line}");
+        assert!(line.contains("client_source=x-real-ip-claimed"), "{line}");
 
         let line = format_line("login", "success", "admin", &loopback(), "");
         assert!(line.contains("client_source=peer"), "{line}");
+    }
+
+    /// SEC-03, at the place an operator actually reads.
+    ///
+    /// `client=` is whatever the sender claimed, and on this host that is
+    /// any local process. The line must therefore never present it alone:
+    /// the observed peer sits beside it, and the source field says the
+    /// address was CLAIMED. Without both, a forged `client=203.0.113.7`
+    /// reads exactly like a real one and the journal stops being evidence.
+    #[test]
+    fn a_claimed_address_is_never_printed_without_the_peer_that_contradicts_it() {
+        let line = format_line("login", "failure", "admin", &proxied(), "");
+        assert!(line.contains("client=203.0.113.7"), "{line}");
+        assert!(
+            line.contains("peer=127.0.0.1"),
+            "the observed peer must appear beside the claimed address: {line}"
+        );
+        assert!(
+            line.contains("client_source=x-real-ip-claimed"),
+            "the source must say the address was claimed, not verified: {line}"
+        );
+        assert!(
+            !line.contains("client_source=x-real-ip "),
+            "an unqualified x-real-ip reads as though ferrumd verified it: {line}"
+        );
+    }
+
+    fn proxied() -> ClientAddr {
+        ClientAddr::Proxied {
+            claimed: "203.0.113.7".parse().unwrap(),
+            peer: "127.0.0.1".parse().unwrap(),
+        }
     }
 
     /// An address that is not known must say so rather than print something
@@ -119,6 +162,7 @@ mod tests {
         let line = format_line("login", "failure", "admin", &ClientAddr::Unknown, "");
         assert!(line.contains("client=unknown"), "{line}");
         assert!(line.contains("client_source=none"), "{line}");
+        assert!(line.contains("peer=none"), "{line}");
     }
 
     fn loopback() -> ClientAddr {
