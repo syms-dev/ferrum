@@ -234,6 +234,15 @@ let
     add_header Content-Security-Policy "frame-ancestors 'none'" always;
   '';
 
+  # Bound once so the rate-limited login location below is the SAME
+  # configuration as /api/ plus one directive, rather than a second copy of
+  # it that can drift. A copy that lost `auth_request` would mean the rate
+  # limiter had opened the hole it was added to narrow.
+  daemonApiConfig = daemonStreamConfig + daemonAuthConfig
+    + lib.optionalString daemonAuthGated ''
+    error_page 401 = @ferrum_api_401;
+  '';
+
   daemonVhost = {
     # exposure is "public" (lib.nix's daemonApp), so this is the real ACME
     # cert modules/proxy/acme.nix creates under exactly this vhost name -- the
@@ -292,9 +301,33 @@ let
       "/api/" = {
         proxyPass = daemonUpstream;
         proxyWebsockets = true;
-        extraConfig = daemonStreamConfig + daemonAuthConfig
-          + lib.optionalString daemonAuthGated ''
-          error_page 401 = @ferrum_api_401;
+        extraConfig = daemonApiConfig;
+      };
+
+      # M-02, the edge half. ferrumd's own lockout is keyed on the submitted
+      # USERNAME, so a remote caller can hold the only `admin` account
+      # locked out indefinitely at one attempt per 60s -- the lockout denies
+      # the correct password too. That is the application's to fix; this is
+      # the part nginx can do, which is to stop the attempts arriving.
+      #
+      # A longer prefix wins in nginx, so this shadows "/api/" above for the
+      # one path that needs it and leaves the SSE stream and every other API
+      # route untouched. It reuses daemonApiConfig rather than restating it:
+      # a login location that quietly lost `auth_request` would be a hole
+      # opened by a rate limiter, which is a poor trade.
+      #
+      # Deliberately mild, and that is a judgement not an oversight. This is
+      # a single-operator appliance; a limit that locks the real operator out
+      # while they retry a password they are sure about is worse than no
+      # limit at all, because the failure is indistinguishable from the
+      # daemon being broken. 20/minute with a burst of 10 taken immediately
+      # means a human fumbling their password never meets it, while an
+      # attacker goes from thousands of guesses a second to twenty a minute.
+      "/api/login" = {
+        proxyPass = daemonUpstream;
+        proxyWebsockets = true;
+        extraConfig = daemonApiConfig + ''
+          limit_req zone=ferrum_login burst=10 nodelay;
         '';
       };
     };
@@ -328,7 +361,24 @@ lib.mkIf proxyEnabled {
     recommendedTlsSettings = true;
     recommendedProxySettings = true;
     recommendedGzipSettings = true;
-    commonHttpConfig = generalSecurityHeaders;
+    # The headers, plus the shared-memory zone the daemon's login location
+    # draws on. limit_req_zone is an http-context directive and the zone has
+    # to exist whether or not anything references it, so it is declared here
+    # rather than beside its one consumer.
+    #
+    # Keyed on $binary_remote_addr -- the client address in 4 or 16 bytes
+    # rather than the text form, which is what makes 1m hold roughly 16000
+    # of them. 1m is far more than a home server will ever populate, and
+    # nginx returns 503 to everyone once a zone fills, so undersizing it is
+    # the failure worth avoiding.
+    #
+    # Returns 429 rather than nginx's default 503: the SPA can tell "you are
+    # going too fast" from "the daemon fell over", and so can the operator
+    # reading a log.
+    commonHttpConfig = generalSecurityHeaders + ''
+      limit_req_zone $binary_remote_addr zone=ferrum_login:1m rate=20r/m;
+      limit_req_status 429;
+    '';
     virtualHosts = {
       # A catch-all that refuses anything we did not explicitly publish.
       #

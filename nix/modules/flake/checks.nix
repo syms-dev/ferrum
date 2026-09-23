@@ -659,6 +659,7 @@
           locOf = loc: (daemonV.locations.${loc} or { }).extraConfig or "";
           rootLoc = locOf "/";
           apiLoc = locOf "/api/";
+          loginLoc = locOf "/api/login";
           hasIn = needle: hay: lib.hasInfix needle hay;
 
           # The daemon vhost's SERVER-level config, and the http-level block
@@ -1010,6 +1011,20 @@
               "the daemon vhost's /api/ redirects a 401 instead of returning it, so the SPA sees an opaque cross-origin redirect (D8)"
             ++ lib.optional (!(hasIn "error_page 401 = @ferrum_api_401" apiLoc))
               "the daemon vhost's /api/ does not override the 401 redirect with a plain 401 (D8)"
+            # M-02, the edge half. The application-side lockout is ferrumd's.
+            ++ lib.optional (!(hasIn "limit_req zone=ferrum_login" loginLoc))
+              "the daemon vhost puts no limit_req on /api/login, so nothing at the edge slows a password guesser -- and ferrumd's own lockout is keyed on the submitted USERNAME, which means an attacker can hold the sole admin account locked out indefinitely rather than being locked out themselves (M-02)"
+            ++ lib.optional (!(hasIn "limit_req_zone $binary_remote_addr zone=ferrum_login" commonHttp))
+              "limit_req zone=ferrum_login is referenced but the zone is never declared in http context, so nginx refuses the WHOLE config file at nginx.service start -- every vhost on the host down after a successful apply (M-02)"
+            # The trade this location exists to make must not cost the one
+            # it was already making. A rate limiter that dropped
+            # auth_request would have opened a hole while narrowing one.
+            ++ lib.optional (daemonV != null && (daemonV.locations."/api/login" or null) != null
+                && !(hasIn "auth_request /authelia" loginLoc))
+              "the daemon vhost's /api/login is NOT behind forward-auth, though /api/ is -- a longer prefix wins in nginx, so adding this location for its rate limit has published the login endpoint unauthenticated (A2/M-02)"
+            ++ lib.optional (daemonV != null && (daemonV.locations."/api/login" or null) != null
+                && !(hasIn "error_page 401 = @ferrum_api_401" loginLoc))
+              "the daemon vhost's /api/login does not override the 401 redirect, so the SPA's own login request comes back as an opaque cross-origin redirect instead of a readable 401 (D8/M-02)"
             # H-03, all three directions.
             ++ lib.optional (authOffFailures == [ ])
               "a host with ferrum.proxy.enable, a real ferrum.proxy.baseDomain and ferrum.auth.enable = false evaluates cleanly: the control plane is published on a real ACME certificate with auth_request absent entirely, and nothing tells the operator. ferrum.auth.enable is an mkEnableOption (default FALSE) while ferrum.daemon.enable defaults to TRUE, so this is the configuration a host reaches by doing nothing (H-03)"
