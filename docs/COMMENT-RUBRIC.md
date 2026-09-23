@@ -1,6 +1,15 @@
 # Comment rubric — the standard, agreed on a sample before any sweep
 
-**Status:** proposed, awaiting owner sign-off. Nothing has been rewritten.
+**Status:** **AGREED by the owner, 2026-09-23.** Nothing has been rewritten yet.
+
+Two decisions, both recorded here rather than left in a conversation:
+
+1. **The sweep is split.** The falsity pass (rule 11) runs **first and alone**, as a correctness
+   fix — it is verifiable against code, needs no taste judgement, and is the only class with a
+   track record here. The style rules follow separately.
+2. **Rules 6–8 run file by file**, not repo-wide. They are the only rules with no mechanical check
+   behind them, so a bad judgement should stay a small diff that can be rejected on its own rather
+   than a repo-wide change that has to be accepted or reverted wholesale.
 
 Road-to-public item 12 asks for the rubric and real before-and-afters *before* touching the
 codebase, because items 13 and 16 would otherwise apply a taste judgement to 10,943 comment lines

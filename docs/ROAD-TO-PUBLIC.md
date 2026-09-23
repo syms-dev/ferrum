@@ -151,10 +151,21 @@ Last updated at HEAD `288f2b3`, branch `grounding-and-install-path`. Nothing pus
 
 ## Phase 5 — The pre-public cleanup (your four steps)
 
-- [ ] **12. Agree the comment rubric on a sample first.** 9,164 comment lines across 32,732 lines
-      of Rust. Comments here are load-bearing — four separate findings this run were comments that
-      had become false — so the sweep carries real risk. Rubric plus a handful of real
-      before-and-afters, including one load-bearing comment, before touching the codebase.
+- [x] **12. Comment rubric.** AGREED 2026-09-23 — `docs/COMMENT-RUBRIC.md`. Nothing rewritten yet.
+      - **The measuring changed the plan.** 30% of the Rust is comment lines (10,943 of 36,776;
+        `auth.rs` is 38%), which reads like bloat until sampled. It is overwhelmingly *reasoning*.
+        The longest block, `inventory.rs:197`, records an incident where an over-strict check
+        retroactively invalidated every inventory file written before it — **landing past the disk
+        wipe**, where it was the only remaining path and its own printed advice could not work.
+      - **The failure modes are asymmetric.** Deleting a load-bearing comment destroys a decision
+        that cost an incident to learn, silently, with no test to catch it. Leaving a verbose one
+        costs a reader seconds. Four findings this run were comments that had gone **false** — one
+        survived three review passes and was caught only by salvaging a nearly-deleted branch.
+      - **Agreed shape:** the **falsity pass runs first and alone** as a correctness fix, pinning
+        load-bearing claims with guards (precedent exists twice). Style rules follow. The
+        subjective rules (6–8) run **file by file**, never repo-wide. Docstrings required by the
+        project's documentation rule are explicitly protected.
+
 - [ ] **13. De-verbose the comments**, via the `humanize` skill (which runs `humanizer` first).
 - [x] **14. Remove AI mentions from the working tree.** DONE. Most vanished with their files —
       see item 19; the two were one decision. The five that remained were in real design docs and
