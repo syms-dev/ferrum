@@ -10,8 +10,30 @@ Last updated at HEAD `288f2b3`, branch `grounding-and-install-path`. Nothing pus
 
 ## Phase 1 — Finish R13 (publishing the dashboard)
 
-- [~] **1. Security gate passes.** Third pass running. Two prior passes went 1C/3H/4M -> 0C/2H/1M
-      -> now re-checking. Everything found so far is fixed and mutation-proved.
+- [~] **1. Security gate passes.** BLOCKED at pass 3: **1 Critical, 1 High, 3 Medium**.
+      All five prior fixes hold, but a *new* Critical class appeared and the standing taint
+      enumeration ("44 leaves, 8 sinks, all constrained") was **wrong**.
+      - **C01 (Critical).** Seven unconstrained `storage.*` / `secretsDir` leaves interpolate
+        unquoted into `systemd.tmpfiles.rules` -- newline-separated and **run as root at every
+        activation**. Proved by real `nix eval`: an injected rule wrote
+        `/root/.ssh/authorized_keys`. Root cause: all three passes enumerated taint *backward*
+        from known-bad nginx files, so a whole directive grammar was never in scope.
+      - **H01 (High).** 11 failed logins from anywhere lock out **every** operator, including one
+        with the correct password: all loopback peers share a throttle bucket and nginx presents
+        `127.0.0.1` for everyone. The SSH-tunnel recovery route shares that bucket, so the
+        lockout also shuts your way back in. Proved by execution.
+      - **M01** `secrets.<name>` has no `propertyNames`; `%2f` writes outside the secrets dir.
+        **M02** Authelia's cookie is scoped `.<baseDomain>`, shared with apps that have
+        unauthenticated bypass locations. **M03** Authelia's ban is username-keyed, so a remote
+        attacker can lock out the sole SSO admin.
+      - **Same defect three times.** M-02, H01 and M03 are all *a throttle keyed on a shared
+        axis is a lockout*. The suite only ever pinned the below-threshold case, which is why it
+        was never observed. Every new throttle must answer: who else shares this key, and does
+        tripping it deny the **correct** password?
+      - **Now running:** a forward taint enumeration from all 43 schema leaves to every directive
+        grammar (tmpfiles, fstab, unit fields, nginx, sysctl, shell, Rust `format!`), so the real
+        sink count is known before anything is patched. Fixes follow in a Nix lane and a Rust lane.
+
 - [ ] **2. Decide: a failed stage 2 now leaves no web UI at all.** Stage 1 turns the daemon off so
       it cannot be published without auth. Correct for security; it means recovery from a failed
       install is SSH-only. Your call, and it bears directly on the hands-off requirement.
