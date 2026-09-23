@@ -201,6 +201,11 @@
         }
       }
     },
+    "extraUnfreePackages": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Additional unfree package NAMES to allow, beyond the ones the app catalog already needs. Unconstrained beyond \"a string\" on purpose, and this is the one settable value in ferrum.* for which that is the right answer: it reaches no generated file at all -- modules/core/overlays.nix compares it with lib.getName inside nixpkgs.config.allowUnfreePredicate and nothing else -- so there is no directive grammar for it to escape, and a name that is not a real package simply never matches. The option exists because allowUnfreePredicate is a single FUNCTION value, which the module system replaces rather than composes: a predicate written in /etc/ferrum/custom/ silently drops the catalog's own allowances (plexmediaserver, unrar) instead of adding to them."
+    },
     "apps": {
       "type": "object",
       "propertyNames": {

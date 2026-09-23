@@ -575,6 +575,35 @@ in
       };
     };
 
+    extraUnfreePackages = mkOption {
+      # Package NAMES, compared with lib.getName inside
+      # nixpkgs.config.allowUnfreePredicate. This is the one list in
+      # ferrum.* that does not reach a generated file at all -- no tmpfiles
+      # rule, no unit field, no directive -- so types.str is correct here
+      # and modules/lib/hostnames.nix has nothing to say about it. A value
+      # that is not a real package name simply never matches.
+      type = types.listOf types.str;
+      default = [ ];
+      example = [ "steam-run" ];
+      description = ''
+        Additional unfree package names to allow, beyond the ones the app
+        catalog already needs.
+
+        This option exists because nixpkgs.config.allowUnfreePredicate is a
+        single FUNCTION value, and the module system does not compose two of
+        them the way it composes a list -- so a predicate written in
+        /etc/ferrum/custom/ does not add to ferrum's, it REPLACES it, and
+        silently: a host that allowed plexmediaserver and unrar stops
+        allowing either, and the first sign is a build failure naming a
+        package the operator never touched.
+
+        modules/core/overlays.nix folds this list into the same union it
+        builds from every app's meta.nix, so an operator who needs one more
+        unfree package adds a name here instead of writing a predicate that
+        would take the catalog's out with it.
+      '';
+    };
+
     apps = mkOption {
       type = appsType;
       default = { };

@@ -2829,6 +2829,66 @@
           domainSensitive = a.script != b.script;
         };
 
+      # ferrum.extraUnfreePackages ADDS to the catalog's allowances rather
+      # than replacing them.
+      #
+      # nixpkgs.config.allowUnfreePredicate is a single FUNCTION value and
+      # nixpkgs.config is types.attrs, so two definitions merge with `//`
+      # and the later one wins -- silently, with no conflict error.
+      # Measured at 03d569f: a /etc/ferrum/custom/ module setting its own
+      # predicate produced a host whose predicate answered plexmediaserver =
+      # false and unrar = false. The operator added one package and took
+      # Plex and SABnzbd out with it, and the only symptom is a build
+      # failure naming a package they never touched.
+      #
+      # The composable thing is the LIST, so ferrum.extraUnfreePackages
+      # joins the same union modules/core/overlays.nix builds from every
+      # meta.nix, and the predicate keeps its non-mkDefault definition. This
+      # check is what pins that: it calls the GENERATED predicate, which is
+      # the thing nixpkgs actually consults, rather than inspecting the list
+      # the module composed.
+      #
+      # Anti-vacuity, and it is the whole check: the baseline must answer
+      # FALSE for the extra package. A predicate that returned true for
+      # everything -- which is what a careless `allowUnfree = true` would
+      # amount to -- satisfies every other row here.
+      extraUnfreePackagesCompose =
+        let
+          hostWith = extra: ferrumLib.mkHost {
+            inherit system;
+            settings = {
+              schemaVersion = realMigrations.currentVersion;
+              extraUnfreePackages = extra;
+            };
+            modules = [ ../../../examples/hosts/minimal/configuration.nix ];
+          };
+          allows = extra: name:
+            (hostWith extra).config.nixpkgs.config.allowUnfreePredicate {
+              pname = name;
+              version = "0";
+            };
+
+          catalogNames = lib.unique
+            (lib.concatMap (meta: meta.unfreePackages or [ ]) (lib.attrValues catalog));
+          extra = "ferrum-check-not-a-real-package";
+
+          baselineMissing = builtins.filter (n: !(allows [ ] n)) catalogNames;
+          extendedMissing = builtins.filter (n: !(allows [ extra ] n)) catalogNames;
+        in
+        {
+          ok = catalogNames != [ ]
+            && baselineMissing == [ ]
+            && !(allows [ ] extra)
+            && extendedMissing == [ ]
+            && allows [ extra ] extra;
+          message =
+            "ferrum.extraUnfreePackages does not compose with the catalog's "
+            + "own unfree allowances";
+          inherit catalogNames baselineMissing extendedMissing;
+          baselineAllowsTheExtra = allows [ ] extra;
+          extendedAllowsTheExtra = allows [ extra ] extra;
+        };
+
       # Recyclarr with nothing to sync is a timer that succeeds at nothing.
       #
       # `configuration` in modules/core/recyclarr.nix is built from
@@ -3283,6 +3343,8 @@
           mkAssertionCheck "selfsigned-cert-tracks-its-domain" selfSignedCertTracksItsDomain;
         recyclarr-needs-an-arr =
           mkAssertionCheck "recyclarr-needs-an-arr" recyclarrNeedsAnArr;
+        extra-unfree-packages-compose =
+          mkAssertionCheck "extra-unfree-packages-compose" extraUnfreePackagesCompose;
         settings-schema-covers-every-option =
           mkAssertionCheck "settings-schema-covers-every-option" schemaCoversEveryOption;
         installer-offers-every-catalog-app =
