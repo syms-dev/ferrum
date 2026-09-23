@@ -102,7 +102,26 @@ Last updated at HEAD `288f2b3`, branch `grounding-and-install-path`. Nothing pus
 - [ ] **18. Remove the run's git worktrees.** Several remain under `.claude/worktrees/`.
 - [ ] **19. Decide what `.gitignore` should do with `.claude/`.** It currently ignores the whole
       directory, so claude-kit's "committed" agent-memory store is not committed.
-- [ ] **20. Fix `stack-catalog.snapshot.yaml`**, which records the wrong stack.
+- [ ] **20. Fix `stack-catalog.snapshot.yaml`** — diagnosed 2026-09-23, less harmful than it
+      looks, but the residue is real. `.ckit/config/` (the live one the hooks read) records
+      **react · typescript · python · fastapi · postgres** for a project that is Rust + Nix with
+      a React `ui-kit`. ferrum contains **0 `.py`, 0 `.sql`, 0 migrations/models dirs.**
+      - **Mostly inert.** `fastapi-patterns.md`, `postgres-patterns.md` and
+        `database-performance.md` are `paths:`-gated to `**/*.py`, `**/*.sql`,
+        `**/migrations/**` and `**/models/**` — globs nothing here matches, so they never load.
+        `react-patterns.md` gates on `**/*.ts(x)` and DOES fire on 170 files, which is correct:
+        `ui-kit` really is React + TypeScript.
+      - **What actually leaks:** three agents that can never apply (`postgres-specialist`,
+        `migration-specialist`, `db-performance-reviewer`), and ~10 Python/DB skills in the
+        picker. CLAUDE.md names *substitution* — a plausible neighbour winning — as a measured
+        failure mode, and a catalog advertising the wrong stack feeds exactly that.
+      - **The real gap is the inverse:** there are **no Rust or Nix overlay rules at all.** The
+        stack this project is actually written in has zero stack-specific guidance installed.
+      - **Two snapshots disagree.** `.claude/config/` says every stack field is `none` and
+        `overlay_rules: []`; `.ckit/config/` matches what is really on disk. `.claude/` is
+        gitignored, so the `.ckit/` one is authoritative. Fixing this means re-running the
+        claude-kit installer, which is **yours to invoke** — the model must not run
+        `/ckit-command-*` skills.
 
 ---
 
