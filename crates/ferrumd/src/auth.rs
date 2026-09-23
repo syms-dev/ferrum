@@ -705,7 +705,17 @@ pub fn change_password(
         .hash_password(new_password.as_bytes(), &salt)
         .map_err(|e| anyhow::anyhow!("failed to hash the new password: {e}"))?
         .to_string();
-    db.conn().execute(
+    // L8. One transaction, because the rotation and the revocation are one
+    // remedy. They used to be two autocommitted statements, so a DELETE
+    // that failed left the worst combination available: the password
+    // rotated, every other session still alive -- including the stolen one
+    // the revocation exists to kill -- and the caller told the change
+    // failed. An operator acting on a suspected compromise would then be
+    // told the remedy did not apply, while the only half that did apply is
+    // the half that does nothing to the attacker.
+    let mut conn = db.conn();
+    let tx = conn.transaction()?;
+    tx.execute(
         "UPDATE users SET password_hash = ?1 WHERE id = ?2",
         rusqlite::params![hash, user_id],
     )?;
@@ -715,10 +725,11 @@ pub fn change_password(
     // good for the rest of its week. Every OTHER session for this account
     // goes; the caller's own stays, so the operator is not logged out of the
     // tab they just used.
-    db.conn().execute(
+    tx.execute(
         "DELETE FROM sessions WHERE user_id = ?1 AND token != ?2",
         rusqlite::params![user_id, keep_token],
     )?;
+    tx.commit()?;
     Ok(PasswordChangeOutcome::Changed)
 }
 
@@ -1541,6 +1552,39 @@ mod tests {
     /// failing disk, `SQLITE_CORRUPT`, or a migration that got half applied.
     fn break_the_users_table(db: &Db) {
         db.conn().execute_batch("ALTER TABLE users RENAME TO users_moved_away").unwrap();
+    }
+
+    /// L8. Rotating the credential and revoking the account's other
+    /// sessions must be one operation or neither.
+    ///
+    /// They were two statements with nothing binding them. If the DELETE
+    /// failed the UPDATE had already committed, so the outcome was the
+    /// worst available combination: the password is rotated, every other
+    /// session stays alive -- including the stolen one the revocation
+    /// exists to kill -- and the caller is told the change failed. An
+    /// operator acting on a suspected compromise is then told the remedy
+    /// did not apply, while the half of it that protects the attacker's
+    /// access is the half that did.
+    ///
+    /// Renaming `sessions` fails the DELETE and nothing before it, which
+    /// is the shape of any real failure of that statement.
+    #[test]
+    fn a_failed_revocation_does_not_leave_the_password_rotated() {
+        let (_dir, db, password, user_id) = bootstrapped();
+        let before = stored_hash(&db, user_id);
+        db.conn().execute_batch("ALTER TABLE sessions RENAME TO sessions_moved_away").unwrap();
+
+        let result =
+            change_password(&db, user_id, &password, "a-new-one", KEPT_SESSION, &test_client());
+        assert!(result.is_err(), "a failed revocation must be reported as a failure");
+        assert_eq!(
+            before,
+            stored_hash(&db, user_id),
+            "the caller was told the change failed, so the credential must not have been \
+             rotated: telling an operator their compromise remedy did not apply while \
+             silently applying the half of it that does not revoke the attacker's session \
+             is the one outcome worse than either"
+        );
     }
 
     /// M1. A database that cannot be read must never be reported as a wrong
