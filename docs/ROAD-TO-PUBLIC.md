@@ -90,10 +90,25 @@ Last updated at HEAD `288f2b3`, branch `grounding-and-install-path`. Nothing pus
       this branch is deployed, since the proof here is against the schema, not against your
       running daemon.
 
-- [ ] **5. R21/A1 — a fresh multi-disk install puts the whole library on one disk.** Reproduced
-      against real mergerfs: `epmfs` only picks a branch that already has the parent path, so a
-      blank second disk stays inert. Your host escapes it only because both disks already held
-      media.
+- [x] **5. R21/A1 — a fresh multi-disk install puts the library on one disk.** ALREADY FIXED in
+      `0993b7b`, verified 2026-09-23, and **now pinned** (it was not).
+      - **Verified, not assumed.** Evaluated a pooled host with two branches and read the
+        generated tmpfiles rules: `d /mnt/d0/media/movies` **and** `d /mnt/d1/media/movies`.
+        Both branches are seeded, so `epmfs` ("existing path, most free space") has more than
+        one candidate and can balance by free space. A disk added later is usable.
+      - **The gap was that nothing held it in place.** No check referenced pool seeding; all 13
+        `pool` mentions in `checks.nix` came from the new security work. Exactly the pairing
+        problem F2 named — two things that must agree with no mechanical check — which is what
+        let the settings schema drift until the dashboard could not save at all.
+      - **Added `pool-branches-are-all-seeded`** (`nix/modules/flake/checks.nix`, wired into
+        `.github/workflows/ci.yml`). It derives the expected subdirectory list from the
+        generated rules for the first branch and requires the others to match, rather than
+        hardcoding a third list free to drift.
+      - **Mutation-proved.** Reverting `storage.nix` to the original bug makes it **exit 1**.
+        Worth noting which half caught it: `divergentBranches: []`, `expectedCount: 0` — all
+        three branches agreed *because all three were empty*. The branch comparison alone would
+        have passed with the defect fully present; only the length floor caught it.
+
 - [ ] **6. R14.**
 - [ ] **7. The three R13 deferred tickets.**
       - `modules/proxy/dns.nix` `daemonRecords` never consults `daemon.enable`, so a daemon-off
