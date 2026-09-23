@@ -1530,17 +1530,53 @@
               # the same reason: `nginx -t` really opens /run/nginx/nginx.pid
               # and the compiled-in /var/log/nginx/access.log, and a build
               # sandbox has neither directory. Every edit here is about a
-              # file the HOST would have and this sandbox does not. None of
+              # capability the HOST has and this sandbox does not. None of
               # them touches a directive whose parse is under test -- the
               # proxy_pass lines reach the parser byte-for-byte as
               # modules/proxy/nginx.nix wrote them, which the mutation test
               # in this commit's message demonstrates.
+              #
+              # The listen ports are the newest member of that family, and
+              # the one that made this check useless for a day. `nginx -t`
+              # does not merely parse: it BINDS every listen address, to
+              # prove the config could actually start. A Nix builder runs
+              # unprivileged, so 443 and 80 come back EACCES and the whole
+              # test fails -- on a config nginx had already reported as
+              # syntactically fine, with a message blaming daemon
+              # listenAddress for a permission problem.
+              #
+              # It passed locally throughout, because a local container runs
+              # as root and root may bind low ports. That is the failure
+              # mode this repository keeps meeting from a new direction: a
+              # check that is green on the machine that wrote it and red
+              # everywhere else. It had never once passed in CI.
+              #
+              # Rewriting to high ports keeps every directive under test
+              # intact. The port a vhost listens on is not what this check
+              # exercises -- server_name, the daemon upstream and every
+              # proxy_pass are, and all of them are untouched.
               sed -e "s|ssl_certificate .*|ssl_certificate $PWD/cert.pem;|" \
                   -e "s|ssl_certificate_key .*|ssl_certificate_key $PWD/key.pem;|" \
                   -e "s|ssl_trusted_certificate .*|ssl_trusted_certificate $PWD/cert.pem;|" \
                   -e "s|^pid .*|pid $PWD/nginx.pid;|" \
                   -e "s|^http {|http {\n\taccess_log off;|" \
+                  -e "/^[[:space:]]*listen /s|:443\([ ;]\)|:8443\1|" \
+                  -e "/^[[:space:]]*listen /s|:80\([ ;]\)|:8080\1|" \
+                  -e "/^[[:space:]]*listen /s| 443\([ ;]\)| 8443\1|" \
+                  -e "/^[[:space:]]*listen /s| 80\([ ;]\)| 8080\1|" \
                   "$cfg" > test.conf
+
+              # Anti-vacuity for the rewrite above, and a guard against the
+              # next privileged port somebody adds. If a `listen` line still
+              # names a port below 1024, the rewrite missed a spelling and
+              # nginx is about to fail on EACCES again -- which would look
+              # exactly like a parse error and send the next reader to
+              # daemonUpstream for a problem that is not there.
+              if grep -nE '^[[:space:]]*listen ([0-9.]+:|\[[^]]*\]:)?([0-9]|[1-9][0-9]|[1-9][0-9]{2}|10[01][0-9]|102[0-3])[[:space:];]' test.conf; then
+                fail "a listen directive still names a privileged port after rewriting (above) -- nginx -t binds every listen address and this sandbox is unprivileged, so the parse result would be meaningless"
+              fi
+              grep -q '^[[:space:]]*listen ' test.conf \
+                || fail "the rewritten config has no listen directive at all, so nginx -t would bind nothing and prove nothing"
 
               mkdir -p prefix/logs
               "$bin" -p "$PWD/prefix" -t -c "$PWD/test.conf" > nginx.log 2>&1 || {
@@ -1558,10 +1594,13 @@
       #
       # Same builtins.tryEval idiom as journalDirCollision above, and scoped
       # to this assertion's own message for the same non-negotiable reason:
-      # these hosts carry other failing assertions (the example host's
-      # placeholder secrets have no *-apikey-raw.sops counterparts), so an
-      # unscoped version would report every host as "rejected" and would pass
-      # identically with the assertion deleted.
+      # an unscoped version would report a host as "rejected" for any
+      # reason at all and would pass identically with the assertion deleted.
+      # (Until 2026-09-23 the example host also carried unmatched servarr
+      # sops pairs, which is what originally made the scoping non-optional;
+      # those secrets have since been deleted and the example now evaluates
+      # cleanly, but scoping a tryEval assertion to its own message is
+      # correct on its own terms and stays.)
       reservedSubdomainCollision =
         let
           hostWith = appSubdomain: ferrumLib.mkHost {
