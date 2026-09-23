@@ -3575,6 +3575,62 @@
           installPhase = "mkdir -p $out";
         };
 
+        # The guard on the escape hatch, asserted against the ARTIFACTS
+        # rather than the source.
+        #
+        # `tests/stage2/run.sh` needs A5's Cloudflare token check to pass
+        # while installing to `s13.invalid`, a domain in nobody's Cloudflare
+        # account. It gets there by building `.#ferrum-install-testing`,
+        # which compiles the `test-cloudflare-endpoint` feature and with it
+        # a second body for `answers::cloudflare_client` that honours
+        # FERRUM_CLOUDFLARE_API_BASE. The operator's installer must have no
+        # such thing: an offline ferrum install produces a media server
+        # nobody can reach, so a redirectable endpoint in the shipped binary
+        # is a way to finish an install that publishes nothing.
+        #
+        # A `#[cfg]` already makes that true. This check exists because the
+        # obvious "simplification" -- collapsing the two bodies into one
+        # with a runtime `if` -- looks harmless, passes every unit test, and
+        # silently reintroduces exactly that. The property is therefore
+        # proved mechanically, by looking for the variable's name in the
+        # built closure.
+        #
+        # The second half is a positive control, and it is not decoration:
+        # a grep that finds nothing proves nothing unless the same grep is
+        # shown to find something when it should. Rename the variable and
+        # this check fails on the control rather than passing vacuously.
+        production-installer-has-no-api-override =
+          pkgs.runCommand "ferrum-check-no-api-override" { } ''
+            needle=FERRUM_CLOUDFLARE_API_BASE
+
+            # -r because makeWrapper leaves $out/bin holding a shell wrapper
+            # beside the real ELF; the string could be in either.
+            if grep -rq "$needle" ${self'.packages.ferrum-install}/bin; then
+              echo "the production installer can be redirected away from Cloudflare:"
+              echo "  $needle appears in ${self'.packages.ferrum-install}/bin"
+              echo
+              echo "That name must exist only under the test-cloudflare-endpoint"
+              echo "feature. If someone replaced the two cfg-gated bodies of"
+              echo "answers::cloudflare_client with one runtime branch, put them back:"
+              echo "A5's token check is what stops an install finishing while it can"
+              echo "publish nothing, and a shipped override is a way around it."
+              exit 1
+            fi
+
+            if ! grep -rq "$needle" ${self'.packages.ferrum-install-testing}/bin; then
+              echo "the positive control failed: $needle is absent from the TESTING"
+              echo "installer too, so the check above proved nothing."
+              echo
+              echo "Either the feature no longer compiles that code path, or the"
+              echo "variable was renamed. Update this check to match the new name."
+              exit 1
+            fi
+
+            echo "the production installer has no Cloudflare endpoint override;"
+            echo "the testing build does, so the grep is known to work"
+            touch $out
+          '';
+
         # ferrum-dns is a LIBRARY crate with no package of its own, so unlike
         # its siblings there is no `cargo-test-ferrum-dns` alias to pair with
         # -- workspace-tests above runs its tests, because that derivation

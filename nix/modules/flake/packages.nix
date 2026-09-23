@@ -37,6 +37,25 @@
           # tool that installed it provably agree.
           ferrumRev = inputs.self.rev or inputs.self.dirtyRev or "dev";
         };
+        # The SAME installer, compiled with `test-cloudflare-endpoint`, and
+        # built by nothing an operator ever runs -- `tests/stage2/run.sh`
+        # and the `production-installer-has-no-api-override` check are its
+        # only consumers, and the Docker image above is deliberately built
+        # from `ferrum-install` rather than from this.
+        #
+        # It exists because A5 verifies the operator's Cloudflare token
+        # against the live API and stage 2 installs to `s13.invalid`, a
+        # domain in nobody's account: no token, real or invented, can pass
+        # there. The alternative -- a skip flag -- was rejected, because an
+        # offline ferrum install produces a media server nobody can reach,
+        # so the valve would ship to every operator as a way to get a
+        # silently broken host. A separate artifact keeps the escape hatch
+        # out of the one people run.
+        ferrum-install-testing = pkgs.callPackage ../../../nix/pkgs/ferrum-install {
+          nixos-anywhere = inputs.nixos-anywhere.packages.${pkgs.stdenv.hostPlatform.system}.default;
+          ferrumRev = inputs.self.rev or inputs.self.dirtyRev or "dev";
+          cargoFeatures = [ "test-cloudflare-endpoint" ];
+        };
         ferrum-install-image = pkgs.callPackage ../../../nix/pkgs/ferrum-install/image.nix {
           ferrum-install = config.packages.ferrum-install;
         };

@@ -22,10 +22,29 @@
   # Passed from nix/modules/flake/packages.nix, which is the only place
   # that can see the flake's own `self`.
 , ferrumRev
+  # Cargo features to compile in. EMPTY for the installer operators get --
+  # `.#ferrum-install` and the Docker image built from it -- and that
+  # default is load-bearing rather than tidy.
+  #
+  # The one caller that passes anything is `.#ferrum-install-testing`, which
+  # asks for `test-cloudflare-endpoint` so that `tests/stage2/run.sh` can
+  # point A5's Cloudflare check at a stand-in API. That feature compiles in
+  # a whole second body for `answers::cloudflare_client`; with this list
+  # empty, neither that body nor the environment variable it names exists in
+  # the artifact. `production-installer-has-no-api-override` in
+  # nix/modules/flake/checks.nix asserts exactly that against both binaries,
+  # so the two packages are kept apart by a check rather than by convention.
+, cargoFeatures ? [ ]
 }:
 rustPlatform.buildRustPackage {
-  pname = "ferrum-install";
+  pname = "ferrum-install" + lib.optionalString (cargoFeatures != [ ]) "-testing";
   version = "0.1.0";
+
+  # Also the check features: buildRustPackage defaults `checkFeatures` to
+  # this list, so the testing build runs the unit suite with the feature on
+  # and a `cfg`-gated body that stopped compiling would fail here rather
+  # than in the CI job that consumes it.
+  buildFeatures = cargoFeatures;
   # Unlike the other crates, this one's source root is the REPOSITORY, not
   # crates/. render.rs does include_str! on
   # examples/hosts/template/disko.nix so that a drift between the generated

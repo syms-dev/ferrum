@@ -756,15 +756,69 @@ pub type ClientFactory<'a> = &'a dyn Fn(ferrum_dns::Secret) -> ferrum_dns::clien
 
 /// The production factory: a client pointed at the real Cloudflare API.
 ///
+/// **This is the whole of the function in a release build.** The
+/// `test-cloudflare-endpoint` variant below replaces it wholesale rather
+/// than adding a branch to it, so a binary built without that feature
+/// contains no code that reads an environment variable here and no string
+/// naming one. See the feature's own comment in `Cargo.toml` for why that
+/// distinction is the point, and
+/// `nix/modules/flake/checks.nix`'s `production-installer-has-no-api-override`
+/// for the check that proves it against the built binaries.
+///
 /// # Arguments
 /// * `token` - the bare token the operator just entered.
 ///
 /// # Returns
 /// A client every call site of [`validate_and_verify_cloudflare_token`]
 /// shares, so there is one place the endpoint and timeouts are decided.
+#[cfg(not(feature = "test-cloudflare-endpoint"))]
 #[must_use]
 pub fn cloudflare_client(token: ferrum_dns::Secret) -> ferrum_dns::client::Client {
     ferrum_dns::client::Client::new(token)
+}
+
+/// The environment variable that redirects Cloudflare calls at a stand-in
+/// API, for `tests/stage2/run.sh` and nothing else.
+///
+/// Declared inside the `cfg` rather than beside it deliberately: a `const`
+/// outside the gate would put this string in the production binary even
+/// though nothing read it, and the check that guards this whole arrangement
+/// works by looking for the string. Keeping the name unreachable makes the
+/// guarantee provable by inspecting the artifact instead of by trusting a
+/// runtime branch.
+#[cfg(feature = "test-cloudflare-endpoint")]
+pub const API_BASE_ENV: &str = "FERRUM_CLOUDFLARE_API_BASE";
+
+/// The same factory, built only when `test-cloudflare-endpoint` is on.
+///
+/// `tests/stage2/run.sh` installs to `s13.invalid`, a domain that exists in
+/// nobody's Cloudflare account, so A5's zone check cannot pass there no
+/// matter what token it is fed -- not a placeholder, and not a real
+/// credential either. Rather than weaken the check, the test serves a
+/// stand-in Cloudflare on loopback and names it here. Everything the
+/// installer then does -- the `Authorization` header, the `success`-field
+/// check, pagination, longest-suffix zone resolution, the delegation
+/// listing, the zone-status refusal -- runs unchanged; only the host it
+/// talks to differs.
+///
+/// An unset or empty value falls back to the real API, so the feature
+/// being compiled in is not by itself a redirect.
+///
+/// # Arguments
+/// * `token` - the bare token the operator just entered.
+///
+/// # Returns
+/// A client pointed at [`API_BASE_ENV`] when it names one, and at
+/// Cloudflare otherwise.
+#[cfg(feature = "test-cloudflare-endpoint")]
+#[must_use]
+pub fn cloudflare_client(token: ferrum_dns::Secret) -> ferrum_dns::client::Client {
+    match std::env::var(API_BASE_ENV) {
+        Ok(base) if !base.trim().is_empty() => {
+            ferrum_dns::client::Client::with_base_url(token, base.trim().to_string())
+        }
+        _ => ferrum_dns::client::Client::new(token),
+    }
 }
 
 /// Both halves of A5's check: the token is well-formed **and** Cloudflare
@@ -2289,5 +2343,56 @@ mod tests {
         sorted.sort();
         sorted.dedup();
         assert_eq!(CATALOG_APPS, sorted.as_slice(), "keep CATALOG_APPS sorted");
+    }
+
+    /// The endpoint override, driven through the PRODUCTION factory.
+    ///
+    /// Every other test here hands `validate_and_verify_cloudflare_token` a
+    /// factory of its own, which proves the verification logic and says
+    /// nothing about what `tests/stage2/run.sh` actually relies on: that
+    /// `answers::cloudflare_client` -- the one the installer's three real
+    /// call sites pass -- honours the variable. Compiled only with
+    /// `test-cloudflare-endpoint`, because without it that behaviour does
+    /// not exist and must not.
+    ///
+    /// Both halves live in one function on purpose: the test binary runs
+    /// its tests on parallel threads and the environment is per-process, so
+    /// two tests setting the same variable would race each other.
+    ///
+    /// Mutation check: delete the `Ok(base)` arm of the gated
+    /// `cloudflare_client` and the first assertion fails with a transport
+    /// error against the real API; widen the arm to accept an empty value
+    /// and the second fails.
+    #[cfg(feature = "test-cloudflare-endpoint")]
+    #[test]
+    fn the_endpoint_override_sends_the_token_check_to_a_stand_in() {
+        let fake = healthy_cloudflare();
+
+        std::env::set_var(API_BASE_ENV, fake.base_url());
+        let verified = validate_and_verify_cloudflare_token(
+            "placeholder-cf-token",
+            "thesyms.ca",
+            &cloudflare_client,
+        );
+
+        // An empty value is NOT a redirect. The variable being present but
+        // blank is what an unset shell variable expands to in a script, and
+        // silently pointing at "" would turn a typo into an unreachable
+        // endpoint rather than the real API.
+        std::env::set_var(API_BASE_ENV, "");
+        let fallback = cloudflare_client(ferrum_dns::Secret::new("placeholder-cf-token".into()));
+        std::env::remove_var(API_BASE_ENV);
+
+        verified.expect("A5 must pass against the stand-in API");
+        assert!(
+            !fake.requests().is_empty(),
+            "the stand-in was never asked anything, so nothing was verified"
+        );
+        // `Client`'s Debug prints its base URL and redacts its token, which
+        // is the only observation of the endpoint this seam offers.
+        assert!(
+            format!("{fallback:?}").contains("api.cloudflare.com"),
+            "an empty override must fall back to the real API: {fallback:?}"
+        );
     }
 }

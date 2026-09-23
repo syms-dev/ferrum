@@ -58,8 +58,29 @@ PUBKEY="$(cat "$WORK/ssh/id_ed25519.pub")"
 ok
 
 step "build the installer and the target VM"
-nix build --print-build-logs --no-link --print-out-paths .#ferrum-install > "$WORK/inst" \
-  || die "could not build ferrum-install"
+# `.#ferrum-install-testing`, NOT `.#ferrum-install`, and the difference is
+# one cargo feature: `test-cloudflare-endpoint`, which makes the installer
+# honour FERRUM_CLOUDFLARE_API_BASE.
+#
+# It is here because R1 A5 verifies the operator's Cloudflare token against
+# the live API before anything is erased, and this test installs to
+# `s13.invalid` -- a domain in nobody's Cloudflare account. No token can
+# pass there. Measured against the real API on 2026-09-23:
+# `placeholder-cf-token` is refused with error 6003 (chain 6111, "Invalid
+# format for Authorization header") because Cloudflare rejects it on shape
+# before checking validity, and a well-formed 40-character fake is refused
+# with 9109 "Invalid access token". ferrum sends the header correctly; the
+# check is working exactly as designed, and it is what stops an install
+# finishing while it can publish nothing.
+#
+# So the test serves a stand-in API rather than asking the product to
+# accept less -- there is deliberately no skip flag, because a valve added
+# for a test ships to every operator. The escape hatch is kept out of the
+# binary people run: `.#ferrum-install` compiles neither that code path nor
+# the variable's name, and `production-installer-has-no-api-override` in
+# nix/modules/flake/checks.nix proves it against both built binaries.
+nix build --print-build-logs --no-link --print-out-paths .#ferrum-install-testing > "$WORK/inst" \
+  || die "could not build ferrum-install-testing"
 INSTALLER="$(cat "$WORK/inst")/bin/ferrum-install"
 nix build --print-build-logs --no-link --print-out-paths --impure --expr "
   let f = builtins.getFlake (toString ./.); in
@@ -86,10 +107,34 @@ echo "disk serial: $SERIAL"
 ok
 
 # ------------------------------------------------------- the install
+step "start the stand-in Cloudflare API"
+# Serves one zone named s13.invalid with no records in it, so the pre-erase
+# gate finds every name ferrum wants unclaimed and asks the operator
+# nothing -- which is what keeps the scripted answers below in step. See
+# tests/stage2/fake-cloudflare.py for what it answers and why it is not
+# ferrum_dns::testing::FakeCloudflare.
+python3 ./tests/stage2/fake-cloudflare.py "$WORK/cf.port" s13.invalid \
+  > "$WORK/cloudflare.log" 2>&1 &
+CF_PID=$!
+# Waits for the port FILE, which the server writes only once its socket is
+# listening, rather than sleeping and hoping.
+for _ in $(seq 1 100); do
+  [ -s "$WORK/cf.port" ] && break
+  kill -0 "$CF_PID" 2>/dev/null || break
+  sleep 0.2
+done
+[ -s "$WORK/cf.port" ] \
+  || die "the stand-in Cloudflare API never came up: $(cat "$WORK/cloudflare.log" 2>/dev/null)"
+CF_BASE="http://127.0.0.1:$(cat "$WORK/cf.port")/client/v4"
+echo "stand-in Cloudflare at $CF_BASE"
+ok
+
 step "run the installer end to end (sonarr + sabnzbd, SSO on)"
 # Answers, in the order answers::collect and confirm::confirm ask for them.
-# The token is a placeholder: ACME is not exercised here, but the secret
-# must exist or modules/proxy/acme.nix refuses to evaluate at all.
+# The token is a placeholder and is checked for real: A5 sends it to the
+# stand-in API above, which requires a bearer token and would refuse an
+# empty one. ACME itself is not exercised here, but the secret must exist
+# or modules/proxy/acme.nix refuses to evaluate at all.
 {
   echo "s13host"                 # hostname
   echo "s13.invalid"             # base domain
@@ -120,9 +165,10 @@ step "run the installer end to end (sonarr + sabnzbd, SSO on)"
       "$(date -u +%H:%M:%S)" "$(wc -l < "$WORK/install.log" 2>/dev/null || echo 0)"
   done
 ) & HEARTBEAT=$!
-trap 'kill $HEARTBEAT 2>/dev/null || true' EXIT
+trap 'kill $HEARTBEAT $CF_PID 2>/dev/null || true' EXIT
 
 set +e
+FERRUM_CLOUDFLARE_API_BASE="$CF_BASE" \
 "$INSTALLER" root@127.0.0.1 --ssh-port 2222 \
   --host-dir "$WORK/host" --ssh-dir "$WORK/ssh" < "$WORK/answers" 2>&1 \
   | tee "$WORK/install.log"
@@ -131,6 +177,25 @@ set -e
 kill $HEARTBEAT 2>/dev/null || true
 
 [ "$RC" -eq 0 ] || die "the installer exited $RC"
+ok
+
+step "A5 really ran: the installer asked the stand-in API for the zone"
+# Without this, a Cloudflare check that passed because nothing was asked
+# would be indistinguishable from one that passed correctly -- and the
+# whole point of the redirect is that the check still runs.
+grep -q "GET /client/v4/zones " "$WORK/cloudflare.log" \
+  || die "the installer never listed zones; the token check did not run"
+# `if`, not `grep ... && die`: this half of the script runs under `set -e`,
+# where a `grep -q` that finds nothing makes the whole && list return 1 and
+# aborts the run with no message at all.
+if grep -q "refusing a request with no bearer token" "$WORK/cloudflare.log"; then
+  die "the installer sent an unauthenticated request to Cloudflare"
+fi
+if grep -q "NO ROUTE" "$WORK/cloudflare.log"; then
+  die "the installer asked for a route the stand-in does not model: $(grep "NO ROUTE" "$WORK/cloudflare.log")"
+fi
+echo "$(grep -c "^fake-cloudflare: GET" "$WORK/cloudflare.log" || true) requests served"
+kill $CF_PID 2>/dev/null || true
 ok
 
 # ------------------------------------------------- R2 A9b: the guard ran
