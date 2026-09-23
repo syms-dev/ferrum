@@ -2651,6 +2651,95 @@
             workingAccepted workingIsAPool;
         };
 
+      # The media tree is seeded AFTER the data mounts, not alongside them.
+      #
+      # Every ferrum data mount carries `nofail`, and per systemd.mount(5)
+      # `nofail` means the mount is only WANTED by local-fs.target and is
+      # explicitly not ordered before it. systemd-tmpfiles-setup.service is
+      # `After=local-fs.target`, so the tree can be created on the ROOT
+      # filesystem under the mountpoint and then shadowed by the mount that
+      # lands on top of it. On pool branches that produces exactly the state
+      # poolBranchesAreAllSeeded above exists to prevent: empty branches,
+      # and under epmfs the whole library on one disk.
+      #
+      # Read off the GENERATED unit text rather than the option tree,
+      # because the ordering directives are the entire fix and NixOS is what
+      # renders them. (The one exception is the tmpfiles invocation, read
+      # from `.script`: NixOS spills that to a separate store derivation, so
+      # the unit text carries only an ExecStart path. It is the verbatim
+      # source of that derivation, one step from generated rather than an
+      # option describing an intention.)
+      #
+      # Two anti-vacuity floors, and the second is the one worth having:
+      #
+      #   * a host with no declared media mount must produce NO unit -- so
+      #     "present" below is a real property rather than one that holds
+      #     unconditionally, and so a no-data-disk host keeps its current
+      #     behaviour exactly.
+      #   * a POOLED host must wait for every BRANCH, not merely for the
+      #     mergerfs mount on top of them. A check that only looked at
+      #     mediaDir would pass while the case that matters most -- the
+      #     per-branch tree -- went unwaited and unseeded.
+      mediaTreeWaitsForItsMounts =
+        let
+          nofailDisk = mountPoint: label: {
+            fileSystems.${mountPoint} = {
+              device = "/dev/disk/by-label/${label}";
+              fsType = "btrfs";
+              options = [ "nofail" ];
+            };
+          };
+
+          hostWith = { storage ? { }, extra ? [ ] }: ferrumLib.mkHost {
+            inherit system;
+            settings = {
+              schemaVersion = realMigrations.currentVersion;
+              inherit storage;
+            };
+            modules = [ ../../../examples/hosts/minimal/configuration.nix ] ++ extra;
+          };
+
+          unitOf = args:
+            let cfg = (hostWith args).config; in
+            if cfg.systemd.units ? "ferrum-media-tree.service"
+            then {
+              present = true;
+              text = cfg.systemd.units."ferrum-media-tree.service".text;
+              script = cfg.systemd.services.ferrum-media-tree.script;
+            }
+            else { present = false; text = ""; script = ""; };
+
+          waitsFor = u: root: lib.hasInfix "\nRequiresMountsFor=${root}\n" u.text;
+          seeds = u: root: lib.hasInfix "--prefix=${root}" u.script;
+
+          bare = unitOf { };
+          single = unitOf { extra = [ (nofailDisk "/data" "ferrum-data") ]; };
+          pooled = unitOf {
+            storage.pool = { enable = true; branches = [ "/mnt/d0" "/mnt/d1" ]; };
+            extra = [ (nofailDisk "/mnt/d0" "d0") (nofailDisk "/mnt/d1" "d1") ];
+          };
+          pooledRoots = [ "/mnt/d0" "/mnt/d1" "/data" ];
+        in
+        {
+          ok = !bare.present
+            && single.present
+            && waitsFor single "/data"
+            && seeds single "/data"
+            && pooled.present
+            && lib.all (waitsFor pooled) pooledRoots
+            && lib.all (seeds pooled) pooledRoots;
+          message =
+            "the ferrum media tree is not ordered after the data mounts it "
+            + "is written to";
+          bareHostHasNoUnit = !bare.present;
+          singlePresent = single.present;
+          singleWaits = waitsFor single "/data";
+          singleSeeds = seeds single "/data";
+          pooledPresent = pooled.present;
+          pooledUnwaited = builtins.filter (r: !(waitsFor pooled r)) pooledRoots;
+          pooledUnseeded = builtins.filter (r: !(seeds pooled r)) pooledRoots;
+        };
+
       # ferrum.daemon.publish: the daemon RUNS and is reachable from
       # nowhere but a tunnel.
       #
@@ -2843,6 +2932,8 @@
           mkAssertionCheck "pool-branches-are-all-seeded" poolBranchesAreAllSeeded;
         pool-assertions-can-fire =
           mkAssertionCheck "pool-assertions-can-fire" poolAssertionsCanFire;
+        media-tree-waits-for-its-mounts =
+          mkAssertionCheck "media-tree-waits-for-its-mounts" mediaTreeWaitsForItsMounts;
         settings-schema-covers-every-option =
           mkAssertionCheck "settings-schema-covers-every-option" schemaCoversEveryOption;
         installer-offers-every-catalog-app =
