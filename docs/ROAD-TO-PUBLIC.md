@@ -213,6 +213,17 @@ Last updated at HEAD `288f2b3`, branch `grounding-and-install-path`. Nothing pus
       - **The aarch64 `smoke` leg failing is EXPECTED** and must not be counted: GitHub's ARM
         runners ship no `/dev/kvm`. It is a deliberate non-blocking live probe with a long comment
         saying exactly that, kept so it starts passing for free the day ARM runners gain KVM.
+      - **`stage2`'s REAL cause found 2026-09-23, and it is not the cache.** The `fallback = true`
+        fix worked: the job now gets past the cache noise, builds ferrum-install (350 tests pass
+        inside the Nix build), boots the target VM, and runs the installer — which then **exits 1
+        because it validates the Cloudflare API token against the live API** and the test supplies
+        `placeholder-cf-token`. `answers.rs:858`, added by **`d19c957` on 2026-09-21** — the exact
+        day stage2 started failing. The cache errors were noise on top of this.
+      - **The product question underneath it:** an install with a base domain cannot complete
+        without a live, valid Cloudflare token. That makes the end-to-end install untestable in CI
+        by construction, and unavailable offline. Either the validation needs a documented bypass
+        for a test/offline path, or `stage2` must drive a no-domain install — which would stop
+        exercising SSO and ACME, the parts most worth testing. **Owner decision.**
       - **`nginx-config-parses` had never passed in CI** — see the fix in `635e7d1`. It landed
         14:46 on 22 Sep; the last green run was 13:56. `nginx -t` **binds** every listen address,
         and a CI builder is unprivileged.
