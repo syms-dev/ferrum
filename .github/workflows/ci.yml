@@ -53,7 +53,9 @@ jobs:
             .#checks.x86_64-linux.root-folders-reach-the-apps \
             .#checks.x86_64-linux.migration-mechanism \
             .#checks.x86_64-linux.mkhost-applies-migration \
-            .#checks.x86_64-linux.journaldir-collision
+            .#checks.x86_64-linux.journaldir-collision \
+            .#checks.x86_64-linux.schema-refuses-every-separator-payload \
+            .#checks.x86_64-linux.directive-separators-never-reach-a-generated-file
 
       # A check nobody runs protects nothing, and this repo has now written
       # one and left it unwired twice. Sixteen of the thirty-one defined

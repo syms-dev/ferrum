@@ -36,21 +36,34 @@ in
 
     storage = {
       stateDir = mkOption {
-        type = types.str;
+        # Not types.str: this lands unquoted in a systemd.tmpfiles.rules
+        # entry (newline-separated, run as root at every activation) AND in
+        # modules/proxy/dns.nix's ReadWritePaths, a systemd unit list-field
+        # NixOS emits one unescaped line per element. See
+        # modules/lib/hostnames.nix, which carries the rendered proof.
+        type = hostnames.absolutePath;
         default = "/var/lib/ferrum/state";
         description = "Root of the btrfs subvolume that participates in snapshot/rollback.";
       };
       snapshotDir = mkOption {
-        type = types.str;
+        # Not types.str, same tmpfiles sink as stateDir above.
+        type = hostnames.absolutePath;
         default = "/var/lib/ferrum/snapshots";
       };
       journalDir = mkOption {
-        type = types.str;
+        # Not types.str, same tmpfiles sink as stateDir above. The assertion
+        # further down checks only that this path does not NEST inside the
+        # other storage roots, which is a containment question and says
+        # nothing about whether the string can carry a record separator.
+        type = hostnames.absolutePath;
         default = "/var/lib/ferrum/journal";
         description = "Where ferrum-apply records one entry per generation, correlating it to its state snapshot. Lives on @root (not the snapshotted @state subvolume) -- see the plan's storage-layout rule that /var/lib/ferrum itself must survive a rollback.";
       };
       mediaDir = mkOption {
-        type = types.str;
+        # Not types.str: the tmpfiles sink above, once directly and once per
+        # TRaSH subdirectory per pool root, plus the /etc/fstab mount point
+        # in modules/core/pool.nix.
+        type = hostnames.absolutePath;
         default = "/data";
         description = ''
           The single root under which downloads AND media both live.
@@ -91,7 +104,16 @@ in
         };
 
         branches = mkOption {
-          type = types.listOf types.str;
+          # Not types.listOf types.str, and this one reaches two grammars
+          # with two different separators: modules/core/storage.nix folds
+          # branches into treeRoots and emits a NEWLINE-separated tmpfiles
+          # rule per branch per subdirectory, while modules/core/pool.nix
+          # emits `x-systemd.requires-mounts-for=${b}` into the /etc/fstab
+          # OPTIONS field, where the separator is a COMMA. A value that was
+          # safe for one was not safe for the other -- `/mnt/d1,suid,dev`
+          # renders as real mount options on the filesystem every app
+          # writes to. See modules/lib/hostnames.nix.
+          type = types.listOf hostnames.absolutePath;
           default = [ ];
           example = [ "/mnt/ferrum-disk-0" "/mnt/ferrum-disk-1" ];
           description = ''
@@ -138,7 +160,13 @@ in
         };
       };
       mediaGroup = mkOption {
-        type = types.str;
+        # Not types.str: modules/core/storage.nix uses this as the ATTRIBUTE
+        # NAME in `users.groups.${mediaGroup}`, so it becomes a row in
+        # /etc/group -- where `\n` and `:` both separate -- as well as the
+        # group field of every media tmpfiles rule. Nix attribute names are
+        # arbitrary strings, so nothing before this type objects. See
+        # modules/lib/hostnames.nix.
+        type = hostnames.groupName;
         default = "ferrum-media";
       };
       minFreeGiB = mkOption {
@@ -169,7 +197,12 @@ in
     };
 
     secretsDir = mkOption {
-      type = types.str;
+      # Not types.str, for two separate reasons: modules/core/bootstrap.nix
+      # interpolates it unquoted into a root-executed tmpfiles rule, and
+      # modules/proxy/{acme,authelia}.nix build each sops sopsFile as
+      # `/. + "${secretsDir}/${name}.sops"`, where `..` walks out of the
+      # secrets directory at eval time. See modules/lib/hostnames.nix.
+      type = hostnames.absolutePath;
       default = "/etc/ferrum/secrets";
       description = ''
         Where per-secret .sops files live on a real deployed box (this is
@@ -210,7 +243,16 @@ in
         # A ferrum.secrets key, never a path -- the UI can only ever name a
         # secret, not point at one on disk.
         credentialSecret = mkOption {
-          type = types.str;
+          # Not types.str: modules/proxy/acme.nix makes this a path
+          # component of a sops sopsFile and modules/proxy/dns.nix makes it
+          # one of `/run/secrets/${credentialSecret}`, which is where root
+          # reads the live Cloudflare token. Neither re-validates it. The
+          # type is the same allowlist
+          # crates/ferrum-apply/src/put_secret.rs's validate_secret_name
+          # applies at the other end of the same name -- see
+          # modules/lib/hostnames.nix on why it must be the same rule and
+          # not merely a similar one.
+          type = hostnames.secretName;
           default = "acme-dns";
         };
         staging = mkOption {
@@ -270,7 +312,13 @@ in
         };
 
         staticAddress = mkOption {
-          type = types.str;
+          # Not types.str: this is the address every A record ferrum
+          # publishes points at, sent to the Cloudflare API with a live
+          # credential. The JSON serialiser makes injection impossible, so
+          # this type is about the value being a real address rather than
+          # about escaping -- a non-address here publishes every app at
+          # something that is not this server. See modules/lib/hostnames.nix.
+          type = hostnames.ipv4Literal;
           default = "";
           example = "203.0.113.10";
           description = ''
@@ -286,7 +334,11 @@ in
         };
 
         cnameTarget = mkOption {
-          type = types.str;
+          # Not types.str: same sink and same reasoning as staticAddress
+          # above. dnsName rather than a new type because this is the same
+          # kind of value as proxy.baseDomain, and the empty string means
+          # the same thing at both -- "not configured".
+          type = hostnames.dnsName;
           default = "";
           example = "myhost.dynamic-dns.example.net";
           description = ''
@@ -298,7 +350,15 @@ in
         };
 
         adoptedNames = mkOption {
-          type = types.listOf types.str;
+          # Not types.listOf types.str: each entry authorises ferrum to
+          # OVERWRITE a DNS record it did not create -- the single exception
+          # to the ownership rule below. dnsLabel rather than dnsName
+          # because an empty entry authorises nothing and can only be a
+          # mistake, and because it is what makes this option's own
+          # statement that "there is no value here that means all of them"
+          # true: `*.example.com` is refused outright rather than merely
+          # being a name no record happens to have.
+          type = types.listOf hostnames.dnsLabel;
           default = [ ];
           example = [ "plex.example.com" ];
           description = ''
@@ -402,21 +462,25 @@ in
       '';
     };
 
-    backup = {
-      enable = mkEnableOption "scheduled state backups";
-      repo = mkOption {
-        type = types.str;
-        default = "";
-      };
-      schedule = mkOption {
-        type = types.str;
-        default = "daily";
-      };
-      passwordSecret = mkOption {
-        type = types.str;
-        default = "restic-password";
-      };
-    };
+    # `ferrum.backup` was declared here -- enable, repo, schedule,
+    # passwordSecret -- and is DELETED rather than constrained, because a
+    # forward sweep of every settings leaf to every sink found it reached
+    # none. No module, no service, no timer, no crate ever read any of the
+    # four. See docs/superpowers/specs/2026-09-21-phase-1-9-ship-it-design.md
+    # R26, which is where backup gets built, and whose A5 is exactly this:
+    # until it works, the settings UI must not present it as functional.
+    #
+    # Deleting is not tidying. An option with no sink is worse than an
+    # absent one in both directions: an operator who sets backup.repo gets
+    # no error and no backup, and a reviewer sweeping this file for values
+    # that need a type reasonably assumes a declared option is consumed and
+    # validated somewhere. This one had to be traced to nothing, twice.
+    #
+    # Reversible, and the way back is the point: reintroduce these four
+    # TOGETHER WITH the module that reads them, at which point repo and
+    # passwordSecret want hostnames.absolutePath and hostnames.secretName
+    # respectively -- both of which now exist. `ferrum.apps.<id>.backup.enable`
+    # in modules/lib/app-submodule.nix is a DIFFERENT option and is untouched.
 
     apply = {
       autoRollbackOnFailure = mkOption {

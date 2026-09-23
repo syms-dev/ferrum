@@ -1075,7 +1075,7 @@ fn final_report(
     // Printed once, to the terminal, and written to no file.
     println!("\nfirst-run credentials -- shown ONCE, stored nowhere by this installer:");
     for (what, path) in verify::credential_paths(answers.sso.enabled) {
-        match collect::run(&pre.target, &pre.ssh_auth, &format!("cat {path}")) {
+        match collect::run(&pre.target, &pre.ssh_auth, &verify::read_credential_command(path)) {
             Ok(value) => println!("  {what:<15} {}", value.trim()),
             Err(e) => println!("  {what:<15} (could not read {path}: {e})"),
         }

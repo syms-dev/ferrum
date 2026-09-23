@@ -19,7 +19,7 @@
 use std::io::Read;
 use std::path::Path;
 
-use ferrum_secrets::{encrypt_and_write, host_age_recipient};
+use ferrum_secrets::{encrypt_and_write, host_age_recipient, validate_secret_name};
 
 /// What `put_secret_in` did, so the caller can report it truthfully rather
 /// than saying "wrote" when it deliberately left an existing file alone.
@@ -32,32 +32,6 @@ pub enum Outcome {
     /// second stage-2 attempt must not fail merely because the first one
     /// got this far.
     Unchanged,
-}
-
-/// Rejects any name that is not a plain lowercase secret identifier.
-///
-/// This is an allowlist on purpose. The name becomes a path component under
-/// `secretsDir`, so a denylist for `..` and `/` would be one encoding trick
-/// away from writing outside it; every real secret in the tree
-/// (`acme-dns`, `authelia-jwt-secret`, `sabnzbd-apikey`, `qbittorrent-vpn`)
-/// already matches this shape.
-pub fn validate_secret_name(name: &str) -> anyhow::Result<()> {
-    if name.is_empty() {
-        anyhow::bail!("secret name is empty");
-    }
-    if !name
-        .chars()
-        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
-    {
-        anyhow::bail!(
-            "secret name {name:?} is not a plain secret identifier \
-             (lowercase letters, digits and '-' only)"
-        );
-    }
-    if name.starts_with('-') || name.ends_with('-') {
-        anyhow::bail!("secret name {name:?} must not start or end with '-'");
-    }
-    Ok(())
 }
 
 /// Encrypts `value` to this host's age recipient and writes it to

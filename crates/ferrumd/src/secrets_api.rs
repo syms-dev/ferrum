@@ -41,6 +41,27 @@ fn is_declared_secret(name: &str) -> anyhow::Result<bool> {
 /// blocking pool in a single hop rather than bouncing between pools four
 /// times.
 fn write_secret_blocking(name: &str, plaintext: &str) -> (StatusCode, String) {
+    // SEC3-M01. FIRST, before a settings document is read and long before
+    // anything is joined to `secrets_dir()`. `name` is the only component
+    // of the destination path and axum has already percent-decoded it, so
+    // `%2f` reaches here as a real separator; `Path::join` neither
+    // normalises nor refuses, so the write simply landed outside. This is
+    // `jobs.rs`'s shape for job ids -- reject the component, then build the
+    // path -- and the ordering is the control: `is_declared_secret` asks
+    // whether settings.json names this key, and settings.json is itself
+    // operator-writable, so a declaration can never be what makes a path
+    // safe.
+    //
+    // The allowlist is `ferrum-secrets`' own, shared with `ferrum-apply
+    // put-secret`, which is the other writer of this same directory. The
+    // schema gains a matching `propertyNames` constraint separately; two
+    // layers is the intent, not redundancy, and this one has to hold on its
+    // own because the schema governs what may be DECLARED rather than what
+    // may be POSTED.
+    if let Err(e) = ferrum_secrets::validate_secret_name(name) {
+        return (StatusCode::BAD_REQUEST, e.to_string());
+    }
+
     match is_declared_secret(name) {
         Ok(true) => {}
         Ok(false) => {
@@ -164,6 +185,64 @@ mod tests {
         let (status, body) = write_secret_blocking("cloudflare-token", "value");
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_no_path_leaked(&body, &absent_key.to_string_lossy());
+    }
+
+    /// SEC3-M01. The secret's name is the ONE component of the destination
+    /// path, and axum percent-decodes before a handler sees it, so
+    /// `POST /api/secrets/..%2f..%2f..%2froot%2f.ssh%2fauthorized_keys`
+    /// arrives here as a real traversal and `secrets_dir().join(..)` leaves
+    /// the directory without complaint. Proved live at the security gate:
+    /// HTTP 200, resolved to
+    /// `/etc/ferrum/secrets/../../../root/.ssh/authorized_keys.sops` --
+    /// breaking this file's own stated invariant that it is not "an
+    /// open-ended file-write primitive".
+    ///
+    /// The declaration check is not a path check. It asks whether
+    /// `settings.json` names this key, and `settings.json` is operator-
+    /// writable through this same API. So the refusal has to come first, in
+    /// the shape `jobs.rs:225` already uses for job ids: reject the
+    /// component before anything is joined to it.
+    ///
+    /// This test sets no environment variable, and that is what makes it
+    /// sharp rather than merely convenient: the refusal must land before
+    /// `is_declared_secret` reads `FERRUM_SETTINGS_PATH` at all, so no
+    /// settings document can authorise one of these. Before the fix each of
+    /// these reached the settings read and came back 500.
+    #[test]
+    fn a_traversing_secret_name_is_refused_before_any_path_is_built() {
+        for bad in [
+            "../../../root/.ssh/authorized_keys",
+            "../evil",
+            "..",
+            "a/b",
+            "/etc/passwd",
+            "acme dns",
+            "",
+        ] {
+            let (status, body) = write_secret_blocking(bad, "value");
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "name {bad:?} was not refused outright (body: {body})"
+            );
+            assert!(
+                body.contains("secret name"),
+                "name {bad:?} was refused, but for the wrong reason: {body}"
+            );
+        }
+    }
+
+    /// The sink itself, so the reason the check above exists cannot be
+    /// deleted as unexplained. `Path::join` does not normalise and does not
+    /// refuse: a traversing component simply becomes part of the path.
+    #[test]
+    fn joining_a_traversing_name_really_does_leave_the_secrets_directory() {
+        let escaped = std::path::Path::new("/etc/ferrum/secrets")
+            .join(format!("{}.sops", "../../../root/.ssh/authorized_keys"));
+        assert_eq!(
+            escaped.to_string_lossy(),
+            "/etc/ferrum/secrets/../../../root/.ssh/authorized_keys.sops"
+        );
     }
 
     /// Asserts a response body says what failed without saying where.

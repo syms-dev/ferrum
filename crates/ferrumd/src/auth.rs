@@ -153,31 +153,17 @@ impl LoginOutcome {
 /// How far back failures are counted when deciding to throttle a source.
 const PRUNE_AFTER_SECS: i64 = RATE_LIMIT_WINDOW_SECS;
 
-/// Whether a source is currently inside a lockout, on either axis.
+/// Whether the caller's OWN bucket is currently inside a lockout -- rule 1,
+/// the fine axis.
 ///
-/// TWO rules, because a single one cannot hold both properties this
-/// throttle needs.
+/// Counts failures against the caller's own key, which is claim-derived
+/// (`ClientAddr::throttle_key`). That is what keeps two remote clients in
+/// separate buckets, so a stranger cannot lock the operator out. It is
+/// M-02's fix, and its consequence is a REFUSAL taken before argon2 runs:
+/// the key belongs to one requester, so denying it denies nobody else.
 ///
-/// Rule 1 -- the fine axis -- counts failures against the caller's own key,
-/// which is claim-derived (`ClientAddr::throttle_key`). That is what keeps
-/// two remote clients in separate buckets, so a stranger cannot lock the
-/// operator out. It is M-02's fix and it is unchanged.
-///
-/// Rule 2 -- the coarse axis, SEC-03 -- counts how many DISTINCT keys the
-/// caller's TRUST DOMAIN (`ClientAddr::peer_key`) has failed under. Rule 1
-/// alone is escapable from on-box: nothing proves an `X-Real-IP` came from
-/// nginx, so a local process picks a fresh claimed address per request and
-/// never accumulates five failures anywhere. It cannot pick a fresh peer
-/// key, because every loopback address folds into one. So the evasion
-/// itself becomes the thing that is counted.
-///
-/// The trade rule 2 makes, stated rather than buried: eleven distinct
-/// remote addresses failing a login inside five minutes will throttle the
-/// whole loopback domain for 60 seconds, and an on-box process can trip
-/// that deliberately. The first is a distributed attack rather than the
-/// single stranger M-02 was about; the second is available to code that is
-/// already running on the host and could stop ferrumd outright. Neither is
-/// a route back to the unauthenticated remote lockout that M-02 removed.
+/// This is also where the attempt table is pruned, because this is the one
+/// check every attempt passes through before any work is done.
 ///
 /// # Arguments
 /// * `db` - the open database.
@@ -187,7 +173,7 @@ const PRUNE_AFTER_SECS: i64 = RATE_LIMIT_WINDOW_SECS;
 ///
 /// # Errors
 /// Any SQLite failure pruning or counting.
-fn is_throttled(db: &Db, scope: &str, client: &ClientAddr) -> anyhow::Result<bool> {
+fn fine_axis_throttled(db: &Db, scope: &str, client: &ClientAddr) -> anyhow::Result<bool> {
     // Bounded here rather than by a timer: `login_attempts` is pure throttle
     // state with no value once it ages out, and before this the table grew
     // without limit on attacker-chosen usernames -- an unauthenticated remote
@@ -199,50 +185,110 @@ fn is_throttled(db: &Db, scope: &str, client: &ClientAddr) -> anyhow::Result<boo
     )?;
 
     let key = scoped_key(scope, &client.throttle_key());
-    let peer = scoped_key(scope, &client.peer_key());
-    let window_start = now() - RATE_LIMIT_WINDOW_SECS;
-
     let recent_failures: i64 = db.conn().query_row(
         "SELECT count(*) FROM login_attempts WHERE ip = ?1 AND succeeded = 0 AND attempted_at > ?2",
-        rusqlite::params![key, window_start],
+        rusqlite::params![key, now() - RATE_LIMIT_WINDOW_SECS],
         |row| row.get(0),
     )?;
-    if recent_failures >= MAX_FAILURES_PER_WINDOW && in_cooldown(db, "ip", &key)? {
-        return Ok(true);
-    }
+    Ok(recent_failures >= MAX_FAILURES_PER_WINDOW && in_cooldown(db, "ip", &key)?)
+}
 
+/// Whether the caller's TRUST DOMAIN has been failing under more DISTINCT
+/// claimed addresses than one domain plausibly holds -- rule 2, the coarse
+/// axis, SEC-03.
+///
+/// Rule 1 alone is escapable from on-box: nothing proves an `X-Real-IP`
+/// came from nginx, so a local process picks a fresh claimed address per
+/// request and never accumulates five failures anywhere. It cannot pick a
+/// fresh peer key, because every loopback address folds into one
+/// (`client_addr.rs`'s `LOOPBACK_TRUST_DOMAIN`). So the evasion itself
+/// becomes the thing that is counted.
+///
+/// # WHY THIS IS NOT A PRE-VERIFICATION REFUSAL (SEC3-H01)
+///
+/// It used to be, and that was an outage rather than a defence. Look at
+/// which callers can ever reach the threshold: an off-box peer's
+/// `peer_key` is `peer:<its own ip>` and its `throttle_key` is derived
+/// from the same address, so `count(DISTINCT ip)` within that domain is
+/// permanently 1 and this rule can never fire for it. The ONLY domain this
+/// rule can fire for is `loopback` -- and every request that arrives
+/// through nginx presents the socket peer `127.0.0.1`, so `loopback` is
+/// the bucket holding the entire remote internet, every local caller, and
+/// the SSH-tunnel recovery route, all at once. A refusal on this axis is
+/// therefore never a refusal of one requester; it is a refusal of
+/// everybody, including an operator typing the correct password, and
+/// including the one route back in when the proxy is what broke. Eleven
+/// strangers failing a login was enough to trigger it.
+///
+/// That is the third instance of one defect class in this codebase --
+/// M-02 (keyed on the attacker-chosen username), SEC3-M03 (Authelia's
+/// username-keyed regulation) and this one. The generalisation, worth more
+/// than any of the three patches: **a throttle keyed on an axis its
+/// requesters SHARE is a denial of service with extra steps.** Before
+/// adding one, answer: who else is in this bucket, and does tripping it
+/// refuse the correct password?
+///
+/// So the axis keeps its detection and loses its veto. The caller pays the
+/// argon2 verification either way; a correct password is honoured; a wrong
+/// one is reported as `Throttled` rather than `BadCredentials`, which is
+/// the strongest consequence available that cannot lock anyone out.
+///
+/// What that gives up, stated rather than buried: this no longer bounds
+/// argon2 work from an on-box caller rotating its claim. It cannot,
+/// because bounding that work means refusing requests in the shared
+/// bucket. The trade is deliberate -- an on-box caller is already inside
+/// the trust boundary and could stop ferrumd outright, whereas the
+/// operator being locked out is the failure that actually strands someone.
+/// Off-box rate is still bounded a layer up by nginx's `limit_req` on
+/// `/api/login` (`modules/proxy/nginx.nix`).
+///
+/// # Arguments
+/// * `db` - the open database.
+/// * `scope` - as [`fine_axis_throttled`].
+/// * `client` - the resolved origin of the request.
+///
+/// # Errors
+/// Any SQLite failure counting distinct claims.
+fn coarse_axis_saturated(db: &Db, scope: &str, client: &ClientAddr) -> anyhow::Result<bool> {
+    let peer = scoped_key(scope, &client.peer_key());
     let claimed_sources: i64 = db.conn().query_row(
         "SELECT count(DISTINCT ip) FROM login_attempts \
          WHERE peer = ?1 AND succeeded = 0 AND attempted_at > ?2",
-        rusqlite::params![peer, window_start],
+        rusqlite::params![peer, now() - RATE_LIMIT_WINDOW_SECS],
         |row| row.get(0),
     )?;
-    if claimed_sources > MAX_CLAIMED_SOURCES_PER_WINDOW && in_cooldown(db, "peer", &peer)? {
-        return Ok(true);
-    }
-
-    Ok(false)
+    Ok(claimed_sources > MAX_CLAIMED_SOURCES_PER_WINDOW && in_cooldown(db, "peer", &peer)?)
 }
 
-/// Whether the most recent attempt matching `column = value` is still inside
-/// the lockout window.
+/// Whether the most recent FAILED attempt matching `column = value` is
+/// still inside the lockout window.
+///
+/// `succeeded = 0` is load-bearing and was missing (SEC3-H01's second
+/// fault). Successes are recorded in this table too, so without the filter
+/// the lockout asked "when did anything last happen here?" and ordinary
+/// working traffic kept an already-expired lockout alive indefinitely. On
+/// the shared `loopback` bucket that meant the appliance's own healthy
+/// logins were what sustained the outage; on a single source it meant a
+/// caller who failed five times and then succeeded was thrown back out on
+/// their next request. A cooldown must be cleared by the passage of time,
+/// never refreshed by the traffic it is not supposed to be punishing.
 ///
 /// `column` is one of this module's two compile-time literals (`ip`,
 /// `peer`); SQLite accepts no bound parameter in that position, so it is
 /// formatted in. `value` is bound.
 ///
 /// # Errors
-/// Any SQLite failure reading the most recent attempt.
+/// Any SQLite failure reading the most recent failure.
 fn in_cooldown(db: &Db, column: &str, value: &str) -> anyhow::Result<bool> {
     // `max` over an empty set is NULL, which is why this reads as an Option
     // rather than an i64: pruning can remove every row for a source between
     // the count above and this lookup.
-    let last_attempt: Option<i64> = db.conn().query_row(
-        &format!("SELECT max(attempted_at) FROM login_attempts WHERE {column} = ?1"),
+    let last_failure: Option<i64> = db.conn().query_row(
+        &format!("SELECT max(attempted_at) FROM login_attempts WHERE {column} = ?1 AND succeeded = 0"),
         rusqlite::params![value],
         |row| row.get(0),
     )?;
-    Ok(last_attempt.is_some_and(|last| now() - last < LOCKOUT_SECS))
+    Ok(last_failure.is_some_and(|last| now() - last < LOCKOUT_SECS))
 }
 
 /// Records one credential check, whichever way it went.
@@ -253,7 +299,7 @@ fn in_cooldown(db: &Db, column: &str, value: &str) -> anyhow::Result<bool> {
 ///
 /// # Arguments
 /// * `db` - the open database.
-/// * `scope` - as [`is_throttled`].
+/// * `scope` - as [`fine_axis_throttled`].
 /// * `client` - the resolved origin of the request.
 /// * `username` - the account this attempt named. Evidence only; it has not
 ///   been a throttle key since M-02.
@@ -336,22 +382,30 @@ fn absent_user_hash() -> &'static str {
 /// The username is still recorded on every attempt. It is evidence for the
 /// audit log, and no longer a gate.
 ///
-/// The check still runs BEFORE argon2, which is the one thing worth keeping
-/// from the original design: verification is deliberately expensive, so a
-/// throttled source must not be able to make the daemon do it. That does
-/// mean a throttled source is refused even with the right password -- but it
-/// is a 60-second cooldown on the source's own address, self-clearing, and
-/// unreachable by anyone else. For a single-operator appliance that is the
-/// right trade: an operator who mistypes five times waits a minute, where
-/// before a stranger could lock them out for as long as they cared to.
+/// The FINE axis still runs BEFORE argon2, which is the one thing worth
+/// keeping from the original design: verification is deliberately
+/// expensive, so a source that has burnt its own bucket must not be able to
+/// make the daemon do it. That does mean such a source is refused even with
+/// the right password -- but it is a 60-second cooldown on the source's own
+/// address, self-clearing, and unreachable by anyone else. For a
+/// single-operator appliance that is the right trade: an operator who
+/// mistypes five times waits a minute, where before a stranger could lock
+/// them out for as long as they cared to.
+///
+/// The COARSE axis is deliberately consulted only AFTER verification, and
+/// only when verification failed, so it can never deny a correct password.
+/// It is the one bucket every caller shares; `coarse_axis_saturated` states
+/// at length why a refusal there is an outage rather than a defence
+/// (SEC3-H01).
 ///
 /// # Arguments
 /// * `db` - the open database.
 /// * `username` - the submitted username, recorded but never a throttle key.
 /// * `password` - the submitted password.
 /// * `client` - the resolved origin of the request. Both of its throttle
-///   axes are used: see `is_throttled`, and `client_addr.rs` for what the
-///   claimed address does and does not prove.
+///   axes are used, with different consequences: see
+///   [`fine_axis_throttled`] and [`coarse_axis_saturated`], and
+///   `client_addr.rs` for what the claimed address does and does not prove.
 ///
 /// # Errors
 /// A database failure, a corrupt stored hash, or an RNG failure. Never a
@@ -362,7 +416,7 @@ pub fn login(
     password: &str,
     client: &ClientAddr,
 ) -> anyhow::Result<LoginOutcome> {
-    if is_throttled(db, LOGIN_SCOPE, client)? {
+    if fine_axis_throttled(db, LOGIN_SCOPE, client)? {
         return Ok(LoginOutcome::Throttled);
     }
 
@@ -396,6 +450,14 @@ pub fn login(
     record_attempt(db, LOGIN_SCOPE, client, username, succeeded)?;
 
     if !succeeded {
+        // Rule 2 gets to change the ANSWER TO A FAILURE, never the answer to
+        // a success. A saturated shared bucket reports 429 instead of 401 --
+        // visible to an attacker probing it, useless to one trying to strand
+        // the operator, because the operator's correct password has already
+        // been honoured above.
+        if coarse_axis_saturated(db, LOGIN_SCOPE, client)? {
+            return Ok(LoginOutcome::Throttled);
+        }
         return Ok(LoginOutcome::BadCredentials);
     }
     let (user_id, _) = row.expect("succeeded implies row was Some");
@@ -570,7 +632,7 @@ pub fn change_password(
     if new_password.is_empty() {
         anyhow::bail!("the new password must not be empty");
     }
-    if is_throttled(db, PASSWORD_SCOPE, client)? {
+    if fine_axis_throttled(db, PASSWORD_SCOPE, client)? {
         return Ok(PasswordChangeOutcome::Throttled);
     }
 
@@ -600,6 +662,12 @@ pub fn change_password(
     // id. It is evidence for the throttle, never a key.
     record_attempt(db, PASSWORD_SCOPE, client, &user_id.to_string(), verified)?;
     if !verified {
+        // As in `login`: the shared axis may relabel a failure, never deny a
+        // success. The operator's correct current password has already been
+        // honoured by the time this runs.
+        if coarse_axis_saturated(db, PASSWORD_SCOPE, client)? {
+            return Ok(PasswordChangeOutcome::Throttled);
+        }
         return Ok(PasswordChangeOutcome::WrongPassword);
     }
 
@@ -786,8 +854,17 @@ mod tests {
         let password = password.trim();
 
         // A different claimed address every time, so rule 1 never sees a
-        // second failure against any one key.
-        for i in 0..=MAX_CLAIMED_SOURCES_PER_WINDOW {
+        // second failure against any one key. Exactly
+        // MAX_CLAIMED_SOURCES_PER_WINDOW of them, which is the number the
+        // constant says a peer MAY fail under.
+        //
+        // This bound used to be one higher, because the rule was evaluated
+        // before the attempt in hand was recorded and so counted one claim
+        // late -- an off-by-one against the constant's own documentation.
+        // Moving the check after verification (SEC3-H01) necessarily moved
+        // it after `record_attempt` too, which incidentally makes the
+        // threshold mean what it says.
+        for i in 0..MAX_CLAIMED_SOURCES_PER_WINDOW {
             let attacker = claiming(&format!("203.0.113.{i}"));
             assert!(
                 matches!(
@@ -806,15 +883,20 @@ mod tests {
             "a caller that escapes its own bucket by rotating X-Real-IP must still be throttled"
         );
 
-        // And the throttle really refuses work rather than merely recording
-        // it: even the correct password does not get past a locked-out
-        // source, which is what makes this a bound on argon2 guessing.
+        // And the consequence stops exactly there. This assertion used to
+        // read the other way -- it required the CORRECT password to be
+        // refused as well, and called that "a bound on argon2 guessing". It
+        // was really SEC3-H01: the only trust domain this rule can ever fire
+        // for is `loopback`, which is the one bucket every proxied request,
+        // every local caller and the SSH-tunnel recovery route share, so
+        // refusing it refused the operator. See `coarse_axis_saturated` for
+        // the full argument and for what bounding argon2 would have cost.
         assert!(
-            matches!(
-                login(&db, "admin", password, &claiming("203.0.113.201")).unwrap(),
-                LoginOutcome::Throttled
-            ),
-            "a throttled source must not be able to make the daemon verify a password"
+            login(&db, "admin", password, &claiming("203.0.113.201"))
+                .unwrap()
+                .session()
+                .is_some(),
+            "a saturated SHARED bucket must never deny a correct password"
         );
     }
 
@@ -863,6 +945,114 @@ mod tests {
                 .session()
                 .is_some(),
             "exactly MAX_CLAIMED_SOURCES_PER_WINDOW distinct claims must not throttle the box"
+        );
+    }
+
+    /// SEC3-H01. The case the suite never exercised, and the reason the
+    /// trade the coarse axis makes was never observed to be an outage.
+    ///
+    /// Every request that arrives through nginx presents the socket peer
+    /// `127.0.0.1`, so `peer_key` folds the whole remote internet into the
+    /// ONE loopback bucket. Eleven distinct remote clients failing a login
+    /// inside the window saturate the coarse axis -- and the operator,
+    /// holding the CORRECT password, is a twelfth request in that same
+    /// bucket. Eleven strangers must not be able to lock the appliance's
+    /// only account out: that is M-02's headline property arriving one
+    /// level up.
+    ///
+    /// The suite pinned only `the_peer_rule_does_not_fire_below_its_threshold`,
+    /// and below the threshold is the case where nothing happens.
+    #[test]
+    fn eleven_remote_failures_must_not_lock_the_real_operator_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("test.db")).unwrap();
+        ensure_first_user(&db, dir.path()).unwrap();
+        let password = std::fs::read_to_string(dir.path().join("ferrumd-setup-password")).unwrap();
+
+        for i in 0..=MAX_CLAIMED_SOURCES_PER_WINDOW {
+            let _ = login(&db, "admin", "wrong", &claiming(&format!("203.0.113.{i}"))).unwrap();
+        }
+
+        assert!(
+            login(&db, "admin", password.trim(), &claiming("203.0.113.222"))
+                .unwrap()
+                .session()
+                .is_some(),
+            "eleven strangers behind nginx must not deny the operator their own correct password"
+        );
+    }
+
+    /// SEC3-H01's second half: the failure and the remedy are the same door.
+    ///
+    /// The documented way back in when the proxy is broken is an SSH tunnel
+    /// straight to ferrumd's loopback port. Such a request carries no
+    /// `X-Real-IP`, so it resolves to `Direct(127.0.0.1)` -- whose
+    /// `peer_key` is the SAME `loopback` bucket every proxied request lands
+    /// in. A coarse-axis lockout therefore closed the recovery route at the
+    /// exact moment it was needed.
+    #[test]
+    fn the_ssh_tunnel_recovery_route_survives_a_saturated_loopback_bucket() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("test.db")).unwrap();
+        ensure_first_user(&db, dir.path()).unwrap();
+        let password = std::fs::read_to_string(dir.path().join("ferrumd-setup-password")).unwrap();
+
+        for i in 0..=MAX_CLAIMED_SOURCES_PER_WINDOW {
+            let _ = login(&db, "admin", "wrong", &claiming(&format!("203.0.113.{i}"))).unwrap();
+        }
+
+        // `test_client()` is `Direct(127.0.0.1)` -- the tunnel, with no
+        // proxy in front of it and nothing to claim.
+        let tunnelled = test_client();
+        assert_eq!(
+            tunnelled.peer_key(),
+            claiming("203.0.113.1").peer_key(),
+            "the tunnel really does share the saturated bucket -- that is the point of the test"
+        );
+        assert!(
+            login(&db, "admin", password.trim(), &tunnelled).unwrap().session().is_some(),
+            "the recovery route must not be closed by the failure it exists to recover from"
+        );
+    }
+
+    /// SEC3-H01's compounding fault: `in_cooldown` asked for the most recent
+    /// attempt of ANY kind, so ordinary successful traffic kept an expired
+    /// lockout alive indefinitely.
+    ///
+    /// Written against the table directly because the property is about
+    /// TIME and the lockout is a minute long. Five failures are back-dated
+    /// past their own 60s cooldown but left inside the 300s counting window,
+    /// so the count rule still matches and the cooldown is the only thing
+    /// left deciding. One recent SUCCESS is then recorded from the same
+    /// source. If a success can refresh the cooldown, that source is locked
+    /// out of its own account by its own successful login.
+    #[test]
+    fn a_recent_success_must_not_keep_an_expired_lockout_alive() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("test.db")).unwrap();
+        ensure_first_user(&db, dir.path()).unwrap();
+        let password = std::fs::read_to_string(dir.path().join("ferrumd-setup-password")).unwrap();
+
+        let client = test_client();
+        let ip = scoped_key(LOGIN_SCOPE, &client.throttle_key());
+        let peer = scoped_key(LOGIN_SCOPE, &client.peer_key());
+        let record = |at: i64, succeeded: i64| {
+            db.conn()
+                .execute(
+                    "INSERT INTO login_attempts (username, attempted_at, succeeded, ip, peer) \
+                     VALUES ('admin', ?1, ?2, ?3, ?4)",
+                    rusqlite::params![at, succeeded, ip, peer],
+                )
+                .unwrap();
+        };
+        for _ in 0..MAX_FAILURES_PER_WINDOW {
+            record(now() - LOCKOUT_SECS - 5, 0);
+        }
+        record(now(), 1);
+
+        assert!(
+            login(&db, "admin", password.trim(), &client).unwrap().session().is_some(),
+            "a successful login must not be the thing that sustains a lockout"
         );
     }
 
