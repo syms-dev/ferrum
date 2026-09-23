@@ -1800,7 +1800,12 @@
       #     published dashboard) -- because a certificate for a name that
       #     does not resolve is the incident R1 exists to fix, and the two
       #     conditions had already drifted apart once.
-      #   * the daemon's own record is present (owner ruling H-01, option C).
+      #   * the daemon's own record is present when the daemon is actually
+      #     published (owner ruling H-01, option C) and absent when it is
+      #     not -- proxyLib.daemonPublished, the same predicate the vhost,
+      #     the Authelia rule and the certificate all read. This file was
+      #     the one consumer that did not read it, so an unpublished daemon
+      #     got a record for a hostname nginx answers with `return 444`.
       #   * EVERY record carries proxied = false (D-05). Cloudflare's orange
       #     cloud makes every request arrive from a Cloudflare edge address,
       #     which inverts nginx.nix's allow/deny against trustedNetworks into
@@ -1879,6 +1884,29 @@
             auth = true;
             daemon.dns.includeRecord = false;
           }).config.system.build.ferrumDnsConfig;
+          # ferrum.daemon.publish = false: the daemon RUNS but is reachable
+          # only over the SSH tunnel modules/core/daemon.nix's A5 assertion
+          # protects. Every other consumer of proxyLib.daemonPublished --
+          # the vhost, the Authelia rule, the certificate -- already reads
+          # it through that one predicate, and this file was the single
+          # consumer that did not: daemonRecords was keyed on
+          # ferrum.daemon.dns.includeRecord ALONE, so an unpublished daemon
+          # still got a public record for a hostname nginx's catch-all
+          # answers with `return 444`.
+          #
+          # That is the auth.thesyms.ca defect with the sign flipped -- a
+          # record with nothing behind it rather than a certificate with
+          # nothing behind it -- and it is exactly what a stage-1 installer
+          # host now looks like, so it stopped being a hypothetical the
+          # moment ferrum.daemon.publish existed.
+          #
+          # radarr stays public, as in recordExcluded above, so the document
+          # still has a record in it: an absence found in an empty list is
+          # not a finding.
+          publishOff = (mkDnsHost {
+            auth = true;
+            daemon.publish = false;
+          }).config.system.build.ferrumDnsConfig;
         in
         pkgs.runCommand "ferrum-check-dns-record-set" { } ''
           set -eu
@@ -1887,6 +1915,7 @@
           dashboard_only=${dashboardOnly}
           proxy_off=${proxyOff}
           record_excluded=${recordExcluded}
+          publish_off=${publishOff}
           fail() {
             echo "dns record-set check: $1" >&2
             echo "--- with auth ---" >&2; cat "$with_auth" >&2
@@ -1894,6 +1923,7 @@
             echo "--- dashboard only ---" >&2; cat "$dashboard_only" >&2
             echo "--- proxy off ---" >&2; cat "$proxy_off" >&2
             echo "--- record excluded ---" >&2; cat "$record_excluded" >&2
+            echo "--- publish off ---" >&2; cat "$publish_off" >&2
             exit 1
           }
 
@@ -1935,21 +1965,36 @@
             "$dashboard_only" > /dev/null \
             || fail "the dashboard-only host has no record for the dashboard itself"
 
-          # A7, the proxy-off half. The daemon record below is the
-          # anti-vacuity guard and nothing more: an absence found in an empty
-          # record list is not a finding, so the auth assertion is only worth
-          # anything once this document is shown to contain records at all.
-          # (That the daemon record is present on a host with no proxy is
-          # daemonRecords' own unconditional `lib.optional
-          # ferrum.daemon.dns.includeRecord` -- a known, separately-owned
-          # gap, deliberately not this check's business.)
-          ${pkgs.jq}/bin/jq -e '.records[] | select(.source == "daemon")' \
+          # A7, the proxy-off half.
+          #
+          # The anti-vacuity guard here USED TO BE "this document contains a
+          # daemon record", and that only ever worked because daemonRecords
+          # ignored proxyLib.daemonPublished -- an absence proof propped up
+          # by the very gap the publishOff fixture above closes. With the
+          # daemon record moving on the same predicate as the auth record,
+          # this fixture's record list is legitimately EMPTY, and "no auth
+          # record in an empty list" proves nothing on its own.
+          #
+          # So the guard is a differential instead of a presence.
+          # $dashboard_only is this exact fixture with ferrum.proxy.enable =
+          # true -- same auth, same lan-only app set, same everything else --
+          # and it is asserted above to carry BOTH the auth record and the
+          # daemon record. The only difference between a document with two
+          # records and a document with none is therefore the proxy term,
+          # which is the claim. The baseDomain assertion pins that this is a
+          # generated document rather than an empty default: a file that
+          # failed to describe this host would have no records either.
+          ${pkgs.jq}/bin/jq -e '.baseDomain == "example.invalid"' \
             "$proxy_off" > /dev/null \
-            || fail "the proxy-off document has no records at all, so finding no auth record in it proves nothing"
+            || fail "the proxy-off document does not carry this fixture's baseDomain, so it is not the generated config and every absence claimed of it is vacuous"
 
           ${pkgs.jq}/bin/jq -e '[.records[] | select(.source == "auth")] | length == 0' \
             "$proxy_off" > /dev/null \
             || fail "a host with ferrum.proxy.enable = false got an auth.example.invalid record -- nginx builds no vhost for it, so that publishes a name with nothing behind it (A7)"
+
+          ${pkgs.jq}/bin/jq -e '[.records[] | select(.source == "daemon")] | length == 0' \
+            "$proxy_off" > /dev/null \
+            || fail "a host with ferrum.proxy.enable = false got a daemon record -- nginx never runs on it, so the name resolves to a box serving nothing at all (A7)"
 
           # ferrum.daemon.dns.includeRecord = false, the only behaviour that
           # option has. The radarr assertion first, for the same reason as
@@ -1962,7 +2007,26 @@
             "$record_excluded" > /dev/null \
             || fail "ferrum.daemon.dns.includeRecord = false still produced a daemon record -- the documented one-line way to opt out of the H-01 ruling does nothing"
 
-          for cfg in "$with_auth" "$without_auth" "$dashboard_only" "$proxy_off" "$record_excluded"; do
+          # ferrum.daemon.publish = false. radarr first, same anti-vacuity
+          # reason as above, and it is also the positive half of the claim:
+          # unpublishing the DASHBOARD must not unpublish the APPS.
+          ${pkgs.jq}/bin/jq -e '.records[] | select(.source == "app:radarr")' \
+            "$publish_off" > /dev/null \
+            || fail "the publish = false document has no app records at all -- either it is not the generated config, so finding no daemon record in it proves nothing, or unpublishing the dashboard has unpublished the apps too"
+
+          ${pkgs.jq}/bin/jq -e '[.records[] | select(.source == "daemon")] | length == 0' \
+            "$publish_off" > /dev/null \
+            || fail "ferrum.daemon.publish = false still produced a daemon record. Nothing serves that name -- nginx builds no vhost for an unpublished daemon, so its catch-all answers with a 444 and closes -- and acme.nix issues no certificate for it, so this is a public record pointing at a closed connection on a host whose dashboard is deliberately tunnel-only"
+
+          # D-05, over every fixture whose record list is non-empty.
+          # $proxy_off is deliberately absent from this list and must stay
+          # absent: its records are now legitimately zero, and the
+          # `(.records | length) > 0` term below is the anti-vacuity half of
+          # this loop -- including it would turn "no record is proxied" into
+          # a hard failure on a document that has nothing to proxy, and
+          # dropping that term to accommodate it would let this loop pass
+          # over five empty lists.
+          for cfg in "$with_auth" "$without_auth" "$dashboard_only" "$record_excluded" "$publish_off"; do
             ${pkgs.jq}/bin/jq -e '(.records | length) > 0 and all(.records[]; .proxied == false)' \
               "$cfg" > /dev/null \
               || fail "a record is proxied -- orange-cloud proxying makes every request arrive from a Cloudflare edge address"
@@ -2350,6 +2414,168 @@
           expectedCount = builtins.length expected;
         };
 
+      # ferrum.daemon.publish: the daemon RUNS and is reachable from
+      # nowhere but a tunnel.
+      #
+      # Why this needed its own check rather than another fixture in
+      # daemon-vhost-enforced: that check answers "is the dashboard
+      # published correctly", and every absence it proves is proved on a
+      # host where ferrumd does not exist at all (its daemonOff fixture
+      # sets ferrum.daemon.enable = false). The claim HERE is the
+      # conjunction those fixtures cannot express -- the unit is present AND
+      # the publication surface is absent -- and it is the claim the
+      # installer's stage 1 now depends on. Splitting `publish` out of
+      # `enable` with only the existing fixtures in place would have left
+      # "ferrumd still runs" asserted by nothing: `enable = true; publish =
+      # false;` could have deleted the unit and every check in this file
+      # would have stayed green.
+      #
+      # The fixtures differ in EXACTLY ONE setting, `ferrum.daemon.publish`.
+      # That is deliberate and load-bearing: every assertion below is a
+      # differential, so a module that stopped reading the option -- or a
+      # check whose expectation was computed from the same default it is
+      # checking -- fails on the control side rather than passing on both.
+      # `ferrum.auth.enable` is FALSE on both, which also makes the pair the
+      # only place in the tree that pins the H-03 exemption: an unpublished
+      # dashboard has nothing for Authelia to sit in front of, and stage 1
+      # cannot enable Authelia at all, so if publish = false did not silence
+      # that assertion the installer would be exactly where it started.
+      #
+      # Everything is read off the GENERATED config -- the systemd unit
+      # text, the nginx virtualHosts attrset, security.acme.certs, and the
+      # real DNS document ferrum-dns consumes -- for the reason this file
+      # gives repeatedly: an assertion over the option would have passed the
+      # entire time ferrum.daemon.subdomain was decorative.
+      daemonUnpublishedButRunning =
+        let
+          mkPublishHost = publish: ferrumLib.mkHost {
+            inherit system;
+            settings = {
+              schemaVersion = realMigrations.currentVersion;
+              # The shape crates/ferrum-install/src/render.rs writes for
+              # stage 1: the proxy is on and a real base domain is set,
+              # because ACME needs both, and auth is off because Authelia's
+              # sops secrets cannot exist before the host does.
+              proxy = {
+                enable = true;
+                baseDomain = "example.invalid";
+                acme.email = "admin@example.invalid";
+                dns = {
+                  enable = true;
+                  recordMode = "a";
+                  staticAddress = "203.0.113.10";
+                };
+              };
+              auth.enable = false;
+              apps = { };
+              daemon = { inherit publish; };
+            };
+            modules = [ ../../../examples/hosts/minimal/configuration.nix ];
+          };
+          unpublished = mkPublishHost false;
+          control = mkPublishHost true;
+
+          daemonName = "ferrum.example.invalid";
+
+          # The unit as systemd will actually receive it, not
+          # config.systemd.services.ferrumd -- the NixOS option set is the
+          # input to the generator, and "the unit exists" is a claim about
+          # its output.
+          unitTextOf = host: host.config.systemd.units."ferrumd.service".text or "";
+          unpublishedUnit = unitTextOf unpublished;
+          controlUnit = unitTextOf control;
+
+          vhostsOf = host: host.config.services.nginx.virtualHosts;
+          certsOf = host: host.config.security.acme.certs;
+
+          # Scoped by message infix and wrapped in tryEval for the same
+          # non-negotiable reason as every other assertion probe in this
+          # file: these fixtures carry OTHER failing assertions of their own
+          # (the example host's placeholder secrets have no
+          # *-apikey-raw.sops counterparts, and a published auth-off host
+          # declares no ACME credential), so an unscoped probe reports every
+          # host as rejected and passes identically with the assertion
+          # deleted.
+          h03FailuresFor = host:
+            let
+              probe = builtins.tryEval (
+                builtins.filter (m: lib.hasInfix "so there is no login in front of it" m)
+                  (map (a: a.message)
+                    (builtins.filter (a: !a.assertion) host.config.assertions)));
+            in
+            if probe.success then probe.value else [ "evaluation threw" ];
+
+          problems =
+            # The half that makes this check different from every other one
+            # here: publish = false must not take the daemon away.
+            lib.optional (!(lib.hasInfix "/bin/ferrumd" unpublishedUnit))
+              "ferrum.daemon.publish = false generated no ferrumd ExecStart: unpublishing the dashboard has deleted it instead of unplugging it, which is the exact failure the option was split out of ferrum.daemon.enable to end -- a stage 2 that fails then leaves the host with no web UI at all and SSH-only recovery"
+            ++ lib.optional (!(lib.hasInfix "FERRUMD_LISTEN_ADDRESS=127.0.0.1" unpublishedUnit))
+              "the unpublished ferrumd unit does not bind 127.0.0.1, so the SSH tunnel this whole option exists to preserve has nothing to land on"
+            ++ lib.optional (!(lib.hasInfix "/bin/ferrumd" controlUnit))
+              "the CONTROL host -- identical but for ferrum.daemon.publish = true -- also generated no ferrumd ExecStart, so the two assertions above are not measuring anything ferrum.daemon.publish changes"
+            ++ lib.optional (!(unpublished.config.users.users ? ferrum))
+              "ferrum.daemon.publish = false removed the `ferrum` system user, which the ferrumd unit runs as and modules/core/bootstrap.nix and modules/core/storage.nix both key their file ownership on"
+
+            # ...and the half that makes it worth having: nothing is
+            # published. Each absence is paired with its presence on the
+            # control, so no absence here can be an empty corpus.
+            ++ lib.optional (!(vhostsOf control ? ${daemonName}))
+              "the control host generated no ${daemonName} vhost, so the absence claimed of the unpublished host below is vacuous"
+            ++ lib.optional (vhostsOf unpublished ? ${daemonName})
+              "ferrum.daemon.publish = false still generated an nginx vhost at ${daemonName}: the dashboard is on the network with Authelia absent, which is the whole exposure the option exists to prevent"
+            ++ lib.optional (!(vhostsOf unpublished ? "_ferrum_unmatched"))
+              "the unpublished host generated no _ferrum_unmatched catch-all, so modules/proxy/nginx.nix did not run on it at all and its vhost absences prove nothing"
+            ++ lib.optional (!(certsOf control ? ${daemonName}))
+              "the control host orders no certificate for ${daemonName}, so the absence claimed below is vacuous"
+            ++ lib.optional (certsOf unpublished ? ${daemonName})
+              "ferrum.daemon.publish = false still orders a Let's Encrypt certificate for ${daemonName} -- a real, logged, publicly-visible CT entry for a name this host deliberately serves nothing on"
+
+            # H-03. The exemption stage 1 depends on, and its control.
+            ++ lib.optional (h03FailuresFor unpublished != [ ])
+              "a host with ferrum.daemon.publish = false is refused by nginx.nix's auth-off assertion, but it publishes nothing: the dashboard is reachable only over the SSH tunnel ferrum.daemon.listenAddress exists for. Stage 1 cannot enable Authelia -- its sops secrets cannot exist before the host does -- so this refusal puts the installer back where it started (H-03)"
+            ++ lib.optional (h03FailuresFor control == [ ])
+              "the CONTROL host -- published, auth off -- evaluates cleanly, so the assertion the exemption above is claimed against is not firing for anyone and that exemption proves nothing (H-03)";
+
+          dnsOf = host: host.config.system.build.ferrumDnsConfig;
+        in
+        pkgs.runCommand "ferrum-check-daemon-unpublished-but-running"
+          {
+            # Passed as a file rather than interpolated into the script:
+            # these messages contain quotes and backticks, and a shell that
+            # mangles the one line explaining a failure is worse than no
+            # message at all.
+            problemsFile = pkgs.writeText "problems.json" (builtins.toJSON problems);
+          } ''
+          set -eu
+          unpublished_dns=${dnsOf unpublished}
+          control_dns=${dnsOf control}
+          fail() {
+            echo "daemon-unpublished-but-running: $1" >&2
+            echo "--- unpublished dns ---" >&2; cat "$unpublished_dns" >&2; echo >&2
+            echo "--- control dns ---" >&2; cat "$control_dns" >&2; echo >&2
+            exit 1
+          }
+
+          if [ "$(${pkgs.jq}/bin/jq 'length' "$problemsFile")" != "0" ]; then
+            ${pkgs.jq}/bin/jq -r '.[] | "  - " + .' "$problemsFile" >&2
+            fail "the evaluated config disagrees with ferrum.daemon.publish (see above)"
+          fi
+
+          # The DNS half, which cannot be read at evaluation: the document
+          # is a file the reconciler consumes, so this is the only place
+          # that sees what ferrum-dns will actually be handed.
+          ${pkgs.jq}/bin/jq -e '[.records[] | select(.source == "daemon")] | length == 1' \
+            "$control_dns" > /dev/null \
+            || fail "the control host wants no daemon record, so the absence asserted of the unpublished host is vacuous"
+
+          ${pkgs.jq}/bin/jq -e '[.records[] | select(.source == "daemon")] | length == 0' \
+            "$unpublished_dns" > /dev/null \
+            || fail "ferrum.daemon.publish = false still wants a DNS record for the dashboard. Nothing answers that name -- no vhost, so nginx's catch-all closes the connection with \`return 444\` -- and no certificate was ordered for it either, so this is a public record advertising a control plane the host deliberately keeps on loopback"
+
+          echo ok > $out
+        '';
+
       mkAssertionCheck = name: result:
         pkgs.runCommand "ferrum-check-${name}" { } (
           if result.ok then
@@ -2362,6 +2588,7 @@
       checks = {
         auth-model-enforced = mkAssertionCheck "auth-model-enforced" authModelEnforced;
         daemon-vhost-enforced = mkAssertionCheck "daemon-vhost-enforced" daemonVhostEnforced;
+        daemon-unpublished-but-running = daemonUnpublishedButRunning;
         nginx-config-parses = nginxConfigParses;
         reserved-subdomain-collision =
           mkAssertionCheck "reserved-subdomain-collision" reservedSubdomainCollision;

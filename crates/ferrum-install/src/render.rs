@@ -643,10 +643,10 @@ fn settings(
         Stage::One => {
             root.insert("apps".into(), serde_json::json!({}));
 
-            // ...and NO control plane either, for the same reason one step
-            // further on.
+            // ...and the control plane RUNS but is not PUBLISHED, for the
+            // same reason one step further on.
             //
-            // `ferrum.daemon.enable` defaults to TRUE, so omitting this key
+            // `ferrum.daemon.publish` defaults to TRUE, so omitting this key
             // does not mean "no daemon", it means "publish the daemon". With
             // the proxy on and a baseDomain set -- both of which stage 1
             // writes, a few lines above -- that publishes ferrum's own
@@ -663,11 +663,38 @@ fn settings(
             //
             // So publication waits for the stage that has a login in front of
             // it. Stage 2 writes no `daemon` key, so the default returns and
-            // the dashboard comes up there, gated. Nothing in stage 1 wants a
-            // reachable dashboard: verify_host's daemon and dashboard checks
-            // (verify.rs service_checks/auth_checks) all run after stage 2 has
-            // been applied.
-            root.insert("daemon".into(), serde_json::json!({ "enable": false }));
+            // the dashboard comes up there, gated.
+            //
+            // `enable` is written explicitly, and TRUE, because it is a
+            // different question and the two were confused for a long time.
+            // This key used to be `{ "enable": false }` on its own, and
+            // modules/core/daemon.nix is wrapped in
+            // `lib.mkIf ferrum.daemon.enable` -- so it did not unpublish the
+            // dashboard, it deleted it: no `ferrum` user, no ferrumd unit,
+            // nothing bound to loopback, nothing to reach over an SSH tunnel
+            // either. The stage-2 failures above therefore cost the operator
+            // the web UI as well, and the only way back in was SSH, which is
+            // precisely what ferrum exists not to require. With
+            // `publish = false` ferrumd runs on ferrum.daemon.listenAddress
+            // -- a loopback literal, asserted by modules/core/daemon.nix's
+            // A5 -- so `ssh -L` reaches the dashboard and the network does
+            // not. It is not an open door: ferrumd's own
+            // `__Host-ferrumd_session` login still stands in front of it.
+            //
+            // Stating `enable: true` rather than inheriting the default is
+            // deliberate. This block's whole subject is the difference
+            // between the two keys, and a reader of the generated
+            // settings.json should not have to know which of them is stated
+            // and which is inherited to see which question was answered how.
+            //
+            // Nothing in stage 1 wants a PUBLISHED dashboard: verify_host's
+            // daemon and dashboard checks (verify.rs
+            // service_checks/auth_checks) all run after stage 2 has been
+            // applied.
+            root.insert(
+                "daemon".into(),
+                serde_json::json!({ "enable": true, "publish": false }),
+            );
         }
         Stage::Two => {
             let apps: serde_json::Map<String, serde_json::Value> = answers
@@ -1682,7 +1709,7 @@ mod tests {
 
     /// The same family as the assertion above, and the consequence of it.
     ///
-    /// `ferrum.daemon.enable` defaults to TRUE, so stage 1 has to turn it
+    /// `ferrum.daemon.publish` defaults to TRUE, so stage 1 has to turn it
     /// OFF explicitly -- omitting the key publishes ferrum's own control
     /// plane at ferrum.<domain>, on a real certificate, in the one stage
     /// that is structurally unable to put auth in front of it. A stage 2
@@ -1696,11 +1723,101 @@ mod tests {
         let f = render(&answers(), &approved(Firmware::Uefi), &keys(), "abc1234").unwrap();
         let s: serde_json::Value = serde_json::from_str(&f["settings.json"]).unwrap();
         assert_eq!(
-            s["daemon"]["enable"],
+            s["daemon"]["publish"],
             serde_json::json!(false),
             "stage 1 sets a baseDomain and cannot enable auth, so it must not publish the \
              dashboard: {s}"
         );
+    }
+
+    /// The half that pays for the assertion above, and the reason
+    /// `ferrum.daemon.publish` was split out of `ferrum.daemon.enable` at
+    /// all.
+    ///
+    /// Stage 1 used to write `enable = false`, and
+    /// `modules/core/daemon.nix` is wrapped in
+    /// `lib.mkIf ferrum.daemon.enable` -- so that did not unpublish the
+    /// dashboard, it deleted it: no `ferrum` user, no `ferrumd.service`,
+    /// nothing bound to loopback, nothing to reach over an SSH tunnel
+    /// either. Stage 2 has failed on real hardware in this project more
+    /// than once, and every one of those hosts sat with no web UI at all
+    /// until someone SSH'd in, on the product whose whole claim is that the
+    /// UI works.
+    ///
+    /// Written as an explicit `true` rather than by omitting the key, even
+    /// though `true` is the option's default. The two other keys stage 1
+    /// writes for this same reason (`apps: {}`, `publish: false`) are
+    /// deliberate departures from the defaults, so a reader of the
+    /// generated `settings.json` should not have to know which of the three
+    /// daemon facts are stated and which are inherited -- and an assertion
+    /// on the literal is the only form that can tell "runs" from "absent".
+    #[test]
+    fn stage_one_still_runs_the_daemon_on_loopback() {
+        let f = render(&answers(), &approved(Firmware::Uefi), &keys(), "abc1234").unwrap();
+        let s: serde_json::Value = serde_json::from_str(&f["settings.json"]).unwrap();
+        assert_eq!(
+            s["daemon"]["enable"],
+            serde_json::json!(true),
+            "stage 1 must leave ferrumd RUNNING and unpublished, not absent: modules/core/\
+             daemon.nix is wrapped in lib.mkIf ferrum.daemon.enable, so turning that off is \
+             what leaves a failed stage 2 with no web UI and SSH-only recovery: {s}"
+        );
+    }
+
+    /// The two generated files must agree about `ferrum.daemon.enable`,
+    /// because NixOS will not reconcile them for us.
+    ///
+    /// `flake.nix` hardcodes `ferrum.daemon.enable = true` inside the
+    /// host's own inline module, and it reads `./settings.json` for
+    /// everything else. `modules/lib/default.nix` feeds that document in as
+    /// a plain `config.ferrum = ...` definition, so the two are ORDINARY,
+    /// equal-priority definitions of one `types.bool` option. Equal values
+    /// merge; unequal values are a hard evaluation error.
+    ///
+    /// That is not a hypothetical, it is what this change fixed. Stage 1
+    /// used to write `daemon.enable = false` into a settings.json read by a
+    /// flake asserting `true`, and evaluating the generated host produced:
+    ///
+    ///   error: The option `ferrum.daemon.enable' has conflicting
+    ///   definition values: ... true ... false
+    ///
+    /// -- confirmed by really evaluating a real host built by
+    /// `ferrum.lib.mkHost` from exactly those two inputs. Nothing caught
+    /// it: the Nix checks build hosts from a settings attrset without the
+    /// generated flake's inline module, and the installer's own tests read
+    /// the two files separately and never evaluated either.
+    ///
+    /// Written as a cross-check of the real rendered output rather than as
+    /// a constant, so it fails whichever of the two files moves.
+    #[test]
+    fn the_generated_flake_and_stage_one_settings_agree_about_daemon_enable() {
+        let f = render(&answers(), &approved(Firmware::Uefi), &keys(), "abc1234").unwrap();
+        let flake = &f["flake.nix"];
+        let s: serde_json::Value = serde_json::from_str(&f["settings.json"]).unwrap();
+        // The flake states it unconditionally, so whichever literal it
+        // states is the one settings.json may not contradict.
+        let in_flake = if flake.contains("ferrum.daemon.enable = true;") {
+            Some(true)
+        } else if flake.contains("ferrum.daemon.enable = false;") {
+            Some(false)
+        } else {
+            None
+        };
+        let Some(in_flake) = in_flake else {
+            // No definition in the flake means no conflict is possible,
+            // and settings.json is then the only voice. Nothing to check.
+            return;
+        };
+        if let Some(in_settings) = s["daemon"]["enable"].as_bool() {
+            assert_eq!(
+                in_settings, in_flake,
+                "the generated flake.nix defines ferrum.daemon.enable = {in_flake} and the \
+                 generated settings.json defines {in_settings}. Both are ordinary module \
+                 definitions of one types.bool option, so this host does not evaluate at \
+                 all -- stage 1 fails before it installs anything, with a conflicting-\
+                 definition error naming a file the operator did not write"
+            );
+        }
     }
 
     /// The other half: the dashboard must really come back in stage 2, or

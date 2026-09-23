@@ -498,7 +498,47 @@ in
       enable = mkOption {
         type = types.bool;
         default = true;
-        description = "Whether ferrumd (the web UI) runs on this host.";
+        description = ''
+          Whether ferrumd (the web UI) runs on this host at all.
+
+          This is the RUNS question, not the REACHABLE one -- see `publish`
+          below. modules/core/daemon.nix is wrapped in
+          `lib.mkIf ferrum.daemon.enable`, so turning this off deletes the
+          user, the unit and the polkit rule: there is nothing left to
+          reach, over a tunnel or otherwise.
+        '';
+      };
+      publish = mkOption {
+        type = types.bool;
+        default = true;
+        description = ''
+          Whether the daemon this host runs is also reachable from the
+          network, at `<ferrum.daemon.subdomain>.<ferrum.proxy.baseDomain>`.
+
+          Split out of `enable` because the two were never the same
+          question, and collapsing them cost a recovery route. `enable =
+          false` does not unpublish ferrumd, it stops it existing (see
+          above), and that was the only spelling of "do not publish the
+          dashboard" -- so the installer's stage 1, which cannot enable
+          Authelia because its sops secrets cannot exist before the host
+          does, had to use it. A stage 2 that failed then left a host with
+          no web UI at all and SSH-only recovery, on the product whose whole
+          claim is that the UI works.
+
+          With `publish = false` the daemon RUNS, bound to
+          `ferrum.daemon.listenAddress` -- which modules/core/daemon.nix's
+          A5 assertion holds to a loopback literal -- so it is reachable
+          over an SSH tunnel and from nowhere else.
+          modules/proxy/lib.nix's `daemonPublished` reads this, which is
+          what keeps the vhost (modules/proxy/nginx.nix), the Authelia rule
+          (modules/proxy/authelia.nix), the certificate
+          (modules/proxy/acme.nix) and the DNS record (modules/proxy/dns.nix)
+          absent together rather than one at a time.
+
+          It is NOT an authentication boundary and must not be read as one:
+          the tunnel still lands on ferrumd's own `__Host-ferrumd_session`
+          login. What it removes is the network path, not the password.
+        '';
       };
       port = mkOption {
         type = types.port;

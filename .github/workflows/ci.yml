@@ -46,6 +46,7 @@ jobs:
             .#checks.x86_64-linux.settings-schema-covers-every-option \
             .#checks.x86_64-linux.auth-model-enforced \
             .#checks.x86_64-linux.daemon-vhost-enforced \
+            .#checks.x86_64-linux.daemon-unpublished-but-running \
             .#checks.x86_64-linux.nginx-config-parses \
             .#checks.x86_64-linux.nginx-emits-no-cors-headers \
             .#checks.x86_64-linux.reserved-subdomain-collision \

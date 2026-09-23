@@ -38,9 +38,10 @@ Last updated at HEAD `288f2b3`, branch `grounding-and-install-path`. Nothing pus
         `SEC-M03…`, each bound to accepting person, evidence hash and commit, each going stale
         automatically if the code moves.
 
-- [~] **2. A failed stage 2 leaves no web UI.** DECIDED 2026-09-23: **keep the daemon
+- [x] **2. A failed stage 2 leaves no web UI.** DECIDED 2026-09-23: **keep the daemon
       unpublished, but keep it RUNNING on loopback** so the SSH-tunnel route reaches a real
-      dashboard. Scoped below; not yet built.
+      dashboard. **DONE 2026-09-23**, together with R13 deferred ticket #1 below — the two
+      reverse each other if landed apart.
       - **Why it happens.** `modules/core/daemon.nix:60` wraps the whole module in
         `lib.mkIf ferrum.daemon.enable`, so stage 1's `daemon.enable = false`
         (`render.rs:670`) does not merely unpublish the daemon — it stops it existing. No
@@ -66,8 +67,38 @@ Last updated at HEAD `288f2b3`, branch `grounding-and-install-path`. Nothing pus
         `modules/proxy/lib.nix`, `modules/proxy/dns.nix`, `crates/ferrum-install/src/render.rs`,
         plus the `checks.nix` anti-vacuity guard that currently depends on ticket #1 staying
         unfixed. Feature-shaped: wants the pipeline, not a patch.
+      - **Built as scoped**, plus three things the scope did not anticipate.
+        `crates/ferrumd/src/settings.rs`'s `publication_matches_auth` is the same predicate
+        written a second time, in Rust, guarding `PUT /api/settings` — without the new term it
+        would have refused the exact document stage 1 writes, and told an operator who wants a
+        tunnel-only dashboard that their only option is a host with no UI. `nginx.nix`'s H-03
+        message offered `daemon.enable = false` as its recommended way out, which is the bug;
+        it now offers `daemon.publish = false` and says plainly what the other two cost.
+      - **A latent hard failure fell out of it.** The generated `flake.nix` hardcodes
+        `ferrum.daemon.enable = true` in the host's own inline module, and `mkHost` feeds
+        `settings.json` in as an ordinary `config.ferrum` definition — so stage 1's
+        `daemon.enable = false` was an *unequal second definition of one `types.bool`*.
+        Really evaluated, really failed: `error: The option 'ferrum.daemon.enable' has
+        conflicting definition values: ... true ... false`. Nothing looked, because the Nix
+        checks build hosts from a settings attrset without the generated flake's module and the
+        installer's tests read the two files separately. Stage 1 now writes `enable: true`,
+        which agrees, and `the_generated_flake_and_stage_one_settings_agree_about_daemon_enable`
+        cross-checks the two rendered files so it fails whichever one moves.
+      - **Added `daemon-unpublished-but-running`** (`nix/modules/flake/checks.nix`, wired into
+        `.github/workflows/ci.yml`). Two fixtures differing in exactly one setting, every
+        assertion a differential against the control, all of it read off the **generated**
+        config: the systemd unit text, the nginx `virtualHosts` attrset, `security.acme.certs`,
+        and the real DNS document `ferrum-dns` consumes. It is the only place asserting the
+        conjunction — *the unit is present* **and** *the publication surface is absent* — which
+        is what stops `publish = false` quietly deleting ferrumd again.
+      - **Mutation-proved, both halves separately.** Reverting the `publish` term in
+        `daemonPublished` makes it **exit 1** on the vhost, the certificate and the H-03
+        exemption; reverting only the `dns.nix` gate makes it **exit 1** on the record alone,
+        with the other assertions still green — which is the evidence that ticket #1's fix is
+        load-bearing on its own and not carried by the predicate change.
       - **Lands with item 11** (confirm the SSH-tunnel route in a real browser), which is the
-        acceptance test for exactly this.
+        acceptance test for exactly this. Item 11 is still open: nothing here has been driven
+        through a real browser over a real tunnel.
 
 - [x] **3. Push the branch and open the PR.** DONE — **PR #4**:
       https://github.com/syms-dev/ferrum/pull/4 (base `main`, 240 files, ~53k insertions).
@@ -113,9 +144,21 @@ Last updated at HEAD `288f2b3`, branch `grounding-and-install-path`. Nothing pus
 
 - [ ] **6. R14.**
 - [ ] **7. The three R13 deferred tickets.**
-      - `modules/proxy/dns.nix` `daemonRecords` never consults `daemon.enable`, so a daemon-off
+      - ~~`modules/proxy/dns.nix` `daemonRecords` never consults `daemon.enable`, so a daemon-off
         host still gets a DNS record for a hostname nginx closes. **Whoever fixes this must also
-        update `checks.nix`'s anti-vacuity guard, which currently depends on it staying unfixed.**
+        update `checks.nix`'s anti-vacuity guard, which currently depends on it staying
+        unfixed.**~~ **DONE 2026-09-23**, with item 2 above and deliberately in the same change:
+        `daemonRecords` is now `daemonPublished && includeRecord`, so the record moves with the
+        vhost, the Authelia rule and the certificate instead of on its own. `includeRecord` is
+        conjoined rather than replaced — it is still the operator's one-line opt-out on a host
+        that *is* publishing, which is a different statement from "this host publishes nothing".
+        The `dns-record-set` anti-vacuity guard was **re-aimed, not deleted**: the proxy-off
+        fixture's record list is legitimately empty now, so "this document contains a daemon
+        record" could no longer carry it. It is a differential instead — `dashboardOnly` is the
+        same fixture with the proxy **on** and is asserted to carry both records, so the only
+        difference between two records and none is the proxy term. The proxy-off document is
+        also removed from the `proxied == false` loop, whose `length > 0` term is that loop's
+        own anti-vacuity half and must not be weakened to accommodate it.
       - ~~`crates/ferrumd/src/main.rs:279-282` still says ferrumd is loopback-only and the
         subdomain is unused. R13 falsified both.~~ **DONE 2026-09-23.** The paragraph above
         `session_handler` now says the same-site sibling is a present fact rather than a future

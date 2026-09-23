@@ -493,18 +493,32 @@ lib.mkIf proxyEnabled {
 
         Two ways forward, and both are one line:
 
-          ferrum.auth.enable = true;   -- turn Authelia on, which is what
-                                          every other published app on this
-                                          host is already behind.
+          ferrum.auth.enable = true;    -- turn Authelia on, which is what
+                                           every other published app on this
+                                           host is already behind.
 
-          ferrum.daemon.enable = false;  -- or ferrum.proxy.baseDomain = "",
-                                          if this host is not meant to
-                                          publish anything at all.
+          ferrum.daemon.publish = false;  -- keep the dashboard, take it off
+                                             the network. ferrumd goes on
+                                             running, bound to
+                                             ferrum.daemon.listenAddress, and
+                                             loses only its vhost, its
+                                             certificate and its DNS record.
+                                             Reach it by forwarding a local
+                                             port to
+                                             ferrum.daemon.listenAddress:${toString ferrum.daemon.port}
+                                             over SSH, which is what that
+                                             option exists for.
+                                             ferrumd's own login still
+                                             applies -- this removes the
+                                             network path, not the password.
 
-        Reach the dashboard without publishing it by leaving
-        ferrum.daemon.enable on and using an SSH tunnel to
-        ferrum.daemon.listenAddress:${toString ferrum.daemon.port}, which is
-        what that option exists for.
+        ferrum.daemon.enable = false and ferrum.proxy.baseDomain = "" also
+        silence this, and both cost more than they look like they do:
+        `enable = false` deletes ferrumd rather than unpublishing it
+        (modules/core/daemon.nix is wrapped in lib.mkIf on that option), so
+        there is nothing left for the tunnel above to reach, and an empty
+        baseDomain unpublishes every app on the host as well. Use them when
+        you mean them, not to get past this message.
       '';
     }
     {

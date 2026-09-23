@@ -177,6 +177,10 @@
       "additionalProperties": false,
       "properties": {
         "enable": { "type": "boolean" },
+        "publish": {
+          "type": "boolean",
+          "description": "Whether the daemon this host runs is also reachable at <subdomain>.<proxy.baseDomain>. Distinct from `enable`, which decides whether ferrumd exists at all: modules/core/daemon.nix is wrapped in lib.mkIf ferrum.daemon.enable, so turning that off leaves nothing to reach even over the SSH tunnel ferrum.daemon.listenAddress exists for. modules/proxy/lib.nix's daemonPublished reads this, so the vhost, the Authelia rule, the certificate and the DNS record go absent together."
+        },
         "port": { "type": "integer" },
         "listenAddress": {
           "type": "string",
