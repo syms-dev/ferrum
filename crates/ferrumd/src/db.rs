@@ -33,7 +33,8 @@ impl Db {
                 user_id INTEGER NOT NULL REFERENCES users(id),
                 csrf_token TEXT NOT NULL,
                 created_at INTEGER NOT NULL,
-                expires_at INTEGER NOT NULL
+                expires_at INTEGER NOT NULL,
+                last_seen_at INTEGER NOT NULL DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS login_attempts (
                 username TEXT NOT NULL,
@@ -47,6 +48,14 @@ impl Db {
         // exists, so a host provisioned before these columns were added
         // would keep the old shape and fail on the first query naming one.
         Self::add_column_if_missing(&conn, "login_attempts", "ip", "TEXT NOT NULL DEFAULT ''")?;
+        Self::add_column_if_missing(&conn, "sessions", "last_seen_at", "INTEGER NOT NULL DEFAULT 0")?;
+        // A session that predates the idle timeout has no last_seen_at, and
+        // the column default of 0 would read as "idle since 1970" -- logging
+        // every existing operator out the moment they upgrade. Seeding from
+        // created_at gives them the remainder of a normal idle window
+        // instead, which is the honest answer to "when did we last see this
+        // session?" when the answer was never recorded.
+        conn.execute("UPDATE sessions SET last_seen_at = created_at WHERE last_seen_at = 0", [])?;
         Ok(Self { conn: Mutex::new(conn) })
     }
 

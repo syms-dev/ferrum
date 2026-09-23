@@ -177,6 +177,19 @@ struct SessionUserId(i64);
 #[derive(Clone)]
 struct SessionCsrfToken(String);
 
+/// The session cookie value `require_session` just authenticated.
+///
+/// `POST /api/password` needs it to know which session is its OWN, so that
+/// invalidating every other session for the account does not log the caller
+/// out of the tab they are standing in. A third newtype rather than widening
+/// either of the two above, for the reason the second one already gives:
+/// axum resolves `Extension<T>` by type, so each value keeps meaning exactly
+/// one thing.
+///
+/// This is the session token, so it never goes anywhere near a log line.
+#[derive(Clone)]
+struct SessionToken(String);
+
 #[derive(Deserialize)]
 struct ChangePasswordRequest {
     current_password: String,
@@ -193,22 +206,34 @@ struct ChangePasswordRequest {
 ///   * `401` -- the current password is wrong. Nothing changed.
 ///   * `500` -- the daemon genuinely failed (database, hashing).
 ///
-/// Existing sessions are deliberately NOT invalidated, including this one:
-/// the session cookie is an independent credential that this call never
-/// touches, and logging an operator out of the tab they just used to change
-/// their password would be a worse experience with no security gain against
-/// the threat this endpoint exists for (an operator rotating the generated
-/// bootstrap password into one of their own).
+/// Every OTHER session for this account is invalidated; this one survives.
+///
+/// This used to invalidate nothing at all, and the reasoning recorded here
+/// was that the cookie is an independent credential and logging the operator
+/// out of their own tab would be a worse experience for no gain. The first
+/// half is still true and is why the caller's own session is kept. The
+/// second half was wrong about the threat (M-03): changing the password is
+/// precisely what an operator does when they think their credential has been
+/// taken, and leaving every other session valid meant a stolen one survived
+/// the single remedy they would reach for -- for the remainder of its week.
+/// Now that the control plane is published, that is not hypothetical.
 async fn change_password_handler(
     State(state): State<Arc<AppState>>,
     axum::Extension(SessionUserId(user_id)): axum::Extension<SessionUserId>,
+    axum::Extension(SessionToken(token)): axum::Extension<SessionToken>,
     Json(req): Json<ChangePasswordRequest>,
 ) -> impl IntoResponse {
     if req.new_password.is_empty() {
         return (StatusCode::BAD_REQUEST, "the new password must not be empty").into_response();
     }
     let outcome = run_blocking(move || {
-        auth::change_password(&state.db, user_id, &req.current_password, &req.new_password)
+        auth::change_password(
+            &state.db,
+            user_id,
+            &req.current_password,
+            &req.new_password,
+            &token,
+        )
     })
     .await;
     let outcome = match outcome {
@@ -298,10 +323,12 @@ async fn require_session(
         .value()
         .to_string();
     let db_state = state.clone();
-    let session = match run_blocking(move || auth::validate_session(&db_state.db, &token)).await? {
-        Ok(Some(session)) => session,
-        _ => return Err(StatusCode::UNAUTHORIZED),
-    };
+    let lookup_token = token.clone();
+    let session =
+        match run_blocking(move || auth::validate_session(&db_state.db, &lookup_token)).await? {
+            Ok(Some(session)) => session,
+            _ => return Err(StatusCode::UNAUTHORIZED),
+        };
 
     if method_is_mutating(request.method()) {
         let provided = request
@@ -321,6 +348,7 @@ async fn require_session(
     request
         .extensions_mut()
         .insert(SessionCsrfToken(session.csrf_token.clone()));
+    request.extensions_mut().insert(SessionToken(token));
 
     Ok(next.run(request).await)
 }
@@ -401,6 +429,18 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/jobs/:id", axum::routing::get(jobs::get_job))
         .route("/api/jobs/:id/stream", axum::routing::get(jobs::stream_job))
         .route("/api/password", post(change_password_handler))
+        // L-01. This sat on the unauthenticated router, so it was the one
+        // mutating route with no CSRF check: any same-site sibling under
+        // <baseDomain> could force the operator's browser to POST it and log
+        // them out at will. Only availability, but it is a control plane, and
+        // "log the operator out whenever they try to fix something" is a real
+        // nuisance to hand a compromised app.
+        //
+        // The trade, stated: logging out with an ALREADY-invalid session now
+        // answers 401 rather than 200. Nothing is lost by that -- an invalid
+        // session has nothing left to invalidate -- and the SPA treats 401 as
+        // logged out anyway.
+        .route("/api/logout", post(logout_handler))
         .route_layer(axum::middleware::from_fn_with_state(state.clone(), require_session));
 
     Router::new()
@@ -410,7 +450,6 @@ fn build_router(state: Arc<AppState>) -> Router {
         // page you log in on would be circular. See static_files.rs's header.
         .fallback(static_files::serve)
         .route("/api/login", post(login_handler))
-        .route("/api/logout", post(logout_handler))
         .merge(protected)
         .layer(CookieManagerLayer::new())
         .with_state(state)
@@ -806,6 +845,46 @@ mod tests {
         let correct = serde_json::json!({ "username": "admin", "password": password.trim() })
             .to_string();
         assert_eq!(attempt(correct).await.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    /// L-01. `POST /api/logout` sat outside `require_session`, so it was the
+    /// one mutating route with no CSRF check at all -- a same-site sibling
+    /// under `<baseDomain>` could make the operator's browser POST it and log
+    /// them out whenever it liked. It must now be refused like every other
+    /// mutating route, while a properly-formed logout still works (which
+    /// `logout_emits_a_removal_cookie_a_browser_will_actually_accept` pins).
+    #[tokio::test]
+    async fn logout_is_behind_the_csrf_gate_like_every_other_mutating_route() {
+        let (_dir, state, session, _csrf) = logged_in();
+
+        // A real session cookie, which a same-site sibling's forged request
+        // WOULD carry, but no CSRF token, which it cannot read.
+        let forged = Request::builder()
+            .method(Method::POST)
+            .uri("/api/logout")
+            .header("Cookie", format!("{SESSION_COOKIE}={session}"))
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            build_router(state.clone()).oneshot(forged).await.unwrap().status(),
+            StatusCode::FORBIDDEN,
+            "a logout with no CSRF token must be refused"
+        );
+        assert!(
+            auth::validate_session(&state.db, &session).unwrap().is_some(),
+            "and the refused request must not have logged anybody out"
+        );
+
+        // No session at all is a 401 rather than a silent 200.
+        let anonymous = Request::builder()
+            .method(Method::POST)
+            .uri("/api/logout")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            build_router(state).oneshot(anonymous).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
     }
 
     /// L-03's real defect, driven by a real fault rather than described.
