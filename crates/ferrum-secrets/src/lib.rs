@@ -15,6 +15,48 @@ use std::process::Command;
 /// wiring for the real production value.
 pub const DEFAULT_HOST_KEY_PUB: &str = "/etc/ssh/ssh_host_ed25519_key.pub";
 
+/// Rejects any name that is not a plain lowercase secret identifier.
+///
+/// This is an allowlist on purpose. The name becomes a path component under
+/// `secretsDir`, so a denylist for `..` and `/` would be one encoding trick
+/// away from writing outside it; every real secret in the tree
+/// (`acme-dns`, `authelia-jwt-secret`, `sabnzbd-apikey`, `qbittorrent-vpn`)
+/// already matches this shape.
+///
+/// It lives in this crate, rather than beside `ferrum-apply`'s
+/// `put-secret` where it was written, because there are TWO ways a secret
+/// name reaches `<secretsDir>/<name>.sops` and only one of them was
+/// checked. `ferrumd`'s `POST /api/secrets/<name>` is the other, and it had
+/// no constraint at all -- axum percent-decodes, so `%2f` arrived as a real
+/// path separator and the join left the directory (SEC3-M01). Both writers
+/// already depend on this crate, so one copy serves both; a second copy
+/// beside the second sink is how the first one came to be the only one.
+///
+/// # Arguments
+/// * `name` - the candidate secret name, as supplied by an operator.
+///
+/// # Errors
+/// An `anyhow::Error` whose message begins `secret name` when the value is
+/// empty, carries anything outside `[a-z0-9-]`, or starts or ends with `-`.
+pub fn validate_secret_name(name: &str) -> anyhow::Result<()> {
+    if name.is_empty() {
+        anyhow::bail!("secret name is empty");
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    {
+        anyhow::bail!(
+            "secret name {name:?} is not a plain secret identifier \
+             (lowercase letters, digits and '-' only)"
+        );
+    }
+    if name.starts_with('-') || name.ends_with('-') {
+        anyhow::bail!("secret name {name:?} must not start or end with '-'");
+    }
+    Ok(())
+}
+
 /// Derives the box's PUBLIC age recipient from its own SSH host key, via
 /// ssh-to-age. Needs no privilege and touches no private key material --
 /// this is the same derivation sops-nix's own decrypt side uses by default
