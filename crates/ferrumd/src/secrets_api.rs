@@ -71,15 +71,42 @@ fn write_secret_blocking(name: &str, plaintext: &str) -> (StatusCode, String) {
     }
 }
 
-pub async fn write_secret(Path(name): Path<String>, body: Bytes) -> impl IntoResponse {
+pub async fn write_secret(
+    Path(name): Path<String>,
+    axum::Extension(crate::SessionUsername(username)): axum::Extension<crate::SessionUsername>,
+    axum::Extension(client): axum::Extension<crate::client_addr::ClientAddr>,
+    body: Bytes,
+) -> impl IntoResponse {
+    let user = username.as_deref().unwrap_or(crate::UNKNOWN_USER).to_string();
+    // The secret's NAME, never one byte of `body`. This file exists to write
+    // secrets, so it is the single most dangerous place in the crate to be
+    // careless with a log line -- and `name` is already constrained to a
+    // value declared in ferrum.secrets, so it is not free-form either.
+    let audit_write = |outcome: &str, detail: &str| {
+        crate::audit::record("secret-write", outcome, &user, &client, detail);
+    };
+    let audited_name = name.clone();
+
     let plaintext = match std::str::from_utf8(&body) {
         Ok(s) => s.to_string(),
-        Err(_) => return (StatusCode::BAD_REQUEST, "secret value must be valid UTF-8").into_response(),
+        Err(_) => {
+            audit_write("failure", "value was not valid UTF-8");
+            return (StatusCode::BAD_REQUEST, "secret value must be valid UTF-8").into_response();
+        }
     };
 
     match crate::run_blocking(move || write_secret_blocking(&name, &plaintext)).await {
-        Ok((StatusCode::OK, _)) => StatusCode::OK.into_response(),
-        Ok((status, message)) => (status, message).into_response(),
-        Err(status) => status.into_response(),
+        Ok((StatusCode::OK, _)) => {
+            audit_write("success", &format!("secret={audited_name}"));
+            StatusCode::OK.into_response()
+        }
+        Ok((status, message)) => {
+            audit_write("failure", &format!("secret={audited_name} status={status}"));
+            (status, message).into_response()
+        }
+        Err(status) => {
+            audit_write("error", "blocking task failed");
+            status.into_response()
+        }
     }
 }

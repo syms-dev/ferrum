@@ -254,6 +254,19 @@ pub fn login(
 pub struct SessionInfo {
     pub user_id: i64,
     pub csrf_token: String,
+    /// The account's name, read in the SAME row as the rest.
+    ///
+    /// `None` means the session authenticated against a user row that no
+    /// longer exists -- a database inconsistency rather than a normal
+    /// outcome, reported distinctly so `GET /api/session` can answer 500
+    /// instead of rendering a blank username in the UI.
+    ///
+    /// A `LEFT JOIN` rather than an inner one for exactly that reason: an
+    /// inner join would make the vanished-user case indistinguishable from
+    /// an invalid session, turning a 500 that names a real inconsistency
+    /// into a 401 that tells the operator to log in again and would not
+    /// help if they did.
+    pub username: Option<String>,
 }
 
 /// Returns the session's own identity and CSRF token if `token` is a real,
@@ -267,10 +280,17 @@ pub fn validate_session(db: &Db, token: &str) -> anyhow::Result<Option<SessionIn
     let session: Option<SessionInfo> = db
         .conn()
         .query_row(
-            "SELECT user_id, csrf_token FROM sessions \
-             WHERE token = ?1 AND expires_at > ?2 AND last_seen_at > ?3",
+            "SELECT s.user_id, s.csrf_token, u.username FROM sessions s \
+             LEFT JOIN users u ON u.id = s.user_id \
+             WHERE s.token = ?1 AND s.expires_at > ?2 AND s.last_seen_at > ?3",
             rusqlite::params![token, now(), now() - IDLE_TIMEOUT_SECS],
-            |row| Ok(SessionInfo { user_id: row.get(0)?, csrf_token: row.get(1)? }),
+            |row| {
+                Ok(SessionInfo {
+                    user_id: row.get(0)?,
+                    csrf_token: row.get(1)?,
+                    username: row.get(2)?,
+                })
+            },
         )
         .map(Some)
         .or_else(|e| {
@@ -309,32 +329,6 @@ fn prune_sessions(db: &Db) -> anyhow::Result<()> {
         rusqlite::params![now(), now() - IDLE_TIMEOUT_SECS],
     )?;
     Ok(())
-}
-
-/// Resolves an authenticated user id to that user's username.
-///
-/// Takes the id `require_session` just authenticated, never anything off the
-/// wire -- the same rule `change_password` follows, for the same reason.
-///
-/// `Ok(None)` means the session referenced a user row that no longer exists.
-/// That is a database inconsistency rather than a normal outcome (a session
-/// should not outlive its user), so it is reported distinctly instead of
-/// being flattened into an empty username the UI would render as a blank.
-pub fn username_for(db: &Db, user_id: i64) -> anyhow::Result<Option<String>> {
-    db.conn()
-        .query_row(
-            "SELECT username FROM users WHERE id = ?1",
-            rusqlite::params![user_id],
-            |row| row.get(0),
-        )
-        .map(Some)
-        .or_else(|e| {
-            if matches!(e, rusqlite::Error::QueryReturnedNoRows) {
-                Ok(None)
-            } else {
-                Err(e.into())
-            }
-        })
 }
 
 /// Rotates one user's own password, after really verifying the current one.

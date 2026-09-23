@@ -146,11 +146,27 @@ fn is_terminal_line(line: &str) -> bool {
 /// job that never actually started can't wedge the daemon.
 pub async fn create_job(
     State(state): State<Arc<AppState>>,
+    axum::Extension(crate::SessionUsername(username)): axum::Extension<crate::SessionUsername>,
+    axum::Extension(client): axum::Extension<crate::client_addr::ClientAddr>,
     Json(req): Json<JobRequest>,
 ) -> impl IntoResponse {
+    let user = username.as_deref().unwrap_or(crate::UNKNOWN_USER).to_string();
+    // apply and rollback are the two most consequential things this daemon
+    // can be asked to do -- they change the running system and they can move
+    // it backwards -- so the dispatch is recorded with WHICH kind it was and
+    // which job id it became, whatever the outcome.
+    let kind = request_body(&req)
+        .get("kind")
+        .and_then(|k| k.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+    let audit_job = |outcome: &str, detail: &str| {
+        crate::audit::record("job-dispatch", outcome, &user, &client, detail);
+    };
     {
         let mut running = state.job_running.lock().unwrap();
         if *running {
+            audit_job("denied", &format!("kind={kind} a job is already running"));
             return (StatusCode::CONFLICT, "a job is already running").into_response();
         }
         *running = true;
@@ -166,6 +182,7 @@ pub async fn create_job(
     let dir = requests_dir();
     if let Err(e) = tokio::fs::create_dir_all(&dir).await {
         release();
+        audit_job("error", &format!("kind={kind} could not create the requests dir"));
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("failed to create requests dir: {e}"),
@@ -175,6 +192,7 @@ pub async fn create_job(
     let request_path = dir.join(format!("{uuid}.json"));
     if let Err(e) = tokio::fs::write(&request_path, body.to_string()).await {
         release();
+        audit_job("error", &format!("kind={kind} could not write the request file"));
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("failed to write request file: {e}"),
@@ -184,9 +202,11 @@ pub async fn create_job(
 
     if let Err(e) = crate::dbus::start_ferrum_apply_unit(&uuid).await {
         release();
+        audit_job("error", &format!("kind={kind} the unit did not start"));
         return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
     }
 
+    audit_job("success", &format!("kind={kind} job={uuid}"));
     (StatusCode::OK, Json(serde_json::json!({"id": uuid}))).into_response()
 }
 

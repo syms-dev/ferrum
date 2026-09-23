@@ -1,3 +1,4 @@
+mod audit;
 mod auth;
 mod catalog;
 mod client_addr;
@@ -98,13 +99,20 @@ async fn login_handler(
 ) -> impl IntoResponse {
     let client = client_addr::ClientAddr::resolve(peer.map(|p| p.0), &headers);
     let throttle_key = client.throttle_key();
+    // The submitted username is audited, so a failed attempt records WHICH
+    // account was tried. `audit::record` escapes it -- it is caller-supplied
+    // and could otherwise forge a log line.
+    let username = req.username.clone();
     let outcome = run_blocking(move || {
         auth::login(&state.db, &req.username, &req.password, &throttle_key)
     })
     .await;
     let outcome = match outcome {
         Ok(outcome) => outcome,
-        Err(status) => return status.into_response(),
+        Err(status) => {
+            audit::record("login", "error", &username, &client, "blocking task failed");
+            return status.into_response();
+        }
     };
     match outcome {
         Ok(auth::LoginOutcome::Success(result)) => {
@@ -114,14 +122,21 @@ async fn login_handler(
             cookie.set_path("/");
             cookie.set_secure(true);
             cookies.add(cookie);
+            audit::record("login", "success", &username, &client, "");
             (StatusCode::OK, Json(LoginResponse { csrf_token: result.csrf_token })).into_response()
         }
-        Ok(auth::LoginOutcome::BadCredentials) => StatusCode::UNAUTHORIZED.into_response(),
-        Ok(auth::LoginOutcome::Throttled) => (
-            StatusCode::TOO_MANY_REQUESTS,
-            "too many failed login attempts -- try again shortly",
-        )
-            .into_response(),
+        Ok(auth::LoginOutcome::BadCredentials) => {
+            audit::record("login", "failure", &username, &client, "bad credentials");
+            StatusCode::UNAUTHORIZED.into_response()
+        }
+        Ok(auth::LoginOutcome::Throttled) => {
+            audit::record("login", "denied", &username, &client, "source throttled");
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                "too many failed login attempts -- try again shortly",
+            )
+                .into_response()
+        }
         // L-03. This arm used to be 429 carrying `e.to_string()`, so a
         // database fault answered with the wrong status AND spilled its
         // internal detail -- on the one unauthenticated endpoint the
@@ -129,6 +144,7 @@ async fn login_handler(
         // operator can read it and a caller cannot.
         Err(e) => {
             eprintln!("ferrumd: login failed: {e:#}");
+            audit::record("login", "error", &username, &client, "daemon fault");
             (StatusCode::INTERNAL_SERVER_ERROR, "login failed").into_response()
         }
     }
@@ -148,12 +164,39 @@ fn removal_cookie() -> Cookie<'static> {
     cookie
 }
 
-async fn logout_handler(State(state): State<Arc<AppState>>, cookies: Cookies) -> impl IntoResponse {
+/// Resolves its own client address and account name rather than reading the
+/// extensions `require_session` publishes, because this route is NOT behind
+/// that middleware -- see the L-01 note in `build_router`. Taking them from
+/// extensions here would compile and then fail at runtime with "Missing
+/// request extension" on every logout.
+async fn logout_handler(
+    State(state): State<Arc<AppState>>,
+    peer: Option<axum::extract::ConnectInfo<std::net::SocketAddr>>,
+    cookies: Cookies,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    let client = client_addr::ClientAddr::resolve(peer.map(|p| p.0), &headers);
+    let mut user = UNKNOWN_USER.to_string();
     if let Some(cookie) = cookies.get(SESSION_COOKIE) {
         let token = cookie.value().to_string();
-        let _ = run_blocking(move || auth::logout(&state.db, &token)).await;
+        // One hop to the blocking pool for both: read who this session
+        // belongs to (so the audit line names an account rather than a
+        // token), then delete it.
+        if let Ok(resolved) = run_blocking(move || {
+            let name = auth::validate_session(&state.db, &token)
+                .ok()
+                .flatten()
+                .and_then(|session| session.username);
+            let _ = auth::logout(&state.db, &token);
+            name
+        })
+        .await
+        {
+            user = resolved.unwrap_or_else(|| UNKNOWN_USER.to_string());
+        }
     }
     cookies.remove(removal_cookie());
+    audit::record("logout", "success", &user, &client, "");
     StatusCode::OK
 }
 
@@ -190,6 +233,23 @@ struct SessionCsrfToken(String);
 #[derive(Clone)]
 struct SessionToken(String);
 
+/// The authenticated account's name, from the same row `require_session`
+/// read everything else out of.
+///
+/// `None` means the session referenced a user row that no longer exists --
+/// see `auth::SessionInfo::username` for why that is kept distinguishable
+/// rather than flattened.
+///
+/// This is what every audit line's `user=` field comes from, so it is read
+/// from the authenticated session and never from anything on the wire. The
+/// one place a caller-supplied username is logged is a LOGIN attempt, where
+/// by definition there is no session yet -- and `audit::record` escapes it.
+#[derive(Clone)]
+struct SessionUsername(Option<String>);
+
+/// The name used in an audit line when the session's user row has vanished.
+const UNKNOWN_USER: &str = "<unknown>";
+
 #[derive(Deserialize)]
 struct ChangePasswordRequest {
     current_password: String,
@@ -221,9 +281,13 @@ async fn change_password_handler(
     State(state): State<Arc<AppState>>,
     axum::Extension(SessionUserId(user_id)): axum::Extension<SessionUserId>,
     axum::Extension(SessionToken(token)): axum::Extension<SessionToken>,
+    axum::Extension(SessionUsername(username)): axum::Extension<SessionUsername>,
+    axum::Extension(client): axum::Extension<client_addr::ClientAddr>,
     Json(req): Json<ChangePasswordRequest>,
 ) -> impl IntoResponse {
+    let user = username.as_deref().unwrap_or(UNKNOWN_USER).to_string();
     if req.new_password.is_empty() {
+        audit::record("password-change", "failure", &user, &client, "empty new password");
         return (StatusCode::BAD_REQUEST, "the new password must not be empty").into_response();
     }
     let outcome = run_blocking(move || {
@@ -241,13 +305,34 @@ async fn change_password_handler(
         Err(status) => return status.into_response(),
     };
     match outcome {
-        Ok(true) => StatusCode::OK.into_response(),
-        Ok(false) => (StatusCode::UNAUTHORIZED, "the current password is incorrect").into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to change the password: {e}"),
-        )
-            .into_response(),
+        Ok(true) => {
+            audit::record(
+                "password-change",
+                "success",
+                &user,
+                &client,
+                "other sessions for this account were invalidated",
+            );
+            StatusCode::OK.into_response()
+        }
+        Ok(false) => {
+            audit::record(
+                "password-change",
+                "failure",
+                &user,
+                &client,
+                "current password incorrect",
+            );
+            (StatusCode::UNAUTHORIZED, "the current password is incorrect").into_response()
+        }
+        Err(e) => {
+            audit::record("password-change", "error", &user, &client, "daemon fault");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to change the password: {e}"),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -317,6 +402,7 @@ async fn require_session(
     mut request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Result<axum::response::Response, StatusCode> {
+    let headers = request.headers().clone();
     let token = cookies
         .get(SESSION_COOKIE)
         .ok_or(StatusCode::UNAUTHORIZED)?
@@ -349,6 +435,20 @@ async fn require_session(
         .extensions_mut()
         .insert(SessionCsrfToken(session.csrf_token.clone()));
     request.extensions_mut().insert(SessionToken(token));
+    request
+        .extensions_mut()
+        .insert(SessionUsername(session.username.clone()));
+    // Resolved here, once, from the request's own ConnectInfo rather than
+    // re-extracted in each handler -- so every audited route behind this
+    // middleware agrees about where the caller is, and there is one place
+    // that decides what may be trusted.
+    let peer = request
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|info| info.0);
+    request
+        .extensions_mut()
+        .insert(client_addr::ClientAddr::resolve(peer, &headers));
 
     Ok(next.run(request).await)
 }
@@ -386,17 +486,11 @@ async fn require_session(
 /// origin. That combination, and only that, turns this endpoint into a CSRF
 /// bypass for every app hosted under the same base domain.
 async fn session_handler(
-    State(state): State<Arc<AppState>>,
-    axum::Extension(SessionUserId(user_id)): axum::Extension<SessionUserId>,
+    axum::Extension(SessionUsername(username)): axum::Extension<SessionUsername>,
     axum::Extension(SessionCsrfToken(csrf_token)): axum::Extension<SessionCsrfToken>,
 ) -> impl IntoResponse {
-    let outcome = run_blocking(move || auth::username_for(&state.db, user_id)).await;
-    let outcome = match outcome {
-        Ok(outcome) => outcome,
-        Err(status) => return status.into_response(),
-    };
-    match outcome {
-        Ok(Some(username)) => {
+    match username {
+        Some(username) => {
             Json(serde_json::json!({ "username": username, "csrf_token": csrf_token }))
                 .into_response()
         }
@@ -404,14 +498,9 @@ async fn session_handler(
         // a database inconsistency, not a failed login, so it is a 500 rather
         // than a 401: telling the operator to log in again would not fix it,
         // and a blank username in the UI would hide it entirely.
-        Ok(None) => (
+        None => (
             StatusCode::INTERNAL_SERVER_ERROR,
             "session references a user that no longer exists",
-        )
-            .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("could not read the session's user: {e}"),
         )
             .into_response(),
     }
@@ -429,18 +518,6 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/jobs/:id", axum::routing::get(jobs::get_job))
         .route("/api/jobs/:id/stream", axum::routing::get(jobs::stream_job))
         .route("/api/password", post(change_password_handler))
-        // L-01. This sat on the unauthenticated router, so it was the one
-        // mutating route with no CSRF check: any same-site sibling under
-        // <baseDomain> could force the operator's browser to POST it and log
-        // them out at will. Only availability, but it is a control plane, and
-        // "log the operator out whenever they try to fix something" is a real
-        // nuisance to hand a compromised app.
-        //
-        // The trade, stated: logging out with an ALREADY-invalid session now
-        // answers 401 rather than 200. Nothing is lost by that -- an invalid
-        // session has nothing left to invalidate -- and the SPA treats 401 as
-        // logged out anyway.
-        .route("/api/logout", post(logout_handler))
         .route_layer(axum::middleware::from_fn_with_state(state.clone(), require_session));
 
     Router::new()
@@ -450,6 +527,14 @@ fn build_router(state: Arc<AppState>) -> Router {
         // page you log in on would be circular. See static_files.rs's header.
         .fallback(static_files::serve)
         .route("/api/login", post(login_handler))
+        // L-01 is knowingly still open here: this is the one mutating route
+        // with no CSRF check. Moving it into `protected` is a one-line fix
+        // that breaks the real UI, which sends no token on logout and then
+        // swallows the 403 -- so the session would silently survive. Both
+        // halves must land together. The whole argument, and the tripwire
+        // that fails if somebody moves this alone, live in
+        // `logout_is_still_unguarded_and_the_ui_still_depends_on_that`.
+        .route("/api/logout", post(logout_handler))
         .merge(protected)
         .layer(CookieManagerLayer::new())
         .with_state(state)
@@ -847,43 +932,86 @@ mod tests {
         assert_eq!(attempt(correct).await.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 
-    /// L-01. `POST /api/logout` sat outside `require_session`, so it was the
-    /// one mutating route with no CSRF check at all -- a same-site sibling
-    /// under `<baseDomain>` could make the operator's browser POST it and log
-    /// them out whenever it liked. It must now be refused like every other
-    /// mutating route, while a properly-formed logout still works (which
-    /// `logout_emits_a_removal_cookie_a_browser_will_actually_accept` pins).
+    /// Every audited handler now extracts `SessionUsername` and `ClientAddr`
+    /// from request extensions, and a missing extension is a RUNTIME failure,
+    /// not a compile error: axum answers 500 with "Missing request
+    /// extension". So adding an audited route, or an audit field, to a
+    /// handler that `require_session` does not feed would compile perfectly
+    /// and fail only when someone actually used it.
+    ///
+    /// This drives every protected route with a real session and pins that
+    /// none of them fails that way. It deliberately does not care what the
+    /// status IS -- these requests carry empty bodies and most are rejected
+    /// on their merits -- only that the reason is never a missing extension.
     #[tokio::test]
-    async fn logout_is_behind_the_csrf_gate_like_every_other_mutating_route() {
+    async fn no_protected_route_is_missing_an_extension_the_audit_log_needs() {
+        let (dir, state, session, csrf) = logged_in();
+        // secrets/settings handlers read these; without them the routes fail
+        // for an unrelated reason and this test would prove less than it says.
+        std::env::set_var("FERRUM_SETTINGS_PATH", dir.path().join("settings.json"));
+        std::env::set_var("FERRUM_SECRETS_DIR", dir.path());
+
+        for (method, _pattern, uri) in cors_is_absent::API_ROUTES {
+            let (session, csrf) = (session.clone(), csrf.clone());
+            let request = Request::builder()
+                .method(Method::from_bytes(method.as_bytes()).unwrap())
+                .uri(*uri)
+                .header("Cookie", format!("{SESSION_COOKIE}={session}"))
+                .header(CSRF_HEADER, csrf)
+                .header("Content-Type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap();
+            let response = build_router(state.clone()).oneshot(request).await.unwrap();
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let body = String::from_utf8_lossy(&body).to_string();
+            assert!(
+                !body.contains("Missing request extension"),
+                "{method} {uri} could not resolve an extension it declares: {body}"
+            );
+        }
+    }
+
+    /// L-01 is knowingly OPEN, and this test is the tripwire for closing it.
+    ///
+    /// `POST /api/logout` still takes no CSRF token, so a same-site sibling
+    /// under `<baseDomain>` can force the operator's browser to POST it. The
+    /// one-line fix -- move the route inside `protected` -- was made and then
+    /// REVERTED, because ferrumd is only half of it: the real UI calls this
+    /// endpoint with `csrf: false` (`ui/api.js:118`) and then SWALLOWS the
+    /// resulting 403 (`ui/api.js:119-123`). Behind the guard the operator
+    /// would appear to log out while the session stayed valid server-side for
+    /// the rest of its idle window -- a worse failure than the forced logout
+    /// being fixed, and a silent one.
+    ///
+    /// So this asserts the CURRENT contract deliberately. It is not approval
+    /// of it: whoever moves the route sees this fail, and the message names
+    /// the other half of the change. A comment in `build_router` would not
+    /// have stopped them.
+    #[tokio::test]
+    async fn logout_is_still_unguarded_and_the_ui_still_depends_on_that() {
         let (_dir, state, session, _csrf) = logged_in();
 
-        // A real session cookie, which a same-site sibling's forged request
-        // WOULD carry, but no CSRF token, which it cannot read.
-        let forged = Request::builder()
+        // No CSRF header, exactly as ui/api.js sends it today.
+        let as_the_ui_sends_it = Request::builder()
             .method(Method::POST)
             .uri("/api/logout")
             .header("Cookie", format!("{SESSION_COOKIE}={session}"))
             .body(Body::empty())
             .unwrap();
+        let response =
+            build_router(state.clone()).oneshot(as_the_ui_sends_it).await.unwrap();
+
         assert_eq!(
-            build_router(state.clone()).oneshot(forged).await.unwrap().status(),
-            StatusCode::FORBIDDEN,
-            "a logout with no CSRF token must be refused"
+            response.status(),
+            StatusCode::OK,
+            "the UI sends no CSRF token on logout (ui/api.js:118). If you are moving this \
+             route inside `protected` to close L-01, drop `csrf: false` from logout() in \
+             ui/api.js in the SAME change -- otherwise the UI catches the 403 and the \
+             session silently survives the logout."
         );
         assert!(
-            auth::validate_session(&state.db, &session).unwrap().is_some(),
-            "and the refused request must not have logged anybody out"
-        );
-
-        // No session at all is a 401 rather than a silent 200.
-        let anonymous = Request::builder()
-            .method(Method::POST)
-            .uri("/api/logout")
-            .body(Body::empty())
-            .unwrap();
-        assert_eq!(
-            build_router(state).oneshot(anonymous).await.unwrap().status(),
-            StatusCode::UNAUTHORIZED
+            auth::validate_session(&state.db, &session).unwrap().is_none(),
+            "and the logout must really have revoked the session server-side"
         );
     }
 
@@ -1728,6 +1856,7 @@ mod tests {
     /// way an absence proof fails without failing.
     const CRATE_SOURCES: &[(&str, &str)] = &[
         ("main.rs", include_str!("main.rs")),
+        ("audit.rs", include_str!("audit.rs")),
         ("auth.rs", include_str!("auth.rs")),
         ("catalog.rs", include_str!("catalog.rs")),
         ("client_addr.rs", include_str!("client_addr.rs")),
@@ -1975,7 +2104,11 @@ mod tests {
         /// re-derives the method/pattern pairs from `build_router`'s own
         /// source. Without that, a route added later would simply not be
         /// tested, and nothing would say so.
-        const API_ROUTES: &[(&str, &str, &str)] = &[
+        /// `pub(super)` so the extension guard in the parent test module can
+        /// reuse it: that check has the same requirement this table already
+        /// carries its own guard for -- it must cover EVERY route, or the
+        /// absence it proves is quietly partial.
+        pub(super) const API_ROUTES: &[(&str, &str, &str)] = &[
             ("POST", "/api/login", "/api/login"),
             ("POST", "/api/logout", "/api/logout"),
             ("GET", "/api/catalog", "/api/catalog"),
