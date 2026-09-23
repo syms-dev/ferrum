@@ -485,9 +485,11 @@ lib.mkIf proxyEnabled {
         settings, its secrets API, and the apply and rollback buttons. It is
         on a real Let's Encrypt certificate and, if ferrum.proxy.dns is on,
         a real DNS record -- so "nobody knows the hostname" is not true
-        either. ferrumd's own login still stands underneath, but it is one
-        password on an internet-facing box with no rate limit in front of
-        it, which is not what this design relies on.
+        either. ferrumd's own login still stands underneath -- one password,
+        behind the 20/minute limit_req on /api/login above and ferrumd's own
+        lockout. Those slow a guess; they are not the gate this design
+        relies on, and neither of them asks a second factor or knows who you
+        are.
 
         Two ways forward, and both are one line:
 
