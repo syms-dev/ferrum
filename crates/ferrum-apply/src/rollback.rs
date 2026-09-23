@@ -211,9 +211,31 @@ mod tests {
     /// exit came back as `Ok(status)` and was discarded, so `run_inner`
     /// returned `Ok(())` and `run` wrote "succeeded -- rebooting into
     /// generation N" about a machine that had not moved.
+    /// Writes an executable `/bin/sh` script that exits with `code`, and
+    /// returns its path.
+    ///
+    /// NOT `/bin/false` and `/bin/true`, which is what these tests used
+    /// first. Those exist on a developer's machine and on CI's runner, and
+    /// do NOT exist inside a Nix build sandbox -- so `cargo test` was green
+    /// everywhere a human looked while the `cargo-test-ferrum-apply` and
+    /// `workspace-tests` flake checks failed with ENOENT. A test fixture
+    /// that depends on the ambient filesystem is a test that passes for a
+    /// reason unrelated to the code. `/bin/sh` is one of the few paths Nix
+    /// guarantees inside the sandbox, so the script is portable where the
+    /// coreutils binaries are not.
+    fn script_exiting(dir: &std::path::Path, name: &str, code: u8) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(name);
+        std::fs::write(&path, format!("#!/bin/sh\nexit {code}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
     #[test]
     fn a_reboot_that_fails_is_not_reported_as_a_reboot() {
-        let err = request_reboot("/bin/false").unwrap_err().to_string();
+        let dir = tempfile::tempdir().unwrap();
+        let failing = script_exiting(dir.path(), "reboot-fails", 1);
+        let err = request_reboot(&failing).unwrap_err().to_string();
         assert!(
             err.contains("did not reboot"),
             "the operator has to be told the machine is still up: {err}"
@@ -229,7 +251,9 @@ mod tests {
     /// satisfied by refusing everything.
     #[test]
     fn a_reboot_that_is_accepted_succeeds() {
-        request_reboot("/bin/true").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let accepting = script_exiting(dir.path(), "reboot-ok", 0);
+        request_reboot(&accepting).unwrap();
     }
 
     /// A `reboot` binary that is not there at all is a spawn failure, and
