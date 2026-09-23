@@ -607,6 +607,33 @@ fn provider_implementation(
     }
 }
 
+/// Builds the `mode=set_config` request that creates or updates one
+/// SABnzbd category.
+///
+/// # Arguments
+/// * `base` - the provider's base URL.
+/// * `provider_key` - SABnzbd's own API key.
+/// * `category` - the category name to create or update.
+///
+/// # Returns
+/// The prepared request, uncalled, so its query can be inspected.
+fn sabnzbd_category_request(base: &str, provider_key: &str, category: &str) -> ureq::Request {
+    // `.query()` rather than a formatted query string. Concatenation made
+    // every value here one `&` away from becoming a PARAMETER instead of
+    // staying a value, and the two parameters it could become are the ones
+    // that matter: `mode` is the whole SABnzbd API surface, and `apikey` is
+    // the credential. It is also simply the correct way to build a query --
+    // concatenation percent-encoded nothing, so a key containing `&` or `+`
+    // went out mangled.
+    ureq::get(&format!("{base}/api"))
+        .query("mode", "set_config")
+        .query("section", "categories")
+        .query("name", category)
+        .query("dir", category)
+        .query("apikey", provider_key)
+        .query("output", "json")
+}
+
 /// SABnzbd requires a category to already exist before any downloadclient
 /// registration can reference it -- confirmed for real: a registration
 /// attempt otherwise returns a real 400 "Category does not exist", unlike
@@ -620,11 +647,7 @@ fn ensure_sabnzbd_category(
     provider_key: &str,
     category: &str,
 ) -> anyhow::Result<()> {
-    let url = format!(
-        "{}/api?mode=set_config&section=categories&name={category}&dir={category}&apikey={provider_key}&output=json",
-        base_url(provider)
-    );
-    ureq::get(&url)
+    sabnzbd_category_request(&base_url(provider), provider_key, category)
         .call()
         .map_err(|e| anyhow::anyhow!("failed to ensure SABnzbd category '{category}': {e}"))?;
     Ok(())
@@ -764,6 +787,58 @@ fn register_application(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// R4/SEC3. The SABnzbd category request built its query by string
+    /// concatenation, so every value in it was one `&` away from becoming a
+    /// PARAMETER rather than staying a value. `mode` is the whole API --
+    /// `mode=shutdown`, `mode=set_config&section=misc` -- and `apikey` is
+    /// the credential, so a second copy of either decides what the call
+    /// actually does.
+    ///
+    /// Constrained in practice today (`category` is a catalog app id and
+    /// `provider_key` a generated hex string), which is why this is
+    /// hardening rather than a live hole. The concatenation is also just
+    /// wrong for a value that legitimately needs escaping: nothing here
+    /// percent-encoded anything, so a key containing `&` or `+` was
+    /// silently mangled on the wire.
+    ///
+    /// Asserted against the parsed query of the real prepared request, not
+    /// against a format string, so it is the request that is pinned.
+    #[test]
+    fn the_sabnzbd_category_request_cannot_have_parameters_smuggled_into_it() {
+        let request = sabnzbd_category_request(
+            "http://127.0.0.1:8080",
+            "realkey&mode=shutdown",
+            "tv&mode=shutdown&apikey=stolen",
+        );
+        let url = request.request_url().expect("the request url parses");
+        let pairs: Vec<(String, String)> = url
+            .as_url()
+            .query_pairs()
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect();
+
+        let values = |key: &str| -> Vec<String> {
+            pairs.iter().filter(|(k, _)| k == key).map(|(_, v)| v.clone()).collect()
+        };
+        assert_eq!(
+            values("mode"),
+            vec!["set_config".to_string()],
+            "a second `mode` decides what this call does: {pairs:?}"
+        );
+        assert_eq!(
+            values("apikey"),
+            vec!["realkey&mode=shutdown".to_string()],
+            "the credential must appear exactly once, intact: {pairs:?}"
+        );
+        assert_eq!(
+            values("name"),
+            vec!["tv&mode=shutdown&apikey=stolen".to_string()],
+            "the category must stay ONE value rather than becoming parameters: {pairs:?}"
+        );
+        assert_eq!(values("section"), vec!["categories".to_string()]);
+        assert_eq!(values("output"), vec!["json".to_string()]);
+    }
 
     #[test]
     fn category_field_name_matches_each_apps_real_schema() {
