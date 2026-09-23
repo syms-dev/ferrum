@@ -117,7 +117,45 @@ fn validate_root_device(root_device: &str) -> anyhow::Result<()> {
 
 /// Performs the validated snapshot-and-rename swap (Phase 1.0 probe 0.2)
 /// against the top-level btrfs volume mounted at `scratch_mount`.
-fn perform_swap(scratch_mount: &Path, snapshot: &str) -> anyhow::Result<PathBuf> {
+///
+/// The swap is two renames, and a crash between them used to be permanently
+/// unrecoverable. `rename(@state -> trash/@state.replaced.<ts>)` succeeds,
+/// then `rename(@state.restoring -> @state)` never runs: the host is left
+/// with NO `@state` and the restored copy still under its working name. The
+/// next boot's retry then deleted `@state.restoring` -- the only copy of
+/// the restored state -- re-snapshotted, and failed at the first rename
+/// with ENOENT because `@state` was not there. Every boot after that did
+/// the same, so apps stayed held down by the failure marker forever, and
+/// `run`'s claim that a transient failure "can self-heal on a later boot"
+/// was false for exactly this state.
+///
+/// That window is real on this unit. It runs early in boot with
+/// `DefaultDependencies = false`, so a SIGKILL on unit timeout, or power
+/// loss during an operator-initiated reboot, land squarely in it.
+///
+/// So the retry now asks which interruption it is looking at before doing
+/// anything destructive:
+///
+/// * `@state` absent AND `@state.restoring` present -- the first rename
+///   completed and the second did not. FINISH it: the second rename is all
+///   that is left, and `@state.restoring` is a complete snapshot because
+///   the first rename only runs after the snapshot succeeded.
+/// * anything else -- start over, which is what the old code always did.
+///
+/// `renameat2(RENAME_EXCHANGE)` would close the window rather than recover
+/// from it, but there is no binding for it in this workspace's dependency
+/// set and adding one is not worth it: detection needs no syscall the std
+/// library does not already expose, and it also recovers hosts already
+/// stuck in this state, which an atomic exchange would not.
+///
+/// # Arguments
+/// * `scratch_mount` - the top-level btrfs volume (`subvolid=5`).
+/// * `snapshot` - the snapshot directory name under `@snapshots`.
+///
+/// # Errors
+/// When the snapshot name is invalid, the btrfs snapshot fails, or either
+/// rename fails.
+fn perform_swap(scratch_mount: &Path, snapshot: &str) -> anyhow::Result<()> {
     validate_snapshot_name(snapshot)?;
 
     let snapshots_dir = scratch_mount.join("@snapshots");
@@ -126,6 +164,17 @@ fn perform_swap(scratch_mount: &Path, snapshot: &str) -> anyhow::Result<PathBuf>
     std::fs::create_dir_all(&trash_dir)?;
 
     let restoring = scratch_mount.join("@state.restoring");
+
+    // Before the destructive cleanup below: is this a swap that was
+    // interrupted between its two renames? If so the only thing missing is
+    // the second one. Restarting from here cannot work -- there is no
+    // @state left to displace -- and the cleanup would destroy the restored
+    // copy on the way to finding that out.
+    if !live_state.exists() && restoring.exists() {
+        std::fs::rename(&restoring, &live_state)?;
+        return Ok(());
+    }
+
     // Best-effort cleanup: a previous attempt may have snapshotted
     // successfully but failed before the rename, leaving this behind. Clear
     // it so this attempt's snapshot doesn't fail with "already exists".
@@ -152,7 +201,7 @@ fn perform_swap(scratch_mount: &Path, snapshot: &str) -> anyhow::Result<PathBuf>
     ));
     std::fs::rename(&live_state, &displaced)?;
     std::fs::rename(&restoring, &live_state)?;
-    Ok(displaced)
+    Ok(())
 }
 
 /// Mounts the top-level btrfs volume and performs the swap. Separated from
@@ -262,6 +311,13 @@ pub fn run(root_device: &str, storage: &StorageConfig) {
             // every reason not to -- a transient failure (a flaky mount, a
             // brief resource contention) can self-heal on a later boot
             // instead of silently never retrying.
+            //
+            // That claim used to be false for one state, and it was the
+            // state most likely to occur: a crash between `perform_swap`'s
+            // two renames left no `@state`, and every retry then failed
+            // identically forever. `perform_swap` now detects that case and
+            // finishes the interrupted swap, so retrying is genuinely
+            // capable of healing it rather than only of repeating.
             if let Err(e) = std::fs::remove_file(&storage.intent_path) {
                 eprintln!(
                     "ferrum-apply restore-state: restore succeeded but failed to remove the \
@@ -320,6 +376,85 @@ mod tests {
         let path = dir.path().join("rollback-intent.json");
         std::fs::write(&path, "not json").unwrap();
         assert!(read_intent(&path).is_err());
+    }
+
+    /// The exact on-disk state a crash between the two renames leaves.
+    ///
+    /// `perform_swap` renames `@state` into `trash/` and then renames
+    /// `@state.restoring` into its place. A crash in between -- a SIGKILL
+    /// on unit timeout, or power loss during an operator-initiated reboot,
+    /// both realistic for a `DefaultDependencies = false` early-boot unit --
+    /// leaves the host with NO `@state` and the restored copy still sitting
+    /// at `@state.restoring`.
+    ///
+    /// Before this was handled, the next boot deleted `@state.restoring`
+    /// (the only copy of the restored state), re-snapshotted, and then
+    /// failed at `rename(@state -> trash/...)` with ENOENT, because
+    /// `@state` was not there. Every subsequent boot did the same, so apps
+    /// stayed held down by the failure marker forever.
+    ///
+    /// The setup below is filesystem state, not btrfs state, so what this
+    /// executes is the recovery decision and the rename that completes the
+    /// swap -- not a real crash. That is the point: the recovery path
+    /// touches no btrfs subcommand at all, which is why it can be asserted
+    /// here with real renames on real directories.
+    #[test]
+    fn an_interrupted_swap_is_finished_rather_than_restarted() {
+        let dir = tempfile::tempdir().unwrap();
+        let mount = dir.path();
+        std::fs::create_dir_all(mount.join("@snapshots/1000-gen1")).unwrap();
+        // The first rename completed: the old state is already in trash.
+        std::fs::create_dir_all(mount.join("trash/@state.replaced.1000")).unwrap();
+        // The second never ran: the restored copy is still under its
+        // working name, and @state does not exist.
+        std::fs::create_dir_all(mount.join("@state.restoring")).unwrap();
+        std::fs::write(mount.join("@state.restoring/marker"), b"restored").unwrap();
+        assert!(!mount.join("@state").exists());
+
+        perform_swap(mount, "1000-gen1").unwrap();
+
+        assert!(
+            mount.join("@state").exists(),
+            "the interrupted swap must be completed, not started over"
+        );
+        assert_eq!(
+            std::fs::read(mount.join("@state/marker")).unwrap(),
+            b"restored",
+            "and it must be the RESTORED copy that lands at @state"
+        );
+        assert!(
+            !mount.join("@state.restoring").exists(),
+            "the working name is consumed by the rename"
+        );
+    }
+
+    /// The recovery must key on `@state` being ABSENT, not merely on
+    /// `@state.restoring` being present.
+    ///
+    /// A leftover `@state.restoring` beside a live `@state` is the other
+    /// interruption -- a crash after the snapshot and before the first
+    /// rename -- and that one genuinely must be restarted, because
+    /// `@state.restoring` may be a half-written snapshot. Treating it as a
+    /// finished swap would discard the live state for an incomplete copy.
+    #[test]
+    fn a_leftover_restoring_beside_a_live_state_is_not_treated_as_finished() {
+        let dir = tempfile::tempdir().unwrap();
+        let mount = dir.path();
+        std::fs::create_dir_all(mount.join("@snapshots/1000-gen1")).unwrap();
+        std::fs::create_dir_all(mount.join("@state")).unwrap();
+        std::fs::write(mount.join("@state/marker"), b"live").unwrap();
+        std::fs::create_dir_all(mount.join("@state.restoring")).unwrap();
+
+        // No btrfs here, so the restart fails at the snapshot step -- which
+        // is the proof that it took the restart path at all rather than
+        // quietly "completing" a swap that had not reached its first
+        // rename.
+        assert!(perform_swap(mount, "1000-gen1").is_err());
+        assert_eq!(
+            std::fs::read(mount.join("@state/marker")).unwrap(),
+            b"live",
+            "the live state must still be there"
+        );
     }
 
     #[test]
