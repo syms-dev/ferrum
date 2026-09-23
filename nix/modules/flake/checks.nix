@@ -922,6 +922,37 @@
           wronglyAcceptedBracketed = builtins.filter (a: loopbackFailuresFor a == [ ])
             [ "[::1]" ];
 
+          # SEC-08. The /authelia subrequest must tell Authelia who is
+          # knocking. It writes its own proxy_pass inside extraConfig, so
+          # nixpkgs' recommendedProxySettings generates no
+          # proxy_set_header include for it, and nginx replaces rather than
+          # extends an inherited set -- so the headers are absent unless
+          # this block sets them itself, and Authelia attributes every
+          # attempt on every vhost to nginx's own loopback address.
+          #
+          # Both vhost shapes, because they are built by different code:
+          # mkVhost for a catalog app, the hand-built daemonVhost for the
+          # control plane. Fixing one and not the other is the shape of
+          # SEC-02 itself.
+          autheliaSubrequests = [
+            { where = "the daemon vhost"; conf = locOf "/authelia"; }
+            {
+              where = "a catalog app vhost (sonarr.example.test)";
+              conf = (vhosts."sonarr.example.test".locations."/authelia" or { }).extraConfig or "";
+            }
+          ];
+          missingClientHeaders = lib.concatMap
+            (sub: map (h: "${sub.where} sets no ${h}")
+              (builtins.filter (h: !(lib.hasInfix h sub.conf))
+                [ "proxy_set_header X-Forwarded-For" "proxy_set_header X-Real-IP" ]))
+            autheliaSubrequests;
+          # Anti-vacuity: an /authelia block that does not exist has no
+          # missing headers either, and would pass the clause above in
+          # silence.
+          autheliaSubrequestsScanned = builtins.filter
+            (sub: !(lib.hasInfix "proxy_pass http://127.0.0.1:9091/api/verify" sub.conf))
+            autheliaSubrequests;
+
           # SEC-01/SEC-02. The same injection class as
           # wronglyAcceptedInjection above, in the two settings-writable
           # values that reach an nginx directive and were NOT covered when
@@ -1262,6 +1293,11 @@
               wronglyAcceptedBypassPath
             ++ map (path: "the catalog declares authBypassPaths = \"${path}\" and it no longer generates a location of that name. A bypass-path type that over-tightens is not a safe failure: `/api` behind forward-auth takes out Prowlarr -> Sonarr/Radarr, every native client, and ferrum's OWN reconciler -- enabling SSO would again disable the self-setup SSO exists to protect (SEC-02)")
               brokenCatalogBypassPath
+            # SEC-08.
+            ++ map (sub: "${sub.where} generated no /authelia subrequest at all, so the header assertions below are a scan over nothing (SEC-08)")
+              autheliaSubrequestsScanned
+            ++ map (m: "${m}. The /authelia block writes its own proxy_pass inside extraConfig, so nixpkgs' recommendedProxySettings adds no proxy_set_header include to it, and nginx REPLACES an inherited set rather than extending it. Authelia therefore sees every verification request as coming from nginx's own loopback connection: its log attributes every attempt to 127.0.0.1, and its regulation counts one global bucket instead of one per source, so an attacker anywhere is indistinguishable from the operator at home (SEC-08)")
+              missingClientHeaders
             # A2/D1.
             ++ lib.optional (daemonRules == [ ])
               "Authelia has no access_control rule for ${daemonName}, so default_policy = deny makes the dashboard unopenable (D1)"

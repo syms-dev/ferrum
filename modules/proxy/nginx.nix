@@ -97,6 +97,7 @@ let
               proxy_pass_request_body off;
               proxy_set_header Content-Length "";
               proxy_set_header X-Original-URL $scheme://$http_host$request_uri;
+              ${autheliaClientHeaders}
             '';
           };
 
@@ -191,6 +192,36 @@ let
     proxy_read_timeout 300s;
   '';
 
+  # SEC-08. Who Authelia thinks is knocking.
+  #
+  # nixpkgs' recommendedProxySettings adds an `include
+  # ...recommended-proxy_set_header-headers.conf` -- which carries X-Real-IP
+  # and X-Forwarded-For -- only to a location it generates a proxy_pass FOR.
+  # The /authelia subrequest writes its own proxy_pass inside extraConfig, so
+  # it gets no include, and nginx's proxy_set_header inheritance is
+  # all-or-nothing in the same way add_header is: the lines this block sets
+  # itself REPLACE the inherited set rather than extending it. Confirmed
+  # against the real generated file, not the docs -- the sibling "/" location
+  # carries the include and this block carries nothing.
+  #
+  # The effect is not a missing header, it is a missing SUBJECT. Every
+  # verification request arrives at Authelia from nginx's own loopback
+  # connection with nothing saying otherwise, so Authelia's log line and its
+  # regulation counter both attribute the attempt to 127.0.0.1. Its lockout
+  # therefore counts one global bucket instead of one per source: an attacker
+  # anywhere is indistinguishable from the operator at home, in the log that
+  # would be read after the fact and in the mechanism meant to stop it
+  # during.
+  #
+  # $proxy_add_x_forwarded_for rather than $remote_addr for the forwarded
+  # chain, because it appends to any inbound header instead of discarding it;
+  # X-Real-IP stays the single peer address, which is the one Authelia reads
+  # when no trusted-proxy chain is configured.
+  autheliaClientHeaders = ''
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Real-IP $remote_addr;
+  '';
+
   # The two headers that are right for every vhost on this host, set once at
   # http level. Neither depends on what the vhost serves: nosniff turns off
   # content-type sniffing, which is only ever a way to get a response treated
@@ -275,6 +306,7 @@ let
           proxy_pass_request_body off;
           proxy_set_header Content-Length "";
           proxy_set_header X-Original-URL $scheme://$http_host$request_uri;
+          ${autheliaClientHeaders}
         '';
       };
 
