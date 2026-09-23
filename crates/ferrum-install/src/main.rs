@@ -586,6 +586,22 @@ fn recover_plan(
         if let Some(by_id) = device.by_id.as_deref() {
             inventory::validate_by_id_path(by_id)?;
         }
+        // The CHILDREN's aliases too. Only the disk's was re-checked here,
+        // and that was survivable exactly as long as a child's alias
+        // reached no sink -- which is to say, as long as
+        // `Filesystem::by_id` was always `None`. It no longer is: it now
+        // renders into `custom/media.nix` as a `fileSystems.<mount>.device`
+        // string, and it is now the value `verify::data_disk_checks`
+        // interpolates into a command that `ssh` hands to a remote root
+        // shell. A recovered value has not been through `parse_by_id`'s
+        // allowlist, so it is allowlisted here instead -- the same "make it
+        // true on every path in" argument as the line above, applied one
+        // level down.
+        for fs in device.children.iter_mut() {
+            if let Some(by_id) = fs.by_id.as_deref() {
+                inventory::validate_partition_by_id_path(by_id)?;
+            }
+        }
         // ...and the fields that RENDER, not just the one that reaches
         // Nix. Only by_id was re-checked here, so a recovered record could
         // still display as a different disk than it is -- the same
@@ -630,11 +646,20 @@ fn read_generated(dir: &std::path::Path) -> anyhow::Result<render::Files> {
     Ok(files)
 }
 
+/// Writes `install-inventory.json`, the record of which disk the operator
+/// approved for erasure.
+///
+/// Delegates to [`state::write_json_atomically`] rather than repeating
+/// temp-write-and-rename here. The two copies had drifted into the same
+/// gap -- both called the result atomic, neither fsynced -- and one
+/// implementation is how they stop drifting. This file matters for the same
+/// reason `install-state.json` does: a resume reads it to decide what has
+/// already been destroyed.
+///
+/// # Errors
+/// Any serialization or filesystem failure.
 fn write_json<T: serde::Serialize>(path: &std::path::Path, value: &T) -> anyhow::Result<()> {
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, serde_json::to_string_pretty(value)?)?;
-    std::fs::rename(&tmp, path)?;
-    Ok(())
+    state::write_json_atomically(path, value)
 }
 
 /// Runs a long command with its output streaming through, so the operator
@@ -825,14 +850,63 @@ fn wait_for_ssh(pre: &preconditions::Preconditions) -> anyhow::Result<()> {
     )
 }
 
+/// Asks the target whether an earlier attempt already delivered the
+/// encrypted Cloudflare secret.
+///
+/// # Errors
+/// When the target cannot be asked. See [`interpret_acme_probe`] for why
+/// that is an error rather than a `false`.
 fn acme_secret_present(pre: &preconditions::Preconditions) -> anyhow::Result<bool> {
-    Ok(collect::run(
+    interpret_acme_probe(collect::run(
         &pre.target,
         &pre.ssh_auth,
         "test -f /etc/ferrum/secrets/acme-dns.sops && echo yes || echo no",
-    )
-    .map(|o| o.trim() == "yes")
-    .unwrap_or(false))
+    ))
+}
+
+/// Turns the probe's outcome into an answer, and refuses to invent one.
+///
+/// This used to end `.unwrap_or(false)`, which collapsed "the secret is not
+/// there" and "I could not ask" into the same answer. The two lead to
+/// opposite places. A `false` makes `ensure_cloudflare_token` re-prompt for
+/// a Cloudflare token -- and a resume is the path taken after the very
+/// failure that loses a credential, so the operator may no longer have it.
+/// An SSH blip is also exactly the condition a resume exists to recover
+/// from, which makes this the one place that failure was most likely to
+/// occur and least affordable.
+///
+/// The command always prints `yes` or `no` on a connection that worked, so
+/// anything else -- an error, or unexpected output -- means the question was
+/// not answered, and the run stops rather than guessing. A stopped resume
+/// costs a re-run; a wrong guess costs a credential the operator may not be
+/// able to produce again.
+///
+/// # Arguments
+/// * `outcome` - what `collect::run` returned for the probe command.
+///
+/// # Returns
+/// `true` for `yes`, `false` for `no`.
+///
+/// # Errors
+/// When the command failed, or printed anything else.
+fn interpret_acme_probe(outcome: anyhow::Result<String>) -> anyhow::Result<bool> {
+    let output = outcome.map_err(|e| {
+        anyhow::anyhow!(
+            "could not ask the target whether the Cloudflare secret is \
+             already installed: {e}. Refusing to assume it is absent -- \
+             that would re-prompt for a token this resume may not be able \
+             to obtain again. Re-run once the target answers SSH."
+        )
+    })?;
+    match output.trim() {
+        "yes" => Ok(true),
+        "no" => Ok(false),
+        other => anyhow::bail!(
+            "the target answered {other:?} when asked whether the Cloudflare \
+             secret is installed, which is neither \"yes\" nor \"no\". \
+             Refusing to guess."
+        ),
+    }
 }
 
 /// Re-asks for the Cloudflare token on a resumed run, and checks it the
@@ -1092,6 +1166,44 @@ fn final_report(
 
 #[cfg(test)]
 mod tests {
+    /// "The secret is not on the host" and "I could not ask" must not be
+    /// the same answer.
+    ///
+    /// The probe ended `.unwrap_or(false)`, so an SSH failure -- the very
+    /// condition a resume exists to recover from -- was reported as the
+    /// secret being absent, and `ensure_cloudflare_token` then re-prompted
+    /// for a Cloudflare token the operator may no longer hold.
+    #[test]
+    fn an_unreachable_target_is_not_an_absent_secret() {
+        let err = interpret_acme_probe(Err(anyhow::anyhow!("ssh: connect: timed out")))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("could not ask"),
+            "the failure has to name itself: {err}"
+        );
+        assert!(
+            err.contains("timed out"),
+            "and carry the underlying cause: {err}"
+        );
+    }
+
+    /// The two answers the probe can actually give still work, so refusing
+    /// an error cannot be satisfied by refusing everything.
+    #[test]
+    fn the_probes_two_real_answers_are_read_as_themselves() {
+        assert!(interpret_acme_probe(Ok("yes\n".to_string())).unwrap());
+        assert!(!interpret_acme_probe(Ok("no\n".to_string())).unwrap());
+    }
+
+    /// A connection that worked always prints one of those two words.
+    /// Anything else means something answered that was not the probe.
+    #[test]
+    fn an_unrecognised_answer_is_not_guessed_at() {
+        assert!(interpret_acme_probe(Ok(String::new())).is_err());
+        assert!(interpret_acme_probe(Ok("Permission denied".to_string())).is_err());
+    }
+
     /// S13's resume test found nixos-anywhere looping on `ssh-copy-id`
     /// for 150 minutes with no output after a kill mid-install. The retry
     /// is inside nixos-anywhere; what we control is refusing to hand it

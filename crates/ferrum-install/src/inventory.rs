@@ -402,29 +402,53 @@ pub fn parse_lsblk(json: &str) -> anyhow::Result<Vec<Device>> {
 // /dev/disk/by-id
 // ---------------------------------------------------------------------
 
-/// True for a `by-id` entry this installer will never name in `disko.nix`.
+/// The character allowlist every `by-id` alias must satisfy, whatever it
+/// names.
 ///
-/// `-partN` aliases point at a partition rather than the whole disk, and
-/// `wwn-` aliases carry no model or serial, so an operator reading one off
-/// the screen cannot tell which physical drive it is. `nvme-eui.` is the
-/// same problem in NVMe's spelling.
-fn is_unusable_alias(alias: &str) -> bool {
-    // An allowlist first. udev builds these from model and serial strings,
-    // and on a resume the stored value is deserialized from a file in the
-    // operator's writable bind mount -- so a shell metacharacter here is
-    // not impossible, only unusual, and it would reach a remote root shell.
-    if !alias
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || "._-:".contains(c))
-    {
-        return true;
-    }
-    alias.contains("-part")
-        || alias.starts_with("wwn-")
+/// udev builds these from model and serial strings, and on a resume the
+/// stored value is deserialized from a file in the operator's writable bind
+/// mount -- so a shell metacharacter here is not impossible, only unusual,
+/// and it would reach a remote root shell. This is the security half of the
+/// old `is_unusable_alias`, split out because the two predicates below
+/// disagree about `-part` and must not be allowed to disagree about this.
+fn alias_chars_ok(alias: &str) -> bool {
+    !alias.is_empty()
+        && alias
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "._-:".contains(c))
+}
+
+/// True for an alias that identifies nothing an operator could read off the
+/// screen: `wwn-` and `nvme-eui.` carry no model or serial, and the mapper
+/// prefixes name a virtual device rather than a drive.
+fn is_opaque_alias(alias: &str) -> bool {
+    alias.starts_with("wwn-")
         || alias.starts_with("nvme-eui.")
         || alias.starts_with("lvm-")
         || alias.starts_with("dm-")
         || alias.starts_with("md-")
+}
+
+/// True for a `by-id` entry this installer will never name as a WHOLE DISK
+/// in `disko.nix`.
+///
+/// `-partN` aliases point at a partition rather than the whole disk, so
+/// they are wrong here -- and right in
+/// [`is_unusable_partition_alias`], which is the point of the split.
+fn is_unusable_alias(alias: &str) -> bool {
+    !alias_chars_ok(alias) || alias.contains("-part") || is_opaque_alias(alias)
+}
+
+/// True for a `by-id` entry this installer will never name as the source of
+/// a data disk's MOUNT.
+///
+/// The mirror image of [`is_unusable_alias`]: a partition alias must carry
+/// `-partN`, because that is how udev spells the thing the filesystem
+/// actually lives on. Everything else -- the character allowlist, the
+/// opaque prefixes -- is held in common, which is why both predicates are
+/// built from the same two helpers rather than restating the rules.
+fn is_unusable_partition_alias(alias: &str) -> bool {
+    !alias_chars_ok(alias) || !alias.contains("-part") || is_opaque_alias(alias)
 }
 
 /// Validates a `/dev/disk/by-id/` path that did NOT come from
@@ -460,11 +484,53 @@ pub fn validate_by_id_path(path: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Parses `ls -l /dev/disk/by-id/` into alias -> kernel name.
+/// The same validation for a PARTITION's `/dev/disk/by-id/` path.
+///
+/// A partition alias is `-partN`-suffixed, which
+/// [`validate_by_id_path`] refuses by design -- so recovered children could
+/// not be validated by that function, and before this existed they were not
+/// validated at all. A child's alias reaches `custom/media.nix` as a
+/// `fileSystems.<mount>.device` string and reaches the verification
+/// command that `ssh` hands to a remote shell, so it needs exactly the
+/// character guarantee its parent already had.
+///
+/// # Arguments
+/// * `path` - the recovered `/dev/disk/by-id/...-partN` value.
+///
+/// # Errors
+/// When the value is not `/dev/disk/by-id/<allowlisted partition alias>`.
+pub fn validate_partition_by_id_path(path: &str) -> anyhow::Result<()> {
+    let Some(alias) = path.strip_prefix("/dev/disk/by-id/") else {
+        anyhow::bail!(
+            "{path:?} is not a /dev/disk/by-id/ path. Kernel names are not \
+             stable across boots and this value is re-read on every apply."
+        );
+    };
+    if is_unusable_partition_alias(alias) {
+        anyhow::bail!(
+            "{path:?} is not a usable /dev/disk/by-id/ partition alias. It \
+             must carry -partN and may contain only letters, digits and \
+             . _ - :"
+        );
+    }
+    Ok(())
+}
+
+/// Parses `ls -l /dev/disk/by-id/` into kernel name -> alias.
 ///
 /// Reads the symlink target's basename rather than trusting the alias's own
 /// spelling, which is what makes this correct across the `../../sda` and
 /// `../../nvme0n1` forms alike.
+///
+/// **Partition aliases are kept.** They used to be dropped here, which made
+/// [`attach_by_id`]'s partition loop -- and the comment above it explaining
+/// why partitions matter -- dead code: `Filesystem::by_id` was `None` on
+/// every device the live pipeline produced. `render::media` refuses a data
+/// disk whose partition has no by-id path, so every install that kept a
+/// data disk aborted while rendering `custom/media.nix`. Keeping both kinds
+/// in one map is safe because the map is keyed by KERNEL NAME, and `sdb`
+/// and `sdb1` are different keys: a disk lookup can never return a
+/// partition alias, nor the reverse.
 pub fn parse_by_id(listing: &str) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
     for line in listing.lines() {
@@ -474,7 +540,7 @@ pub fn parse_by_id(listing: &str) -> BTreeMap<String, String> {
         let Some(alias) = alias_part.split_whitespace().next_back() else {
             continue;
         };
-        if is_unusable_alias(alias) {
+        if is_unusable_alias(alias) && is_unusable_partition_alias(alias) {
             continue;
         }
         let Some(kernel) = target.rsplit('/').next() else {
@@ -494,20 +560,33 @@ pub fn parse_by_id(listing: &str) -> BTreeMap<String, String> {
 }
 
 /// Attaches the stable `by-id` path to each device.
+///
+/// The map now carries whole-disk and partition aliases together, so each
+/// lookup re-asserts the kind it wants rather than trusting the key space
+/// to keep them apart. The keys ARE disjoint -- `sdb` and `sdb1` -- but a
+/// malformed listing line is the one input that could pair a `-part` alias
+/// with a disk's kernel name, and the cost of checking is a string scan.
 pub fn attach_by_id(devices: &mut [Device], by_id: &BTreeMap<String, String>) {
-    let path_for = |name: &str| {
+    let path_for = |name: &str, want_partition: bool| {
         by_id
             .get(name)
+            .filter(|alias| {
+                if want_partition {
+                    !is_unusable_partition_alias(alias)
+                } else {
+                    !is_unusable_alias(alias)
+                }
+            })
             .map(|alias| format!("/dev/disk/by-id/{alias}"))
     };
     for dev in devices.iter_mut() {
-        dev.by_id = path_for(&dev.name);
+        dev.by_id = path_for(&dev.name, false);
         // Partitions too. The disk's path is what the operator confirms
         // and what disko is told to erase; the PARTITION's path is what a
         // data disk is mounted from, because that is where the filesystem
         // is. Conflating them mounts /dev/sdb instead of /dev/sdb1.
         for fs in dev.children.iter_mut() {
-            fs.by_id = path_for(&fs.name);
+            fs.by_id = path_for(&fs.name, true);
         }
     }
 }
@@ -1121,17 +1200,75 @@ lrwxrwxrwx 1 root root 13 Sep 17 10:00 nvme-eui.0025385991b1c2d3 -> ../../nvme0n
 lrwxrwxrwx 1 root root 13 Sep 17 10:00 nvme-Samsung_SSD_980_S5P2NG0N123456 -> ../../nvme0n1
 ";
 
+    /// A disk's key never resolves to a partition alias, and vice versa.
+    ///
+    /// This test used to assert `!m.values().any(|v| v.contains("-part"))`
+    /// -- that partition aliases were dropped outright. That was the
+    /// defect, not the contract: dropping them left `Filesystem::by_id`
+    /// `None` on every live inventory, and `render::media` refuses a data
+    /// disk whose partition has no by-id path. What actually has to hold is
+    /// that the two kinds do not bleed into each other's keys.
     #[test]
-    fn drops_partition_and_opaque_aliases() {
+    fn separates_partition_from_whole_disk_aliases() {
         let m = parse_by_id(BY_ID);
         assert_eq!(
             m.get("sda").map(String::as_str),
             Some("ata-WDC_WD20EZAZ_WD-ABC123")
         );
         assert_eq!(m.get("sdb").map(String::as_str), Some("ata-ST4000VN_ZDH9"));
-        // wwn- lost to the ata- alias; -part1 never considered at all.
-        assert!(!m.values().any(|v| v.contains("-part")));
+        // The partition is now reachable -- under its OWN kernel name.
+        assert_eq!(
+            m.get("sda1").map(String::as_str),
+            Some("ata-WDC_WD20EZAZ_WD-ABC123-part1")
+        );
+        // ...and no whole-disk key carries one.
+        assert!(!m["sda"].contains("-part"), "{m:?}");
+        assert!(!m["sdb"].contains("-part"), "{m:?}");
+        // wwn- still loses to the ata- alias.
         assert!(!m.values().any(|v| v.starts_with("wwn-")));
+    }
+
+    /// The end-to-end path that `render::media` depends on, exercised
+    /// through the real `parse_by_id` + `attach_by_id` pair rather than by
+    /// hand-constructing a `Filesystem` with its `by_id` already filled in.
+    ///
+    /// Every render test did the latter, which is why this never showed up:
+    /// the pipeline that produces the value was never run in a test that
+    /// asserted on it. On a real install it produced `None`, and the
+    /// install aborted rendering `custom/media.nix`.
+    #[test]
+    fn a_partition_alias_survives_the_live_inventory_pipeline() {
+        let json = r#"{"blockdevices":[
+            {"name":"sdb","size":"7.3T","model":"ST8000DM004","serial":"ZR13ABCD","type":"disk",
+             "children":[{"name":"sdb1","size":"7.3T","fstype":"ext4","type":"part"}]}]}"#;
+        let listing = "\
+lrwxrwxrwx 1 root root  9 x x x ata-ST8000DM004_ZR13ABCD -> ../../sdb
+lrwxrwxrwx 1 root root 10 x x x ata-ST8000DM004_ZR13ABCD-part1 -> ../../sdb1
+lrwxrwxrwx 1 root root 10 x x x wwn-0x5000c500a1b2c3d4-part1 -> ../../sdb1
+";
+        let mut d = parse_lsblk(json).unwrap();
+        attach_by_id(&mut d, &parse_by_id(listing));
+        assert_eq!(
+            d[0].by_id.as_deref(),
+            Some("/dev/disk/by-id/ata-ST8000DM004_ZR13ABCD")
+        );
+        assert_eq!(
+            d[0].children[0].by_id.as_deref(),
+            Some("/dev/disk/by-id/ata-ST8000DM004_ZR13ABCD-part1"),
+            "the mount source render::media needs"
+        );
+    }
+
+    /// A listing line pairing a `-part` alias with a DISK's kernel name is
+    /// malformed, and `attach_by_id` must not hand it to disko as the thing
+    /// to erase.
+    #[test]
+    fn a_partition_alias_is_never_attached_to_a_whole_disk() {
+        let json = r#"{"blockdevices":[{"name":"sdb","size":"1T","type":"disk","children":[]}]}"#;
+        let listing = "lrwxrwxrwx 1 root root 9 x x x ata-X_1-part1 -> ../../sdb\n";
+        let mut d = parse_lsblk(json).unwrap();
+        attach_by_id(&mut d, &parse_by_id(listing));
+        assert_eq!(d[0].by_id, None, "{:?}", d[0].by_id);
     }
 
     /// An `nvme-eui.` alias carries no model or serial, so an operator
@@ -1186,6 +1323,36 @@ lrwxrwxrwx 1 root root 13 Sep 17 10:00 nvme-Samsung_SSD_980_S5P2NG0N123456 -> ..
             "relative/ata-X",
         ] {
             assert!(validate_by_id_path(bad).is_err(), "accepted {bad:?}");
+        }
+    }
+
+    /// The children of a recovered device reach the same two sinks -- the
+    /// generated `fileSystems.<mount>.device` string and the `ssh` command
+    /// that verifies the mount -- and until now nothing validated them.
+    #[test]
+    fn a_recovered_partition_by_id_path_is_validated_too() {
+        validate_partition_by_id_path("/dev/disk/by-id/ata-WDC_WD20EZAZ_WD-ABC123-part1").unwrap();
+        validate_partition_by_id_path("/dev/disk/by-id/nvme-Samsung_980_S5P2-part3").unwrap();
+
+        for bad in [
+            "/dev/sda1",
+            "/dev/disk/by-id/",
+            "/dev/disk/by-id/ata-X-part1$(touch /tmp/p)",
+            "/dev/disk/by-id/ata-X-part1;id",
+            "/dev/disk/by-id/ata-X-part1`id`",
+            "/dev/disk/by-id/ata-X-part1 id",
+            "/dev/disk/by-id/ata-X-part1\nid",
+            "/dev/disk/by-id/wwn-0x5000-part1",
+            // A WHOLE-DISK alias is wrong here for the same reason a
+            // partition alias is wrong in the function above: mounting the
+            // disk fails with "wrong fs type, bad superblock".
+            "/dev/disk/by-id/ata-X",
+            "relative/ata-X-part1",
+        ] {
+            assert!(
+                validate_partition_by_id_path(bad).is_err(),
+                "accepted {bad:?}"
+            );
         }
     }
 

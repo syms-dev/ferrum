@@ -237,11 +237,46 @@ pub fn unauthenticated_checks(domain: &str, apps: &[String]) -> Vec<Check> {
 ///
 /// A data disk that failed to mount should be a loud failure now, not a
 /// missing directory discovered weeks later when a library looks empty.
+///
+/// **The check must name the PARTITION, not the disk.** This asked
+/// `findmnt --source <disk by-id>` while `render::media` (render.rs:441)
+/// mounts `<partition by-id>`, and `findmnt --source` matches the source
+/// string the kernel recorded in `/proc/self/mountinfo` -- it does not walk
+/// the device hierarchy from a disk down to its partitions. So the check
+/// was not merely wrong, it was *unsatisfiable*: no install that kept a
+/// data disk could ever pass it. Reproduced on a real loop device with a
+/// GPT partition table and hand-built `/dev/disk/by-id` aliases:
+/// `--source <disk by-id>` exits 1 printing nothing, `--source <partition
+/// by-id>` prints `ext4`.
+///
+/// What that cost was not a cosmetic report line. `collect::run` errors on
+/// a failed check, `verify_host` records the failure, and `main` bails
+/// before `final_report` -- so the operator never saw the URL list or the
+/// one-time ferrumd and Authelia passwords, and `phase = Verified` was
+/// never written, so every re-run failed the same way. A working host and
+/// no way into it.
+///
+/// The partition is chosen by the same rule `render::media` uses -- the
+/// first child carrying a filesystem -- so the two cannot drift apart, and
+/// the `fstype` now comes from that same child rather than from whichever
+/// child happened to have one first.
+///
+/// # Arguments
+/// * `kept` - the data disks the operator chose not to erase.
+///
+/// # Returns
+/// One check per kept disk whose partition has both a filesystem and a
+/// stable by-id path. A disk missing either yields no check, because
+/// `render::media` refuses to generate a mount for it at all.
 pub fn data_disk_checks(kept: &[&Device]) -> Vec<Check> {
     kept.iter()
         .filter_map(|d| {
-            let by_id = d.by_id.as_deref()?;
-            let fstype = d.children.iter().find_map(|c| c.fstype.as_deref())?;
+            // The SAME selection render::media makes. Taking the fstype
+            // from one child and the device path from another is how the
+            // two halves of a check come to describe different partitions.
+            let part = d.children.iter().find(|c| c.fstype.is_some())?;
+            let by_id = part.by_id.as_deref()?;
+            let fstype = part.fstype.as_deref()?;
             Some(Check {
                 what: "a kept data disk is mounted",
                 // Quoted like every other remote interpolation. On a resume
@@ -839,7 +874,12 @@ mod tests {
                         name: "sdb1".into(),
                         fstype: Some(f.into()),
                         mountpoint: None,
-                        by_id: None,
+                        // The partition's OWN alias, as `attach_by_id`
+                        // fills it in on a live inventory. This helper left
+                        // it `None`, which is precisely how the test below
+                        // could assert the wrong command string and stay
+                        // green for as long as it did.
+                        by_id: Some(format!("{by_id}-part1")),
                     }]
                 })
                 .unwrap_or_default(),
@@ -973,18 +1013,73 @@ mod tests {
         );
     }
 
+    /// The check has to name the SAME device `render::media` mounted.
+    ///
+    /// This test previously asserted
+    /// `c[0].command.contains("'/dev/disk/by-id/ata-DATA_1'")` -- the whole
+    /// DISK. That assertion encoded the defect rather than the
+    /// requirement: `render::media` mounts the partition, `findmnt
+    /// --source` matches the source string the kernel recorded and does not
+    /// walk the device hierarchy, so the disk-level command matched nothing
+    /// on any real install. Verified against a real loop device with a GPT
+    /// partition: `findmnt -no FSTYPE --source <disk by-id>` exits 1 with
+    /// empty output while `--source <partition by-id>` prints `ext4`.
     #[test]
-    fn a_kept_disk_is_checked_for_its_recorded_filesystem() {
+    fn a_kept_disk_is_checked_by_the_partition_that_was_mounted() {
         let d = disk("/dev/disk/by-id/ata-DATA_1", Some("ext4"));
         let c = data_disk_checks(&[&d]);
         assert_eq!(c.len(), 1);
-        assert!(c[0].command.contains("ata-DATA_1"));
         assert!(
-            c[0].command.contains("'/dev/disk/by-id/ata-DATA_1'"),
-            "must be quoted: {}",
+            c[0].command
+                .contains("'/dev/disk/by-id/ata-DATA_1-part1'"),
+            "must name the partition, quoted, exactly as render::media \
+             mounted it: {}",
+            c[0].command
+        );
+        assert!(
+            !c[0].command.contains("'/dev/disk/by-id/ata-DATA_1'"),
+            "the whole-disk path never matches a partition mount: {}",
             c[0].command
         );
         assert_eq!(c[0].expect, "ext4");
+    }
+
+    /// A kept disk whose partition has no stable alias yields no check
+    /// rather than a check naming the disk.
+    ///
+    /// `render::media` refuses to generate a mount for this disk at all, so
+    /// asserting that something is mounted would fail for a reason the
+    /// operator cannot act on from the verification report.
+    #[test]
+    fn a_partition_with_no_stable_alias_is_not_checked() {
+        let mut d = disk("/dev/disk/by-id/ata-DATA_1", Some("ext4"));
+        d.children[0].by_id = None;
+        assert!(data_disk_checks(&[&d]).is_empty());
+    }
+
+    /// The filesystem asserted on must come from the same child the
+    /// partition path came from.
+    ///
+    /// The old code took `by_id` from the disk and `fstype` from the first
+    /// child that had one, so on a disk whose first partition is an
+    /// unformatted ESP the two halves of the check could describe different
+    /// partitions.
+    #[test]
+    fn the_filesystem_and_the_partition_come_from_the_same_child() {
+        let mut d = disk("/dev/disk/by-id/ata-DATA_1", Some("xfs"));
+        d.children.insert(
+            0,
+            Filesystem {
+                name: "sdb0".into(),
+                fstype: None,
+                mountpoint: None,
+                by_id: Some("/dev/disk/by-id/ata-DATA_1-part0".into()),
+            },
+        );
+        let c = data_disk_checks(&[&d]);
+        assert_eq!(c.len(), 1);
+        assert!(c[0].command.contains("-part1'"), "{}", c[0].command);
+        assert_eq!(c[0].expect, "xfs");
     }
 
     #[test]
