@@ -491,14 +491,26 @@ async fn require_session(
 ///   2. ferrumd installs no CORS layer at all, so the browser's same-origin
 ///      policy stops a cross-origin page reading the response body.
 ///
-/// Control 2 is the one that will still be load-bearing later, and it is
-/// worth being precise about why. `SameSite` is scoped to the registrable
-/// SITE, not the origin. ferrumd is loopback-only today (nginx builds vhosts
-/// solely from `exposedApps`, and `ferrum.daemon.subdomain` is declared but
-/// unused), but once a daemon vhost exists under `ferrum.proxy.baseDomain`, a
-/// sibling catalog-app subdomain is same-site -- a compromised app WOULD have
-/// the browser attach `__Host-ferrumd_session` to a request here. What stops it
+/// Control 2 is the load-bearing one, and it is worth being precise about
+/// why. `SameSite` is scoped to the registrable SITE, not the origin -- and
+/// the dashboard now has a site to share. `modules/proxy/nginx.nix` serves
+/// it at `<ferrum.daemon.subdomain>.<ferrum.proxy.baseDomain>` on every host
+/// where `modules/proxy/lib.nix`'s `daemonPublished` holds, which is the
+/// ordinary host. So a compromised catalog app on a sibling subdomain IS
+/// same-site with this endpoint, and the browser WILL attach
+/// `__Host-ferrumd_session` to a request it makes here. What stops it
 /// reading the answer is purely the absence of CORS.
+///
+/// This was written as a future risk, on the premise that the daemon had no
+/// vhost and its subdomain option went unread. Phase 1.7c R13 shipped the
+/// vhost, so the paragraph stands because the risk arrived -- not because it
+/// might.
+///
+/// Where ferrumd LISTENS is a different claim, and still loopback (see
+/// `default_listen_address`): publishing the dashboard means nginx reaches
+/// it there, not that the daemon binds a public interface. Both are true at
+/// once, and reading the second as the first is what left this paragraph
+/// arguing from a premise the host no longer had.
 ///
 /// So the invariant to protect is specific: never serve this route with
 /// `Access-Control-Allow-Credentials: true` alongside a reflected or wildcard
@@ -2142,6 +2154,116 @@ mod tests {
         assert_eq!(module_declared_on("    mod nested;"), None);
         assert_eq!(module_declared_on("use auth::mod;"), None);
         assert_eq!(module_declared_on("// mod auth;"), None);
+    }
+
+    /// Comment prose only, with the markers stripped and the wrapping
+    /// undone.
+    ///
+    /// Doc comments in this crate wrap in the middle of a sentence, so a
+    /// claim worth pinning is nearly always split across two lines and
+    /// cannot be matched against the source as written. Collapsing to one
+    /// whitespace-normalised string is what makes a phrase searchable;
+    /// keeping only comment lines is what stops the scan reading code.
+    ///
+    /// # Arguments
+    /// * `source` - Rust source, exactly as written.
+    ///
+    /// # Returns
+    /// Every `//`, `///` and `//!` line's text, joined by single spaces.
+    fn comment_prose(source: &str) -> String {
+        let mut words: Vec<&str> = Vec::new();
+        for line in source.lines() {
+            let trimmed = line.trim_start();
+            let text = trimmed
+                .strip_prefix("//!")
+                .or_else(|| trimmed.strip_prefix("///"))
+                .or_else(|| trimmed.strip_prefix("//"));
+            if let Some(text) = text {
+                words.extend(text.split_whitespace());
+            }
+        }
+        words.join(" ")
+    }
+
+    /// Sentences Phase 1.7c R13 turned false, kept here so a comment
+    /// cannot quietly go back to making them.
+    ///
+    /// All four come from one paragraph above `session_handler`, which
+    /// argued that no sibling could be same-site with this daemon yet
+    /// because nginx built vhosts from `exposedApps` alone and
+    /// `ferrum.daemon.subdomain` went unread. R13 built the vhost, so each
+    /// of these now states the opposite of what an ordinary host does.
+    const FALSIFIED_BY_R13: &[&str] = &[
+        "ferrumd is loopback-only today",
+        "`ferrum.daemon.subdomain` is declared but unused",
+        "once a daemon vhost exists",
+        "nginx builds vhosts solely from",
+    ];
+
+    /// The first sentence in `FALSIFIED_BY_R13` this source still makes.
+    ///
+    /// # Arguments
+    /// * `source` - Rust source to read the comments of.
+    ///
+    /// # Returns
+    /// The matched entry, or `None` for prose that makes none of them.
+    fn stale_claim_in(source: &str) -> Option<&'static str> {
+        let prose = comment_prose(source);
+        FALSIFIED_BY_R13
+            .iter()
+            .copied()
+            .find(|claim| prose.contains(claim))
+    }
+
+    /// A comment that has gone false is worse than no comment, because it
+    /// is read as current and argues for a decision on grounds that have
+    /// evaporated. This one is load-bearing in the strongest sense: the
+    /// paragraph above `session_handler` is the crate's own statement of
+    /// WHY the absence of CORS is the control that matters, and it reached
+    /// that conclusion through a premise -- no sibling can be same-site
+    /// with us yet -- that R13 removed. `ferrum-install`'s
+    /// `no_state_still_claims_the_dashboard_has_not_shipped` pins the same
+    /// class of sentence on the installer side, for the same reason.
+    ///
+    /// Scoped to the source ABOVE `mod tests`: that is where the crate's
+    /// prose lives, and it is what keeps the table above from matching
+    /// itself.
+    #[test]
+    fn no_comment_still_claims_the_daemon_has_no_vhost() {
+        let (prose, _) = include_str!("main.rs")
+            .split_once("\nmod tests {")
+            .expect("main.rs must declare its test module at column zero");
+        assert_eq!(
+            stale_claim_in(prose),
+            None,
+            "a comment in this crate still makes a claim R13 falsified; the \
+             daemon is published on <ferrum.daemon.subdomain>.<baseDomain> \
+             whenever modules/proxy/lib.nix's daemonPublished holds"
+        );
+    }
+
+    /// The positive control, without which the guard above is an assertion
+    /// that `None == None`: a recogniser that matched nothing would leave
+    /// it green forever while pinning no sentence at all.
+    #[test]
+    fn the_stale_claim_scan_really_reads_comments_and_only_comments() {
+        for claim in FALSIFIED_BY_R13 {
+            assert_eq!(
+                stale_claim_in(&format!("/// {claim}")),
+                Some(*claim),
+                "the scan misses a claim it lists: {claim}"
+            );
+        }
+        // Wrapped mid-sentence, which is how each of them was actually
+        // written.
+        assert_eq!(
+            stale_claim_in("/// ferrumd is\n/// loopback-only today"),
+            Some("ferrumd is loopback-only today")
+        );
+        // Code is not prose. A constant or a fixture naming the sentence
+        // is not the crate asserting it.
+        assert_eq!(stale_claim_in("let s = \"once a daemon vhost exists\";"), None);
+        assert_eq!(stale_claim_in("// an ordinary comment"), None);
     }
 
     /// A5, on the half this crate owns.

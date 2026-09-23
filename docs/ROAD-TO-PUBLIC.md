@@ -114,8 +114,15 @@ Last updated at HEAD `288f2b3`, branch `grounding-and-install-path`. Nothing pus
       - `modules/proxy/dns.nix` `daemonRecords` never consults `daemon.enable`, so a daemon-off
         host still gets a DNS record for a hostname nginx closes. **Whoever fixes this must also
         update `checks.nix`'s anti-vacuity guard, which currently depends on it staying unfixed.**
-      - `crates/ferrumd/src/main.rs:279-282` still says ferrumd is loopback-only and the subdomain
-        is unused. R13 falsified both.
+      - ~~`crates/ferrumd/src/main.rs:279-282` still says ferrumd is loopback-only and the
+        subdomain is unused. R13 falsified both.~~ **DONE 2026-09-23.** The paragraph above
+        `session_handler` now says the same-site sibling is a present fact rather than a future
+        one, and separates *published* from *binds loopback* — conflating those two is what made
+        it wrong. **Pinned**, because this is the fourth comment in this tree to go quietly
+        false: `no_comment_still_claims_the_daemon_has_no_vhost` scans main.rs's own comment
+        prose for the four sentences R13 falsified, with
+        `the_stale_claim_scan_really_reads_comments_and_only_comments` as its positive control.
+        Mutation-proved: the old paragraph makes it **exit 101**.
       - `examples/hosts/minimal` does not evaluate — two reasons now (missing `acme-dns`, plus the
         auth-off assertion). This is the config a new operator copies, so it matters more than its
         severity suggests.
