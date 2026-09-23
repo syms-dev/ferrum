@@ -271,6 +271,14 @@ async fn create_job_in(
 
     if let Err(e) = crate::dbus::start_ferrum_apply_unit(&uuid).await {
         release();
+        // L6. The interlock was already released here; the request file was
+        // not. It is the input a `ferrum-apply@<uuid>.service` start
+        // consumes, so one left behind is a replayable privileged trigger
+        // -- and nothing else would ever remove it, because `JobRemoved`
+        // never fires for a unit that never started and that signal is the
+        // only other path to `remove_request_file`. It survived until a
+        // reboot cleared /run.
+        remove_request_file_in(dir, &uuid);
         audit_job("error", &format!("kind={kind} the unit did not start"));
         return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
     }
@@ -402,13 +410,27 @@ pub fn summarize(id: &str, path: &std::path::Path) -> std::io::Result<Option<Job
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e),
     };
+    Ok(Some(summarize_content(id, &content)))
+}
+
+/// Summarizes a job's progress file from content already in hand.
+///
+/// Split out of `summarize` for L5: `get_job_in` needs both the summary and
+/// the events, and reading the file twice to get them meant the two halves
+/// of one response could disagree about what was on disk. With the content
+/// read once and passed to both, they cannot.
+///
+/// # Arguments
+/// * `id` - the job's UUID, echoed into the summary.
+/// * `content` - the whole progress file.
+fn summarize_content(id: &str, content: &str) -> JobSummary {
     let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
 
     let first = lines.first().and_then(|l| parse_line(l));
     let last = lines.last().and_then(|l| parse_line(l));
 
     let Some(first) = first else {
-        return Ok(Some(JobSummary {
+        return JobSummary {
             id: id.to_string(),
             kind: None,
             status: "unknown",
@@ -416,7 +438,7 @@ pub fn summarize(id: &str, path: &std::path::Path) -> std::io::Result<Option<Job
             detail: None,
             started_at: None,
             finished_at: None,
-        }));
+        };
     };
 
     let started_at = first.get("ts").and_then(|t| t.as_u64());
@@ -443,7 +465,7 @@ pub fn summarize(id: &str, path: &std::path::Path) -> std::io::Result<Option<Job
         None => ("running", None, None, None),
     };
 
-    Ok(Some(JobSummary { id: id.to_string(), kind, status, result, detail, started_at, finished_at }))
+    JobSummary { id: id.to_string(), kind, status, result, detail, started_at, finished_at }
 }
 
 /// Newest first, via the same `Reverse` idiom gc.rs already uses.
@@ -538,8 +560,8 @@ fn list_jobs_in(dir: &std::path::Path, limit: Option<usize>) -> axum::response::
 
 /// `GET /api/jobs/:id`
 pub async fn get_job(Path(id): Path<String>) -> impl IntoResponse {
-    // Reads the job's whole progress file twice (summarize, then events), so
-    // it goes to the blocking pool -- see main.rs's run_blocking.
+    // Reads the job's whole progress file, so it goes to the blocking pool
+    // -- see main.rs's run_blocking.
     match crate::run_blocking(move || get_job_in(&jobs_dir(), &id)).await {
         Ok(response) => response,
         Err(status) => status.into_response(),
@@ -555,9 +577,25 @@ fn get_job_in(dir: &std::path::Path, id: &str) -> axum::response::Response {
         return (StatusCode::BAD_REQUEST, "job id must be a UUID").into_response();
     }
     let path = dir.join(format!("{id}.jsonl"));
-    let summary = match summarize(id, &path) {
-        Ok(Some(s)) => s,
-        Ok(None) => return (StatusCode::NOT_FOUND, "no such job").into_response(),
+    // L5. ONE read, feeding both halves of the response.
+    //
+    // This used to read the file twice -- `summarize` for the summary, then
+    // again for the events -- and the second read ended in
+    // `unwrap_or_default()`. A failure of that second read therefore became
+    // `events: []` on a `200`, next to a summary saying the job started and
+    // naming its kind: a document that cannot be true, reading as "the
+    // progress log is empty". That is precisely the fault-as-absence
+    // `summarize`'s own doc forbids, and the two reads made it reachable
+    // with no permission change at all -- the file only had to stop being
+    // readable between them.
+    //
+    // Reading once removes the window rather than narrowing it, and the
+    // summary and the events can no longer disagree about what was on disk.
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return (StatusCode::NOT_FOUND, "no such job").into_response()
+        }
         // A permission regression on an existing job file is a fault, not a
         // 404: reporting "no such job" would send an operator hunting for a
         // job that is right there on disk.
@@ -570,19 +608,17 @@ fn get_job_in(dir: &std::path::Path, id: &str) -> axum::response::Response {
         }
     };
 
-    let events = std::fs::read_to_string(&path)
-        .map(|c| {
-            c.lines()
-                .filter(|l| !l.trim().is_empty())
-                .filter_map(parse_line)
-                .map(|v| JobEvent {
-                    ts: v.get("ts").and_then(|t| t.as_u64()),
-                    event: str_field(&v, "event"),
-                    detail: str_field(&v, "detail"),
-                })
-                .collect()
+    let summary = summarize_content(id, &content);
+    let events: Vec<JobEvent> = content
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(parse_line)
+        .map(|v| JobEvent {
+            ts: v.get("ts").and_then(|t| t.as_u64()),
+            event: str_field(&v, "event"),
+            detail: str_field(&v, "detail"),
         })
-        .unwrap_or_default();
+        .collect();
 
     Json(JobDetail { summary, events }).into_response()
 }
@@ -590,6 +626,74 @@ fn get_job_in(dir: &std::path::Path, id: &str) -> axum::response::Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// L5. A job whose file cannot be read must never be rendered as a job
+    /// that has no events.
+    ///
+    /// `get_job_in` read the same file twice -- once through `summarize`,
+    /// once for the events -- and the second read ended in
+    /// `unwrap_or_default()`. Any failure of that second read therefore
+    /// produced `events: []` on a `200`, alongside a summary that says the
+    /// job started and names its kind. That document is not merely
+    /// incomplete, it is impossible: a job that started and emitted
+    /// nothing. It reads as "the progress log is empty", and it directly
+    /// contradicts the rule `summarize`'s own doc states -- a fault must
+    /// not be indistinguishable from an absence, because an operator who
+    /// cannot tell them apart concludes their history was lost.
+    ///
+    /// The two reads are what make the failure reachable without any
+    /// permission change at all: the file only has to stop being readable
+    /// BETWEEN them. This drives exactly that, with a thread removing and
+    /// restoring the file underneath. On a single read the window does not
+    /// exist -- a 200 is served from one successful read or it is not
+    /// served -- so the assertion cannot fail on the fixed code rather than
+    /// merely tending not to.
+    #[tokio::test]
+    async fn a_job_file_that_vanishes_mid_request_is_never_rendered_as_having_no_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = "6e2f7795-58c7-4654-82b6-f655b065ea47";
+        let path = job_file(
+            dir.path(),
+            id,
+            &[(10, "started", "apply"), (11, "step", "building"), (12, "complete", "ok")],
+        );
+        let body = std::fs::read_to_string(&path).unwrap();
+
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let churn = {
+            let (path, body, stop) = (path.clone(), body.clone(), stop.clone());
+            std::thread::spawn(move || {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let _ = std::fs::remove_file(&path);
+                    let _ = std::fs::write(&path, &body);
+                }
+            })
+        };
+
+        let mut impossible = 0usize;
+        for _ in 0..5_000 {
+            let response = get_job_in(dir.path(), id);
+            if response.status() != StatusCode::OK {
+                continue;
+            }
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let doc: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            let started = doc.get("kind").and_then(|k| k.as_str()).is_some();
+            let no_events = doc.get("events").and_then(|e| e.as_array()).is_some_and(|e| e.is_empty());
+            if started && no_events {
+                impossible += 1;
+            }
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        churn.join().unwrap();
+
+        assert_eq!(
+            impossible, 0,
+            "{impossible} response(s) reported a job that started and named its kind while \
+             showing an empty event list -- a fault rendered as an absence, which is the one \
+             thing summarize's own documentation says must never happen"
+        );
+    }
 
     /// Writes a job file whose lines are the given `(event, detail)` pairs,
     /// each with an explicit `ts`, and returns its path.
@@ -929,8 +1033,8 @@ mod tests {
         remove_request_file_in(dir.path(), uuid);
     }
 
-    /// M4. The rollback target guard, driven through the real handler.
-    mod rollback_target {
+    /// `POST /api/jobs`, driven through the real handler.
+    mod create_job {
         use super::*;
 
         /// A profile directory whose `system` symlink names `current`.
@@ -1043,6 +1147,43 @@ mod tests {
                 status,
                 StatusCode::BAD_REQUEST,
                 "a rollback to a generation the host is NOT running must reach the dispatch"
+            );
+        }
+
+        /// L6. A dispatch that never started must not leave its request
+        /// file behind.
+        ///
+        /// The request file IS the privileged trigger: it is the input a
+        /// `ferrum-apply@<uuid>.service` start consumes. When the D-Bus
+        /// start failed, `create_job` released the interlock and returned
+        /// 500 -- but left the file sitting in /run/ferrum/requests, where
+        /// nothing would ever remove it. `JobRemoved` never fires for a
+        /// unit that never started, so the cleanup in `attach_and_watch`
+        /// does not reach it, and the file survives until a reboot clears
+        /// /run.
+        ///
+        /// It is the same class of leftover `remove_request_file`'s own
+        /// documentation exists for, arriving by the one path that
+        /// documentation did not cover, and the same defence-in-depth
+        /// argument applies: polkit's `subject.user == "ferrum"` check is
+        /// the primary control, and shrinking the window in which a replay
+        /// finds anything to replay is what this adds underneath it.
+        #[tokio::test]
+        async fn a_dispatch_that_never_started_leaves_no_replayable_request_file() {
+            let requests = tempfile::tempdir().unwrap();
+            // Preflight, so the rollback guard is not what refuses it: this
+            // has to get all the way to the D-Bus start and fail THERE,
+            // which it does because the test environment has no system bus.
+            let (status, _body, written) =
+                dispatch(requests.path(), Err(anyhow::anyhow!("unused")), JobRequest::Preflight).await;
+            assert_eq!(
+                status,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "the dispatch must really have failed at the unit start"
+            );
+            assert!(
+                written.is_empty(),
+                "a request file for a job that never started is a replayable privileged                  trigger with nothing left to clean it up. Found: {written:?}"
             );
         }
 
