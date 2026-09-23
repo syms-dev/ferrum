@@ -462,21 +462,25 @@ in
       '';
     };
 
-    backup = {
-      enable = mkEnableOption "scheduled state backups";
-      repo = mkOption {
-        type = types.str;
-        default = "";
-      };
-      schedule = mkOption {
-        type = types.str;
-        default = "daily";
-      };
-      passwordSecret = mkOption {
-        type = types.str;
-        default = "restic-password";
-      };
-    };
+    # `ferrum.backup` was declared here -- enable, repo, schedule,
+    # passwordSecret -- and is DELETED rather than constrained, because a
+    # forward sweep of every settings leaf to every sink found it reached
+    # none. No module, no service, no timer, no crate ever read any of the
+    # four. See docs/superpowers/specs/2026-09-21-phase-1-9-ship-it-design.md
+    # R26, which is where backup gets built, and whose A5 is exactly this:
+    # until it works, the settings UI must not present it as functional.
+    #
+    # Deleting is not tidying. An option with no sink is worse than an
+    # absent one in both directions: an operator who sets backup.repo gets
+    # no error and no backup, and a reviewer sweeping this file for values
+    # that need a type reasonably assumes a declared option is consumed and
+    # validated somewhere. This one had to be traced to nothing, twice.
+    #
+    # Reversible, and the way back is the point: reintroduce these four
+    # TOGETHER WITH the module that reads them, at which point repo and
+    # passwordSecret want hostnames.absolutePath and hostnames.secretName
+    # respectively -- both of which now exist. `ferrum.apps.<id>.backup.enable`
+    # in modules/lib/app-submodule.nix is a DIFFERENT option and is untouched.
 
     apply = {
       autoRollbackOnFailure = mkOption {

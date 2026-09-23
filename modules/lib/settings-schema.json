@@ -164,16 +164,6 @@
         }
       }
     },
-    "backup": {
-      "type": "object",
-      "additionalProperties": false,
-      "properties": {
-        "enable": { "type": "boolean" },
-        "repo": { "type": "string" },
-        "schedule": { "type": "string" },
-        "passwordSecret": { "type": "string" }
-      }
-    },
     "apply": {
       "type": "object",
       "additionalProperties": false,
