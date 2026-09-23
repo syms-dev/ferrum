@@ -268,9 +268,11 @@ Last updated at HEAD `288f2b3`, branch `grounding-and-install-path`. Nothing pus
         returning `None` unconditionally would sit green forever pinning nothing.
       - **The audit is explicit about its limits.** It establishes these tests *can* fail, not
         that they test the right things. And it names the real gap rather than burying it: this
-        is item 9 — **21 of 41 checks have never executed on this machine**, so everything about a
-        *running* system is unproven rather than safe. That is a bigger hole than anything found
-        here.
+        is item 9. **Corrected after CI ran:** those checks are KVM-gated and never run on this
+        Mac, but CI's `vm-tests` job runs eight of them and **passes** — including
+        `install-from-nothing` and `rollback`. Saying a running system was "unproven" was true of
+        this laptop and false of the project. The real residue is item 10 (real hardware) and
+        item 11 (the tunnel route in a browser).
 
 ## Phase 6 — Housekeeping before anyone looks
 

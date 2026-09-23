@@ -60,10 +60,15 @@ Honest scope, because a sufficiency audit that overstates itself is the defect i
 - **No mutation testing of the suite as a whole.** Individual fixes this run were mutation-proved
   (revert the fix, watch the check go red) — that standard was applied per change, not retroactively
   to all 765 tests.
-- **21 of 41 Nix checks have never run on this machine.** They are KVM-gated, and this is a Mac.
-  Everything about a *running* system — Authelia actually starting, real ACME issuance, rollback,
-  install-from-nothing — is unproven rather than safe. That is road-to-public item 9, and it is a
-  bigger gap than anything in this document.
+- **21 of 41 Nix checks have never run on this machine** — they are KVM-gated and this is a Mac.
+  **Corrected 2026-09-23 after CI ran:** they are *not* unproven. CI's `vm-tests` job runs eight of
+  them on `x86_64-linux` and **passed** — `install-from-nothing`, `rollback`,
+  `rollback-proves-necessity`, `apply-generation-switch`, `daemon-end-to-end`,
+  `daemon-apply-end-to-end`, `privilege-boundary`, `state-restore-interlock`. An earlier draft of
+  this section said everything about a running system was "unproven rather than safe", which was
+  materially overstated: it was true of this laptop and false of the project. The real residue is
+  narrower — no run on *real hardware* (item 10) and no browser confirmation of the SSH-tunnel
+  route (item 11).
 - **The heuristics were crude on purpose** and produced 159 and then 26 candidates before being
   narrowed. Every survivor was inspected by hand. A quieter heuristic would have found less and
   claimed more.
