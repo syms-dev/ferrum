@@ -2756,6 +2756,79 @@
             workingAccepted workingIsAPool;
         };
 
+      # The self-signed certificate follows ferrum.proxy.baseDomain.
+      #
+      # Its CN and both SANs are built from that option, and the unit that
+      # generates it used to be gated on `ConditionPathExists =
+      # "!<certDir>/cert.pem"` -- "is there a certificate", never "is it the
+      # right one". So changing baseDomain, which is one field in the
+      # settings UI, left every lan-exposure vhost and (on a host with no
+      # public app) the auth vhost itself serving a certificate for the OLD
+      # name. The browser refuses it, and since the auth vhost is where
+      # Authelia's forward-auth redirect lands, it presents as "SSO broke
+      # after an apply that succeeded" rather than as anything pointing at a
+      # certificate.
+      #
+      # Read off the GENERATED unit, because the stale gate was a unit
+      # directive and the new gate is script text. Three properties:
+      #
+      #   1. the unit is not gated on the mere existence of a path,
+      #   2. its script records the domain beside the certificate, so a
+      #      later start can compare rather than assume,
+      #   3. the script is domain-SENSITIVE -- two hosts differing only in
+      #      baseDomain must not generate the same script. Without (3) a
+      #      hardcoded marker path would satisfy (2) while regenerating
+      #      nothing.
+      #
+      # Anti-vacuity: the unit must exist on the proxy-on host at all
+      # (otherwise every property above holds of an empty string), and must
+      # NOT exist on a proxy-off host, which is what makes its presence a
+      # real property rather than a constant.
+      selfSignedCertTracksItsDomain =
+        let
+          hostWith = { domain, proxy ? true }: ferrumLib.mkHost {
+            inherit system;
+            settings = {
+              schemaVersion = realMigrations.currentVersion;
+              proxy = { enable = proxy; }
+                // lib.optionalAttrs proxy {
+                baseDomain = domain;
+                acme.email = "a@example.test";
+              };
+              apps.sonarr = { enable = true; exposure = "lan"; };
+            };
+            modules = [ ../../../examples/hosts/minimal/configuration.nix ];
+          };
+          unitOf = args:
+            let cfg = (hostWith args).config; in
+            if cfg.systemd.units ? "ferrum-proxy-selfsigned-cert.service"
+            then {
+              present = true;
+              text = cfg.systemd.units."ferrum-proxy-selfsigned-cert.service".text;
+              script = cfg.systemd.services.ferrum-proxy-selfsigned-cert.script;
+            }
+            else { present = false; text = ""; script = ""; };
+
+          a = unitOf { domain = "a.example.test"; };
+          b = unitOf { domain = "b.example.test"; };
+          off = unitOf { domain = "a.example.test"; proxy = false; };
+        in
+        {
+          ok = a.present
+            && !off.present
+            && !(lib.hasInfix "ConditionPathExists=!" a.text)
+            && lib.hasInfix "/domain" a.script
+            && a.script != b.script;
+          message =
+            "the self-signed certificate is not regenerated when "
+            + "ferrum.proxy.baseDomain changes";
+          unitPresent = a.present;
+          absentWithProxyOff = !off.present;
+          gatedOnMereExistence = lib.hasInfix "ConditionPathExists=!" a.text;
+          recordsDomain = lib.hasInfix "/domain" a.script;
+          domainSensitive = a.script != b.script;
+        };
+
       # An app the catalog marks `portIsFixed` really cannot honour a port,
       # and ferrum refuses to be pointed at one it cannot reach.
       #
@@ -3152,6 +3225,8 @@
           mkAssertionCheck "media-tree-waits-for-its-mounts" mediaTreeWaitsForItsMounts;
         fixed-ports-are-enforced =
           mkAssertionCheck "fixed-ports-are-enforced" fixedPortsAreEnforced;
+        selfsigned-cert-tracks-its-domain =
+          mkAssertionCheck "selfsigned-cert-tracks-its-domain" selfSignedCertTracksItsDomain;
         settings-schema-covers-every-option =
           mkAssertionCheck "settings-schema-covers-every-option" schemaCoversEveryOption;
         installer-offers-every-catalog-app =
