@@ -25,6 +25,12 @@ CLAUDE.md
 *.env.local
 
 # ckit shared runtime state and recoverable sidecars
+# CONTINUITY.md is the live working-memory scratchpad: high-churn by design,
+# rewritten every turn, and meaningful only on the machine that wrote it.
+# claude-kit's own rule (.claude/rules/continuity.md) says never commit it --
+# it was tracked here by accident and touched 12 commits on this branch alone.
+# The committed counterpart is .ckit/agent-memory/, which is durable and low-churn.
+.ckit/CONTINUITY.md
 .ckit/state/*
 !.ckit/state/.gitkeep
 .ckit/tmp/*
