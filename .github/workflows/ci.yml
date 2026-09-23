@@ -56,6 +56,7 @@ jobs:
             .#checks.x86_64-linux.migration-mechanism \
             .#checks.x86_64-linux.mkhost-applies-migration \
             .#checks.x86_64-linux.journaldir-collision \
+            .#checks.x86_64-linux.storage-path-nesting \
             .#checks.x86_64-linux.schema-refuses-every-separator-payload \
             .#checks.x86_64-linux.directive-separators-never-reach-a-generated-file \
             .#checks.x86_64-linux.pool-branches-are-all-seeded \

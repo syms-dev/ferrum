@@ -287,6 +287,111 @@
           inherit defaultFailures notRejected;
         };
 
+      # The storage collision assertions ask about PATH NESTING, so they must
+      # not be answered with a substring test.
+      #
+      # Both of them used `lib.hasInfix a b`, and it is wrong in both
+      # directions. Measured against the module at 03d569f:
+      #
+      #   * snapshotDir = "<stateDir>-snaps" -- a SIBLING -- was rejected as
+      #     nested, because the parent's string is a substring of the
+      #     child's. Same for journalDir = "<mediaDir>-journal". Two legal
+      #     layouts refused at apply time, with a message saying something
+      #     untrue about them.
+      #   * stateDir nested inside snapshotDir was missed entirely. That is
+      #     the same hazard with the arguments swapped, and
+      #     modules/core/state-restore.nix cares about it in both directions
+      #     -- it swaps @state and @snapshots as two subvolumes of ONE
+      #     volume, which one containing the other is not.
+      #
+      # Deliberately two lists rather than one. A check that only listed
+      # values that must be REFUSED is passed by an assertion that refuses
+      # everything, which is precisely the failure mode the old condition
+      # had; a check that only listed values that must be ACCEPTED is passed
+      # by deleting the assertion. Each list is the other's anti-vacuity
+      # floor, and the `legal` list is the half this repo did not have.
+      #
+      # Scoped to these assertions' own messages, and to phrases they keep
+      # on one line, for the reason journalDirCollision above spells out at
+      # length.
+      storagePathNesting =
+        let
+          hostWith = storage: ferrumLib.mkHost {
+            inherit system;
+            settings = {
+              schemaVersion = realMigrations.currentVersion;
+              inherit storage;
+            };
+            modules = [ ../../../examples/hosts/minimal/configuration.nix ];
+          };
+
+          phrases = [
+            "ferrum.storage.journalDir must not be"
+            "separate paths, with neither equal to nor nested"
+          ];
+          rejected = storage:
+            let
+              probe = builtins.tryEval (
+                builtins.filter
+                  (m: lib.any (phrase: lib.hasInfix phrase m) phrases)
+                  (map (a: a.message)
+                    (builtins.filter (a: !a.assertion) (hostWith storage).config.assertions))
+              );
+            in
+            # A value the option TYPE refuses throws rather than returning a
+            # message; that is still a refusal, and counting it as one keeps
+            # a type-level control from reading as a missing assertion.
+            if probe.success then probe.value != [ ] else true;
+
+          defaults = (hostWith { }).config.ferrum.storage;
+
+          # Siblings and unrelated paths. Every one of these is a legal
+          # layout and must evaluate clean.
+          legal = {
+            "snapshotDir is a sibling of stateDir" = {
+              snapshotDir = "${defaults.stateDir}-snaps";
+            };
+            "journalDir is a sibling of mediaDir" = {
+              journalDir = "${defaults.mediaDir}-journal";
+            };
+            "journalDir is a sibling of stateDir" = {
+              journalDir = "${defaults.stateDir}-journal";
+            };
+            "the declared defaults" = { };
+          };
+
+          # Real containment, in both directions, plus equality.
+          illegal = {
+            "snapshotDir inside stateDir" = {
+              snapshotDir = "${defaults.stateDir}/snapshots";
+            };
+            "stateDir inside snapshotDir" = {
+              stateDir = "${defaults.snapshotDir}/state";
+              snapshotDir = defaults.snapshotDir;
+            };
+            "stateDir equals snapshotDir" = {
+              stateDir = "/srv/ferrum-both";
+              snapshotDir = "/srv/ferrum-both";
+            };
+            "journalDir inside mediaDir" = {
+              journalDir = "${defaults.mediaDir}/journal";
+            };
+            "journalDir equals stateDir" = {
+              journalDir = defaults.stateDir;
+            };
+          };
+
+          wronglyRejected = builtins.attrNames (lib.filterAttrs (_: rejected) legal);
+          wronglyAccepted = builtins.attrNames (lib.filterAttrs (_: s: !(rejected s)) illegal);
+        in
+        {
+          ok = wronglyRejected == [ ] && wronglyAccepted == [ ];
+          message =
+            "modules/core/storage.nix's path-collision assertions do not "
+            + "test path nesting";
+          inherit wronglyRejected wronglyAccepted;
+        };
+
       # Every schema shape the real settings-schema.json contains must have a
       # control in ui/forms.js.
       #
@@ -3054,6 +3159,7 @@
         sopsfile-are-paths = mkAssertionCheck "sopsfile-are-paths" sopsFilesArePaths;
         migration-mechanism = mkAssertionCheck "migration-mechanism" migrationMechanism;
         journaldir-collision = mkAssertionCheck "journaldir-collision" journalDirCollision;
+        storage-path-nesting = mkAssertionCheck "storage-path-nesting" storagePathNesting;
         mkhost-applies-migration = mkAssertionCheck "mkhost-applies-migration" mkHostAppliesMigration;
         directive-separators-never-reach-a-generated-file =
           mkAssertionCheck "directive-separators-never-reach-a-generated-file"

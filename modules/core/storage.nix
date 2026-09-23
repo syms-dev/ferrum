@@ -58,6 +58,39 @@ let
   # host at apply time -- a worse failure than the one being closed here.
   # modules/core/storage.nix's ferrum-media-tree unit covers the runtime
   # half of the same question.
+  # Path containment, which lib.hasInfix is not.
+  #
+  # Both storage collision assertions below used `lib.hasInfix a b`, a plain
+  # SUBSTRING test, to ask a question about path nesting. It answers a
+  # different question and it is wrong in both directions, proved by
+  # evaluation:
+  #
+  #   * FALSE POSITIVE. snapshotDir = "/var/lib/ferrum/state-snaps" is a
+  #     SIBLING of the default stateDir "/var/lib/ferrum/state" and was
+  #     rejected as nested inside it, because the parent's string really is
+  #     a substring of the child's. Same for journalDir = "/data-journal"
+  #     against the default mediaDir "/data". Two legal layouts refused at
+  #     apply time, with a message saying something untrue about them.
+  #   * FALSE NEGATIVE. The reverse nesting was missed entirely: stateDir =
+  #     "/var/lib/ferrum/snapshots/state" inside snapshotDir =
+  #     "/var/lib/ferrum/snapshots" evaluated clean. That is the same
+  #     hazard with the arguments swapped, and modules/core/state-restore.nix
+  #     cares about it in both directions -- it swaps @state and @snapshots
+  #     as two subvolumes of one volume, which one containing the other is
+  #     not.
+  #
+  # `hasPrefix "${parent}/"` is the containment test: the trailing slash is
+  # what makes "/data-journal" not start with "/data/" while "/data/journal"
+  # does. Equality is folded in because a path contains itself for every
+  # purpose these assertions care about -- two tmpfiles rules for one path
+  # with different arguments is the conflict the journalDir check exists to
+  # prevent, and stateDir == snapshotDir is a rollback that swaps a
+  # subvolume with itself. Both were previously caught only as an artefact
+  # of hasInfix, so folding equality in here is what stops this fix from
+  # quietly removing coverage.
+  containsPath = parent: child: parent == child || lib.hasPrefix "${parent}/" child;
+  collide = a: b: containsPath a b || containsPath b a;
+
   defaultMediaDir = options.ferrum.storage.mediaDir.default;
   mediaDirIsMounted = config.fileSystems ? ${cfg.mediaDir};
   hostHasDataDisks =
@@ -189,21 +222,32 @@ in
         '';
       }
       {
-        assertion = !(lib.hasInfix cfg.stateDir cfg.snapshotDir);
-        message = "ferrum.storage.snapshotDir must not nest inside ferrum.storage.stateDir.";
+        # Mutual, not one-way. modules/core/state-restore.nix mounts ONE
+        # top-level btrfs volume and expects @state and @snapshots to be two
+        # subvolumes of it; either one containing the other breaks that, and
+        # only one direction was checked.
+        assertion = !(collide cfg.stateDir cfg.snapshotDir);
+        message = ''
+          ferrum.storage.stateDir ("${cfg.stateDir}") and
+          ferrum.storage.snapshotDir ("${cfg.snapshotDir}") must be
+          separate paths, with neither equal to nor nested inside the other.
+          modules/core/state-restore.nix swaps them as two subvolumes of one
+          btrfs volume, which a path containing the other is not.
+        '';
       }
       {
         assertion =
           cfg.journalDir != "/var/lib/ferrum"
-          && !(lib.any (dir: lib.hasInfix dir cfg.journalDir) [
+          && !(lib.any (dir: collide dir cfg.journalDir) [
             cfg.stateDir
             cfg.snapshotDir
             cfg.mediaDir
           ]);
         message = ''
           ferrum.storage.journalDir must not be /var/lib/ferrum itself, and
-          must be neither equal to nor nested inside stateDir, snapshotDir or
-          mediaDir. It is operator-settable and otherwise unconstrained, and
+          must be neither equal to, nested inside, nor a parent of stateDir,
+          snapshotDir or mediaDir. It is operator-settable and otherwise
+          unconstrained, and
           this module declares a systemd.tmpfiles rule for whatever it is set
           to -- and as the note above says, two rules for one path with
           different arguments is a real conflict, not a merge. NixOS
