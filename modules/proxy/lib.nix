@@ -64,17 +64,42 @@
 
   # "Is the control plane actually published on a real hostname?" -- the
   # single predicate behind the daemon's vhost (nginx.nix), its Authelia rule
-  # (authelia.nix) and its certificate (acme.nix). Deliberately one definition
-  # rather than three, because those three must agree EXACTLY or the dashboard
+  # (authelia.nix), its certificate (acme.nix) and its DNS record (dns.nix).
+  # Deliberately one definition
+  # rather than four, because those four must agree EXACTLY or the dashboard
   # only half-exists: a vhost with no Authelia rule denies everyone (that
-  # file's access_control.default_policy is "deny"), and a vhost with no
-  # certificate falls silently to the self-signed branch.
+  # file's access_control.default_policy is "deny"), a vhost with no
+  # certificate falls silently to the self-signed branch, and a record with
+  # no vhost resolves to nginx's catch-all and a closed connection.
   #
   # Note what this is NOT keyed on: publicApps. A host publishing only the
   # dashboard, with every catalog app left at lan/local -- the safest
   # configuration available -- still publishes the dashboard (D6).
+  #
+  # `daemon.enable` and `daemon.publish` are two terms because they answer
+  # two questions, and for a long time only the first existed.
+  # modules/core/daemon.nix is wrapped in `lib.mkIf ferrum.daemon.enable`,
+  # so turning that off does not unpublish ferrumd -- it deletes the system
+  # user, the unit and the polkit rule, leaving nothing to reach even over
+  # the SSH tunnel daemon.listenAddress exists for. That collapsed "do not
+  # publish the dashboard" and "do not run a dashboard" into one line, and
+  # the installer's stage 1 had to write it: stage 1 sets proxy.enable and a
+  # real baseDomain because ACME needs both, and it structurally cannot
+  # enable Authelia, whose sops secrets cannot exist before the host does,
+  # so leaving the daemon at its default would have published settings,
+  # apply and rollback on a real certificate with auth_request absent
+  # entirely. The price of that correct decision was the bug: a stage 2 that
+  # failed -- and stage 2 has failed on real hardware in this project more
+  # than once -- left a host with no web UI at all and SSH-only recovery, on
+  # a product whose whole claim is that the UI works.
+  #
+  # `publish` separates them. Stage 1 now runs a loopback-bound,
+  # tunnel-reachable dashboard while every consumer of this predicate still
+  # sees an unpublished host. It is NOT an authentication boundary: what it
+  # removes is the network path, not ferrumd's own login.
   daemonPublished = ferrum:
     ferrum.daemon.enable
+    && ferrum.daemon.publish
     && ferrum.proxy.enable
     && ferrum.proxy.baseDomain != "";
 }

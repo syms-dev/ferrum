@@ -113,8 +113,14 @@ fn validate_proposed(proposed: &Value) -> Result<(), String> {
 /// conjoined with the assertion at `modules/proxy/nginx.nix:447`. The
 /// defaults below are the NixOS options' own (modules/core/options.nix): a
 /// key absent from settings.json takes the option default, so reading a
-/// missing `daemon.enable` as `false` would let exactly the failing
-/// document through.
+/// missing `daemon.enable` or `daemon.publish` as `false` would let exactly
+/// the failing document through.
+///
+/// This is the one predicate written twice in two languages, so the drift
+/// it can suffer is silent in both: a term added to `daemonPublished` and
+/// not here refuses documents the host would build, and a term added here
+/// and not there accepts documents it would not. `daemon.publish` was the
+/// most recent such term.
 ///
 /// Refusing the WRITE rather than only the apply is the same choice
 /// `daemon.listenAddress`'s schema `pattern` already makes, and for the
@@ -139,16 +145,27 @@ fn publication_matches_auth(proposed: &Value) -> Result<(), String> {
         .and_then(Value::as_str)
         .unwrap_or("");
 
-    // ferrum.daemon.enable defaults to TRUE and ferrum.auth.enable is an
-    // mkEnableOption, so it defaults to FALSE -- which is why a document
-    // that merely sets a domain lands here.
-    let published = flag("daemon", "enable", true) && flag("proxy", "enable", false) && !base_domain.is_empty();
+    // ferrum.daemon.enable and ferrum.daemon.publish both default to TRUE
+    // and ferrum.auth.enable is an mkEnableOption, so it defaults to FALSE
+    // -- which is why a document that merely sets a domain lands here.
+    //
+    // `publish` is a term here for the same reason it is a term in
+    // daemonPublished: it is the ONLY key that unpublishes the dashboard
+    // without deleting it. Omitting it would refuse the exact document the
+    // installer's stage 1 writes, and would tell an operator who wants a
+    // tunnel-only dashboard that their only option is a host with no web UI
+    // at all -- which is the state this option was added to end.
+    let published = flag("daemon", "enable", true)
+        && flag("daemon", "publish", true)
+        && flag("proxy", "enable", false)
+        && !base_domain.is_empty();
     if published && !flag("auth", "enable", false) {
         return Err(
             "this would publish ferrum's own dashboard at the configured domain with no \
              login in front of it, and every apply would then be refused. Either set \
-             auth.enable to true, or turn daemon.enable off and reach the dashboard \
-             over an SSH tunnel."
+             auth.enable to true, or set daemon.publish to false -- which keeps ferrumd \
+             running on loopback, reachable over an SSH tunnel, and takes only its vhost, \
+             certificate and DNS record away."
                 .to_string(),
         );
     }
@@ -394,6 +411,7 @@ mod tests {
                         "type": "object",
                         "properties": {
                             "enable": { "type": "boolean" },
+                            "publish": { "type": "boolean" },
                             "listenAddress": {
                                 "type": "string",
                                 "pattern": LISTEN_ADDRESS_PATTERN,
@@ -617,7 +635,17 @@ mod tests {
                 }),
             ),
             (
-                "the daemon not published, reached over an SSH tunnel",
+                "the daemon not published, but still RUNNING and reached over an SSH \
+                 tunnel -- the configuration ferrum.daemon.publish exists for, and the \
+                 one the installer's stage 1 writes",
+                serde_json::json!({
+                    "proxy": { "enable": true, "baseDomain": "home.example.com" },
+                    "daemon": { "enable": true, "publish": false },
+                }),
+            ),
+            (
+                "the daemon not running at all, which also publishes nothing -- the \
+                 older, blunter spelling, still legal and still safe",
                 serde_json::json!({
                     "proxy": { "enable": true, "baseDomain": "home.example.com" },
                     "daemon": { "enable": false },
@@ -647,7 +675,8 @@ mod tests {
     #[test]
     fn an_absent_key_takes_the_nixos_option_default_not_the_json_one() {
         let (_dir, schema) = schema_with_patterns();
-        // daemon.enable absent -> true, so this IS published.
+        // daemon.enable and daemon.publish both absent -> both TRUE, so
+        // this IS published.
         assert!(
             validate_proposed_at(&schema, &serde_json::json!({
                 "proxy": { "enable": true, "baseDomain": "home.example.com" },
@@ -655,6 +684,20 @@ mod tests {
             }))
             .is_err(),
             "an absent daemon.enable defaults to TRUE, so this publishes the dashboard"
+        );
+        // ...and specifically publish, which is the term added last and so
+        // the one most likely to be read with a `false` default lifted from
+        // JSON's idea of a missing boolean. A `daemon` block that names
+        // some other key is the shape that would expose it: the block
+        // exists, so a careless reader might treat its absence of `publish`
+        // as an answer.
+        assert!(
+            validate_proposed_at(&schema, &serde_json::json!({
+                "proxy": { "enable": true, "baseDomain": "home.example.com" },
+                "daemon": { "enable": true },
+            }))
+            .is_err(),
+            "an absent daemon.publish defaults to TRUE, so this publishes the dashboard"
         );
         // proxy.enable absent -> false, so nothing is published and the
         // domain alone is harmless.

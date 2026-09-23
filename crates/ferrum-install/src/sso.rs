@@ -66,12 +66,18 @@ pub fn apps_left_open(apps: &[String]) -> Vec<&str> {
 /// hostname: the installer's side of `daemonPublished` in
 /// `modules/proxy/lib.nix`.
 ///
-/// That predicate is `daemon.enable && proxy.enable && baseDomain != ""`,
-/// and this installer settles the first two terms rather than asking about
-/// them. `ferrum.daemon.enable` defaults to true in
-/// `modules/core/options.nix` and nothing here ever writes it; `render.rs`
-/// emits `proxy.enable = true` exactly when a base domain was answered. So
-/// the only term left to evaluate is the base domain.
+/// That predicate is
+/// `daemon.enable && daemon.publish && proxy.enable && baseDomain != ""`,
+/// and this installer settles the first three terms rather than asking
+/// about them. `ferrum.daemon.enable` and `ferrum.daemon.publish` both
+/// default to true in `modules/core/options.nix`, and the only place
+/// `render.rs` writes either is stage 1, which sets
+/// `{ enable: true, publish: false }` so the dashboard runs on loopback
+/// without being published in the stage that cannot put Authelia in front
+/// of it. This function describes the FINISHED host, which is stage 2, and
+/// stage 2 writes no `daemon` key at all. `render.rs` emits
+/// `proxy.enable = true` exactly when a base domain was answered. So the
+/// only term left to evaluate is the base domain.
 ///
 /// It is still spelled out as a predicate rather than folded into its one
 /// caller, for two reasons. It is the join point where independently

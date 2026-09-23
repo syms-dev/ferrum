@@ -106,14 +106,18 @@ pub const CREDENTIAL_LOCATION: &str =
 /// have. So the caveat is now a pure function of the answered state.
 ///
 /// The state that decides it is `daemonPublished` in
-/// `modules/proxy/lib.nix` -- `daemon.enable && proxy.enable && baseDomain
-/// != ""` -- plus `auth.enable` for whether the published vhost is gated.
-/// Two of those four terms are settled by this installer rather than asked
-/// about: `ferrum.daemon.enable` defaults to true and nothing here writes
-/// it, and `render.rs` emits `proxy.enable = true` exactly when a base
-/// domain was answered. `ferrum.daemon.subdomain` is likewise never asked
-/// and is [`DAEMON_SUBDOMAIN`]. That leaves the two parameters below, and
-/// an empty `base_domain` is how "no vhost at all" is spelled.
+/// `modules/proxy/lib.nix` -- `daemon.enable && daemon.publish &&
+/// proxy.enable && baseDomain != ""` -- plus `auth.enable` for whether the
+/// published vhost is gated. Three of those five terms are settled by this
+/// installer rather than asked about: `ferrum.daemon.enable` and
+/// `ferrum.daemon.publish` both default to true and the only place
+/// `render.rs` writes either is stage 1, whose
+/// `{ enable: true, publish: false }` this sentence is not about -- this
+/// describes the FINISHED host, which is stage 2, and stage 2 writes no
+/// `daemon` key at all. `render.rs` emits `proxy.enable = true` exactly
+/// when a base domain was answered. `ferrum.daemon.subdomain` is likewise
+/// never asked and is [`DAEMON_SUBDOMAIN`]. That leaves the two parameters
+/// below, and an empty `base_domain` is how "no vhost at all" is spelled.
 ///
 /// This is the one place where independently written Rust and Nix describe
 /// the same runtime fact, so it can drift without anything failing. If the
@@ -399,11 +403,16 @@ impl DryRun {
 /// `auth.thesyms.ca` shape of defect, one layer quieter.
 ///
 /// The daemon record is unconditional here while `modules/proxy/dns.nix`
-/// gates it on `ferrum.daemon.dns.includeRecord`. They agree for every host
-/// this function can describe: that option defaults to `true`, the
-/// installer writes no `daemon` settings at all (`render::settings`), and
-/// no prompt or flag can reach it. Teaching the installer to set it means
-/// teaching this function to read it.
+/// gates it on `daemonPublished && ferrum.daemon.dns.includeRecord`. They
+/// agree for every host this function can describe, and it is worth being
+/// exact about why, because one of those terms is no longer untouched by
+/// the installer. `includeRecord` defaults to `true` and no prompt or flag
+/// can reach it. `daemonPublished` holds because the host being described
+/// is the FINISHED, stage-2 one: `render::settings` writes a `daemon` block
+/// only for stage 1, where `publish: false` deliberately withholds the
+/// record along with the vhost and the certificate, and stage 1 is never
+/// what this dry run reports on. Teaching the installer to set either
+/// option on the finished host means teaching this function to read it.
 ///
 /// # Arguments
 /// * `base_domain` - `ferrum.proxy.baseDomain`.

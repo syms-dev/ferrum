@@ -27,13 +27,18 @@
 #     this requirement exists to fix (auth.thesyms.ca).
 #
 #   * the daemon's own <ferrum.daemon.subdomain>.<baseDomain>, on by default
-#     (owner ruling H-01, option C). This record was created for a year
-#     before there was anything behind it -- nginx.nix's _ferrum_unmatched
-#     catch-all answered the name with `return 444`, a resolving hostname
-#     that closed the connection -- and the ruling was to create it anyway
-#     and disclose it. Phase 1.7c R13 ended that: nginx.nix now builds a
-#     real vhost for the daemon, so this record points at the dashboard.
-#     ferrum.daemon.dns.includeRecord remains, so turning it off is still a
+#     (owner ruling H-01, option C), under the SAME predicate the daemon's
+#     vhost, Authelia rule and certificate use -- modules/proxy/lib.nix's
+#     daemonPublished. This record was created for a year before there was
+#     anything behind it -- nginx.nix's _ferrum_unmatched catch-all answered
+#     the name with `return 444`, a resolving hostname that closed the
+#     connection -- and the ruling was to create it anyway and disclose it.
+#     Phase 1.7c R13 ended that: nginx.nix now builds a real vhost for the
+#     daemon, so this record points at the dashboard. What R13 left behind
+#     was this record still being created on hosts that build no vhost at
+#     all, which is the pre-R13 dead name back again and is fixed where
+#     daemonRecords is defined below. ferrum.daemon.dns.includeRecord
+#     remains, so opting out on a host that IS publishing is still a
 #     one-line change.
 #
 #   * ferrum.proxy.dns.adoptedNames carried through verbatim (A3). ferrum
@@ -120,8 +125,28 @@ let
     (ferrum.auth.enable && (publicApps != { } || daemonPublished))
     (mkRecord "auth" "auth.${baseDomain}");
 
+  # The same pairing the comment above authRecords describes, in the one
+  # place that had not learned it. This was keyed on
+  # ferrum.daemon.dns.includeRecord ALONE, which reads as "does the operator
+  # want a record" and silently answered a question nobody asked: whether
+  # this host publishes a dashboard at all. Every other consumer of
+  # daemonPublished -- the vhost, the Authelia rule, the certificate --
+  # already went absent together on an unpublished host, and this file
+  # created a public record for the name anyway. Nothing answers it: nginx's
+  # _ferrum_unmatched catch-all closes the connection with `return 444` when
+  # the proxy is on, and when the proxy is off nothing is listening at all.
+  #
+  # It is the auth.thesyms.ca defect with the sign flipped -- a record with
+  # nothing behind it rather than a certificate with nothing behind it --
+  # and ferrum.daemon.publish is what turned it from a corner case into the
+  # ordinary state of an installer's stage-1 host.
+  #
+  # includeRecord stays, and stays conjoined rather than replaced: it is the
+  # operator's documented one-line way out of the H-01 option-C ruling on a
+  # host that IS publishing, which is a different statement from "this host
+  # publishes nothing".
   daemonRecords = lib.optional
-    ferrum.daemon.dns.includeRecord
+    (daemonPublished && ferrum.daemon.dns.includeRecord)
     (mkRecord "daemon" "${ferrum.daemon.subdomain}.${baseDomain}");
 
   # Sorted so a rebuild that changes nothing produces a byte-identical file,
