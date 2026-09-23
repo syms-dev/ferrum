@@ -642,6 +642,32 @@ fn settings(
         // the host, encrypted to a key the host does not have yet.
         Stage::One => {
             root.insert("apps".into(), serde_json::json!({}));
+
+            // ...and NO control plane either, for the same reason one step
+            // further on.
+            //
+            // `ferrum.daemon.enable` defaults to TRUE, so omitting this key
+            // does not mean "no daemon", it means "publish the daemon". With
+            // the proxy on and a baseDomain set -- both of which stage 1
+            // writes, a few lines above -- that publishes ferrum's own
+            // dashboard at ferrum.<domain> on a real ACME certificate. And
+            // stage 1 cannot enable auth (see the comment above: Authelia
+            // declares sops secrets that cannot exist before the host does),
+            // so it would be published with `auth_request` entirely absent.
+            //
+            // That window is not theoretical. If stage 2 fails -- and stage 2
+            // has failed on real hardware in this project more than once --
+            // the host stays exactly there: settings, apply and rollback
+            // reachable by anyone who finds the hostname, on a certificate
+            // that makes the hostname easy to find.
+            //
+            // So publication waits for the stage that has a login in front of
+            // it. Stage 2 writes no `daemon` key, so the default returns and
+            // the dashboard comes up there, gated. Nothing in stage 1 wants a
+            // reachable dashboard: verify_host's daemon and dashboard checks
+            // (verify.rs service_checks/auth_checks) all run after stage 2 has
+            // been applied.
+            root.insert("daemon".into(), serde_json::json!({ "enable": false }));
         }
         Stage::Two => {
             let apps: serde_json::Map<String, serde_json::Value> = answers
@@ -1652,6 +1678,49 @@ mod tests {
         assert!(s.get("secrets").is_none(), "{s}");
         // The proxy IS configured in stage 1 -- it declares no secret.
         assert_eq!(s["proxy"]["baseDomain"], "thesyms.ca");
+    }
+
+    /// The same family as the assertion above, and the consequence of it.
+    ///
+    /// `ferrum.daemon.enable` defaults to TRUE, so stage 1 has to turn it
+    /// OFF explicitly -- omitting the key publishes ferrum's own control
+    /// plane at ferrum.<domain>, on a real certificate, in the one stage
+    /// that is structurally unable to put auth in front of it. A stage 2
+    /// that fails leaves the host there permanently, with settings, apply
+    /// and rollback open to anyone who finds the hostname.
+    ///
+    /// Asserted on the literal `false` rather than on the key's presence:
+    /// `daemon: {}` would satisfy "the key is there" and still publish.
+    #[test]
+    fn stage_one_does_not_publish_the_control_plane() {
+        let f = render(&answers(), &approved(Firmware::Uefi), &keys(), "abc1234").unwrap();
+        let s: serde_json::Value = serde_json::from_str(&f["settings.json"]).unwrap();
+        assert_eq!(
+            s["daemon"]["enable"],
+            serde_json::json!(false),
+            "stage 1 sets a baseDomain and cannot enable auth, so it must not publish the \
+             dashboard: {s}"
+        );
+    }
+
+    /// The other half: the dashboard must really come back in stage 2, or
+    /// the fix above would have traded an exposure for a host that never
+    /// serves a control plane at all.
+    ///
+    /// Stage 2 asserts the ABSENCE of the key, because the default is the
+    /// mechanism -- writing `enable: true` here would freeze today's default
+    /// into every generated host, which is the rule the apps map follows for
+    /// the same reason.
+    #[test]
+    fn stage_two_lets_the_control_plane_come_back_up() {
+        let f = render(&answers(), &approved(Firmware::Uefi), &keys(), "abc1234").unwrap();
+        let s: serde_json::Value = serde_json::from_str(&f["settings.stage2.json"]).unwrap();
+        assert!(
+            s.get("daemon").is_none(),
+            "stage 2 must leave ferrum.daemon at its default so the dashboard is published \
+             once auth is in front of it: {s}"
+        );
+        assert_eq!(s["auth"]["enable"], true, "and it is only safe because of this");
     }
 
     #[test]
