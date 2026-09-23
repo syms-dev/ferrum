@@ -12,6 +12,7 @@ use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
 use argon2::password_hash::SaltString;
 use rand_core::OsRng;
 use std::path::Path;
+use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const SESSION_LIFETIME_SECS: i64 = 60 * 60 * 24 * 7; // one week
@@ -286,6 +287,36 @@ fn scoped_key(scope: &str, key: &str) -> String {
     format!("{scope}|{key}")
 }
 
+/// A real argon2id hash of a value nobody holds, verified against when the
+/// submitted username matches no row (SEC-07).
+///
+/// Without it, `login` ran argon2 only when the account existed, so the
+/// response time answered "does this username exist?" for an
+/// unauthenticated caller. The impact on this appliance is near zero -- it
+/// has one account, called `admin` -- but the fix is four lines and it stops
+/// being near zero the moment a second account exists.
+///
+/// Built at first use from `Argon2::default()`, not written down as a
+/// literal, so it necessarily costs the same as whatever `login` verifies
+/// against. A hardcoded PHC string would drift the instant those parameters
+/// changed, and would do so silently -- which is the failure mode of a
+/// timing defence nobody can see working.
+fn absent_user_hash() -> &'static str {
+    static HASH: OnceLock<String> = OnceLock::new();
+    HASH.get_or_init(|| {
+        let salt = SaltString::generate(&mut OsRng);
+        // The value hashed is irrelevant as long as it is not a password any
+        // caller could submit; only the COST of verifying against the result
+        // matters. `expect` rather than a fallback: this is the same call
+        // `ensure_first_user` makes, and a failure means argon2 itself is
+        // unusable, which is not a condition this daemon can log in through.
+        Argon2::default()
+            .hash_password(b"ferrumd: no such user", &salt)
+            .expect("argon2 could not hash a fixed local value")
+            .to_string()
+    })
+}
+
 /// Real argon2id verification against the stored hash, throttled PER SOURCE
 /// ADDRESS rather than per username.
 ///
@@ -350,7 +381,16 @@ pub fn login(
                 .map_err(|e| anyhow::anyhow!("stored password hash is corrupt: {e}"))?;
             Argon2::default().verify_password(password.as_bytes(), &parsed).is_ok()
         }
-        None => false,
+        // SEC-07. Verify against a throwaway hash of the same cost rather
+        // than returning early, so an unknown username takes the same work
+        // as a known one and the response time stops answering "does this
+        // account exist?".
+        None => {
+            let parsed = PasswordHash::new(absent_user_hash())
+                .map_err(|e| anyhow::anyhow!("the absent-user hash is corrupt: {e}"))?;
+            Argon2::default().verify_password(password.as_bytes(), &parsed).ok();
+            false
+        }
     };
 
     record_attempt(db, LOGIN_SCOPE, client, username, succeeded)?;
@@ -884,6 +924,40 @@ mod tests {
         );
     }
 
+    /// SEC-07. argon2 used to run only when the username matched a row, so
+    /// the response time told an unauthenticated caller whether an account
+    /// existed. Near-irrelevant on an appliance with one account called
+    /// `admin`, and four lines to close.
+    ///
+    /// Asserted as a ratio rather than an absolute duration: the point is
+    /// that BOTH paths do the same argon2 work, and a ratio is stable under
+    /// whatever machine this runs on. The bound is deliberately loose --
+    /// removing the verification drops the unknown-user path from tens of
+    /// milliseconds to microseconds, which is three orders of magnitude
+    /// clear of any noise this could pick up.
+    #[test]
+    fn an_unknown_username_costs_the_same_argon2_work_as_a_known_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("test.db")).unwrap();
+        ensure_first_user(&db, dir.path()).unwrap();
+
+        // Warm the cached hash, so its one-off construction is not timed.
+        let _ = login(&db, "nobody", "wrong", &test_client()).unwrap();
+
+        let known_start = std::time::Instant::now();
+        let _ = login(&db, "admin", "wrong", &test_client()).unwrap();
+        let known = known_start.elapsed();
+
+        let unknown_start = std::time::Instant::now();
+        let _ = login(&db, "no-such-account", "wrong", &test_client()).unwrap();
+        let unknown = unknown_start.elapsed();
+
+        assert!(
+            unknown * 4 >= known,
+            "an unknown username returned far faster than a known one \
+             ({unknown:?} vs {known:?}) -- the response time is a username oracle"
+        );
+    }
 
     /// The other half of M-02: `login_attempts` grew without limit on
     /// attacker-chosen usernames, so an unauthenticated caller could write
