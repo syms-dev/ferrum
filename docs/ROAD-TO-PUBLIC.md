@@ -270,7 +270,44 @@ Last updated at HEAD `288f2b3`, branch `grounding-and-install-path`. Nothing pus
         after someone else has cloned is materially worse), or if a future commit message carries
         real attribution rather than a tool name — which the standing rule already forbids.
 
-- [ ] **16. Deep bug-hunt across the whole codebase.** Not a diff review — a sweep.
+- [x] **16. Deep bug-hunt across the whole codebase.** DONE 2026-09-23 — a sweep, not a diff
+      review. Three read-only hunts on disjoint surfaces, then three fix lanes.
+      **32 findings: 1 Critical, 3 High, 11 Medium, 17 Low. 26 fixed, 6 deliberately deferred.**
+      Verified on the merged tree: `cargo test` **807 passed, exit 0** (765 before, +42 tests) ·
+      clippy **0 diagnostics, exit 0** · **37 of 37 CI cheap checks pass**.
+      - **The Critical was found while fixing something else.** `inventory.rs:422` rejected any
+        by-id alias containing `-part` — and **every** partition alias contains it. So
+        `Filesystem::by_id` was `None` on every device the live pipeline produced, and
+        `render::media` aborted **before verification was ever reached**. The install path was
+        broken twice over for any host keeping a data disk, and the second break masked the first.
+        Every render test hand-built its `Filesystem` with the field pre-populated — the tests
+        were testing a struct the pipeline never produces.
+      - **The High it was found under:** verification asked `findmnt` about the **disk** while the
+        generated config mounts the **partition**, so every install keeping a data disk failed its
+        last check and bailed **before printing the one-time passwords**. A working host nobody
+        can log into. The existing test asserted the *wrong* command string — it pinned the bug.
+      - **The other two Highs:** a failed `reboot` reported a **successful rollback** while leaving
+        the state swap armed for some later, unrelated boot; and two apps could claim one
+        subdomain, with the alphabetically-earlier one silently winning the vhost, the DNS record
+        and the Authelia policy.
+      - **The dominant class was guards that cannot fire** — not missing code. The pool assertions
+        sat inside the `mkIf` they policed; the reserved-subdomain assertion sat inside
+        `mkIf proxyEnabled`, absent on the host where an operator would later turn the proxy on;
+        the `secretsDir` assertion had become unreachable. That is the same class the test
+        sufficiency audit (item 17) looked for and did not find **in the tests** — it was in the
+        assertions instead.
+      - **A regression the workspace run could not see.** Two new tests invoked `/bin/false` and
+        `/bin/true`, absent from a Nix build sandbox, so `cargo test` was green everywhere a human
+        looked while two flake checks failed with ENOENT. Caught only by running the **full** CI
+        check set against the merged tree, and fixed by having the fixture write its own script.
+        Mirror image of the nginx check fixed the same day, which was green locally as root and
+        red in CI unprivileged.
+      - **Deferred, named not silent:** job-file pruning (`list_jobs` reads every file before
+        applying `limit`, and nothing prunes the directory — the lane refused it as "a behaviour
+        change dressed as a perf fix"); `verify_still` on a resume past the wipe (lost
+        defence-in-depth, not an open hole); 27 of 32 module assertions have no fixture (a
+        programme, not a fix); and three catalog-derivation duplications.
+
 - [x] **17. Test sufficiency audit.** DONE — `docs/TEST-SUFFICIENCY-AUDIT.md`. Audited on the
       axis the item was actually raised on: **vacuity**, not coverage percentage. A test that
       cannot fail is worse than no test, and this run's gate failed twice on exactly that.
