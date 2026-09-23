@@ -361,7 +361,19 @@ in
     auth = {
       enable = mkEnableOption "Authelia forward-auth";
       adminEmail = mkOption {
-        type = types.str;
+        # Not types.str, and the sink is in the other language:
+        # crates/ferrum-apply/src/secrets.rs builds Authelia's
+        # users_database.yml with format!, interpolating this value inside a
+        # double-quoted YAML scalar (`email: "{admin_email}"`). A `"` and a
+        # newline therefore write arbitrary YAML into the file that decides
+        # who may log in.
+        #
+        # Constraining it HERE does not make that formatting correct, and it
+        # is not a substitute for fixing it -- it is the boundary control on
+        # the write path ferrum actually owns, which is
+        # modules/lib/settings-schema.json plus this type. The Rust-side
+        # serialization is raised separately.
+        type = hostnames.emailAddress;
         default = "";
       };
     };

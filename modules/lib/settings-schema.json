@@ -86,7 +86,11 @@
       "additionalProperties": false,
       "properties": {
         "enable": { "type": "boolean" },
-        "adminEmail": { "type": "string" }
+        "adminEmail": {
+          "type": "string",
+          "pattern": "^([A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(\\.[A-Za-z0-9-]+)*)?$",
+          "description": "The first Authelia user's address. Pattern-constrained because crates/ferrum-apply/src/secrets.rs writes Authelia's users_database.yml with format!, interpolating this value inside a double-quoted YAML scalar -- a quote and a newline here write arbitrary YAML into the file that decides who may log in. Mirrors modules/lib/hostnames.nix's emailAddress. This is the boundary control, not a fix for the serialization."
+        }
       }
     },
     "recyclarr": {

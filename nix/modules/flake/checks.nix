@@ -656,13 +656,16 @@
               # word rather than a config directive. Same reason as above:
               # the fixture has to be able to MOVE it.
             , acmeEmail ? "a@example.test"
+              # Authelia's first user, which reaches a format!-built YAML
+              # scalar in crates/ferrum-apply/src/secrets.rs.
+            , adminEmail ? "a@example.test"
             }: ferrumLib.mkHost {
               inherit system;
               settings = {
                 schemaVersion = realMigrations.currentVersion;
                 proxy = { enable = proxy; inherit baseDomain; acme.email = acmeEmail; }
                   // lib.optionalAttrs (trustedNetworks != null) { inherit trustedNetworks; };
-                auth = { enable = auth; adminEmail = "a@example.test"; };
+                auth = { enable = auth; adminEmail = adminEmail; };
                 inherit apps secrets daemon;
               };
               modules = [ ../../../examples/hosts/minimal/configuration.nix ];
@@ -963,6 +966,30 @@
               "a'; touch /tmp/pwned; '@example.test"
               "a b@example.test"
               "a$(id)@example.test"
+            ];
+
+          # ferrum.auth.adminEmail, whose sink is in the other language:
+          # crates/ferrum-apply/src/secrets.rs writes Authelia's
+          # users_database.yml with format!, interpolating this inside
+          # `email: "{admin_email}"`. A quote and a newline write arbitrary
+          # YAML into the file that decides who may log in -- a second
+          # `admins` member, or a replacement password hash. The Rust-side
+          # serialization is raised separately; this is the boundary control
+          # on the write path, asserted so it cannot quietly go back to
+          # types.str.
+          adminEmailAccepted = email:
+            let
+              probe = builtins.tryEval (
+                let v = (mkProxyHost { adminEmail = email; }).config.ferrum.auth.adminEmail;
+                in builtins.deepSeq v v);
+            in
+            probe.success;
+          wronglyRejectedAdminEmail = builtins.filter (e: !(adminEmailAccepted e))
+            [ "" "a@example.test" "ops+ferrum@example.co.uk" ];
+          wronglyAcceptedAdminEmail = builtins.filter adminEmailAccepted
+            [
+              ''a"@example.test''
+              "a@example.test\"\n  attacker:\n    groups:\n      - admins"
             ];
 
           # SEC-08. The /authelia subrequest must tell Authelia who is
@@ -1346,6 +1373,10 @@
               wronglyAcceptedEmail
             ++ map (e: "ferrum.proxy.acme.email = \"${e}\" is refused at evaluation, and it is a legitimate contact address. The empty string in particular is the option's DEFAULT and the sentinel modules/proxy/acme.nix tests to produce its own operator-facing \"Let's Encrypt requires a real contact address\" message -- refusing it here would replace that explanation with a pattern mismatch, and would break every host that needs no real certificate")
               wronglyRejectedEmail
+            ++ map (e: "ferrum.auth.adminEmail = \"${e}\" evaluates cleanly, and crates/ferrum-apply/src/secrets.rs writes Authelia's users_database.yml with format!, interpolating it inside `email: \"{admin_email}\"`. A quote and a newline here write arbitrary YAML into the file that decides who may log in -- a second admins member, or a replacement password hash. Settings-API writable")
+              wronglyAcceptedAdminEmail
+            ++ map (e: "ferrum.auth.adminEmail = \"${e}\" is refused at evaluation, and it is a legitimate address. The empty string is the option's default and the sentinel modules/proxy/authelia.nix tests to produce its own \"the generated first user needs a real email address\" message")
+              wronglyRejectedAdminEmail
             # A2/D1.
             ++ lib.optional (daemonRules == [ ])
               "Authelia has no access_control rule for ${daemonName}, so default_policy = deny makes the dashboard unopenable (D1)"
