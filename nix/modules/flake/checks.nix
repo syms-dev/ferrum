@@ -654,6 +654,23 @@
           apiLoc = locOf "/api/";
           hasIn = needle: hay: lib.hasInfix needle hay;
 
+          # The daemon vhost's SERVER-level config, and the http-level block
+          # every vhost inherits. Both are read because nginx's add_header
+          # makes them interdependent in a way that reading either alone
+          # would miss: a child block that sets any add_header REPLACES the
+          # inherited set rather than extending it, so the moment the daemon
+          # sets its frame headers at server level it stops emitting the
+          # http-level pair unless it repeats them. Measured on a real nginx
+          # -- the vhost asking for more protection got strictly less. The
+          # per-location checks below then rely on the daemon's locations
+          # setting no add_header of their own, which is what lets them
+          # inherit these four.
+          daemonServer = if daemonV == null then "" else (daemonV.extraConfig or "");
+          commonHttp = published.config.services.nginx.commonHttpConfig or "";
+          locationsWithAddHeader = builtins.filter
+            (loc: hasIn "add_header" (locOf loc))
+            (builtins.attrNames (if daemonV == null then { } else daemonV.locations or { }));
+
           # A7: no baseDomain, or no proxy, means NO vhost -- not a vhost on a
           # hostname that will never resolve.
           #
@@ -934,6 +951,32 @@
               "the daemon vhost's /api/ redirects a 401 instead of returning it, so the SPA sees an opaque cross-origin redirect (D8)"
             ++ lib.optional (!(hasIn "error_page 401 = @ferrum_api_401" apiLoc))
               "the daemon vhost's /api/ does not override the 401 redirect with a plain 401 (D8)"
+            # H-02/M-04: the response headers. Asserted on the server-level
+            # block rather than on the locations because that is where they
+            # are set, and on ALL FOUR at that level because of the
+            # replacement rule described where daemonServer is bound.
+            ++ lib.optional (!(hasIn "X-Frame-Options \"DENY\"" daemonServer))
+              "the daemon vhost sets no X-Frame-Options: a compromised sibling app on the same baseDomain is SAME-SITE, so the browser attaches ferrumd's session cookie to a framed ferrum.<baseDomain>, the real dashboard renders authenticated, and it supplies the CSRF token itself -- one framed click reaches POST /api/jobs, which is apply and rollback (H-02)"
+            ++ lib.optional (!(hasIn "frame-ancestors 'none'" daemonServer))
+              "the daemon vhost sets no Content-Security-Policy frame-ancestors: X-Frame-Options is the legacy spelling and this is the standard one, and a browser that honours only the latter frames the control plane (H-02)"
+            ++ lib.optional (!(hasIn "X-Content-Type-Options \"nosniff\"" commonHttp))
+              "services.nginx.commonHttpConfig sets no X-Content-Type-Options, so no vhost on this host sends nosniff (M-04)"
+            ++ lib.optional (!(hasIn "Referrer-Policy" commonHttp))
+              "services.nginx.commonHttpConfig sets no Referrer-Policy, so an outbound link leaks the path it was clicked from -- a *arr URL carries the library layout in it (M-04)"
+            # ...and the two that make the pair above reach the daemon at
+            # all. This is the half a reviewer reading either file alone
+            # would call redundant, and it is the half that actually breaks:
+            # the daemon vhost sets add_header at server level, so unless it
+            # REPEATS the http-level pair, the most sensitive vhost on the
+            # host is the one vhost without nosniff.
+            ++ lib.optional
+              (!(hasIn "X-Content-Type-Options \"nosniff\"" daemonServer)
+                || !(hasIn "Referrer-Policy" daemonServer))
+              "the daemon vhost sets add_header at server level but does not repeat the http-level pair, and nginx's add_header REPLACES the inherited set rather than extending it -- so the control plane is the one vhost on this host that sends no nosniff and no Referrer-Policy (M-04)"
+            ++ lib.optional (!(hasIn "always" daemonServer))
+              "the daemon vhost's security headers are not marked `always`, so nginx omits them from exactly the responses that matter: a bare add_header skips 401 and 5xx (H-02/M-04)"
+            ++ map (loc: "the daemon vhost's location \"${loc}\" sets its own add_header, which REPLACES the server-level set rather than extending it -- that location now serves the control plane with whichever of the four security headers it did not re-list (H-02/M-04)")
+              locationsWithAddHeader
             # A7, both halves -- each preceded by the guard that keeps its
             # absence proof from being a scan over nothing.
             ++ lib.optional (proxyOffFerrumVhosts != [ ])

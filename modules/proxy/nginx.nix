@@ -191,12 +191,73 @@ let
     proxy_read_timeout 300s;
   '';
 
+  # The two headers that are right for every vhost on this host, set once at
+  # http level. Neither depends on what the vhost serves: nosniff turns off
+  # content-type sniffing, which is only ever a way to get a response treated
+  # as something it did not claim to be, and the referrer policy stops a
+  # cross-origin link leaking the path it was clicked from -- a *arr URL
+  # carries the library layout in it.
+  #
+  # `always` on both, because the interesting responses are the error ones. A
+  # bare add_header applies to a fixed list of success-ish codes and skips
+  # 401 and 500, which are exactly the responses an attacker is iterating
+  # over. Measured: with `always` the 401 below carries all four headers;
+  # without it, none.
+  #
+  # HSTS is deliberately NOT here. See the assertion block at the bottom of
+  # this file for the certificate-issuance reason.
+  generalSecurityHeaders = ''
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+  '';
+
+  # THE FOOTGUN, and the reason the two lines above are repeated below:
+  # nginx's add_header is INHERITED ONLY WHEN THE CHILD SETS NONE. A server
+  # or location block that adds even one header of its own REPLACES the
+  # whole inherited set rather than extending it.
+  #
+  # Measured against a real nginx rather than taken from the docs, because
+  # the failure is silent and points the wrong way. Two vhosts, the same
+  # http-level pair above, one of them also setting the frame headers at
+  # server level:
+  #
+  #   withserver.test -> X-Frame-Options, Content-Security-Policy
+  #   noserver.test   -> X-Content-Type-Options, Referrer-Policy
+  #
+  # The vhost that asked for MORE protection got less, and the one that
+  # would have lost nosniff is the control plane. Repeating the pair here is
+  # what makes the daemon's set a superset instead of a swap; the daemon's
+  # locations then set no add_header at all, so they inherit these four
+  # (confirmed on both a 200 and a 401).
+  daemonSecurityHeaders = generalSecurityHeaders + ''
+    add_header X-Frame-Options "DENY" always;
+    add_header Content-Security-Policy "frame-ancestors 'none'" always;
+  '';
+
   daemonVhost = {
     # exposure is "public" (lib.nix's daemonApp), so this is the real ACME
     # cert modules/proxy/acme.nix creates under exactly this vhost name -- the
     # same mechanism every app uses, not a second one (A6).
     useACMEHost = daemonVhostName;
     forceSSL = true;
+    # Why the control plane and not every vhost: a sibling app on
+    # <baseDomain> is SAME-SITE, so the browser attaches ferrumd's session
+    # cookie to a framed ferrum.<baseDomain> and the real, authenticated
+    # dashboard renders inside the attacker's page. The CSRF token does not
+    # help -- the genuine page supplies it itself -- so a single framed click
+    # reaches POST /api/jobs, which is apply and rollback. The spec's own
+    # threat model enumerates compromised same-site siblings; framing is the
+    # same-site vector it missed.
+    #
+    # Both spellings, because they are not redundant: X-Frame-Options is what
+    # older browsers obey and frame-ancestors is what the standard defines,
+    # and the cost of carrying both is two header lines.
+    #
+    # Scoped to the daemon rather than set at http level because a blanket
+    # frame-ancestors 'none' would break anyone embedding Jellyfin or a *arr
+    # in a dashboard, which is a thing people do and which this finding is
+    # not about.
+    extraConfig = daemonSecurityHeaders;
     locations = {
       "/authelia" = lib.mkIf daemonAuthGated {
         extraConfig = ''
@@ -267,6 +328,7 @@ lib.mkIf proxyEnabled {
     recommendedTlsSettings = true;
     recommendedProxySettings = true;
     recommendedGzipSettings = true;
+    commonHttpConfig = generalSecurityHeaders;
     virtualHosts = {
       # A catch-all that refuses anything we did not explicitly publish.
       #
