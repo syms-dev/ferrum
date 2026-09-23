@@ -137,7 +137,19 @@ pub(crate) fn current_generation() -> anyhow::Result<(u32, PathBuf)> {
 /// app does NOT make `systemctl is-active ferrum-apps.target` report
 /// inactive -- checking the target alone would make a fully-dead system
 /// after a switch still look healthy.
-fn all_managed_units_active() -> anyhow::Result<bool> {
+///
+/// Which units those are is decided by [`units_to_check`], not by the
+/// listing alone: a listing that printed nothing used to make this return
+/// `Ok(true)` without interrogating a single unit.
+///
+/// # Arguments
+/// * `expected` - the app names the settings document enables, used as
+///   independent evidence of what ought to be running.
+///
+/// # Errors
+/// When `systemctl list-dependencies` fails, or a unit's status cannot be
+/// queried.
+fn all_managed_units_active(expected: &[String]) -> anyhow::Result<bool> {
     let list_output = Command::new("systemctl")
         .args([
             "list-dependencies",
@@ -152,21 +164,81 @@ fn all_managed_units_active() -> anyhow::Result<bool> {
             String::from_utf8_lossy(&list_output.stderr)
         );
     }
-    let units: Vec<String> = String::from_utf8_lossy(&list_output.stdout)
+    let listed: Vec<String> = String::from_utf8_lossy(&list_output.stdout)
         .lines()
         .map(|l| l.trim().to_string())
         .filter(|l| !l.is_empty())
         .collect();
 
-    for unit in &units {
+    for unit in units_to_check(expected, &listed) {
         let status = Command::new("systemctl")
-            .args(["is-active", "--quiet", unit])
+            .args(["is-active", "--quiet", &unit])
             .status()?;
         if !status.success() {
             return Ok(false);
         }
     }
     Ok(true)
+}
+
+/// The units a health check must actually interrogate.
+///
+/// The old code checked exactly what `systemctl list-dependencies` printed,
+/// which made an EMPTY listing a clean bill of health: the loop did not
+/// execute and the function returned `Ok(true)`. A closure that wired up no
+/// app units at all -- or a `list-dependencies` that printed nothing for
+/// any other reason -- was reported as a successful apply on a dead host.
+///
+/// It also left a question that could not be settled in a sandbox: whether
+/// `list-dependencies --plain --no-legend <target>` includes the root unit
+/// line varies by systemd version. **That question is now moot rather than
+/// answered.** The expectation is stated explicitly and unioned with
+/// whatever the listing happened to contain, so `ferrum-apps.target` is
+/// interrogated whether or not systemd chose to print it, and the result
+/// does not depend on which behaviour the host's systemd has. This does not
+/// claim the version question was resolved -- it was not, and nothing here
+/// needs it to be.
+///
+/// The expectation comes from the settings document, not from the listing,
+/// which is what makes it independent evidence: `FERRUM_SERVARR_APPS` is
+/// set from `enabledServarrApps` in modules/core/overlays.nix, so each name
+/// corresponds to a real `systemd.services.<app>`.
+///
+/// The union, not just the expectation: apps outside the servarr set
+/// (sabnzbd, plex, jellyfin, qbittorrent) are not named to this process as
+/// a list, so the listing is still the only thing that covers them. It is
+/// no longer the only thing that covers anything.
+///
+/// # Arguments
+/// * `expected` - app names from the settings document.
+/// * `listed` - unit names as `systemctl list-dependencies` reported them.
+///
+/// # Returns
+/// A deduplicated set of unit names, never empty: it always contains
+/// `ferrum-apps.target`.
+fn units_to_check(expected: &[String], listed: &[String]) -> Vec<String> {
+    let mut units: std::collections::BTreeSet<String> =
+        std::iter::once("ferrum-apps.target".to_string()).collect();
+    units.extend(
+        expected
+            .iter()
+            // A name that is not a plausible unit name is dropped rather
+            // than passed through. FERRUM_SERVARR_APPS reaches this process
+            // as `--set-default`, so the environment can override it, and a
+            // value beginning with `-` would be read by systemctl as an
+            // OPTION rather than a unit -- `is-active --quiet --version`
+            // exits 0.
+            .filter(|app| {
+                !app.is_empty()
+                    && !app.starts_with('-')
+                    && app
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || "._-@".contains(c))
+            })
+            .map(|app| format!("{app}.service")),
+    );
+    units.extend(listed.iter().filter(|u| !u.starts_with('-')).cloned());
+    units.into_iter().collect()
 }
 
 /// Polls `check` until it reports healthy or `timeout` elapses, sleeping
@@ -193,8 +265,10 @@ fn wait_for_healthy_with<F: FnMut() -> anyhow::Result<bool>>(
     }
 }
 
-fn wait_for_healthy(timeout: Duration) -> anyhow::Result<bool> {
-    wait_for_healthy_with(timeout, Duration::from_millis(500), all_managed_units_active)
+fn wait_for_healthy(timeout: Duration, expected: &[String]) -> anyhow::Result<bool> {
+    wait_for_healthy_with(timeout, Duration::from_millis(500), || {
+        all_managed_units_active(expected)
+    })
 }
 
 pub struct StorageConfig {
@@ -311,7 +385,10 @@ fn run_inner(
         // degraded (e.g. an app crashed after activation) -- report real
         // health instead of a bare, potentially-false "succeeded".
         progress.event("health-check", "already on the target closure; checking health only");
-        let healthy = classify(0, wait_for_healthy(storage.health_check_timeout)?);
+        let healthy = classify(
+            0,
+            wait_for_healthy(storage.health_check_timeout, &storage.servarr_apps)?,
+        );
         // DNS is reconciled here too, and that is load-bearing rather than
         // symmetric: an apply whose records failed (a refused token, an
         // unreachable API) leaves the closure unchanged, so the operator's
@@ -398,7 +475,7 @@ fn run_inner(
     })?;
 
     progress.event("health-check", "waiting for every managed unit to become active");
-    let healthy = wait_for_healthy(storage.health_check_timeout)?;
+    let healthy = wait_for_healthy(storage.health_check_timeout, &storage.servarr_apps)?;
 
     // 8. Reconcile the DNS records the new closure publishes (R1, D-08).
     // After the switch, so the document read is the one this generation
@@ -543,6 +620,67 @@ mod tests {
             ),
             ApplyResult::Failed("nix build failed".to_string())
         );
+    }
+
+    fn owned(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// An empty `systemctl list-dependencies` must not read as health.
+    ///
+    /// `all_managed_units_active` checked exactly the units the listing
+    /// printed, so an empty listing meant the loop never ran and the
+    /// function returned `Ok(true)` -- a closure that wired up no app units
+    /// was reported as a clean apply on a dead host.
+    #[test]
+    fn an_empty_dependency_listing_still_checks_something() {
+        let units = units_to_check(&owned(&["sonarr", "radarr"]), &[]);
+        assert!(
+            units.contains(&"ferrum-apps.target".to_string()),
+            "{units:?}"
+        );
+        assert!(units.contains(&"sonarr.service".to_string()), "{units:?}");
+        assert!(units.contains(&"radarr.service".to_string()), "{units:?}");
+    }
+
+    /// ...and with no apps configured either, the target itself is still
+    /// interrogated, so the check can never be vacuous.
+    #[test]
+    fn the_set_to_check_is_never_empty() {
+        assert_eq!(units_to_check(&[], &[]), vec!["ferrum-apps.target"]);
+    }
+
+    /// Whether `list-dependencies --plain --no-legend` prints the root unit
+    /// varies by systemd version, and that question is sidestepped rather
+    /// than answered: the target is asserted explicitly, so both behaviours
+    /// produce the same set.
+    #[test]
+    fn the_target_is_checked_whether_or_not_systemd_lists_it() {
+        let with_root = units_to_check(&owned(&["sonarr"]), &owned(&["ferrum-apps.target", "sonarr.service"]));
+        let without_root = units_to_check(&owned(&["sonarr"]), &owned(&["sonarr.service"]));
+        assert_eq!(with_root, without_root);
+        assert_eq!(with_root, vec!["ferrum-apps.target", "sonarr.service"]);
+    }
+
+    /// The listing still contributes: sabnzbd, plex, jellyfin and
+    /// qbittorrent are not named to this process as a list, so it is the
+    /// only thing covering them.
+    #[test]
+    fn units_only_systemd_knows_about_are_still_checked() {
+        let units = units_to_check(&owned(&["sonarr"]), &owned(&["sabnzbd.service", "plex.service"]));
+        assert!(units.contains(&"sabnzbd.service".to_string()), "{units:?}");
+        assert!(units.contains(&"plex.service".to_string()), "{units:?}");
+    }
+
+    /// `FERRUM_SERVARR_APPS` reaches this process as `--set-default`, so the
+    /// environment can override it -- and a name beginning with `-` would be
+    /// read by systemctl as an OPTION, not a unit. `is-active --quiet
+    /// --version` exits 0, which would turn the health check into a
+    /// guaranteed pass.
+    #[test]
+    fn a_name_that_would_be_read_as_an_option_is_dropped() {
+        let units = units_to_check(&owned(&["--version", "sonarr"]), &owned(&["--all"]));
+        assert_eq!(units, vec!["ferrum-apps.target", "sonarr.service"]);
     }
 
     #[test]
