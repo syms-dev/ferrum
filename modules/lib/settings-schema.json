@@ -8,26 +8,57 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "stateDir": { "type": "string" },
-        "snapshotDir": { "type": "string" },
-        "journalDir": { "type": "string" },
-        "mediaDir": { "type": "string" },
+        "stateDir": {
+          "type": "string",
+          "pattern": "^(/[A-Za-z0-9_][A-Za-z0-9._-]*)+$",
+          "description": "An absolute path: one or more segments, each beginning with a letter, digit or underscore. Pattern-constrained because this value is interpolated UNQUOTED into two root-executed grammars that are both line-oriented: modules/core/storage.nix's systemd.tmpfiles.rules entry, which systemd-tmpfiles re-reads on every switch-to-configuration, and modules/proxy/dns.nix's ReadWritePaths -- a systemd unit LIST-field, which NixOS emits as one Key=value line per element with no escaping at all (unlike Environment=, whose value it JSON-quotes). A newline in this value is therefore an extra tmpfiles rule AND an extra [Service] directive, both executed as root. It reaches modules/apps/sabnzbd/service.nix too, via the per-app stateDir. Mirrors modules/lib/hostnames.nix's absolutePath, which enforces the same thing at evaluation. Requiring each segment to START with an alphanumeric is what bans a `..` segment, and it is written that way rather than as an explicit exclusion because the shipped validator's regex engine has no lookaround: `any segment except ..` cannot be expressed there without an alternation nobody could audit at a glance."
+        },
+        "snapshotDir": {
+          "type": "string",
+          "pattern": "^(/[A-Za-z0-9_][A-Za-z0-9._-]*)+$",
+          "description": "An absolute path. Same grammar and same reasoning as stateDir above: modules/core/storage.nix interpolates it unquoted into a systemd.tmpfiles.rules line."
+        },
+        "journalDir": {
+          "type": "string",
+          "pattern": "^(/[A-Za-z0-9_][A-Za-z0-9._-]*)+$",
+          "description": "An absolute path. Same grammar and same reasoning as stateDir above. The NixOS assertion this option already carries checks only that it does not NEST inside the other storage roots -- a containment question, orthogonal to whether the string can carry a separator. Both controls are load-bearing; neither substitutes for the other."
+        },
+        "mediaDir": {
+          "type": "string",
+          "pattern": "^(/[A-Za-z0-9_][A-Za-z0-9._-]*)+$",
+          "description": "An absolute path. Reaches modules/core/storage.nix's systemd.tmpfiles.rules once directly and once per TRaSH subdirectory per pool root, and modules/core/pool.nix as the /etc/fstab mount point. Same reasoning as stateDir above."
+        },
         "pool": {
           "type": "object",
           "additionalProperties": false,
           "properties": {
             "enable": { "type": "boolean" },
-            "branches": { "type": "array", "items": { "type": "string" } },
+            "branches": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "pattern": "^(/[A-Za-z0-9_][A-Za-z0-9._-]*)+$",
+                "description": "One pool branch mount point, absolute. Pattern-constrained on the ITEM rather than the array because each entry reaches two root grammars with two DIFFERENT separators. modules/core/storage.nix folds branches into treeRoots and generates a systemd.tmpfiles.rules line per branch per TRaSH subdirectory, where the separator is a NEWLINE; modules/core/pool.nix emits `x-systemd.requires-mounts-for=${branch}` into the /etc/fstab OPTIONS field, where the separator is a COMMA. The comma is why an entry that merely looked like a path was not safe: `/mnt/d1,suid,dev` renders as real mount options, and suid+dev on the pool every app writes to is a setuid-binary escalation path. This leaf was previously classed Low on the strength of the fstab sink alone; the tmpfiles sink lives in a different file and makes it Critical. Mirrors modules/lib/hostnames.nix's absolutePath."
+              }
+            },
             "minFreeGiB": { "type": "integer" },
             "policy": { "type": "string", "enum": ["epmfs", "mfs"] }
           }
         },
-        "mediaGroup": { "type": "string" },
+        "mediaGroup": {
+          "type": "string",
+          "pattern": "^[a-z_][a-z0-9_-]*$",
+          "description": "A POSIX group name. Pattern-constrained because it reaches three root-executed sinks, and the first of them is not a value position at all: modules/core/storage.nix uses it as the ATTRIBUTE NAME in `users.groups.${mediaGroup}`, so the string becomes a /etc/group row that update-users-groups.pl writes -- where both a newline and a `:` are separators. It is also the group field of every media tmpfiles rule in the same file, and lands in six apps' extraGroups. Mirrors modules/lib/hostnames.nix's groupName. The charset is shadow-utils' own (NAME_REGEX), which is narrower than what NixOS would accept and deliberately so."
+        },
         "minFreeGiB": { "type": "integer" },
         "keepGenerations": { "type": "integer" }
       }
     },
-    "secretsDir": { "type": "string" },
+    "secretsDir": {
+      "type": "string",
+      "pattern": "^(/[A-Za-z0-9_][A-Za-z0-9._-]*)+$",
+      "description": "An absolute path. Pattern-constrained for two distinct reasons at two distinct sinks. modules/core/bootstrap.nix interpolates it unquoted into a systemd.tmpfiles.rules line, so a newline here is a root-executed rule. Separately, modules/proxy/acme.nix and modules/proxy/authelia.nix build each sops `sopsFile` as `/. + \"${secretsDir}/${name}.sops\"`, so a `..` segment here walks the path out of the secrets directory at evaluation time -- which is the second thing the pattern refuses, by requiring every segment to begin with an alphanumeric or underscore. Mirrors modules/lib/hostnames.nix's absolutePath."
+    },
     "proxy": {
       "type": "object",
       "additionalProperties": false,
@@ -48,7 +79,11 @@
               "description": "The Let's Encrypt contact address, or empty on a host that needs no real certificate. Pattern-constrained because nixpkgs' security.acme interpolates this value raw inside a single-quoted shell word in the renewal script it generates -- `find accounts -name '${email}.key'` -- so a single quote here is command execution in acme-<cert>.service, as the acme user, on every renewal. Mirrors modules/lib/hostnames.nix's emailAddress, which enforces the same thing at evaluation."
             },
             "dnsProvider": { "type": "string", "enum": ["cloudflare"] },
-            "credentialSecret": { "type": "string" },
+            "credentialSecret": {
+              "type": "string",
+              "pattern": "^[a-z0-9]([a-z0-9-]*[a-z0-9])?$",
+              "description": "The name of a ferrum.secrets entry, never a path. Pattern-constrained because both consumers treat it as a path COMPONENT and neither re-validates it: modules/proxy/acme.nix builds the sops `sopsFile` as `${secretsDir}/${credentialSecret}.sops`, and modules/proxy/dns.nix hands root `/run/secrets/${credentialSecret}` to read the live Cloudflare token from. A `..` segment in either reads a file of the attacker's choosing. The pattern is the same allowlist crates/ferrum-apply/src/put_secret.rs's validate_secret_name already applies -- lowercase letters, digits and interior hyphens -- transcribed so the two ends of the same name agree; every secret in the tree (acme-dns, authelia-jwt-secret, sabnzbd-apikey, qbittorrent-vpn) matches it."
+            },
             "staging": { "type": "boolean" }
           }
         },
@@ -66,9 +101,24 @@
           "properties": {
             "enable": { "type": "boolean" },
             "recordMode": { "type": "string", "enum": ["a", "cname"] },
-            "staticAddress": { "type": "string" },
-            "cnameTarget": { "type": "string" },
-            "adoptedNames": { "type": "array", "items": { "type": "string" } },
+            "staticAddress": {
+              "type": "string",
+              "pattern": "^((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])(\\.(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])){3})?$",
+              "description": "An IPv4 address literal, or empty when recordMode is not \"a\". Pattern-constrained because modules/proxy/dns.nix serialises it into the document crates/ferrum-dns sends to the Cloudflare API with a live credential; the JSON serialiser is safe, so this is about the VALUE being a real address rather than about escaping. IPv4 only, matching the option's own contract that ferrum publishes no AAAA record. Empty stays legal: it is the default and the sentinel for \"no target configured\"."
+            },
+            "cnameTarget": {
+              "type": "string",
+              "pattern": "^([A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*)?$",
+              "description": "A DNS name, or empty when recordMode is not \"cname\". Same sink and same reasoning as staticAddress above. Shares proxy.baseDomain's pattern and modules/lib/hostnames.nix's dnsName, because it is the same kind of value."
+            },
+            "adoptedNames": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*$",
+                "description": "One fully qualified record name ferrum is authorised to overwrite. Non-empty, unlike the two above: an empty entry authorises nothing and can only be a mistake. Pattern-constrained because each entry is the key against which modules/proxy/dns.nix decides whether to REPLACE a record it does not own -- the one exception to ferrum never touching foreign DNS. The option's own documentation states there is no value here meaning \"all of them\"; this is what makes that true, since `*.example.com` is refused rather than merely being a name no record has. Mirrors modules/lib/hostnames.nix's dnsLabel."
+              }
+            },
             "ddnsUpdater": {
               "type": "object",
               "additionalProperties": false,
@@ -102,6 +152,10 @@
     },
     "secrets": {
       "type": "object",
+      "propertyNames": {
+        "pattern": "^[a-z0-9]([a-z0-9-]*[a-z0-9])?$",
+        "description": "A secret name is a KEY here, and until now nothing in this schema constrained it. That is not an oversight anyone made once -- it is structural: a schema walk that enumerates value-leaves cannot see a map key at all, which is why this position survived three security passes that each re-derived the leaf set. The key becomes a path component: crates/ferrumd/src/secrets_api.rs joins it under secretsDir to write `<name>.sops`, and axum percent-decodes the route segment first, so `..%2f` in a DECLARED name turns POST /api/secrets/:name into an arbitrary file write. The allowlist is crates/ferrum-apply/src/put_secret.rs's validate_secret_name, which already rejects exactly this and is the rule the two ends must agree on: lowercase letters, digits, interior hyphens, non-empty, no leading or trailing hyphen."
+      },
       "additionalProperties": {
         "type": "object",
         "additionalProperties": false,
@@ -155,6 +209,10 @@
     },
     "apps": {
       "type": "object",
+      "propertyNames": {
+        "pattern": "^[a-z0-9]([a-z0-9-]*[a-z0-9])?$",
+        "description": "A catalog app id, and the same key-position blind spot as secrets above -- a value-only walk of this document never sees it. The id is not inert: modules/lib/app-submodule.nix derives each app's stateDir as `${stateRoot}/${id}`, and the id names a systemd unit, a user and a vhost. Every directory under modules/apps/ (jellyfin, plex, prowlarr, qbittorrent, radarr, sabnzbd, sonarr) matches this, and it is the same allowlist the secrets keys use, because it is the same kind of thing: a name that becomes a path component."
+      },
       "description": "Per-app settings, keyed by catalog app name. Deep per-app validation is STILL deferred -- every key other than auth.bypassPaths below is accepted unvalidated, which is what the two additionalProperties: true nodes say. What is no longer deferred is the one value under here that lands inside a generated directive.",
       "additionalProperties": {
         "type": "object",
