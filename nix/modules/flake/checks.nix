@@ -529,6 +529,18 @@
               # additionalProperties slot.
               if key == "<name>" then builtins.isAttrs extra && covers extra rest
               else if props ? ${key} then covers props.${key} rest
+              # `additionalProperties: true` is JSON Schema for "and
+              # anything else is fine", which is precisely the partial
+              # deferral the apps node now expresses: it names
+              # auth.bypassPaths so that value gets its pattern, and leaves
+              # every sibling open. Before SEC-02 the apps node declared no
+              # child vocabulary at all and was opaque by the clause above,
+              # so this case could not arise. It is a narrowing of coverage
+              # ONLY where a schema author writes the keyword deliberately;
+              # a node with additionalProperties: false that misses an
+              # option still fails, which is the case this check was
+              # written for.
+              else if (node.additionalProperties or null) == true then true
               else false;
 
           uncovered = builtins.filter (o: !(covers schema (builtins.tail o.loc))) ferrumDocs;
@@ -975,6 +987,59 @@
               "127.0.0.1;\n}\nlocation /anything { proxy_pass http://127.0.0.1:8989;"
             ];
 
+          # ferrum.apps.<id>.auth.bypassPaths[] -> `location ${path} {` in
+          # modules/proxy/nginx.nix, AND `resources = [ "^${path}.*$" ]` --
+          # an Authelia REGEX -- in modules/proxy/authelia.nix. Returns the
+          # generated location names, or null if refused at evaluation.
+          bypassLocationsFor = path:
+            let
+              probe = builtins.tryEval (
+                let
+                  names = builtins.attrNames
+                    (mkProxyHost {
+                      apps.sonarr = {
+                        enable = true;
+                        exposure = "public";
+                        auth.bypassPaths = [ path ];
+                      };
+                    }).config.services.nginx.virtualHosts."sonarr.example.test".locations;
+                in
+                builtins.deepSeq names names);
+            in
+            if probe.success then probe.value else null;
+
+          # The control, derived from the catalog rather than restated, so
+          # an app added later with a path this type refuses fails HERE
+          # rather than on the operator's host. This is the clause that
+          # matters most: `/api` behind forward-auth takes out Prowlarr ->
+          # *arr, every native client, and ferrum's own reconciler, so a
+          # type that over-tightens disables the self-setup SSO exists to
+          # protect. That has been a real bug in this repo before.
+          catalogBypassPaths = lib.unique
+            (lib.concatMap (a: a.authBypassPaths or [ ]) (builtins.attrValues catalog));
+          brokenCatalogBypassPath = builtins.filter
+            (path:
+              let n = bypassLocationsFor path; in
+              n == null || !(builtins.elem path n))
+            catalogBypassPaths;
+
+          # The attack, and it is worse than SEC-01's: a bypass path is a
+          # LOCATION NAME, so the injected block is a sibling of "/" rather
+          # than something spliced into it, and it deletes auth_request from
+          # a catalog app outright.
+          wronglyAcceptedBypassPath = builtins.filter
+            (path: bypassLocationsFor path != null)
+            [
+              "/api { proxy_pass http://127.0.0.1:8989; } location /anything"
+              "/api;\n}\nlocation /anything { proxy_pass http://127.0.0.1:8989;"
+              # Not an nginx injection but an Authelia one: authelia.nix
+              # wraps this value in `^${path}.*$`, so a regex metacharacter
+              # widens the bypass RULE even where the nginx location is
+              # harmless. `.*` makes the bypass match every resource on the
+              # vhost, which is the whole app unauthenticated.
+              "/.*"
+            ];
+
 
           # H-03. The host that publishes the control plane with no gate in
           # front of it -- proxy on, a real baseDomain, and auth.enable left
@@ -1190,6 +1255,13 @@
               wronglyAcceptedTrustedNetwork
             ++ map (net: "ferrum.proxy.trustedNetworks default entry \"${net}\" no longer renders as `allow ${net};` in the lan vhost. Either the option type now refuses RFC1918 space -- which takes every lan-exposure app on every existing host offline -- or lanRestriction stopped emitting it, in which case every injection fixture above is a scan over a config that is not generated (SEC-01)")
               brokenTrustedNetwork
+            # SEC-02. Worse than SEC-01, because a bypass path is a location
+            # NAME: the injected block is a sibling of "/" rather than
+            # something spliced into it.
+            ++ map (path: "ferrum.apps.sonarr.auth.bypassPaths contains \"${path}\", and it is not a path -- modules/proxy/nginx.nix interpolates it unquoted as `location ${path} {` and modules/proxy/authelia.nix wraps it in the REGEX `^${path}.*$`. The `apps` node in modules/lib/settings-schema.json defers on per-app shape, so `PUT /api/settings` composes this value. An injected location deletes auth_request from a catalog app; an injected regex metacharacter widens the Authelia bypass rule to resources the app never meant to exempt (SEC-02)")
+              wronglyAcceptedBypassPath
+            ++ map (path: "the catalog declares authBypassPaths = \"${path}\" and it no longer generates a location of that name. A bypass-path type that over-tightens is not a safe failure: `/api` behind forward-auth takes out Prowlarr -> Sonarr/Radarr, every native client, and ferrum's OWN reconciler -- enabling SSO would again disable the self-setup SSO exists to protect (SEC-02)")
+              brokenCatalogBypassPath
             # A2/D1.
             ++ lib.optional (daemonRules == [ ])
               "Authelia has no access_control rule for ${daemonName}, so default_policy = deny makes the dashboard unopenable (D1)"

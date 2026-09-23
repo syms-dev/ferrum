@@ -108,4 +108,43 @@ in
   # is an outage rather than a bypass. That asymmetry is the whole reason the
   # cheap control goes here: it closes the direction that silently serves.
   networkLiteral = lib.types.strMatching "[0-9A-Fa-f.:]+(/[0-9]{1,3})?";
+
+  # SEC-02. One entry of ferrum.apps.<id>.auth.bypassPaths, and it reaches
+  # TWO generated grammars, which is why the set below is tighter than the
+  # nginx side alone would need:
+  #
+  #   * modules/proxy/nginx.nix: `location ${path} {`, where the path is the
+  #     location NAME. An injected block is therefore a SIBLING of "/"
+  #     rather than something spliced into it, so it does not merely weaken
+  #     the gate on a catalog app -- it adds an ungated route to it.
+  #
+  #   * modules/proxy/authelia.nix: `resources = [ "^${path}.*$" ]`, a
+  #     REGULAR EXPRESSION. A metacharacter here widens the bypass RULE even
+  #     when the rendered nginx location is harmless: `/.*` is a perfectly
+  #     legal nginx location name and an Authelia rule exempting the entire
+  #     vhost.
+  #
+  # `.` is the one regex metacharacter this admits, because real paths
+  # contain it; the cost is that `/a.b` also matches `/axb`, one character
+  # wide, on a rule the operator wrote themselves. Everything that quantifies
+  # or alternates -- * + ? ( ) | [ ] ^ $ \\ { } -- is out, along with the
+  # space, `;` and `#` the nginx half needs excluded.
+  #
+  # Width checked against the catalog rather than guessed, and
+  # nix/modules/flake/checks.nix asserts that rather than trusting this
+  # comment: every authBypassPaths value in modules/apps/*/meta.nix
+  # (/api, /api/v2, /feed, /ping, /signalr, /identity, /Sessions,
+  # /System/Info/Public, /Users/AuthenticateByName) must still generate a
+  # location of its own name. Over-tightening is not a safe failure here --
+  # `/api` behind forward-auth takes out Prowlarr -> Sonarr/Radarr, every
+  # native client, and ferrum's OWN reconciler, so enabling SSO would once
+  # again disable the self-setup that SSO exists to protect. That is a bug
+  # this repo has actually shipped.
+  #
+  # The leading `/` is required, matching the option's own documented
+  # contract ("location prefixes"). nginx's other location forms -- `= /x`,
+  # `~ regex`, `@named` -- are consequently not expressible, which is
+  # intended: none of them is a prefix, and an operator-supplied regex is
+  # the thing above that this type exists to refuse.
+  locationPath = lib.types.strMatching "/[A-Za-z0-9._~%/-]*";
 }

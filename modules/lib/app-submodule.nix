@@ -89,12 +89,23 @@ types.attrsOf (types.submodule ({ name, ... }:
         };
 
         bypassPaths = mkOption {
-          type = types.listOf types.str;
+          # Not types.str, and for two grammars rather than one: each entry
+          # becomes a `location ${path} {` NAME in modules/proxy/nginx.nix
+          # AND the Authelia access_control REGEX `^${path}.*$` in
+          # modules/proxy/authelia.nix. Its sibling `subdomain` above got a
+          # constrained type one cycle before this one did, which is the
+          # miss modules/lib/hostnames.nix's header now names.
+          type = types.listOf hostnames.locationPath;
           default = meta.authBypassPaths or [ ];
           description = ''
             Location prefixes served without forward-auth regardless of
             policy. Needed for API clients and for apps that cannot follow
             an auth redirect (e.g. Plex/Jellyfin native clients).
+
+            A prefix, so it starts with "/". nginx's other location forms
+            (= exact, ~ regex, @named) are deliberately not expressible:
+            none of them is a prefix, and an operator-supplied regex is
+            exactly what the Authelia half of this must not accept.
           '';
         };
       };

@@ -147,7 +147,27 @@
     },
     "apps": {
       "type": "object",
-      "description": "Per-app settings, keyed by catalog app name. Deep per-app validation is deferred -- Phase 1.5a's own scope is the daemon backend; a future task tightens this against the real catalog-driven submodule shape."
+      "description": "Per-app settings, keyed by catalog app name. Deep per-app validation is STILL deferred -- every key other than auth.bypassPaths below is accepted unvalidated, which is what the two additionalProperties: true nodes say. What is no longer deferred is the one value under here that lands inside a generated directive.",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": true,
+        "properties": {
+          "auth": {
+            "type": "object",
+            "additionalProperties": true,
+            "properties": {
+              "bypassPaths": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "pattern": "^/[A-Za-z0-9._~%/-]*$",
+                  "description": "A location prefix served without forward-auth. Pattern-constrained because modules/proxy/nginx.nix interpolates it as the `location ${path} {` NAME and modules/proxy/authelia.nix wraps it in the access_control regex `^${path}.*$` -- an unconstrained string here either adds an ungated sibling location to a catalog app or widens the Authelia bypass rule to the whole vhost. Mirrors modules/lib/hostnames.nix's locationPath, which enforces the same thing at evaluation."
+                }
+              }
+            }
+          }
+        }
+      }
     }
   }
 }
