@@ -150,6 +150,26 @@ pub async fn create_job(
     axum::Extension(client): axum::Extension<crate::client_addr::ClientAddr>,
     Json(req): Json<JobRequest>,
 ) -> impl IntoResponse {
+    create_job_in(&requests_dir(), crate::generations::profiles_dir(), state, username, client, req).await
+}
+
+/// The body of `create_job`, with both directories passed in.
+///
+/// Same reason `remove_request_file_in` and `list_jobs_in` exist: the tests
+/// drive the real handler against real temp directories without mutating
+/// process-wide environment state that the other tests in this crate read
+/// concurrently. `profiles_dir` arrives as the `Result` its lookup
+/// produced, because an unresolvable profile directory is not a detail to
+/// paper over here -- see the rollback guard below.
+#[allow(clippy::too_many_arguments)]
+async fn create_job_in(
+    dir: &std::path::Path,
+    profiles_dir: anyhow::Result<std::path::PathBuf>,
+    state: Arc<AppState>,
+    username: Option<String>,
+    client: crate::client_addr::ClientAddr,
+    req: JobRequest,
+) -> axum::response::Response {
     let user = username.as_deref().unwrap_or(crate::UNKNOWN_USER).to_string();
     // apply and rollback are the two most consequential things this daemon
     // can be asked to do -- they change the running system and they can move
@@ -163,6 +183,56 @@ pub async fn create_job(
     let audit_job = |outcome: &str, detail: &str| {
         crate::audit::record("job-dispatch", outcome, &user, &client, detail);
     };
+    // M4. The rollback target is validated HERE, before anything of it
+    // reaches the privilege boundary.
+    //
+    // It used to be validated nowhere. `create_job` wrote
+    // `{"kind":"rollback","to":<u32>}` through untouched, and the only
+    // check on the target anywhere in the daemon was the `rollbackable`
+    // field `generations.rs` hands the UI for display -- which a caller is
+    // free to ignore, and which `generations.rs`'s own header comment
+    // claimed this endpoint was the authority behind. It was not.
+    //
+    // The specific harm is that a rollback to the CURRENT generation is not
+    // a no-op. The closure does not change, so nothing is rolled back; but
+    // every app's state directory is restored from the last apply's
+    // snapshot and the box reboots. An operator gets the destruction
+    // without the rollback.
+    //
+    // It fails closed: if the current generation cannot be established, the
+    // one thing certain is that we cannot say the target is not it, and the
+    // operation being guarded reboots the machine. Only rollback pays for
+    // this lookup -- the other four kinds have no target to check.
+    if let JobRequest::Rollback { to } = req {
+        let target = to;
+        // A directory walk plus an lstat per generation, so it goes to the
+        // blocking pool rather than the executor thread -- as
+        // `get_generations` does with the same read.
+        let current = match profiles_dir {
+            Ok(profiles) => crate::run_blocking(move || crate::generations::current_generation(&profiles)).await,
+            Err(e) => Ok(Err(e)),
+        };
+        match current {
+            Ok(Ok(Some(current))) if current == target => {
+                audit_job("denied", &format!("kind={kind} to={target} is the current generation"));
+                return (
+                    StatusCode::BAD_REQUEST,
+                    crate::generations::rollback_to_current_reason(current),
+                )
+                    .into_response();
+            }
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => {
+                audit_job("error", &format!("kind={kind} could not read the current generation"));
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("refusing a rollback: could not establish which generation this host is running: {e:#}"),
+                )
+                    .into_response();
+            }
+            Err(status) => return status.into_response(),
+        }
+    }
     {
         let mut running = state.job_running.lock().unwrap();
         if *running {
@@ -179,8 +249,7 @@ pub async fn create_job(
         *state.job_running.lock().unwrap() = false;
     };
 
-    let dir = requests_dir();
-    if let Err(e) = tokio::fs::create_dir_all(&dir).await {
+    if let Err(e) = tokio::fs::create_dir_all(dir).await {
         release();
         audit_job("error", &format!("kind={kind} could not create the requests dir"));
         return (
@@ -858,6 +927,164 @@ mod tests {
         assert!(!path.exists(), "the spent request file must really be gone");
         // Idempotent: a re-delivered JobRemoved must not panic or fail.
         remove_request_file_in(dir.path(), uuid);
+    }
+
+    /// M4. The rollback target guard, driven through the real handler.
+    mod rollback_target {
+        use super::*;
+
+        /// A profile directory whose `system` symlink names `current`.
+        ///
+        /// Passed to the handler directly rather than through
+        /// `FERRUM_PROFILES_DIR`, for the reason `remove_request_file_in`
+        /// already records: the other tests in this crate read that
+        /// variable concurrently.
+        fn profiles(current: u32) -> tempfile::TempDir {
+            let dir = tempfile::tempdir().unwrap();
+            for generation in [current, current + 1] {
+                let link = format!("system-{generation}-link");
+                std::os::unix::fs::symlink("/nonexistent-store-path", dir.path().join(&link)).unwrap();
+            }
+            std::os::unix::fs::symlink(
+                format!("system-{current}-link"),
+                dir.path().join("system"),
+            )
+            .unwrap();
+            dir
+        }
+
+        fn state() -> Arc<AppState> {
+            let dir = tempfile::tempdir().unwrap();
+            let db = crate::db::Db::open(&dir.path().join("test.db")).unwrap();
+            Arc::new(AppState { db, job_running: std::sync::Mutex::new(false) })
+        }
+
+        /// Drives the real handler and hands back its status, its body, and
+        /// whatever privileged request files it left behind.
+        async fn dispatch(
+            requests: &std::path::Path,
+            profiles: anyhow::Result<std::path::PathBuf>,
+            req: JobRequest,
+        ) -> (StatusCode, String, Vec<String>) {
+            let response = create_job_in(
+                requests,
+                profiles,
+                state(),
+                Some("operator".to_string()),
+                crate::client_addr::ClientAddr::Direct("127.0.0.1".parse().unwrap()),
+                req,
+            )
+            .await;
+            let mut written: Vec<String> = std::fs::read_dir(requests)
+                .map(|entries| {
+                    entries
+                        .flatten()
+                        .map(|e| e.file_name().to_string_lossy().into_owned())
+                        .collect()
+                })
+                .unwrap_or_default();
+            written.sort();
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            (status, String::from_utf8_lossy(&body).into_owned(), written)
+        }
+
+        /// The headline of M4.
+        ///
+        /// Rolling back to the generation the host is already running does
+        /// not roll anything back: the closure does not change. What it
+        /// DOES do is restore every app's state directory from the last
+        /// apply's snapshot and reboot -- a destructive no-op, and the
+        /// reason `generations.rs` marks the current generation
+        /// `rollbackable: false`. That guard lived only in a display field
+        /// the UI is free to ignore; `create_job` wrote the target through
+        /// unchecked.
+        ///
+        /// The assertion is on the request file, not just the status,
+        /// because the request file IS the privileged trigger: once it
+        /// exists and the unit is started, the decision has crossed the
+        /// privilege boundary and ferrumd has no say left.
+        #[tokio::test]
+        async fn a_rollback_to_the_current_generation_never_becomes_a_request() {
+            let requests = tempfile::tempdir().unwrap();
+            let profiles = profiles(7);
+            let (status, _body, written) = dispatch(
+                requests.path(),
+                Ok(profiles.path().to_path_buf()),
+                JobRequest::Rollback { to: 7 },
+            )
+            .await;
+            assert!(
+                written.is_empty(),
+                "no privileged rollback request may reach /run/ferrum/requests for the \
+                 generation the host is already running -- it would restore every app's \
+                 state directory and reboot without changing the closure. Found: {written:?}"
+            );
+            assert_eq!(status, StatusCode::BAD_REQUEST, "it must be refused outright");
+        }
+
+        /// The guard on the guard: a real rollback must still get through.
+        ///
+        /// There is no system bus in the test environment, so the dispatch
+        /// fails at `start_ferrum_apply_unit` and answers 500. That is the
+        /// point -- it got as far as trying, which a refused request never
+        /// does.
+        #[tokio::test]
+        async fn a_rollback_to_a_different_generation_is_not_refused() {
+            let requests = tempfile::tempdir().unwrap();
+            let profiles = profiles(7);
+            let (status, _body, _written) = dispatch(
+                requests.path(),
+                Ok(profiles.path().to_path_buf()),
+                JobRequest::Rollback { to: 8 },
+            )
+            .await;
+            assert_ne!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "a rollback to a generation the host is NOT running must reach the dispatch"
+            );
+        }
+
+        /// Fail closed. If the current generation cannot be established,
+        /// the one thing that is certain is that we cannot say the target
+        /// is not it -- and the operation being guarded reboots the box.
+        #[tokio::test]
+        async fn a_rollback_is_refused_when_the_current_generation_cannot_be_read() {
+            let requests = tempfile::tempdir().unwrap();
+            let (status, body, written) = dispatch(
+                requests.path(),
+                Err(anyhow::anyhow!("FERRUM_PROFILES_DIR not set")),
+                JobRequest::Rollback { to: 7 },
+            )
+            .await;
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+            assert!(
+                body.contains("FERRUM_PROFILES_DIR"),
+                "the refusal must name what it could not read: {body}"
+            );
+            assert!(written.is_empty(), "found: {written:?}");
+        }
+
+        /// The guard is scoped to rollback and must not cost the other
+        /// four kinds a profile-directory lookup they have no use for.
+        #[tokio::test]
+        async fn the_other_job_kinds_do_not_need_a_readable_profile_directory() {
+            let requests = tempfile::tempdir().unwrap();
+            let (status, body, _written) = dispatch(
+                requests.path(),
+                Err(anyhow::anyhow!("FERRUM_PROFILES_DIR not set")),
+                JobRequest::Preflight,
+            )
+            .await;
+            assert_ne!(status, StatusCode::BAD_REQUEST);
+            // It still fails at the dispatch -- there is no system bus here
+            // -- but it must not fail for a directory it never reads.
+            assert!(
+                !body.contains("FERRUM_PROFILES_DIR"),
+                "a preflight must not be refused for a profile directory it never reads: {body}"
+            );
+        }
     }
 
     #[test]
