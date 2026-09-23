@@ -252,9 +252,25 @@ Last updated at HEAD `288f2b3`, branch `grounding-and-install-path`. Nothing pus
         real attribution rather than a tool name — which the standing rule already forbids.
 
 - [ ] **16. Deep bug-hunt across the whole codebase.** Not a diff review — a sweep.
-- [ ] **17. Test sufficiency audit, unit and e2e.** Warranted: this run's test-coverage gate failed
-      twice on tests that could not fail, including assertions scanning an empty corpus and an
-      acceptance criterion enforced by nothing.
+- [x] **17. Test sufficiency audit.** DONE — `docs/TEST-SUFFICIENCY-AUDIT.md`. Audited on the
+      axis the item was actually raised on: **vacuity**, not coverage percentage. A test that
+      cannot fail is worse than no test, and this run's gate failed twice on exactly that.
+      - **765 Rust tests, 41 Nix checks. Zero genuine findings.** Every candidate the heuristics
+        surfaced was a false positive on inspection — the two assertion-free tests assert a few
+        lines below where the detector stopped reading; the two unguarded Nix checks drive
+        hardcoded literal data and assert exact equality, which cannot go empty.
+      - **Why it came back clean:** `checks.nix` carries **176** occurrences of anti-vacuity
+        vocabulary (`control` ×82, `vacuous` ×9, `would pass` ×7). That is a project that has been
+        bitten and answered, not a style tic.
+      - **The pattern worth copying** (`crates/ferrumd/src/main.rs:2124`) defends itself three
+        ways: a cross-check, an `is_empty` assertion so two empty lists cannot agree their way to
+        green, and **a positive control for the recogniser itself** — without which a matcher
+        returning `None` unconditionally would sit green forever pinning nothing.
+      - **The audit is explicit about its limits.** It establishes these tests *can* fail, not
+        that they test the right things. And it names the real gap rather than burying it: this
+        is item 9 — **21 of 41 checks have never executed on this machine**, so everything about a
+        *running* system is unproven rather than safe. That is a bigger hole than anything found
+        here.
 
 ## Phase 6 — Housekeeping before anyone looks
 
