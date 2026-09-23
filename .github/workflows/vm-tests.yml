@@ -49,6 +49,19 @@ jobs:
       - uses: DeterminateSystems/nix-installer-action@main
 
       - uses: DeterminateSystems/magic-nix-cache-action@main
+      # Every job in this workflow now carries this, including the cheap
+      # one. Fixing only the jobs that happened to be red is what left
+      # vm-tests exposed to the identical failure one push later.
+      - name: A throttled cache must slow this job, not fail it
+        run: |
+          sudo tee -a /etc/nix/nix.conf >/dev/null <<'CONF'
+          fallback = true
+          connect-timeout = 5
+          stalled-download-timeout = 20
+          CONF
+          nix config show 2>/dev/null \
+            | grep -E '^(fallback|connect-timeout|stalled-download-timeout)' \
+            || echo "note: could not read the settings back; they are appended regardless"
 
       - name: /dev/kvm is available and accessible
         run: |
@@ -211,6 +224,26 @@ jobs:
       - uses: DeterminateSystems/nix-installer-action@main
 
       - uses: DeterminateSystems/magic-nix-cache-action@main
+      # Same reason as stage2 above, arrived at one push later. This job was
+      # passing until the bug-hunt work added eight checks and forty-two
+      # tests; the extra build volume was enough to pull it over the same
+      # GitHub Actions cache rate limit, and it failed with the identical
+      # HTTP 418 / ResourceExhausted / "throttled Magic Nix Cache" trio.
+      #
+      # Fixing only the jobs that were red at the time was the narrower and
+      # more careful choice, and it was wrong: the throttle is a property of
+      # how much this workflow builds, not of which job builds it, so any
+      # job here is one busy run away from the same failure.
+      - name: A throttled cache must slow this job, not fail it
+        run: |
+          sudo tee -a /etc/nix/nix.conf >/dev/null <<'CONF'
+          fallback = true
+          connect-timeout = 5
+          stalled-download-timeout = 20
+          CONF
+          nix config show 2>/dev/null \
+            | grep -E '^(fallback|connect-timeout|stalled-download-timeout)' \
+            || echo "note: could not read the settings back; they are appended regardless"
 
       - name: /dev/kvm is available and accessible
         run: |
