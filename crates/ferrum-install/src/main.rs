@@ -586,6 +586,22 @@ fn recover_plan(
         if let Some(by_id) = device.by_id.as_deref() {
             inventory::validate_by_id_path(by_id)?;
         }
+        // The CHILDREN's aliases too. Only the disk's was re-checked here,
+        // and that was survivable exactly as long as a child's alias
+        // reached no sink -- which is to say, as long as
+        // `Filesystem::by_id` was always `None`. It no longer is: it now
+        // renders into `custom/media.nix` as a `fileSystems.<mount>.device`
+        // string, and it is now the value `verify::data_disk_checks`
+        // interpolates into a command that `ssh` hands to a remote root
+        // shell. A recovered value has not been through `parse_by_id`'s
+        // allowlist, so it is allowlisted here instead -- the same "make it
+        // true on every path in" argument as the line above, applied one
+        // level down.
+        for fs in device.children.iter_mut() {
+            if let Some(by_id) = fs.by_id.as_deref() {
+                inventory::validate_partition_by_id_path(by_id)?;
+            }
+        }
         // ...and the fields that RENDER, not just the one that reaches
         // Nix. Only by_id was re-checked here, so a recovered record could
         // still display as a different disk than it is -- the same
