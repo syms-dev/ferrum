@@ -5,9 +5,21 @@
 # ferrum.proxy.baseDomain, ferrum.daemon.subdomain and every
 # ferrum.apps.<id>.subdomain -- are interpolated into `server_name`, into an
 # ACME certificate name, and into modules/proxy/nginx.nix's `error_page 401
-# =302 https://auth.${baseDomain}/...`, and a fourth,
-# ferrum.daemon.listenAddress, is interpolated into `proxy_pass`. All four
-# were `types.str`. None of them is free text: nginx is reading them.
+# =302 https://auth.${baseDomain}/...`; ferrum.daemon.listenAddress is
+# interpolated into `proxy_pass`; every ferrum.proxy.trustedNetworks entry
+# into `allow ${net};`; and every ferrum.apps.<id>.auth.bypassPaths entry
+# into a `location ${path} {` NAME and into an Authelia access_control
+# `resources` REGEX. All six were `types.str`. None of them is free text:
+# nginx is reading them.
+#
+# Six, and the count is the point. The first four were fixed in one pass and
+# the last two were not, in the same diff -- ferrum.apps.<id>.subdomain got
+# dnsLabel while its sibling three lines below, bypassPaths, kept
+# types.listOf types.str. So the rule for this file is: a new option whose
+# value lands inside a generated nginx, Authelia or ACME directive belongs
+# HERE before it belongs in modules/core/options.nix, and
+# nix/modules/flake/checks.nix's daemon-vhost-enforced carries a payload
+# fixture for each one.
 #
 # The concrete defect these replace, proved end to end against a real nginx
 # before this file existed:
@@ -69,4 +81,31 @@ in
   # that a name resolves to two addresses and ferrumd binds one of them. The
   # cheap character-set control must not swallow the expensive explanation.
   addressLiteral = lib.types.strMatching "[0-9A-Za-z.:-]*";
+
+  # SEC-01. One entry of ferrum.proxy.trustedNetworks, which
+  # modules/proxy/nginx.nix renders as `allow ${net};` at the top of a
+  # lan-exposure app's `location /`.
+  #
+  # This one is not "a malformed allow directive". lanRestriction is
+  # concatenated in FRONT of the `deny all;` and the whole auth_request
+  # block, so a `}` in this value closes `location /` before nginx has read
+  # either of them, and everything after the brace becomes a sibling
+  # location with no gate on it at all. Served, not theorised: against a real
+  # nginx with an Authelia stub wired to return 401 unconditionally,
+  #
+  #   ferrum.proxy.trustedNetworks = [
+  #     ''127.0.0.1; } location /anything { proxy_pass http://127.0.0.1:8989; #''
+  #   ];
+  #
+  # answered GET / with 200 and the application's body, while the same
+  # request against the same upstream with a benign value answered 403.
+  #
+  # Deliberately a character-set control and not a CIDR parse, for the reason
+  # addressLiteral is: what makes the payload work is the space, the `}` and
+  # the `#`, and none of them survives this. A value that is in the character
+  # set but is not a real network ("1.2.3.4.5/99") is refused later by
+  # nginx's own parser -- `nginx -t` fails and the unit does not start, which
+  # is an outage rather than a bypass. That asymmetry is the whole reason the
+  # cheap control goes here: it closes the direction that silently serves.
+  networkLiteral = lib.types.strMatching "[0-9A-Fa-f.:]+(/[0-9]{1,3})?";
 }

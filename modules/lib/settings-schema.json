@@ -48,7 +48,14 @@
             "staging": { "type": "boolean" }
           }
         },
-        "trustedNetworks": { "type": "array", "items": { "type": "string" } },
+        "trustedNetworks": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[0-9A-Fa-f.:]+(/[0-9]{1,3})?$",
+            "description": "One network for nginx's `allow` directive. Pattern-constrained because modules/proxy/nginx.nix interpolates each entry into `allow ${net};` at the head of a lan app's `location /`, BEFORE the `deny all;` and the auth_request block -- an unconstrained string here closes the location and publishes the app with forward-auth absent. Mirrors modules/lib/hostnames.nix's networkLiteral, which enforces the same thing at evaluation."
+          }
+        },
         "dns": {
           "type": "object",
           "additionalProperties": false,

@@ -215,7 +215,13 @@ in
       };
 
       trustedNetworks = mkOption {
-        type = types.listOf types.str;
+        # Not types.str, for a sharper reason than baseDomain above. Each
+        # entry lands in `allow ${net};` at the TOP of a lan app's
+        # `location /`, ahead of the `deny all;` and the auth_request block
+        # it is concatenated in front of -- so a `}` here does not corrupt
+        # the allow-list, it closes the location and leaves the rest of the
+        # payload as an ungated sibling. See modules/lib/hostnames.nix.
+        type = types.listOf hostnames.networkLiteral;
         default = [ "10.0.0.0/8" "172.16.0.0/12" "192.168.0.0/16" ];
       };
 

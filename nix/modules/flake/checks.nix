@@ -635,11 +635,17 @@
               # check never built is the one a real host lands on by doing
               # nothing.
             , auth ? true
+              # SEC-01. Left null so every existing fixture keeps the option
+              # at its default -- the point of the fixtures below is that
+              # this value MOVES, and a fixture that never moves an option
+              # cannot tell a value being read from a value being assumed.
+            , trustedNetworks ? null
             }: ferrumLib.mkHost {
               inherit system;
               settings = {
                 schemaVersion = realMigrations.currentVersion;
-                proxy = { enable = proxy; inherit baseDomain; acme.email = "a@example.test"; };
+                proxy = { enable = proxy; inherit baseDomain; acme.email = "a@example.test"; }
+                  // lib.optionalAttrs (trustedNetworks != null) { inherit trustedNetworks; };
                 auth = { enable = auth; adminEmail = "a@example.test"; };
                 inherit apps secrets daemon;
               };
@@ -904,6 +910,72 @@
           wronglyAcceptedBracketed = builtins.filter (a: loopbackFailuresFor a == [ ])
             [ "[::1]" ];
 
+          # SEC-01/SEC-02. The same injection class as
+          # wronglyAcceptedInjection above, in the two settings-writable
+          # values that reach an nginx directive and were NOT covered when
+          # listenAddress, baseDomain and the two subdomains were fixed.
+          #
+          # These need probes of their own rather than another entry in the
+          # list above, because the refusal is a different mechanism:
+          # listenAddress is refused by an ASSERTION carrying a message, so
+          # loopbackFailuresFor can scope itself to that message, while
+          # these are refused by their option TYPE and so simply fail to
+          # evaluate. "It threw" is therefore the whole signal, which makes
+          # the accepted-controls below non-negotiable: a probe that throws
+          # for some unrelated reason reads as a refusal, and every fixture
+          # here would then pass with the new types deleted.
+          #
+          # Both probes read the GENERATED nginx config rather than the
+          # option, for the same reason authModelEnforced does: the option
+          # value is not what nginx parses.
+
+          # ferrum.proxy.trustedNetworks[] -> `allow ${net};` in
+          # modules/proxy/nginx.nix's lanRestriction. Returns the "/"
+          # location's rendered extraConfig, or null if the value was
+          # refused at evaluation.
+          lanRestrictionFor = net:
+            let
+              probe = builtins.tryEval (
+                let
+                  conf = (mkProxyHost {
+                    apps.sonarr = { enable = true; exposure = "lan"; };
+                    trustedNetworks = [ net ];
+                  }).config.services.nginx.virtualHosts."sonarr.example.test"
+                    .locations."/".extraConfig;
+                in
+                builtins.deepSeq conf conf);
+            in
+            if probe.success then probe.value else null;
+
+          # The control, and the reason none of this is a scan over nothing:
+          # the SHIPPED default has to keep rendering, as the directive it
+          # is supposed to render. A type that refused RFC1918 space would
+          # take every lan-exposure app on every existing host offline,
+          # which is a worse outage than the finding.
+          defaultTrustedNetworks = published.config.ferrum.proxy.trustedNetworks;
+          brokenTrustedNetwork = builtins.filter
+            (net:
+              let c = lanRestrictionFor net; in
+              c == null || !(lib.hasInfix "allow ${net};" c))
+            defaultTrustedNetworks;
+
+          # The attack. `}` closes `location /` before nginx ever reads the
+          # `deny all;` and the `auth_request` block that lanRestriction is
+          # concatenated in FRONT of, so the injected location serves the
+          # app with forward-auth absent entirely. Proved end to end against
+          # a real nginx with an Authelia stub that always returns 401: the
+          # injected arm answered 200 with the application's body while the
+          # benign control answered 403.
+          wronglyAcceptedTrustedNetwork = builtins.filter
+            (net: lanRestrictionFor net != null)
+            [
+              "127.0.0.1; } location /anything { proxy_pass http://127.0.0.1:8989; #"
+              # The newline spelling of the same attack: `;` is not nginx's
+              # only directive separator.
+              "127.0.0.1;\n}\nlocation /anything { proxy_pass http://127.0.0.1:8989;"
+            ];
+
+
           # H-03. The host that publishes the control plane with no gate in
           # front of it -- proxy on, a real baseDomain, and auth.enable left
           # at the FALSE it defaults to, against ferrum.daemon.enable's
@@ -1110,6 +1182,14 @@
               wronglyAcceptedNames
             ++ map (a: "ferrum.daemon.listenAddress = \"${a}\" evaluates cleanly, and it is an ALREADY-BRACKETED IPv6 literal -- modules/proxy/nginx.nix brackets any address containing a colon unconditionally, with no \"already bracketed?\" branch, because this refusal is what guarantees one never arrives. Accepting it renders `proxy_pass http://[[::1]]:7788`, which nginx rejects as an invalid host, refusing the WHOLE config file: every vhost on the host down at nginx.service start, after an apply that reported success (A5)")
               wronglyAcceptedBracketed
+            # SEC-01. The allow-list is concatenated in FRONT of the gate,
+            # so this is not "a malformed allow directive" -- it is the
+            # deletion of `deny all` and `auth_request` from the location
+            # they were guarding.
+            ++ map (net: "ferrum.proxy.trustedNetworks contains \"${net}\", and it is not a network -- it is an nginx DIRECTIVE, smuggled through an option modules/lib/settings-schema.json lets `PUT /api/settings` write and interpolated unquoted into `allow ${net};` by modules/proxy/nginx.nix. modules/proxy/nginx.nix concatenates lanRestriction BEFORE the auth_request block, so a `}` in this value closes `location /` and the app is served with `deny all` and forward-auth both absent. Proved against a real nginx with an always-401 Authelia stub: 200 with the application body, where the benign control answered 403 (SEC-01)")
+              wronglyAcceptedTrustedNetwork
+            ++ map (net: "ferrum.proxy.trustedNetworks default entry \"${net}\" no longer renders as `allow ${net};` in the lan vhost. Either the option type now refuses RFC1918 space -- which takes every lan-exposure app on every existing host offline -- or lanRestriction stopped emitting it, in which case every injection fixture above is a scan over a config that is not generated (SEC-01)")
+              brokenTrustedNetwork
             # A2/D1.
             ++ lib.optional (daemonRules == [ ])
               "Authelia has no access_control rule for ${daemonName}, so default_policy = deny makes the dashboard unopenable (D1)"
