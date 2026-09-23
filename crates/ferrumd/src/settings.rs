@@ -65,19 +65,94 @@ fn validate_against_schema_at(schema_path: &std::path::Path, proposed: &Value) -
     result
 }
 
-/// [`validate_against_schema_at`] against the schema this host was built
-/// with.
+/// Everything a proposed settings document must satisfy before it is
+/// written: the schema's shape rules, then the cross-field rules the schema
+/// cannot express.
+///
+/// Ordered deliberately. Schema first, so a document that is the wrong
+/// SHAPE is reported as that rather than as whatever the cross-check makes
+/// of a field of the wrong type.
+///
+/// # Arguments
+/// * `schema_path` - the settings schema to validate against.
+/// * `proposed` - the document as it arrived on the wire.
+///
+/// # Errors
+/// A caller-facing message naming what is wrong, for a `400`.
+fn validate_proposed_at(schema_path: &std::path::Path, proposed: &Value) -> Result<(), String> {
+    validate_against_schema_at(schema_path, proposed)?;
+    publication_matches_auth(proposed)
+}
+
+/// [`validate_proposed_at`] against the schema this host was built with.
 ///
 /// The one place `$FERRUM_SETTINGS_SCHEMA` is read, so the variable is a
 /// detail of how the daemon is wired rather than something every layer
 /// below has to know about.
 ///
 /// # Errors
-/// As [`validate_against_schema_at`], plus the variable being unset.
-fn validate_against_schema(proposed: &Value) -> Result<(), String> {
+/// As [`validate_proposed_at`], plus the variable being unset.
+fn validate_proposed(proposed: &Value) -> Result<(), String> {
     let schema_path = std::env::var("FERRUM_SETTINGS_SCHEMA")
         .map_err(|_| "FERRUM_SETTINGS_SCHEMA not set -- cannot validate settings".to_string())?;
-    validate_against_schema_at(std::path::Path::new(&schema_path), proposed)
+    validate_proposed_at(std::path::Path::new(&schema_path), proposed)
+}
+
+/// Refuses a document that would publish the control plane with no login in
+/// front of it (SEC-04).
+///
+/// `auth.enable` is a bare boolean in the schema with no relation to
+/// `daemon.enable`, so this write SUCCEEDED and then every subsequent apply
+/// failed at modules/proxy/nginx.nix's H-03 assertion. Fail-closed, so
+/// never an exposure -- but it bricks applies from the UI, which is a bad
+/// outcome on a product whose whole claim is that the UI works. The
+/// operator's only route back was to edit the file by hand, which is the
+/// thing ferrum exists to avoid.
+///
+/// The predicate mirrors `modules/proxy/lib.nix`'s `daemonPublished`
+/// conjoined with the assertion at `modules/proxy/nginx.nix:447`. The
+/// defaults below are the NixOS options' own (modules/core/options.nix): a
+/// key absent from settings.json takes the option default, so reading a
+/// missing `daemon.enable` as `false` would let exactly the failing
+/// document through.
+///
+/// Refusing the WRITE rather than only the apply is the same choice
+/// `daemon.listenAddress`'s schema `pattern` already makes, and for the
+/// same reason: eval time is too late once the value is on disk.
+///
+/// # Arguments
+/// * `proposed` - the document as it arrived on the wire.
+///
+/// # Errors
+/// A message naming both lines that would fix it, for a `400`.
+fn publication_matches_auth(proposed: &Value) -> Result<(), String> {
+    let flag = |section: &str, key: &str, default: bool| -> bool {
+        proposed
+            .get(section)
+            .and_then(|s| s.get(key))
+            .and_then(Value::as_bool)
+            .unwrap_or(default)
+    };
+    let base_domain = proposed
+        .get("proxy")
+        .and_then(|p| p.get("baseDomain"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+
+    // ferrum.daemon.enable defaults to TRUE and ferrum.auth.enable is an
+    // mkEnableOption, so it defaults to FALSE -- which is why a document
+    // that merely sets a domain lands here.
+    let published = flag("daemon", "enable", true) && flag("proxy", "enable", false) && !base_domain.is_empty();
+    if published && !flag("auth", "enable", false) {
+        return Err(
+            "this would publish ferrum's own dashboard at the configured domain with no \
+             login in front of it, and every apply would then be refused. Either set \
+             auth.enable to true, or turn daemon.enable off and reach the dashboard \
+             over an SSH tunnel."
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 pub async fn put_settings(
@@ -100,7 +175,7 @@ pub async fn put_settings(
     // thread serving this request. The document is handed to the closure and
     // handed back by it, so validation and the write that follows cannot
     // disagree about what was validated.
-    let validated = crate::run_blocking(move || validate_against_schema(&proposed).map(|()| proposed)).await;
+    let validated = crate::run_blocking(move || validate_proposed(&proposed).map(|()| proposed)).await;
     let proposed = match validated {
         Ok(Ok(proposed)) => proposed,
         Ok(Err(msg)) => {
@@ -151,9 +226,9 @@ mod tests {
     }
 
     #[test]
-    fn validate_against_schema_rejects_when_env_var_unset() {
+    fn validate_proposed_rejects_when_env_var_unset() {
         std::env::remove_var("FERRUM_SETTINGS_SCHEMA");
-        let result = validate_against_schema(&serde_json::json!({}));
+        let result = validate_proposed(&serde_json::json!({}));
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("FERRUM_SETTINGS_SCHEMA not set"));
     }
@@ -330,5 +405,102 @@ mod tests {
             let result = validate_against_schema_at(&schema, document);
             assert!(result.is_ok(), "the schema refused a legitimate value {document}: {result:?}");
         }
+    }
+
+    // --- SEC-04: auth.enable vs daemon.enable --------------------------
+
+    /// The document a host reaches by doing nothing but setting a domain:
+    /// `daemon.enable` defaults to true, `auth.enable` to false. It used to
+    /// be written happily and then refuse every apply afterwards.
+    #[test]
+    fn a_published_dashboard_with_auth_off_is_refused_at_the_write() {
+        let (_dir, schema) = schema_with_patterns();
+        let result = validate_proposed_at(&schema, &serde_json::json!({
+            "proxy": { "enable": true, "baseDomain": "home.example.com" },
+        }));
+        let message = result.expect_err("a write that bricks every later apply must be refused");
+        assert!(
+            message.contains("auth.enable"),
+            "the refusal must name the line that fixes it: {message}"
+        );
+    }
+
+    /// Both ways out of it, exactly as the H-03 assertion offers them, and
+    /// the two configurations that were never the problem. This is what
+    /// keeps the check from being "refuse anything with a domain".
+    #[test]
+    fn the_configurations_that_are_actually_safe_are_still_writable() {
+        let (_dir, schema) = schema_with_patterns();
+        let cases: &[(&str, serde_json::Value)] = &[
+            (
+                "auth turned on, which is the fix the assertion asks for",
+                serde_json::json!({
+                    "proxy": { "enable": true, "baseDomain": "home.example.com" },
+                    "auth": { "enable": true },
+                }),
+            ),
+            (
+                "the daemon not published, reached over an SSH tunnel",
+                serde_json::json!({
+                    "proxy": { "enable": true, "baseDomain": "home.example.com" },
+                    "daemon": { "enable": false },
+                }),
+            ),
+            (
+                "no domain at all -- the safest configuration ferrum offers, \
+                 and the one an assertion keyed on auth alone would wrongly refuse",
+                serde_json::json!({ "proxy": { "enable": true, "baseDomain": "" } }),
+            ),
+            (
+                "the proxy off entirely",
+                serde_json::json!({ "proxy": { "enable": false, "baseDomain": "home.example.com" } }),
+            ),
+            ("an empty document", serde_json::json!({})),
+        ];
+        for (what, document) in cases {
+            let result = validate_proposed_at(&schema, document);
+            assert!(result.is_ok(), "a write was refused for {what}: {result:?}");
+        }
+    }
+
+    /// The defaults are the load-bearing part, and the easiest thing to get
+    /// wrong: reading an absent `daemon.enable` as `false` would let the
+    /// exact failing document through, because settings.json omits every
+    /// key the operator has not set.
+    #[test]
+    fn an_absent_key_takes_the_nixos_option_default_not_the_json_one() {
+        let (_dir, schema) = schema_with_patterns();
+        // daemon.enable absent -> true, so this IS published.
+        assert!(
+            validate_proposed_at(&schema, &serde_json::json!({
+                "proxy": { "enable": true, "baseDomain": "home.example.com" },
+                "auth": {},
+            }))
+            .is_err(),
+            "an absent daemon.enable defaults to TRUE, so this publishes the dashboard"
+        );
+        // proxy.enable absent -> false, so nothing is published and the
+        // domain alone is harmless.
+        assert!(
+            validate_proposed_at(&schema, &serde_json::json!({ "proxy": { "baseDomain": "home.example.com" } }))
+                .is_ok(),
+            "an absent proxy.enable defaults to FALSE, so nothing is published"
+        );
+    }
+
+    /// Order matters: a document of the wrong SHAPE must be reported as
+    /// that, not as whatever the cross-field check makes of a field whose
+    /// type it never checked.
+    #[test]
+    fn schema_validation_runs_before_the_cross_field_check() {
+        let (_dir, schema) = schema_with_patterns();
+        let message = validate_proposed_at(&schema, &serde_json::json!({
+            "proxy": { "enable": true, "baseDomain": "not a domain; return 200;" },
+        }))
+        .expect_err("a malformed baseDomain must be refused");
+        assert!(
+            message.contains("schema validation"),
+            "the shape error must be the one reported: {message}"
+        );
     }
 }
