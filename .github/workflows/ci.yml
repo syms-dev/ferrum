@@ -171,6 +171,18 @@ jobs:
       # checks.nix), so they cost no extra build time; they are named
       # explicitly so the wiring check in flake-check can see them covered
       # rather than needing an exception.
+      #
+      # production-installer-has-no-api-override is here rather than in
+      # "cheap checks" for the same reason: it realizes BOTH installers --
+      # the operator's `.#ferrum-install` and the
+      # `test-cloudflare-endpoint` build tests/stage2/run.sh drives -- and
+      # shares this job's vendored Cargo.lock closure, so the second costs
+      # little after the first. What it asserts is that only the second can
+      # be pointed away from Cloudflare, proved by grepping the built
+      # binaries rather than by reading the source. Without it, collapsing
+      # the two cfg-gated bodies of answers::cloudflare_client into one
+      # runtime branch would pass every test while shipping operators a way
+      # to finish an install that can publish nothing.
       - name: build and test the Rust workspace
         run: |
           nix build --print-build-logs \
@@ -187,7 +199,8 @@ jobs:
             .#checks.x86_64-linux.clippy-ferrum-dns \
             .#checks.x86_64-linux.clippy-ferrum-install \
             .#checks.x86_64-linux.clippy-ferrum-reconcile \
-            .#checks.x86_64-linux.clippy-ferrumd
+            .#checks.x86_64-linux.clippy-ferrumd \
+            .#checks.x86_64-linux.production-installer-has-no-api-override
 
   # A mechanical CVE scan of the Rust dependency tree. Cheap, and the
   # alternative is a knowledge-based review whose freshness silently decays
