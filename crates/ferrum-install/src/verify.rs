@@ -85,6 +85,14 @@ pub fn ownership_checks() -> Vec<Check> {
 /// is a substring of another, because `Check::expect` is matched with
 /// `contains`.
 pub fn hardware_config_command(path: &str) -> String {
+    // Quoted, like every other value this crate sends to a remote shell.
+    // The path is a `&'static str` at both call sites today, so this is
+    // latent rather than live -- but an unquoted path is also a CORRECTNESS
+    // bug and not only a security one: a real file under a directory with a
+    // space in it word-splits, `test -f` sees two arguments, and the check
+    // answers MISSING for a host that is fine. A three-outcome check whose
+    // outcomes depend on the shape of the path is not a check.
+    let path = crate::collect::sh_quote(path);
     format!(
         "test -f {path} && {{ grep -q '{s}' {path} && echo STANDIN || echo REAL; }} || echo MISSING",
         s = crate::render::HARDWARE_CONFIG_SENTINEL
@@ -250,6 +258,21 @@ pub fn data_disk_checks(kept: &[&Device]) -> Vec<Check> {
         })
         .collect()
 }
+/// Builds the command that reads one first-run credential off the target.
+///
+/// Split out for the same reason `hardware_config_command` was: this string
+/// is handed to `ssh`, which hands it to a remote shell, so the only honest
+/// test of it is one that executes it.
+///
+/// # Arguments
+/// * `path` - the file on the target holding the credential.
+///
+/// # Returns
+/// A shell command printing that file's contents.
+pub fn read_credential_command(path: &str) -> String {
+    format!("cat {}", crate::collect::sh_quote(path))
+}
+
 
 /// R1 A8's reachability proof: is the address ferrum published the address
 /// the internet actually delivers to this host?
@@ -983,6 +1006,66 @@ mod tests {
     #[test]
     fn only_ferrumds_credential_is_reported_without_sso() {
         assert_eq!(credential_paths(false).len(), 1);
+    }
+
+    /// R3/SEC3. Both remote-command builders in this crate interpolate a
+    /// path into a shell string that `collect::run` hands to `ssh`, which
+    /// hands it to a remote shell -- and neither went through `sh_quote`.
+    ///
+    /// Latent today, and recorded as latent so nobody later reads this
+    /// commit as evidence of a live hole: every call site passes a
+    /// `&'static str` literal. It is fixed anyway because the distance
+    /// between "this argument is a constant" and "this argument is a
+    /// setting" is one feature, and the failure is silent when it closes.
+    ///
+    /// Executed rather than asserted against the string, because the bug is
+    /// SHELL word-splitting: a path containing a space is two arguments to
+    /// `test`, and a path containing `;` is two commands. Reading the
+    /// format string does not show that. The fixture directory carries both.
+    #[test]
+    fn the_hardware_config_check_survives_a_path_needing_quoting() {
+        let dir = tempfile::tempdir().unwrap();
+        let awkward = dir.path().join("a b;c");
+        std::fs::create_dir_all(&awkward).unwrap();
+        let path = awkward.join("hardware-configuration.nix");
+        std::fs::write(&path, "{ }\n").unwrap();
+
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(super::hardware_config_command(path.to_str().unwrap()))
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            "REAL",
+            "a real hardware configuration at a path needing quoting must still read as REAL"
+        );
+    }
+
+    /// The companion sink: `final_report` reads each first-run credential
+    /// off the target with `cat <path>`, built the same unquoted way.
+    ///
+    /// Extracted into a named builder for the same reason
+    /// `hardware_config_command` was -- so the command that actually runs
+    /// can be executed in a test rather than inspected.
+    #[test]
+    fn the_credential_read_survives_a_path_needing_quoting() {
+        let dir = tempfile::tempdir().unwrap();
+        let awkward = dir.path().join("a b;c");
+        std::fs::create_dir_all(&awkward).unwrap();
+        let path = awkward.join("ferrumd-setup-password");
+        std::fs::write(&path, "the-generated-password\n").unwrap();
+
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(super::read_credential_command(path.to_str().unwrap()))
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            "the-generated-password",
+            "the credential must be read from the path asked for, whatever is in it"
+        );
     }
 
     // ---- R1 A8: the reachability proof ---------------------------------
