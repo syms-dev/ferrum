@@ -165,9 +165,25 @@ Last updated at HEAD `288f2b3`, branch `grounding-and-install-path`. Nothing pus
       the audit trail of a decision the project made deliberately and still honours.
       **Two remain on purpose:** `.gitignore` must name `.claude/` in order to ignore it, and
       this file is the live checklist — review it last, not while writing against it.
-- [ ] **15. Decide on git history.** 6 commit messages contain a mention. Editing them means
-      rewriting history, which is destructive and has already invalidated a pipeline ledger here
-      once. Separate decision from the working tree.
+- [x] **15. Git history.** DECIDED 2026-09-23: **leave it alone.** The decision is recorded here
+      so it is not re-litigated at the last minute before going public.
+      - **The attribution is already gone.** The `Co-Authored-By` trailers — 186 of 226 commits —
+        were stripped under the plan approved on 2026-09-21
+        (`docs/superpowers/specs/2026-09-21-phase-1-9-ship-it-design.md`). That plan did what the
+        standing rule asks: no commit or PR claims the work was machine-authored.
+      - **What remains is not attribution.** Seven commit bodies name tools and files actually
+        used — `.claude/skills/humanize`, `CLAUDE.md`, `claude-kit`, `Claude Design`. They say
+        what a change touched, not who wrote it. Scrubbing them would leave messages describing
+        things by names that no longer appear anywhere, which is worse documentation, not better
+        hygiene. Only `657a052` carries one in its subject, so only one is visible in
+        `git log --oneline`.
+      - **The price went up after the checklist was written.** PR #4 is open, so a force-push now
+        rewrites a branch under review; ~20 commit SHAs are cited inside docs and evidence files
+        and would dangle; and a rewrite has already invalidated a pipeline ledger here once.
+      - **Reopen only if** the repo gains an external contributor before going public (rewriting
+        after someone else has cloned is materially worse), or if a future commit message carries
+        real attribution rather than a tool name — which the standing rule already forbids.
+
 - [ ] **16. Deep bug-hunt across the whole codebase.** Not a diff review — a sweep.
 - [ ] **17. Test sufficiency audit, unit and e2e.** Warranted: this run's test-coverage gate failed
       twice on tests that could not fail, including assertions scanning an empty corpus and an
