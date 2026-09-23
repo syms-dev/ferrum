@@ -381,146 +381,70 @@ let
   # colliding app at exposure = "local" is a trap armed for whenever someone
   # publishes it, and reporting that at eval time costs nothing.
   reservedSubdomains = [ ferrum.daemon.subdomain "auth" ];
+  enabledApps = lib.filterAttrs (_: app: app.enable) ferrum.apps;
   reservedCollisions = lib.mapAttrsToList
     (name: app: "ferrum.apps.${name}.subdomain = \"${app.subdomain}\"")
     (lib.filterAttrs
-      (_: app: app.enable && lib.elem app.subdomain reservedSubdomains)
-      ferrum.apps);
-in
-lib.mkIf proxyEnabled {
-  services.nginx = {
-    enable = true;
-    recommendedTlsSettings = true;
-    recommendedProxySettings = true;
-    recommendedGzipSettings = true;
-    # The headers, plus the shared-memory zone the daemon's login location
-    # draws on. limit_req_zone is an http-context directive and the zone has
-    # to exist whether or not anything references it, so it is declared here
-    # rather than beside its one consumer.
-    #
-    # Keyed on $binary_remote_addr -- the client address in 4 or 16 bytes
-    # rather than the text form, which is what makes 1m hold roughly 16000
-    # of them. 1m is far more than a home server will ever populate, and
-    # nginx returns 503 to everyone once a zone fills, so undersizing it is
-    # the failure worth avoiding.
-    #
-    # Returns 429 rather than nginx's default 503: the SPA can tell "you are
-    # going too fast" from "the daemon fell over", and so can the operator
-    # reading a log.
-    commonHttpConfig = generalSecurityHeaders + ''
-      limit_req_zone $binary_remote_addr zone=ferrum_login:1m rate=20r/m;
-      limit_req_status 429;
-    '';
-    virtualHosts = {
-      # A catch-all that refuses anything we did not explicitly publish.
-      #
-      # Without it nginx makes the FIRST vhost its default server, so any
-      # hostname with no vhost of its own is silently served by whichever app
-      # happens to sort first. Found on a real host: jellyfin was enabled but
-      # left at exposure = "local" (so it correctly got no vhost), and
-      # jellyfin.thesyms.ca then served Plex's login page. The operator
-      # reasonably read that as ferrum routing one app to another.
-      #
-      # 444 -- nginx's own "close without a response" -- rather than 404,
-      # because there is nothing useful to say to a request for a hostname
-      # this box does not serve, and a body would only confirm that something
-      # is listening. This also covers a wildcard DNS record pointed at the
-      # host, which is the normal way these subdomains get resolved.
-      #
-      # `default_server` on a catch-all is only meaningful if it really is
-      # the default: `default = true` is what makes nginx pick this one for
-      # an unmatched Host, instead of the alphabetically-first app.
-      "_ferrum_unmatched" = {
-        default = true;
-        rejectSSL = true;
-        locations."/".return = "444";
-      };
-    }
-      // lib.listToAttrs (lib.mapAttrsToList mkVhost exposedApps)
-      // lib.optionalAttrs daemonPublished { "${daemonVhostName}" = daemonVhost; }
-      // lib.optionalAttrs ferrum.auth.enable {
-        "auth.${ferrum.proxy.baseDomain}" = {
-          forceSSL = true;
-          useACMEHost = lib.mkIf realCertsNeeded "auth.${ferrum.proxy.baseDomain}";
-          sslCertificate = lib.mkIf (!realCertsNeeded) "${selfSignedCertDir}/cert.pem";
-          sslCertificateKey = lib.mkIf (!realCertsNeeded) "${selfSignedCertDir}/key.pem";
-          locations."/".proxyPass = "http://127.0.0.1:9091";
-        };
-      };
-  };
+      (_: app: lib.elem app.subdomain reservedSubdomains)
+      enabledApps);
 
-  assertions = [
-    {
-      # Publication and gating are two predicates on purpose (see
-      # modules/proxy/lib.nix), and before R13 the gap between them was
-      # survivable: ferrum.daemon.subdomain was decorative, so a host with
-      # auth off published catalog apps and nothing else. R13 shipped the
-      # vhost, so the same gap now publishes settings, secrets, apply and
-      # rollback on a real ACME certificate with auth_request absent
-      # entirely.
-      #
-      # The spec put this out of scope on the ground that auth-off with a
-      # public domain is an existing hazard and that R13 does not change the
-      # policy. The policy is indeed unchanged; the BLAST RADIUS is not, and
-      # the out-of-scope reasoning rests on a premise R13 itself falsified.
-      #
-      # An assertion rather than a warning, and an assertion rather than the
-      # installer's typed consent, because of WHO gets caught. The installer
-      # asks once, at first install; an operator upgrading an existing
-      # auth-off host never sees that prompt, and a warning scrolls past in
-      # the output of a command that succeeded. This stops EVERY apply until
-      # it is answered, which is the only form that reaches the host the
-      # finding is actually about.
-      #
-      # Note what it does NOT do: daemonPublished is untouched. Several
-      # things read it, and making publication depend on auth would silently
-      # unpublish the dashboard instead of reporting the problem -- the same
-      # class of failure as issuing a certificate for a name nothing serves.
-      assertion = !(daemonPublished && !ferrum.auth.enable);
-      message = ''
-        ferrum publishes its own control plane at ${daemonVhostName} on this
-        host, and ferrum.auth.enable is false, so there is no login in front of it.
+  # The other half of the same hazard, and the half that was never closed.
+  #
+  # The comment above stops an app from taking a name ferrum reserves. It
+  # says nothing about two APPS taking the same name as each other, and
+  # every mechanism downstream of `subdomain` resolves that silently in
+  # favour of whichever app happens to sort first:
+  #
+  #   * nginx (below): virtualHosts is built with `lib.listToAttrs`, which
+  #     keeps the FIRST entry for a duplicated key, over a list produced by
+  #     `lib.mapAttrsToList` -- and attribute sets iterate in sorted order.
+  #     So with sonarr.subdomain = radarr.subdomain = "tv", the host gets
+  #     ONE vhost for tv.<domain> proxying to RADARR's port. Sonarr is
+  #     enabled, is reported as published, has a certificate ordered for a
+  #     name it does not serve, and is unreachable.
+  #   * modules/proxy/dns.nix: `mapAttrsToList` again, with no de-duplication
+  #     -- the document gets TWO records for one name, in a file that file
+  #     sorts specifically so a no-op rebuild is byte-identical.
+  #   * modules/proxy/authelia.nix: two access_control rules for one domain,
+  #     and Authelia takes the first match -- so the policy that applies is
+  #     decided by attribute order too.
+  #
+  # Compared on the rendered vhost NAME rather than on `subdomain`, because
+  # the vhost name is what all three of those actually key on. Today that is
+  # `${subdomain}.${baseDomain}` for every app so the two are equivalent;
+  # if vhostNameFor ever grows a per-app term, this check follows it instead
+  # of quietly testing the wrong string.
+  #
+  # ENABLED apps, not exposed ones, for the reason the reserved check gives:
+  # a collision at exposure = "local" is armed for whenever someone
+  # publishes it, and eval time is the cheap place to say so.
+  vhostClaims = lib.mapAttrsToList
+    (name: app: { app = name; vhost = vhostNameFor app; })
+    enabledApps;
+  duplicateVhostCollisions = lib.mapAttrsToList
+    (vhost: claims:
+      "${vhost} is claimed by "
+      + lib.concatMapStringsSep " and "
+        (c: "ferrum.apps.${c.app}.subdomain") claims)
+    (lib.filterAttrs
+      (_: claims: lib.length claims > 1)
+      (lib.groupBy (claim: claim.vhost) vhostClaims));
 
-        Anyone who can reach that name gets the dashboard: this host's
-        settings, its secrets API, and the apply and rollback buttons. It is
-        on a real Let's Encrypt certificate and, if ferrum.proxy.dns is on,
-        a real DNS record -- so "nobody knows the hostname" is not true
-        either. ferrumd's own login still stands underneath -- one password,
-        behind the 20/minute limit_req on /api/login above and ferrumd's own
-        lockout. Those slow a guess; they are not the gate this design
-        relies on, and neither of them asks a second factor or knows who you
-        are.
-
-        Two ways forward, and both are one line:
-
-          ferrum.auth.enable = true;    -- turn Authelia on, which is what
-                                           every other published app on this
-                                           host is already behind.
-
-          ferrum.daemon.publish = false;  -- keep the dashboard, take it off
-                                             the network. ferrumd goes on
-                                             running, bound to
-                                             ferrum.daemon.listenAddress, and
-                                             loses only its vhost, its
-                                             certificate and its DNS record.
-                                             Reach it by forwarding a local
-                                             port to
-                                             ferrum.daemon.listenAddress:${toString ferrum.daemon.port}
-                                             over SSH, which is what that
-                                             option exists for.
-                                             ferrumd's own login still
-                                             applies -- this removes the
-                                             network path, not the password.
-
-        ferrum.daemon.enable = false and ferrum.proxy.baseDomain = "" also
-        silence this, and both cost more than they look like they do:
-        `enable = false` deletes ferrumd rather than unpublishing it
-        (modules/core/daemon.nix is wrapped in lib.mkIf on that option), so
-        there is nothing left for the tunnel above to reach, and an empty
-        baseDomain unpublishes every app on the host as well. Use them when
-        you mean them, not to get past this message.
-      '';
-    }
+  # Everything that does NOT depend on the proxy being enabled on this host.
+  #
+  # These two assertions used to sit inside the `lib.mkIf proxyEnabled`
+  # below, which made the reserved check's own justification false in the
+  # one direction that matters. It argues -- correctly -- that a colliding
+  # app at exposure = "local" must still be reported, because it is "a trap
+  # armed for whenever someone publishes it". That reasoning holds across
+  # the exposure axis and then stops dead at the proxy axis: an operator
+  # building a host with ferrum.proxy.enable = false could name two apps
+  # "tv", or name one of them after the dashboard, and hear nothing at all
+  # until the day they turned the proxy on -- which is precisely the moment
+  # the collision stops being theoretical. Neither assertion reads
+  # anything the proxy defines, so there is no reason for either to be
+  # conditional on it.
+  subdomainAssertions = [
     {
       assertion = reservedCollisions == [ ];
       message = ''
@@ -533,7 +457,167 @@ lib.mkIf proxyEnabled {
         ferrum.daemon.subdomain.
       '';
     }
-  ];
+    {
+      assertion = duplicateVhostCollisions == [ ];
+      message = ''
+        Two enabled apps claim the same hostname, and ferrum would publish
+        only one of them: ${lib.concatStringsSep "; " duplicateVhostCollisions}.
 
-  networking.firewall.allowedTCPPorts = [ 80 443 ];
-}
+        This does not fail loudly anywhere downstream, which is why it is
+        stopped here. nginx keeps the first vhost for a duplicated server
+        name and attribute sets iterate in sorted order, so the
+        alphabetically-earlier app wins and the other becomes unreachable
+        on a name it believes it owns -- with a certificate ordered for it,
+        a DNS record pointing at it, and nothing in the UI saying so. The
+        generated DNS document gets two records for the one name, and
+        Authelia gets two access_control rules for it and applies whichever
+        it matches first, so the auth policy in force is decided by
+        attribute order rather than by either app's own setting.
+
+        Give each app its own ferrum.apps.<name>.subdomain.
+      '';
+    }
+  ];
+in
+lib.mkMerge [
+  { assertions = subdomainAssertions; }
+
+  (lib.mkIf proxyEnabled {
+    services.nginx = {
+      enable = true;
+      recommendedTlsSettings = true;
+      recommendedProxySettings = true;
+      recommendedGzipSettings = true;
+      # The headers, plus the shared-memory zone the daemon's login location
+      # draws on. limit_req_zone is an http-context directive and the zone has
+      # to exist whether or not anything references it, so it is declared here
+      # rather than beside its one consumer.
+      #
+      # Keyed on $binary_remote_addr -- the client address in 4 or 16 bytes
+      # rather than the text form, which is what makes 1m hold roughly 16000
+      # of them. 1m is far more than a home server will ever populate, and
+      # nginx returns 503 to everyone once a zone fills, so undersizing it is
+      # the failure worth avoiding.
+      #
+      # Returns 429 rather than nginx's default 503: the SPA can tell "you are
+      # going too fast" from "the daemon fell over", and so can the operator
+      # reading a log.
+      commonHttpConfig = generalSecurityHeaders + ''
+        limit_req_zone $binary_remote_addr zone=ferrum_login:1m rate=20r/m;
+        limit_req_status 429;
+      '';
+      virtualHosts = {
+        # A catch-all that refuses anything we did not explicitly publish.
+        #
+        # Without it nginx makes the FIRST vhost its default server, so any
+        # hostname with no vhost of its own is silently served by whichever app
+        # happens to sort first. Found on a real host: jellyfin was enabled but
+        # left at exposure = "local" (so it correctly got no vhost), and
+        # jellyfin.thesyms.ca then served Plex's login page. The operator
+        # reasonably read that as ferrum routing one app to another.
+        #
+        # 444 -- nginx's own "close without a response" -- rather than 404,
+        # because there is nothing useful to say to a request for a hostname
+        # this box does not serve, and a body would only confirm that something
+        # is listening. This also covers a wildcard DNS record pointed at the
+        # host, which is the normal way these subdomains get resolved.
+        #
+        # `default_server` on a catch-all is only meaningful if it really is
+        # the default: `default = true` is what makes nginx pick this one for
+        # an unmatched Host, instead of the alphabetically-first app.
+        "_ferrum_unmatched" = {
+          default = true;
+          rejectSSL = true;
+          locations."/".return = "444";
+        };
+      }
+        // lib.listToAttrs (lib.mapAttrsToList mkVhost exposedApps)
+        // lib.optionalAttrs daemonPublished { "${daemonVhostName}" = daemonVhost; }
+        // lib.optionalAttrs ferrum.auth.enable {
+          "auth.${ferrum.proxy.baseDomain}" = {
+            forceSSL = true;
+            useACMEHost = lib.mkIf realCertsNeeded "auth.${ferrum.proxy.baseDomain}";
+            sslCertificate = lib.mkIf (!realCertsNeeded) "${selfSignedCertDir}/cert.pem";
+            sslCertificateKey = lib.mkIf (!realCertsNeeded) "${selfSignedCertDir}/key.pem";
+            locations."/".proxyPass = "http://127.0.0.1:9091";
+          };
+        };
+    };
+
+    assertions = [
+      {
+        # Publication and gating are two predicates on purpose (see
+        # modules/proxy/lib.nix), and before R13 the gap between them was
+        # survivable: ferrum.daemon.subdomain was decorative, so a host with
+        # auth off published catalog apps and nothing else. R13 shipped the
+        # vhost, so the same gap now publishes settings, secrets, apply and
+        # rollback on a real ACME certificate with auth_request absent
+        # entirely.
+        #
+        # The spec put this out of scope on the ground that auth-off with a
+        # public domain is an existing hazard and that R13 does not change the
+        # policy. The policy is indeed unchanged; the BLAST RADIUS is not, and
+        # the out-of-scope reasoning rests on a premise R13 itself falsified.
+        #
+        # An assertion rather than a warning, and an assertion rather than the
+        # installer's typed consent, because of WHO gets caught. The installer
+        # asks once, at first install; an operator upgrading an existing
+        # auth-off host never sees that prompt, and a warning scrolls past in
+        # the output of a command that succeeded. This stops EVERY apply until
+        # it is answered, which is the only form that reaches the host the
+        # finding is actually about.
+        #
+        # Note what it does NOT do: daemonPublished is untouched. Several
+        # things read it, and making publication depend on auth would silently
+        # unpublish the dashboard instead of reporting the problem -- the same
+        # class of failure as issuing a certificate for a name nothing serves.
+        assertion = !(daemonPublished && !ferrum.auth.enable);
+        message = ''
+          ferrum publishes its own control plane at ${daemonVhostName} on this
+          host, and ferrum.auth.enable is false, so there is no login in front of it.
+
+          Anyone who can reach that name gets the dashboard: this host's
+          settings, its secrets API, and the apply and rollback buttons. It is
+          on a real Let's Encrypt certificate and, if ferrum.proxy.dns is on,
+          a real DNS record -- so "nobody knows the hostname" is not true
+          either. ferrumd's own login still stands underneath -- one password,
+          behind the 20/minute limit_req on /api/login above and ferrumd's own
+          lockout. Those slow a guess; they are not the gate this design
+          relies on, and neither of them asks a second factor or knows who you
+          are.
+
+          Two ways forward, and both are one line:
+
+            ferrum.auth.enable = true;    -- turn Authelia on, which is what
+                                             every other published app on this
+                                             host is already behind.
+
+            ferrum.daemon.publish = false;  -- keep the dashboard, take it off
+                                               the network. ferrumd goes on
+                                               running, bound to
+                                               ferrum.daemon.listenAddress, and
+                                               loses only its vhost, its
+                                               certificate and its DNS record.
+                                               Reach it by forwarding a local
+                                               port to
+                                               ferrum.daemon.listenAddress:${toString ferrum.daemon.port}
+                                               over SSH, which is what that
+                                               option exists for.
+                                               ferrumd's own login still
+                                               applies -- this removes the
+                                               network path, not the password.
+
+          ferrum.daemon.enable = false and ferrum.proxy.baseDomain = "" also
+          silence this, and both cost more than they look like they do:
+          `enable = false` deletes ferrumd rather than unpublishing it
+          (modules/core/daemon.nix is wrapped in lib.mkIf on that option), so
+          there is nothing left for the tunnel above to reach, and an empty
+          baseDomain unpublishes every app on the host as well. Use them when
+          you mean them, not to get past this message.
+        '';
+      }
+    ];
+
+    networking.firewall.allowedTCPPorts = [ 80 443 ];
+  })
+]

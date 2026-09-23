@@ -1655,6 +1655,106 @@
           reserved = colliding;
         };
 
+      # The app-vs-app half of the same hazard, which the check above never
+      # covered: two ENABLED apps claiming one hostname.
+      #
+      # Proven before the assertion existed, by evaluating a host with
+      # sonarr.subdomain = radarr.subdomain = "tv": exactly ONE vhost
+      # (tv.example.test) whose `locations."/".proxyPass` was
+      # http://127.0.0.1:7878 -- Radarr's port -- while Sonarr was enabled,
+      # certificated and reported as published on that same name.
+      # lib.listToAttrs keeps the FIRST entry for a duplicated key and
+      # attribute sets iterate sorted, so the alphabetically-earlier app
+      # always wins. Same evaluation produced ten Authelia access_control
+      # rules for the one domain.
+      #
+      # Three properties, and the third is the one that would have been
+      # easiest to omit:
+      #
+      #   1. a host with distinct subdomains is NOT rejected (the
+      #      anti-vacuity floor -- without it this check passes with the
+      #      assertion inverted, or with `subdomain` ignored entirely),
+      #   2. a host with two apps on one name IS rejected, by a message
+      #      naming both apps and the hostname,
+      #   3. both of the above hold with ferrum.proxy.enable = FALSE.
+      #
+      # (3) is the regression guard for the hoist out of `lib.mkIf
+      # proxyEnabled`. The assertion's own reasoning is that a collision
+      # must be reported before it is published -- "a trap armed for
+      # whenever someone publishes it" -- and while it lived inside that
+      # mkIf, that was true across the exposure axis and false across the
+      # proxy axis, which is the axis an operator actually crosses when
+      # they turn the proxy on. A check that only ever built proxy-on hosts
+      # could not see the difference.
+      duplicateSubdomainCollision =
+        let
+          hostWith = { proxy, sonarrSubdomain }: ferrumLib.mkHost {
+            inherit system;
+            settings = {
+              schemaVersion = realMigrations.currentVersion;
+              proxy = { enable = proxy; }
+                // lib.optionalAttrs proxy {
+                baseDomain = "example.test";
+                acme.email = "a@example.test";
+              };
+              apps = {
+                radarr = { enable = true; subdomain = "tv"; };
+                sonarr = { enable = true; subdomain = sonarrSubdomain; };
+              };
+            };
+            modules = [ ../../../examples/hosts/minimal/configuration.nix ];
+          };
+
+          # Scoped to this assertion's own message, and to a phrase it keeps
+          # on ONE line, for both reasons the reserved check above gives: an
+          # unscoped filter reports a host as "rejected" for any reason at
+          # all, and an infix spanning a line break in a multi-line Nix
+          # string never matches.
+          failuresFor = args:
+            let
+              probe = builtins.tryEval (
+                builtins.filter (m: lib.hasInfix "claim the same hostname" m)
+                  (map (a: a.message)
+                    (builtins.filter (a: !a.assertion) (hostWith args).config.assertions))
+              );
+            in
+            if probe.success then probe.value else [ "evaluation threw" ];
+
+          axes = [ true false ];
+
+          # (1) Distinct names must pass. This is the floor that makes the
+          # rest of the check mean something.
+          distinctRejected = builtins.filter
+            (proxy: failuresFor { inherit proxy; sonarrSubdomain = "shows"; } != [ ])
+            axes;
+
+          # (2)+(3) One name, two apps, on a proxy-on AND a proxy-off host.
+          collidingAccepted = builtins.filter
+            (proxy: failuresFor { inherit proxy; sonarrSubdomain = "tv"; } == [ ])
+            axes;
+
+          # The message has to name both apps and the hostname, or an
+          # operator cannot act on it. Checked on the proxy-ON host, where
+          # the vhost name is a real one rather than the bare "tv." a host
+          # with no baseDomain renders.
+          collisionMessages = failuresFor { proxy = true; sonarrSubdomain = "tv"; };
+          namesBothApps = builtins.any
+            (m: lib.hasInfix "ferrum.apps.sonarr.subdomain" m
+              && lib.hasInfix "ferrum.apps.radarr.subdomain" m)
+            collisionMessages;
+          namesTheHostname = builtins.any (m: lib.hasInfix "tv.example.test" m) collisionMessages;
+        in
+        {
+          ok = distinctRejected == [ ]
+            && collidingAccepted == [ ]
+            && namesBothApps
+            && namesTheHostname;
+          message =
+            "two enabled apps may claim one hostname, and only the "
+            + "alphabetically-earlier one is published";
+          inherit distinctRejected collidingAccepted namesBothApps namesTheHostname;
+        };
+
       # A3/D5, leg 2: nginx emits no CORS header either.
       #
       # ferrumd's own test matrix cannot see this. After R13 nginx is a
@@ -2631,6 +2731,8 @@
         nginx-config-parses = nginxConfigParses;
         reserved-subdomain-collision =
           mkAssertionCheck "reserved-subdomain-collision" reservedSubdomainCollision;
+        duplicate-subdomain-collision =
+          mkAssertionCheck "duplicate-subdomain-collision" duplicateSubdomainCollision;
         nginx-emits-no-cors-headers =
           mkAssertionCheck "nginx-emits-no-cors-headers" nginxEmitsNoCorsHeaders;
         root-folders-reach-the-apps = rootFoldersReachTheApps;

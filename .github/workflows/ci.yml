@@ -50,6 +50,7 @@ jobs:
             .#checks.x86_64-linux.nginx-config-parses \
             .#checks.x86_64-linux.nginx-emits-no-cors-headers \
             .#checks.x86_64-linux.reserved-subdomain-collision \
+            .#checks.x86_64-linux.duplicate-subdomain-collision \
             .#checks.x86_64-linux.dns-record-set \
             .#checks.x86_64-linux.root-folders-reach-the-apps \
             .#checks.x86_64-linux.migration-mechanism \
