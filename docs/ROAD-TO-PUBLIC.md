@@ -194,10 +194,29 @@ Last updated at HEAD `288f2b3`, branch `grounding-and-install-path`. Nothing pus
 
 ## Phase 4 — Prove it works, not just that it builds
 
-- [ ] **9. Run the KVM-gated VM tests in CI.** 21 of 34 Nix checks have never run on this Mac.
-      Everything about a *running* system is currently unproven rather than safe: Authelia
-      actually starting, real ACME issuance, real ferrumd behind the vhost, rollback,
-      install-from-nothing.
+- [~] **9. The KVM-gated VM tests.** **Premise corrected 2026-09-23 — CI already runs them, and
+      they pass.** What is actually broken is narrower and worse.
+      - **`vm-tests` PASSES** on `x86_64-linux`, covering eight checks: `install-from-nothing`,
+        `rollback`, `rollback-proves-necessity`, `apply-generation-switch`, `daemon-end-to-end`,
+        `daemon-apply-end-to-end`, `privilege-boundary`, `state-restore-interlock`. They never run
+        on this Mac (no KVM), which is not the same as never running.
+      - **`stage2` and `stage2-resume` have failed on EVERY run since at least 2026-09-21** — and
+        not on ferrum code. Both die on the GitHub Actions nix cache: `ResourceExhausted / rate
+        limit exceeded`, surfacing as `HTTP error 418` today and `substituter ... is disabled`
+        on 21 September. **`stage2` is "install a real host end to end", so the single most
+        important test this project has have been returning no signal for days**, and returning
+        it in the shape of a red cross that looks like a code failure.
+      - **Fix direction:** stop depending on the GHA cache for these two jobs — pin
+        `--option substituters`, or tolerate a disabled substituter instead of failing, so a cache
+        outage degrades to a slower build rather than a false red. Until then neither job can
+        confirm or deny anything about the installer.
+      - **The aarch64 `smoke` leg failing is EXPECTED** and must not be counted: GitHub's ARM
+        runners ship no `/dev/kvm`. It is a deliberate non-blocking live probe with a long comment
+        saying exactly that, kept so it starts passing for free the day ARM runners gain KVM.
+      - **`nginx-config-parses` had never passed in CI** — see the fix in `635e7d1`. It landed
+        14:46 on 22 Sep; the last green run was 13:56. `nginx -t` **binds** every listen address,
+        and a CI builder is unprivileged.
+
 - [ ] **10. A real install on real hardware, start to finish, no manual steps.** The standing test:
       from a bare machine, does the operator end up with a working, published, logged-in system
       without being told to do anything by hand?
