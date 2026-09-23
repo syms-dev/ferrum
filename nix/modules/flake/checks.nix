@@ -628,12 +628,19 @@
               # moves an option cannot tell a value being READ from a value
               # being ASSUMED.
             , daemon ? { }
+              # Every fixture here also took auth.enable = true, which is
+              # the value that hides H-03: ferrum.auth.enable is an
+              # mkEnableOption and so defaults to FALSE, while
+              # ferrum.daemon.enable defaults to true. The configuration this
+              # check never built is the one a real host lands on by doing
+              # nothing.
+            , auth ? true
             }: ferrumLib.mkHost {
               inherit system;
               settings = {
                 schemaVersion = realMigrations.currentVersion;
                 proxy = { enable = proxy; inherit baseDomain; acme.email = "a@example.test"; };
-                auth = { enable = true; adminEmail = "a@example.test"; };
+                auth = { enable = auth; adminEmail = "a@example.test"; };
                 inherit apps secrets daemon;
               };
               modules = [ ../../../examples/hosts/minimal/configuration.nix ];
@@ -896,6 +903,58 @@
           wronglyAcceptedBracketed = builtins.filter (a: loopbackFailuresFor a == [ ])
             [ "[::1]" ];
 
+          # H-03. The host that publishes the control plane with no gate in
+          # front of it -- proxy on, a real baseDomain, and auth.enable left
+          # at the FALSE it defaults to, against ferrum.daemon.enable's
+          # default of true. That combination is what a host reaches by
+          # doing nothing, and until now nothing in either language said a
+          # word about it: the vhost, the Authelia-less auth_request, and a
+          # real Let's Encrypt certificate all appeared, and the apply
+          # reported success.
+          #
+          # Same builtins.tryEval + single-line message scoping as
+          # loopbackFailuresFor above, and scoped for the identical
+          # non-negotiable reason: this fixture carries other failing
+          # assertions of its own (the example host's placeholder secrets
+          # have no *-apikey-raw.sops counterparts), so an unscoped probe
+          # would report it "rejected" and would pass just as happily with
+          # the new assertion deleted. The phrase matched is kept whole on
+          # ONE line of nginx.nix's message, because an infix spanning a
+          # multi-line Nix string's line break never matches.
+          authOffFailures =
+            let
+              probe = builtins.tryEval (
+                builtins.filter (m: lib.hasInfix "so there is no login in front of it" m)
+                  (map (a: a.message)
+                    (builtins.filter (a: !a.assertion)
+                      (mkProxyHost { auth = false; }).config.assertions)));
+            in
+            if probe.success then probe.value else [ "evaluation threw" ];
+          # ...and the other direction, which is what stops the assertion
+          # being written as `true` and passing. The ordinary published host
+          # HAS auth on, and must not be stopped.
+          authOnFailures =
+            let
+              probe = builtins.tryEval (
+                builtins.filter (m: lib.hasInfix "so there is no login in front of it" m)
+                  (map (a: a.message)
+                    (builtins.filter (a: !a.assertion) published.config.assertions)));
+            in
+            if probe.success then probe.value else [ "evaluation threw" ];
+          # And the third: auth off is only a problem for a host that
+          # PUBLISHES. A daemon reached over an SSH tunnel on a box with no
+          # domain is the safest configuration ferrum offers, and refusing
+          # to build it would make this assertion a bug rather than a guard.
+          authOffUnpublishedFailures =
+            let
+              probe = builtins.tryEval (
+                builtins.filter (m: lib.hasInfix "so there is no login in front of it" m)
+                  (map (a: a.message)
+                    (builtins.filter (a: !a.assertion)
+                      (mkProxyHost { auth = false; baseDomain = ""; }).config.assertions)));
+            in
+            if probe.success then probe.value else [ "evaluation threw" ];
+
           # A2/D1: the Authelia rule. Without it, default_policy = "deny"
           # applies and the auth_request wiring asserted above denies every
           # request forever -- the dashboard would not be weakly protected, it
@@ -951,6 +1010,13 @@
               "the daemon vhost's /api/ redirects a 401 instead of returning it, so the SPA sees an opaque cross-origin redirect (D8)"
             ++ lib.optional (!(hasIn "error_page 401 = @ferrum_api_401" apiLoc))
               "the daemon vhost's /api/ does not override the 401 redirect with a plain 401 (D8)"
+            # H-03, all three directions.
+            ++ lib.optional (authOffFailures == [ ])
+              "a host with ferrum.proxy.enable, a real ferrum.proxy.baseDomain and ferrum.auth.enable = false evaluates cleanly: the control plane is published on a real ACME certificate with auth_request absent entirely, and nothing tells the operator. ferrum.auth.enable is an mkEnableOption (default FALSE) while ferrum.daemon.enable defaults to TRUE, so this is the configuration a host reaches by doing nothing (H-03)"
+            ++ lib.optional (authOnFailures != [ ])
+              "the ordinary published host -- auth ON -- is refused by the auth-off assertion, so that assertion is not reading ferrum.auth.enable at all (H-03)"
+            ++ lib.optional (authOffUnpublishedFailures != [ ])
+              "a host with auth off and NO baseDomain is refused, but that host publishes nothing: the daemon is reachable only over the SSH tunnel ferrum.daemon.listenAddress exists for, which is the safest configuration ferrum offers. The assertion is keyed on auth alone instead of on publication (H-03)"
             # H-02/M-04: the response headers. Asserted on the server-level
             # block rather than on the locations because that is where they
             # are set, and on ALL FOUR at that level because of the

@@ -369,6 +369,61 @@ lib.mkIf proxyEnabled {
 
   assertions = [
     {
+      # Publication and gating are two predicates on purpose (see
+      # modules/proxy/lib.nix), and before R13 the gap between them was
+      # survivable: ferrum.daemon.subdomain was decorative, so a host with
+      # auth off published catalog apps and nothing else. R13 shipped the
+      # vhost, so the same gap now publishes settings, secrets, apply and
+      # rollback on a real ACME certificate with auth_request absent
+      # entirely.
+      #
+      # The spec put this out of scope on the ground that auth-off with a
+      # public domain is an existing hazard and that R13 does not change the
+      # policy. The policy is indeed unchanged; the BLAST RADIUS is not, and
+      # the out-of-scope reasoning rests on a premise R13 itself falsified.
+      #
+      # An assertion rather than a warning, and an assertion rather than the
+      # installer's typed consent, because of WHO gets caught. The installer
+      # asks once, at first install; an operator upgrading an existing
+      # auth-off host never sees that prompt, and a warning scrolls past in
+      # the output of a command that succeeded. This stops EVERY apply until
+      # it is answered, which is the only form that reaches the host the
+      # finding is actually about.
+      #
+      # Note what it does NOT do: daemonPublished is untouched. Several
+      # things read it, and making publication depend on auth would silently
+      # unpublish the dashboard instead of reporting the problem -- the same
+      # class of failure as issuing a certificate for a name nothing serves.
+      assertion = !(daemonPublished && !ferrum.auth.enable);
+      message = ''
+        ferrum publishes its own control plane at ${daemonVhostName} on this
+        host, and ferrum.auth.enable is false, so there is no login in front of it.
+
+        Anyone who can reach that name gets the dashboard: this host's
+        settings, its secrets API, and the apply and rollback buttons. It is
+        on a real Let's Encrypt certificate and, if ferrum.proxy.dns is on,
+        a real DNS record -- so "nobody knows the hostname" is not true
+        either. ferrumd's own login still stands underneath, but it is one
+        password on an internet-facing box with no rate limit in front of
+        it, which is not what this design relies on.
+
+        Two ways forward, and both are one line:
+
+          ferrum.auth.enable = true;   -- turn Authelia on, which is what
+                                          every other published app on this
+                                          host is already behind.
+
+          ferrum.daemon.enable = false;  -- or ferrum.proxy.baseDomain = "",
+                                          if this host is not meant to
+                                          publish anything at all.
+
+        Reach the dashboard without publishing it by leaving
+        ferrum.daemon.enable on and using an SSH tunnel to
+        ferrum.daemon.listenAddress:${toString ferrum.daemon.port}, which is
+        what that option exists for.
+      '';
+    }
+    {
       assertion = reservedCollisions == [ ];
       message = ''
         A catalog app claims a subdomain ferrum reserves for its control plane,
