@@ -142,11 +142,20 @@ pub fn serve_from(root: &Path, uri_path: &str) -> Response {
                     // The file resolved but could not be read: a real fault,
                     // not a miss, so it must not fall through to index.html
                     // and look like a routing outcome.
-                    Err(e) => (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("could not read {}: {e}", resolved.display()),
-                    )
-                        .into_response(),
+                    //
+                    // L-03. The body used to name the resolved path, which
+                    // handed an unauthenticated caller the absolute location
+                    // of $FERRUM_UI_DIR on the host. The operator still needs
+                    // that detail to fix it, so it goes to the journal rather
+                    // than being dropped.
+                    Err(e) => {
+                        eprintln!("ferrumd: could not read {}: {e}", resolved.display());
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "could not read the requested file",
+                        )
+                            .into_response()
+                    }
                 };
             }
             // Resolved OUTSIDE the root: a traversal attempt, however it was
@@ -176,8 +185,17 @@ pub fn serve_from(root: &Path, uri_path: &str) -> Response {
 }
 
 /// The router fallback. Resolves `$FERRUM_UI_DIR` and delegates.
+///
+/// The delegate canonicalizes a path and reads a whole file, both blocking,
+/// so it runs on the blocking pool -- see main.rs's run_blocking. This is the
+/// one route an unauthenticated caller can drive, which makes it the cheapest
+/// way to occupy executor threads if it stays on them.
 pub async fn serve(uri: Uri) -> Response {
-    serve_from(&ui_dir(), uri.path())
+    let path = uri.path().to_string();
+    match crate::run_blocking(move || serve_from(&ui_dir(), &path)).await {
+        Ok(response) => response,
+        Err(status) => status.into_response(),
+    }
 }
 
 #[cfg(test)]

@@ -46,9 +46,12 @@ pub fn build_catalog() -> Result<Value, String> {
 }
 
 pub async fn get_catalog() -> impl IntoResponse {
-    match build_catalog() {
-        Ok(doc) => (StatusCode::OK, Json(doc)).into_response(),
-        Err(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response(),
+    // Two file reads and two JSON parses per request, on the blocking pool
+    // rather than on the executor thread -- see main.rs's run_blocking.
+    match crate::run_blocking(build_catalog).await {
+        Ok(Ok(doc)) => (StatusCode::OK, Json(doc)).into_response(),
+        Ok(Err(msg)) => (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response(),
+        Err(status) => status.into_response(),
     }
 }
 

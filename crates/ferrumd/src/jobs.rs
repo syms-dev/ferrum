@@ -146,11 +146,27 @@ fn is_terminal_line(line: &str) -> bool {
 /// job that never actually started can't wedge the daemon.
 pub async fn create_job(
     State(state): State<Arc<AppState>>,
+    axum::Extension(crate::SessionUsername(username)): axum::Extension<crate::SessionUsername>,
+    axum::Extension(client): axum::Extension<crate::client_addr::ClientAddr>,
     Json(req): Json<JobRequest>,
 ) -> impl IntoResponse {
+    let user = username.as_deref().unwrap_or(crate::UNKNOWN_USER).to_string();
+    // apply and rollback are the two most consequential things this daemon
+    // can be asked to do -- they change the running system and they can move
+    // it backwards -- so the dispatch is recorded with WHICH kind it was and
+    // which job id it became, whatever the outcome.
+    let kind = request_body(&req)
+        .get("kind")
+        .and_then(|k| k.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+    let audit_job = |outcome: &str, detail: &str| {
+        crate::audit::record("job-dispatch", outcome, &user, &client, detail);
+    };
     {
         let mut running = state.job_running.lock().unwrap();
         if *running {
+            audit_job("denied", &format!("kind={kind} a job is already running"));
             return (StatusCode::CONFLICT, "a job is already running").into_response();
         }
         *running = true;
@@ -164,8 +180,9 @@ pub async fn create_job(
     };
 
     let dir = requests_dir();
-    if let Err(e) = std::fs::create_dir_all(&dir) {
+    if let Err(e) = tokio::fs::create_dir_all(&dir).await {
         release();
+        audit_job("error", &format!("kind={kind} could not create the requests dir"));
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("failed to create requests dir: {e}"),
@@ -173,8 +190,9 @@ pub async fn create_job(
             .into_response();
     }
     let request_path = dir.join(format!("{uuid}.json"));
-    if let Err(e) = std::fs::write(&request_path, body.to_string()) {
+    if let Err(e) = tokio::fs::write(&request_path, body.to_string()).await {
         release();
+        audit_job("error", &format!("kind={kind} could not write the request file"));
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("failed to write request file: {e}"),
@@ -184,9 +202,11 @@ pub async fn create_job(
 
     if let Err(e) = crate::dbus::start_ferrum_apply_unit(&uuid).await {
         release();
+        audit_job("error", &format!("kind={kind} the unit did not start"));
         return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
     }
 
+    audit_job("success", &format!("kind={kind} job={uuid}"));
     (StatusCode::OK, Json(serde_json::json!({"id": uuid}))).into_response()
 }
 
@@ -209,7 +229,13 @@ pub async fn stream_job(Path(id): Path<String>) -> impl IntoResponse {
     let stream = async_stream::stream! {
         let mut last_len: usize = 0;
         loop {
-            let Ok(content) = std::fs::read_to_string(&path) else {
+            // `tokio::fs` rather than `spawn_blocking`: ferrumd already
+            // depends on tokio with `features = ["full"]`, which enables
+            // `fs`, so this adds no feature and pulls in no new code. It is
+            // also the call that most needed moving -- this loop re-reads the
+            // whole growing progress file every 500ms, per connected stream,
+            // for the entire duration of an apply.
+            let Ok(content) = tokio::fs::read_to_string(&path).await else {
                 tokio::time::sleep(Duration::from_millis(500)).await;
                 continue;
             };
@@ -374,7 +400,12 @@ pub struct ListJobsQuery {
 /// never dispatched a job is a real, valid state, and the UI's "no jobs yet"
 /// is the correct rendering of it.
 pub async fn list_jobs(Query(q): Query<ListJobsQuery>) -> impl IntoResponse {
-    list_jobs_in(&jobs_dir(), q.limit)
+    // A directory walk plus a read of every job file it lists, so it goes to
+    // the blocking pool -- see main.rs's run_blocking.
+    match crate::run_blocking(move || list_jobs_in(&jobs_dir(), q.limit)).await {
+        Ok(response) => response,
+        Err(status) => status.into_response(),
+    }
 }
 
 /// The body of `list_jobs`, with the directory passed in so the tests below
@@ -438,7 +469,12 @@ fn list_jobs_in(dir: &std::path::Path, limit: Option<usize>) -> axum::response::
 
 /// `GET /api/jobs/:id`
 pub async fn get_job(Path(id): Path<String>) -> impl IntoResponse {
-    get_job_in(&jobs_dir(), &id)
+    // Reads the job's whole progress file twice (summarize, then events), so
+    // it goes to the blocking pool -- see main.rs's run_blocking.
+    match crate::run_blocking(move || get_job_in(&jobs_dir(), &id)).await {
+        Ok(response) => response,
+        Err(status) => status.into_response(),
+    }
 }
 
 /// The body of `get_job`; see `list_jobs_in` for why the directory is a

@@ -1,5 +1,7 @@
+mod audit;
 mod auth;
 mod catalog;
+mod client_addr;
 mod db;
 mod dbus;
 mod generations;
@@ -58,23 +60,93 @@ struct LoginResponse {
 /// stored at all.
 const SESSION_COOKIE: &str = "__Host-ferrumd_session";
 
+/// Moves blocking work off the async executor and onto tokio's blocking pool.
+///
+/// Almost everything ferrumd does behind a request is synchronous: rusqlite
+/// blocks the calling thread for the whole query, argon2id verification is
+/// deliberately expensive CPU work, and `std::fs` blocks on the disk. Called
+/// directly from an `async fn` each of those occupies one of tokio's worker
+/// threads for its entire duration, and that pool is sized to the core count
+/// -- so a handful of concurrent logins can starve every other request on the
+/// daemon, including the SSE stream an operator is watching an apply through.
+/// On a small box "a handful" is two or three.
+///
+/// What this does NOT do is change how the database mutex is held. The guard
+/// discipline in this crate is already correct -- no `MutexGuard` crosses an
+/// `.await` anywhere, which is why the usual deadlock shape is absent here --
+/// and moving the same synchronous calls to a different thread preserves that
+/// property rather than reopening it.
+///
+/// A panic inside `f` (a poisoned database mutex, most plausibly) arrives as
+/// a `JoinError` instead of unwinding the caller, so it becomes a 500 rather
+/// than taking the daemon down with it.
+async fn run_blocking<F, T>(f: F) -> Result<T, StatusCode>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
 async fn login_handler(
     State(state): State<Arc<AppState>>,
+    peer: Option<axum::extract::ConnectInfo<std::net::SocketAddr>>,
     cookies: Cookies,
+    headers: axum::http::HeaderMap,
     Json(req): Json<LoginRequest>,
 ) -> impl IntoResponse {
-    match auth::login(&state.db, &req.username, &req.password) {
-        Ok(Some(result)) => {
+    let client = client_addr::ClientAddr::resolve(peer.map(|p| p.0), &headers);
+    let throttle_key = client.throttle_key();
+    // The submitted username is audited, so a failed attempt records WHICH
+    // account was tried. `audit::record` escapes it -- it is caller-supplied
+    // and could otherwise forge a log line.
+    let username = req.username.clone();
+    let outcome = run_blocking(move || {
+        auth::login(&state.db, &req.username, &req.password, &throttle_key)
+    })
+    .await;
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
+        Err(status) => {
+            audit::record("login", "error", &username, &client, "blocking task failed");
+            return status.into_response();
+        }
+    };
+    match outcome {
+        Ok(auth::LoginOutcome::Success(result)) => {
             let mut cookie = Cookie::new(SESSION_COOKIE, result.session_token);
             cookie.set_http_only(true);
             cookie.set_same_site(tower_cookies::cookie::SameSite::Strict);
             cookie.set_path("/");
             cookie.set_secure(true);
             cookies.add(cookie);
+            audit::record("login", "success", &username, &client, "");
             (StatusCode::OK, Json(LoginResponse { csrf_token: result.csrf_token })).into_response()
         }
-        Ok(None) => StatusCode::UNAUTHORIZED.into_response(),
-        Err(e) => (StatusCode::TOO_MANY_REQUESTS, e.to_string()).into_response(),
+        Ok(auth::LoginOutcome::BadCredentials) => {
+            audit::record("login", "failure", &username, &client, "bad credentials");
+            StatusCode::UNAUTHORIZED.into_response()
+        }
+        Ok(auth::LoginOutcome::Throttled) => {
+            audit::record("login", "denied", &username, &client, "source throttled");
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                "too many failed login attempts -- try again shortly",
+            )
+                .into_response()
+        }
+        // L-03. This arm used to be 429 carrying `e.to_string()`, so a
+        // database fault answered with the wrong status AND spilled its
+        // internal detail -- on the one unauthenticated endpoint the
+        // internet can reach. The detail goes to the journal, where an
+        // operator can read it and a caller cannot.
+        Err(e) => {
+            eprintln!("ferrumd: login failed: {e:#}");
+            audit::record("login", "error", &username, &client, "daemon fault");
+            (StatusCode::INTERNAL_SERVER_ERROR, "login failed").into_response()
+        }
     }
 }
 
@@ -92,11 +164,39 @@ fn removal_cookie() -> Cookie<'static> {
     cookie
 }
 
-async fn logout_handler(State(state): State<Arc<AppState>>, cookies: Cookies) -> impl IntoResponse {
+/// Resolves its own client address and account name rather than reading the
+/// extensions `require_session` publishes, because this route is NOT behind
+/// that middleware -- see the L-01 note in `build_router`. Taking them from
+/// extensions here would compile and then fail at runtime with "Missing
+/// request extension" on every logout.
+async fn logout_handler(
+    State(state): State<Arc<AppState>>,
+    peer: Option<axum::extract::ConnectInfo<std::net::SocketAddr>>,
+    cookies: Cookies,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    let client = client_addr::ClientAddr::resolve(peer.map(|p| p.0), &headers);
+    let mut user = UNKNOWN_USER.to_string();
     if let Some(cookie) = cookies.get(SESSION_COOKIE) {
-        let _ = auth::logout(&state.db, cookie.value());
+        let token = cookie.value().to_string();
+        // One hop to the blocking pool for both: read who this session
+        // belongs to (so the audit line names an account rather than a
+        // token), then delete it.
+        if let Ok(resolved) = run_blocking(move || {
+            let name = auth::validate_session(&state.db, &token)
+                .ok()
+                .flatten()
+                .and_then(|session| session.username);
+            let _ = auth::logout(&state.db, &token);
+            name
+        })
+        .await
+        {
+            user = resolved.unwrap_or_else(|| UNKNOWN_USER.to_string());
+        }
     }
     cookies.remove(removal_cookie());
+    audit::record("logout", "success", &user, &client, "");
     StatusCode::OK
 }
 
@@ -120,6 +220,36 @@ struct SessionUserId(i64);
 #[derive(Clone)]
 struct SessionCsrfToken(String);
 
+/// The session cookie value `require_session` just authenticated.
+///
+/// `POST /api/password` needs it to know which session is its OWN, so that
+/// invalidating every other session for the account does not log the caller
+/// out of the tab they are standing in. A third newtype rather than widening
+/// either of the two above, for the reason the second one already gives:
+/// axum resolves `Extension<T>` by type, so each value keeps meaning exactly
+/// one thing.
+///
+/// This is the session token, so it never goes anywhere near a log line.
+#[derive(Clone)]
+struct SessionToken(String);
+
+/// The authenticated account's name, from the same row `require_session`
+/// read everything else out of.
+///
+/// `None` means the session referenced a user row that no longer exists --
+/// see `auth::SessionInfo::username` for why that is kept distinguishable
+/// rather than flattened.
+///
+/// This is what every audit line's `user=` field comes from, so it is read
+/// from the authenticated session and never from anything on the wire. The
+/// one place a caller-supplied username is logged is a LOGIN attempt, where
+/// by definition there is no session yet -- and `audit::record` escapes it.
+#[derive(Clone)]
+struct SessionUsername(Option<String>);
+
+/// The name used in an audit line when the session's user row has vanished.
+const UNKNOWN_USER: &str = "<unknown>";
+
 #[derive(Deserialize)]
 struct ChangePasswordRequest {
     current_password: String,
@@ -136,28 +266,73 @@ struct ChangePasswordRequest {
 ///   * `401` -- the current password is wrong. Nothing changed.
 ///   * `500` -- the daemon genuinely failed (database, hashing).
 ///
-/// Existing sessions are deliberately NOT invalidated, including this one:
-/// the session cookie is an independent credential that this call never
-/// touches, and logging an operator out of the tab they just used to change
-/// their password would be a worse experience with no security gain against
-/// the threat this endpoint exists for (an operator rotating the generated
-/// bootstrap password into one of their own).
+/// Every OTHER session for this account is invalidated; this one survives.
+///
+/// This used to invalidate nothing at all, and the reasoning recorded here
+/// was that the cookie is an independent credential and logging the operator
+/// out of their own tab would be a worse experience for no gain. The first
+/// half is still true and is why the caller's own session is kept. The
+/// second half was wrong about the threat (M-03): changing the password is
+/// precisely what an operator does when they think their credential has been
+/// taken, and leaving every other session valid meant a stolen one survived
+/// the single remedy they would reach for -- for the remainder of its week.
+/// Now that the control plane is published, that is not hypothetical.
 async fn change_password_handler(
     State(state): State<Arc<AppState>>,
     axum::Extension(SessionUserId(user_id)): axum::Extension<SessionUserId>,
+    axum::Extension(SessionToken(token)): axum::Extension<SessionToken>,
+    axum::Extension(SessionUsername(username)): axum::Extension<SessionUsername>,
+    axum::Extension(client): axum::Extension<client_addr::ClientAddr>,
     Json(req): Json<ChangePasswordRequest>,
 ) -> impl IntoResponse {
+    let user = username.as_deref().unwrap_or(UNKNOWN_USER).to_string();
     if req.new_password.is_empty() {
+        audit::record("password-change", "failure", &user, &client, "empty new password");
         return (StatusCode::BAD_REQUEST, "the new password must not be empty").into_response();
     }
-    match auth::change_password(&state.db, user_id, &req.current_password, &req.new_password) {
-        Ok(true) => StatusCode::OK.into_response(),
-        Ok(false) => (StatusCode::UNAUTHORIZED, "the current password is incorrect").into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to change the password: {e}"),
+    let outcome = run_blocking(move || {
+        auth::change_password(
+            &state.db,
+            user_id,
+            &req.current_password,
+            &req.new_password,
+            &token,
         )
-            .into_response(),
+    })
+    .await;
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
+        Err(status) => return status.into_response(),
+    };
+    match outcome {
+        Ok(true) => {
+            audit::record(
+                "password-change",
+                "success",
+                &user,
+                &client,
+                "other sessions for this account were invalidated",
+            );
+            StatusCode::OK.into_response()
+        }
+        Ok(false) => {
+            audit::record(
+                "password-change",
+                "failure",
+                &user,
+                &client,
+                "current password incorrect",
+            );
+            (StatusCode::UNAUTHORIZED, "the current password is incorrect").into_response()
+        }
+        Err(e) => {
+            audit::record("password-change", "error", &user, &client, "daemon fault");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to change the password: {e}"),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -227,11 +402,19 @@ async fn require_session(
     mut request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Result<axum::response::Response, StatusCode> {
-    let token = cookies.get(SESSION_COOKIE).ok_or(StatusCode::UNAUTHORIZED)?;
-    let session = match auth::validate_session(&state.db, token.value()) {
-        Ok(Some(session)) => session,
-        _ => return Err(StatusCode::UNAUTHORIZED),
-    };
+    let headers = request.headers().clone();
+    let token = cookies
+        .get(SESSION_COOKIE)
+        .ok_or(StatusCode::UNAUTHORIZED)?
+        .value()
+        .to_string();
+    let db_state = state.clone();
+    let lookup_token = token.clone();
+    let session =
+        match run_blocking(move || auth::validate_session(&db_state.db, &lookup_token)).await? {
+            Ok(Some(session)) => session,
+            _ => return Err(StatusCode::UNAUTHORIZED),
+        };
 
     if method_is_mutating(request.method()) {
         let provided = request
@@ -251,6 +434,21 @@ async fn require_session(
     request
         .extensions_mut()
         .insert(SessionCsrfToken(session.csrf_token.clone()));
+    request.extensions_mut().insert(SessionToken(token));
+    request
+        .extensions_mut()
+        .insert(SessionUsername(session.username.clone()));
+    // Resolved here, once, from the request's own ConnectInfo rather than
+    // re-extracted in each handler -- so every audited route behind this
+    // middleware agrees about where the caller is, and there is one place
+    // that decides what may be trusted.
+    let peer = request
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|info| info.0);
+    request
+        .extensions_mut()
+        .insert(client_addr::ClientAddr::resolve(peer, &headers));
 
     Ok(next.run(request).await)
 }
@@ -288,12 +486,11 @@ async fn require_session(
 /// origin. That combination, and only that, turns this endpoint into a CSRF
 /// bypass for every app hosted under the same base domain.
 async fn session_handler(
-    State(state): State<Arc<AppState>>,
-    axum::Extension(SessionUserId(user_id)): axum::Extension<SessionUserId>,
+    axum::Extension(SessionUsername(username)): axum::Extension<SessionUsername>,
     axum::Extension(SessionCsrfToken(csrf_token)): axum::Extension<SessionCsrfToken>,
 ) -> impl IntoResponse {
-    match auth::username_for(&state.db, user_id) {
-        Ok(Some(username)) => {
+    match username {
+        Some(username) => {
             Json(serde_json::json!({ "username": username, "csrf_token": csrf_token }))
                 .into_response()
         }
@@ -301,14 +498,9 @@ async fn session_handler(
         // a database inconsistency, not a failed login, so it is a 500 rather
         // than a 401: telling the operator to log in again would not fix it,
         // and a blank username in the UI would hide it entirely.
-        Ok(None) => (
+        None => (
             StatusCode::INTERNAL_SERVER_ERROR,
             "session references a user that no longer exists",
-        )
-            .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("could not read the session's user: {e}"),
         )
             .into_response(),
     }
@@ -335,6 +527,13 @@ fn build_router(state: Arc<AppState>) -> Router {
         // page you log in on would be circular. See static_files.rs's header.
         .fallback(static_files::serve)
         .route("/api/login", post(login_handler))
+        // L-01 is knowingly still open here: this is the one mutating route
+        // with no CSRF check. Moving it into `protected` is a one-line fix
+        // that breaks the real UI, which sends no token on logout and then
+        // swallows the 403 -- so the session would silently survive. Both
+        // halves must land together. The whole argument, and the tripwire
+        // that fails if somebody moves this alone, live in
+        // `logout_is_still_unguarded_and_the_ui_still_depends_on_that`.
         .route("/api/logout", post(logout_handler))
         .merge(protected)
         .layer(CookieManagerLayer::new())
@@ -583,7 +782,15 @@ async fn main() -> anyhow::Result<()> {
         std::env::var("FERRUMD_LISTEN_ADDRESS").unwrap_or_else(|_| default_listen_address().into());
     let port: u16 = std::env::var("FERRUMD_PORT").ok().and_then(|v| v.parse().ok()).unwrap_or(7788);
     let listener = tokio::net::TcpListener::bind(format!("{listen_address}:{port}")).await?;
-    axum::serve(listener, app).await?;
+    // `into_make_service_with_connect_info` is what makes the real socket
+    // peer available to handlers. Without it `ConnectInfo` never resolves,
+    // every request looks like it came from nowhere, and both the login
+    // throttle and the audit log lose the only address they can trust.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }
 
@@ -623,6 +830,11 @@ mod tests {
     use axum::http::{Method, Request, StatusCode};
     use tower::ServiceExt as _;
 
+    /// One source address, for tests that drive `auth::login` directly and
+    /// are not about the throttle. Real callers get this from
+    /// `ClientAddr::throttle_key`.
+    const TEST_CLIENT: &str = "peer:127.0.0.1";
+
     /// A real database with a real user, plus a real login producing a real
     /// session cookie and its real paired CSRF token.
     fn logged_in() -> (tempfile::TempDir, Arc<AppState>, String, String) {
@@ -630,7 +842,7 @@ mod tests {
         let db = db::Db::open(&dir.path().join("test.db")).unwrap();
         auth::ensure_first_user(&db, dir.path()).unwrap();
         let password = std::fs::read_to_string(dir.path().join("ferrumd-setup-password")).unwrap();
-        let result = auth::login(&db, "admin", password.trim()).unwrap().unwrap();
+        let result = auth::login(&db, "admin", password.trim(), TEST_CLIENT).unwrap().session().unwrap();
         let state = Arc::new(AppState { db, job_running: Mutex::new(false) });
         (dir, state, result.session_token, result.csrf_token)
     }
@@ -661,6 +873,298 @@ mod tests {
             builder = builder.header(CSRF_HEADER, csrf);
         }
         builder.body(Body::empty()).unwrap()
+    }
+
+    /// L-03. A throttled login is the ONLY thing that may answer 429, and it
+    /// must answer with a fixed string.
+    ///
+    /// The old arm returned 429 with `e.to_string()` for every `Err` from
+    /// `auth::login`, so a database fault -- a corrupt hash, an unreadable
+    /// file, a disk full -- came back as "too many requests" carrying its own
+    /// internal detail, on the one unauthenticated endpoint the internet can
+    /// reach. The enum is what makes the arms separable; this pins that the
+    /// handler really uses it.
+    #[tokio::test]
+    async fn a_throttled_login_is_429_with_no_internal_detail() {
+        let (dir, state, _session, _csrf) = logged_in();
+        let password = std::fs::read_to_string(dir.path().join("ferrumd-setup-password")).unwrap();
+
+        let attempt = |body: String| {
+            let router = build_router(state.clone());
+            async move {
+                router
+                    .oneshot(
+                        Request::builder()
+                            .method(Method::POST)
+                            .uri("/api/login")
+                            .header("Content-Type", "application/json")
+                            .body(Body::from(body))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap()
+            }
+        };
+        let wrong =
+            serde_json::json!({ "username": "admin", "password": "wrong" }).to_string();
+
+        // Five real failures put this source over the limit. They are 401 --
+        // "wrong password" is not "too many requests".
+        for _ in 0..5 {
+            assert_eq!(attempt(wrong.clone()).await.status(), StatusCode::UNAUTHORIZED);
+        }
+
+        let throttled = attempt(wrong).await;
+        assert_eq!(throttled.status(), StatusCode::TOO_MANY_REQUESTS);
+        let body = axum::body::to_bytes(throttled.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert_eq!(body, "too many failed login attempts -- try again shortly");
+
+        // And the throttle really is per-source rather than per-account: the
+        // correct password from this same source is still refused (that is
+        // the cooldown), but nothing here is a 500 or leaks a path.
+        assert!(
+            !body.contains('/'),
+            "the 429 body must not carry a filesystem path: {body}"
+        );
+        let correct = serde_json::json!({ "username": "admin", "password": password.trim() })
+            .to_string();
+        assert_eq!(attempt(correct).await.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    /// Every audited handler now extracts `SessionUsername` and `ClientAddr`
+    /// from request extensions, and a missing extension is a RUNTIME failure,
+    /// not a compile error: axum answers 500 with "Missing request
+    /// extension". So adding an audited route, or an audit field, to a
+    /// handler that `require_session` does not feed would compile perfectly
+    /// and fail only when someone actually used it.
+    ///
+    /// This drives every protected route with a real session and pins that
+    /// none of them fails that way. It deliberately does not care what the
+    /// status IS -- these requests carry empty bodies and most are rejected
+    /// on their merits -- only that the reason is never a missing extension.
+    #[tokio::test]
+    async fn no_protected_route_is_missing_an_extension_the_audit_log_needs() {
+        let (dir, state, session, csrf) = logged_in();
+        // secrets/settings handlers read these; without them the routes fail
+        // for an unrelated reason and this test would prove less than it says.
+        std::env::set_var("FERRUM_SETTINGS_PATH", dir.path().join("settings.json"));
+        std::env::set_var("FERRUM_SECRETS_DIR", dir.path());
+
+        for (method, _pattern, uri) in cors_is_absent::API_ROUTES {
+            let (session, csrf) = (session.clone(), csrf.clone());
+            let request = Request::builder()
+                .method(Method::from_bytes(method.as_bytes()).unwrap())
+                .uri(*uri)
+                .header("Cookie", format!("{SESSION_COOKIE}={session}"))
+                .header(CSRF_HEADER, csrf)
+                .header("Content-Type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap();
+            let response = build_router(state.clone()).oneshot(request).await.unwrap();
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let body = String::from_utf8_lossy(&body).to_string();
+            assert!(
+                !body.contains("Missing request extension"),
+                "{method} {uri} could not resolve an extension it declares: {body}"
+            );
+        }
+    }
+
+    /// L-01 is knowingly OPEN, and this test is the tripwire for closing it.
+    ///
+    /// `POST /api/logout` still takes no CSRF token, so a same-site sibling
+    /// under `<baseDomain>` can force the operator's browser to POST it. The
+    /// one-line fix -- move the route inside `protected` -- was made and then
+    /// REVERTED, because ferrumd is only half of it: the real UI calls this
+    /// endpoint with `csrf: false` (`ui/api.js:118`) and then SWALLOWS the
+    /// resulting 403 (`ui/api.js:119-123`). Behind the guard the operator
+    /// would appear to log out while the session stayed valid server-side for
+    /// the rest of its idle window -- a worse failure than the forced logout
+    /// being fixed, and a silent one.
+    ///
+    /// So this asserts the CURRENT contract deliberately. It is not approval
+    /// of it: whoever moves the route sees this fail, and the message names
+    /// the other half of the change. A comment in `build_router` would not
+    /// have stopped them.
+    #[tokio::test]
+    async fn logout_is_still_unguarded_and_the_ui_still_depends_on_that() {
+        let (_dir, state, session, _csrf) = logged_in();
+
+        // No CSRF header, exactly as ui/api.js sends it today.
+        let as_the_ui_sends_it = Request::builder()
+            .method(Method::POST)
+            .uri("/api/logout")
+            .header("Cookie", format!("{SESSION_COOKIE}={session}"))
+            .body(Body::empty())
+            .unwrap();
+        let response =
+            build_router(state.clone()).oneshot(as_the_ui_sends_it).await.unwrap();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "the UI sends no CSRF token on logout (ui/api.js:118). If you are moving this \
+             route inside `protected` to close L-01, drop `csrf: false` from logout() in \
+             ui/api.js in the SAME change -- otherwise the UI catches the 403 and the \
+             session silently survives the logout."
+        );
+        assert!(
+            auth::validate_session(&state.db, &session).unwrap().is_none(),
+            "and the logout must really have revoked the session server-side"
+        );
+    }
+
+    /// L-03's real defect, driven by a real fault rather than described.
+    ///
+    /// A corrupt stored hash makes `auth::login` return `Err`. That arm used
+    /// to answer **429 carrying `e.to_string()`**, so this exact fault told
+    /// an unauthenticated caller "too many requests" -- the wrong status
+    /// entirely -- and handed them the daemon's own internal error text.
+    /// It must be a 500 with a fixed body.
+    #[tokio::test]
+    async fn a_daemon_fault_during_login_is_500_and_leaks_no_detail() {
+        let (_dir, state, _session, _csrf) = logged_in();
+        state
+            .db
+            .conn()
+            .execute(
+                "UPDATE users SET password_hash = 'not-a-valid-argon2-hash' WHERE username = 'admin'",
+                [],
+            )
+            .unwrap();
+
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/login")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "username": "admin", "password": "anything" })
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "a corrupt stored hash is a daemon fault, not a rate limit"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert_eq!(body, "login failed");
+        assert!(
+            !body.contains("corrupt") && !body.contains("argon2"),
+            "the internal detail must go to the journal, not to the caller: {body}"
+        );
+    }
+
+    /// C-01's actual property: expensive blocking work inside a handler must
+    /// not stop the executor from running everything else.
+    ///
+    /// Deliberately on a SINGLE worker thread. `auth::login` runs argon2id
+    /// verification, which is expensive on purpose -- `Argon2::default()` is
+    /// 19MiB and two passes, tens of milliseconds per call. Called straight
+    /// from the `async fn`, several concurrent logins own that one worker for
+    /// the whole of their combined runtime, and nothing else on the runtime
+    /// is polled until the last finishes: no timer, no second request, no SSE
+    /// keep-alive on the apply an operator is watching. Handed to the
+    /// blocking pool, the worker stays free.
+    ///
+    /// The probe is a bare 1ms timer loop, because a timer needs nothing from
+    /// the process except to be polled -- so the longest gap between two of
+    /// its ticks IS the longest time the executor was unavailable. Measuring
+    /// the worst gap rather than a tick count is what makes this robust: the
+    /// gap is ~1-3ms when the work is off the executor and the full length of
+    /// the blocking run when it is not, and that separation does not depend
+    /// on how long the test happens to take overall.
+    ///
+    /// PROVED TO FAIL, with real numbers rather than an assurance: reverting
+    /// `login_handler` to call `auth::login` directly takes the observed
+    /// worst stall from **3ms to 1948ms**. The 150ms threshold sits three
+    /// orders of magnitude clear of one arm and an order clear of the other,
+    /// so this is a real discriminator and not a timing race.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn blocking_work_in_a_handler_does_not_stall_the_executor() {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::time::{Duration, Instant};
+
+        let (dir, state, _session, _csrf) = logged_in();
+        let password = std::fs::read_to_string(dir.path().join("ferrumd-setup-password")).unwrap();
+        let password = password.trim().to_string();
+
+        let worst_stall_ms = Arc::new(AtomicU64::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let ticker = {
+            let worst = worst_stall_ms.clone();
+            let stop = stop.clone();
+            tokio::spawn(async move {
+                let mut last = Instant::now();
+                while !stop.load(Ordering::Relaxed) {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                    worst.fetch_max(last.elapsed().as_millis() as u64, Ordering::Relaxed);
+                    last = Instant::now();
+                }
+            })
+        };
+
+        // Let the ticker reach steady state, then discard the startup gap so
+        // only the window that overlaps the logins is measured.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        worst_stall_ms.store(0, Ordering::Relaxed);
+
+        let logins: Vec<_> = (0..8)
+            .map(|_| {
+                let router = build_router(state.clone());
+                let body =
+                    serde_json::json!({ "username": "admin", "password": password }).to_string();
+                tokio::spawn(async move {
+                    router
+                        .oneshot(
+                            Request::builder()
+                                .method(Method::POST)
+                                .uri("/api/login")
+                                .header("Content-Type", "application/json")
+                                .body(Body::from(body))
+                                .unwrap(),
+                        )
+                        .await
+                        .unwrap()
+                })
+            })
+            .collect();
+
+        for login in logins {
+            assert_eq!(
+                login.await.unwrap().status(),
+                StatusCode::OK,
+                "each probe must be a REAL login -- a rejected one would not have run argon2 \
+                 at all, and the test would be measuring nothing"
+            );
+        }
+
+        // The ticker only records a gap when it is next POLLED, and while the
+        // executor is blocked it is not polled at all -- so reading the value
+        // the instant the logins finish races the scheduler and reads a stall
+        // of zero no matter how long the executor was actually unavailable.
+        // This measurement was wrong in exactly that way once: the reverted
+        // build reported 0ms and the test passed. Let the ticker run once
+        // more so the gap it has been sitting on is actually written down.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let observed = worst_stall_ms.load(Ordering::Relaxed);
+        stop.store(true, Ordering::Relaxed);
+        ticker.await.unwrap();
+
+        assert!(
+            observed < 150,
+            "the executor stalled for {observed}ms while eight logins were in flight, which \
+             means argon2id ran on the executor thread rather than the blocking pool"
+        );
     }
 
     /// `GET /api/session` with no cookie at all must be a 401 -- it is
@@ -730,7 +1234,7 @@ mod tests {
     async fn the_session_endpoint_returns_this_sessions_token_not_another() {
         let (_dir, state, _session, csrf) = logged_in();
         let password = std::fs::read_to_string(_dir.path().join("ferrumd-setup-password")).unwrap();
-        let other = auth::login(&state.db, "admin", password.trim()).unwrap().unwrap();
+        let other = auth::login(&state.db, "admin", password.trim(), TEST_CLIENT).unwrap().session().unwrap();
         assert_ne!(other.csrf_token, csrf, "two real logins, two real tokens");
 
         let request = Request::builder()
@@ -804,9 +1308,7 @@ mod tests {
         // session.
         let password =
             std::fs::read_to_string(_dir.path().join("ferrumd-setup-password")).unwrap();
-        let other = auth::login(&state.db, "admin", password.trim())
-            .unwrap()
-            .unwrap();
+        let other = auth::login(&state.db, "admin", password.trim(), TEST_CLIENT).unwrap().session().unwrap();
         assert_ne!(other.csrf_token, _csrf);
         let response = sentinel_router(state)
             .oneshot(guarded_request(Method::PUT, &session, Some(&other.csrf_token)))
@@ -945,9 +1447,9 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK, "a correct current password must be accepted");
 
-        assert!(auth::login(&state.db, "admin", "the-new-one").unwrap().is_some());
+        assert!(auth::login(&state.db, "admin", "the-new-one", TEST_CLIENT).unwrap().session().is_some());
         assert!(
-            auth::login(&state.db, "admin", &old).unwrap().is_none(),
+            auth::login(&state.db, "admin", &old, TEST_CLIENT).unwrap().session().is_none(),
             "the old password must really stop working"
         );
     }
@@ -970,10 +1472,10 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
         assert!(
-            auth::login(&state.db, "admin", &old).unwrap().is_some(),
+            auth::login(&state.db, "admin", &old, TEST_CLIENT).unwrap().session().is_some(),
             "the real password must still work after a refused rotation"
         );
-        assert!(auth::login(&state.db, "admin", "attempted").unwrap().is_none());
+        assert!(auth::login(&state.db, "admin", "attempted", TEST_CLIENT).unwrap().session().is_none());
     }
 
     #[tokio::test]
@@ -988,7 +1490,7 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert!(auth::login(&state.db, "admin", old.trim()).unwrap().is_some());
+        assert!(auth::login(&state.db, "admin", old.trim(), TEST_CLIENT).unwrap().session().is_some());
     }
 
     /// AC25 -- the READ route is behind the session gate too.
@@ -1354,8 +1856,10 @@ mod tests {
     /// way an absence proof fails without failing.
     const CRATE_SOURCES: &[(&str, &str)] = &[
         ("main.rs", include_str!("main.rs")),
+        ("audit.rs", include_str!("audit.rs")),
         ("auth.rs", include_str!("auth.rs")),
         ("catalog.rs", include_str!("catalog.rs")),
+        ("client_addr.rs", include_str!("client_addr.rs")),
         ("db.rs", include_str!("db.rs")),
         ("dbus.rs", include_str!("dbus.rs")),
         ("generations.rs", include_str!("generations.rs")),
@@ -1600,7 +2104,11 @@ mod tests {
         /// re-derives the method/pattern pairs from `build_router`'s own
         /// source. Without that, a route added later would simply not be
         /// tested, and nothing would say so.
-        const API_ROUTES: &[(&str, &str, &str)] = &[
+        /// `pub(super)` so the extension guard in the parent test module can
+        /// reuse it: that check has the same requirement this table already
+        /// carries its own guard for -- it must cover EVERY route, or the
+        /// absence it proves is quietly partial.
+        pub(super) const API_ROUTES: &[(&str, &str, &str)] = &[
             ("POST", "/api/login", "/api/login"),
             ("POST", "/api/logout", "/api/logout"),
             ("GET", "/api/catalog", "/api/catalog"),
@@ -1646,7 +2154,7 @@ mod tests {
         /// would quietly become a 401, and the matrix would stop testing
         /// what it says it tests.
         fn fresh_credentials(state: &Arc<AppState>, password: &str) -> (String, String) {
-            let result = auth::login(&state.db, "admin", password).unwrap().unwrap();
+            let result = auth::login(&state.db, "admin", password, TEST_CLIENT).unwrap().session().unwrap();
             (result.session_token, result.csrf_token)
         }
 

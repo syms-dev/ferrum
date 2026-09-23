@@ -19,7 +19,7 @@ fn settings_path() -> std::path::PathBuf {
 }
 
 pub async fn get_settings() -> impl IntoResponse {
-    match std::fs::read_to_string(settings_path()) {
+    match tokio::fs::read_to_string(settings_path()).await {
         Ok(raw) => match serde_json::from_str::<Value>(&raw) {
             Ok(parsed) => (StatusCode::OK, Json(parsed)).into_response(),
             Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("settings.json is corrupt: {e}")).into_response(),
@@ -60,16 +60,47 @@ fn validate_against_schema(proposed: &Value) -> Result<(), String> {
 
 pub async fn put_settings(
     State(_state): State<Arc<AppState>>,
+    axum::Extension(crate::SessionUsername(username)): axum::Extension<crate::SessionUsername>,
+    axum::Extension(client): axum::Extension<crate::client_addr::ClientAddr>,
     Json(proposed): Json<Value>,
 ) -> impl IntoResponse {
-    if let Err(msg) = validate_against_schema(&proposed) {
-        return (StatusCode::BAD_REQUEST, msg).into_response();
-    }
+    let user = username.as_deref().unwrap_or(crate::UNKNOWN_USER).to_string();
+    // The settings DOCUMENT is never logged. It is operator-authored and can
+    // hold anything, and `ferrum.secrets` declares secret names next to
+    // whatever else an operator has put in there -- so the audit line
+    // records that a write happened, by whom, from where, not what was in
+    // it. The file itself is the record of its own contents.
+    let audit_write = |outcome: &str, detail: &str| {
+        crate::audit::record("settings-write", outcome, &user, &client, detail);
+    };
+    // Reading the schema off disk and compiling it is both file I/O and real
+    // CPU work, so it runs on the blocking pool rather than on the executor
+    // thread serving this request. The document is handed to the closure and
+    // handed back by it, so validation and the write that follows cannot
+    // disagree about what was validated.
+    let validated = crate::run_blocking(move || validate_against_schema(&proposed).map(|()| proposed)).await;
+    let proposed = match validated {
+        Ok(Ok(proposed)) => proposed,
+        Ok(Err(msg)) => {
+            audit_write("failure", "rejected by schema validation");
+            return (StatusCode::BAD_REQUEST, msg).into_response();
+        }
+        Err(status) => {
+            audit_write("error", "blocking task failed");
+            return status.into_response();
+        }
+    };
     let path = settings_path();
     let content = serde_json::to_string_pretty(&proposed).unwrap();
-    match std::fs::write(&path, content) {
-        Ok(()) => StatusCode::OK.into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("failed to write settings.json: {e}")).into_response(),
+    match tokio::fs::write(&path, content).await {
+        Ok(()) => {
+            audit_write("success", "");
+            StatusCode::OK.into_response()
+        }
+        Err(e) => {
+            audit_write("error", "write failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("failed to write settings.json: {e}")).into_response()
+        }
     }
 }
 
