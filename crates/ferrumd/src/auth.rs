@@ -22,6 +22,14 @@ fn now() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64
 }
 
+/// Deliberately synchronous and deliberately NOT wrapped in `spawn_blocking`
+/// by its caller: this runs once in `main`, before the listener binds, so
+/// there is no request path to block and no other task to starve. Its argon2
+/// hash and `std::fs` writes are the same blocking calls that had to move off
+/// the executor everywhere else -- the difference is where they run, not what
+/// they do. `Db::open`, immediately above it in `main`, is startup-only for
+/// the same reason.
+///
 /// Idempotent: does nothing if any user already exists, so a ferrumd
 /// restart never resets an operator's already-changed password. Mirrors
 /// ensure_first_authelia_user's exact shape (crates/ferrum-apply/src/

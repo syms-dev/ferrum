@@ -164,7 +164,7 @@ pub async fn create_job(
     };
 
     let dir = requests_dir();
-    if let Err(e) = std::fs::create_dir_all(&dir) {
+    if let Err(e) = tokio::fs::create_dir_all(&dir).await {
         release();
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -173,7 +173,7 @@ pub async fn create_job(
             .into_response();
     }
     let request_path = dir.join(format!("{uuid}.json"));
-    if let Err(e) = std::fs::write(&request_path, body.to_string()) {
+    if let Err(e) = tokio::fs::write(&request_path, body.to_string()).await {
         release();
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -209,7 +209,13 @@ pub async fn stream_job(Path(id): Path<String>) -> impl IntoResponse {
     let stream = async_stream::stream! {
         let mut last_len: usize = 0;
         loop {
-            let Ok(content) = std::fs::read_to_string(&path) else {
+            // `tokio::fs` rather than `spawn_blocking`: ferrumd already
+            // depends on tokio with `features = ["full"]`, which enables
+            // `fs`, so this adds no feature and pulls in no new code. It is
+            // also the call that most needed moving -- this loop re-reads the
+            // whole growing progress file every 500ms, per connected stream,
+            // for the entire duration of an apply.
+            let Ok(content) = tokio::fs::read_to_string(&path).await else {
                 tokio::time::sleep(Duration::from_millis(500)).await;
                 continue;
             };
@@ -374,7 +380,12 @@ pub struct ListJobsQuery {
 /// never dispatched a job is a real, valid state, and the UI's "no jobs yet"
 /// is the correct rendering of it.
 pub async fn list_jobs(Query(q): Query<ListJobsQuery>) -> impl IntoResponse {
-    list_jobs_in(&jobs_dir(), q.limit)
+    // A directory walk plus a read of every job file it lists, so it goes to
+    // the blocking pool -- see main.rs's run_blocking.
+    match crate::run_blocking(move || list_jobs_in(&jobs_dir(), q.limit)).await {
+        Ok(response) => response,
+        Err(status) => status.into_response(),
+    }
 }
 
 /// The body of `list_jobs`, with the directory passed in so the tests below
@@ -438,7 +449,12 @@ fn list_jobs_in(dir: &std::path::Path, limit: Option<usize>) -> axum::response::
 
 /// `GET /api/jobs/:id`
 pub async fn get_job(Path(id): Path<String>) -> impl IntoResponse {
-    get_job_in(&jobs_dir(), &id)
+    // Reads the job's whole progress file twice (summarize, then events), so
+    // it goes to the blocking pool -- see main.rs's run_blocking.
+    match crate::run_blocking(move || get_job_in(&jobs_dir(), &id)).await {
+        Ok(response) => response,
+        Err(status) => status.into_response(),
+    }
 }
 
 /// The body of `get_job`; see `list_jobs_in` for why the directory is a

@@ -19,7 +19,7 @@ fn settings_path() -> std::path::PathBuf {
 }
 
 pub async fn get_settings() -> impl IntoResponse {
-    match std::fs::read_to_string(settings_path()) {
+    match tokio::fs::read_to_string(settings_path()).await {
         Ok(raw) => match serde_json::from_str::<Value>(&raw) {
             Ok(parsed) => (StatusCode::OK, Json(parsed)).into_response(),
             Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("settings.json is corrupt: {e}")).into_response(),
@@ -62,12 +62,20 @@ pub async fn put_settings(
     State(_state): State<Arc<AppState>>,
     Json(proposed): Json<Value>,
 ) -> impl IntoResponse {
-    if let Err(msg) = validate_against_schema(&proposed) {
-        return (StatusCode::BAD_REQUEST, msg).into_response();
-    }
+    // Reading the schema off disk and compiling it is both file I/O and real
+    // CPU work, so it runs on the blocking pool rather than on the executor
+    // thread serving this request. The document is handed to the closure and
+    // handed back by it, so validation and the write that follows cannot
+    // disagree about what was validated.
+    let validated = crate::run_blocking(move || validate_against_schema(&proposed).map(|()| proposed)).await;
+    let proposed = match validated {
+        Ok(Ok(proposed)) => proposed,
+        Ok(Err(msg)) => return (StatusCode::BAD_REQUEST, msg).into_response(),
+        Err(status) => return status.into_response(),
+    };
     let path = settings_path();
     let content = serde_json::to_string_pretty(&proposed).unwrap();
-    match std::fs::write(&path, content) {
+    match tokio::fs::write(&path, content).await {
         Ok(()) => StatusCode::OK.into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("failed to write settings.json: {e}")).into_response(),
     }

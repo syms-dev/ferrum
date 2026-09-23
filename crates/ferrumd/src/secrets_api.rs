@@ -35,26 +35,51 @@ fn is_declared_secret(name: &str) -> anyhow::Result<bool> {
         .unwrap_or(false))
 }
 
-pub async fn write_secret(Path(name): Path<String>, body: Bytes) -> impl IntoResponse {
-    match is_declared_secret(&name) {
+/// Every step of a secret write blocks: two file reads, an age recipient
+/// derivation, and the encrypt-and-write itself. They are kept together in
+/// one synchronous function so the handler hands the whole sequence to the
+/// blocking pool in a single hop rather than bouncing between pools four
+/// times.
+fn write_secret_blocking(name: &str, plaintext: &str) -> (StatusCode, String) {
+    match is_declared_secret(name) {
         Ok(true) => {}
-        Ok(false) => return (StatusCode::BAD_REQUEST, format!("'{name}' is not declared in ferrum.secrets")).into_response(),
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("failed to check ferrum.secrets: {e}")).into_response(),
+        Ok(false) => {
+            return (StatusCode::BAD_REQUEST, format!("'{name}' is not declared in ferrum.secrets"))
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to check ferrum.secrets: {e}"),
+            )
+        }
     }
-
-    let plaintext = match std::str::from_utf8(&body) {
-        Ok(s) => s,
-        Err(_) => return (StatusCode::BAD_REQUEST, "secret value must be valid UTF-8").into_response(),
-    };
 
     let recipient = match ferrum_secrets::host_age_recipient(&host_key_pub()) {
         Ok(r) => r,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("failed to derive host age recipient: {e}")).into_response(),
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to derive host age recipient: {e}"),
+            )
+        }
     };
 
     let dest = secrets_dir().join(format!("{name}.sops"));
     match ferrum_secrets::encrypt_and_write(plaintext, &recipient, &dest) {
-        Ok(()) => StatusCode::OK.into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("failed to write secret: {e}")).into_response(),
+        Ok(()) => (StatusCode::OK, String::new()),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("failed to write secret: {e}")),
+    }
+}
+
+pub async fn write_secret(Path(name): Path<String>, body: Bytes) -> impl IntoResponse {
+    let plaintext = match std::str::from_utf8(&body) {
+        Ok(s) => s.to_string(),
+        Err(_) => return (StatusCode::BAD_REQUEST, "secret value must be valid UTF-8").into_response(),
+    };
+
+    match crate::run_blocking(move || write_secret_blocking(&name, &plaintext)).await {
+        Ok((StatusCode::OK, _)) => StatusCode::OK.into_response(),
+        Ok((status, message)) => (status, message).into_response(),
+        Err(status) => status.into_response(),
     }
 }

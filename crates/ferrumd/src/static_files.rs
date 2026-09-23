@@ -176,8 +176,17 @@ pub fn serve_from(root: &Path, uri_path: &str) -> Response {
 }
 
 /// The router fallback. Resolves `$FERRUM_UI_DIR` and delegates.
+///
+/// The delegate canonicalizes a path and reads a whole file, both blocking,
+/// so it runs on the blocking pool -- see main.rs's run_blocking. This is the
+/// one route an unauthenticated caller can drive, which makes it the cheapest
+/// way to occupy executor threads if it stays on them.
 pub async fn serve(uri: Uri) -> Response {
-    serve_from(&ui_dir(), uri.path())
+    let path = uri.path().to_string();
+    match crate::run_blocking(move || serve_from(&ui_dir(), &path)).await {
+        Ok(response) => response,
+        Err(status) => status.into_response(),
+    }
 }
 
 #[cfg(test)]

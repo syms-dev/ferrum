@@ -186,9 +186,12 @@ pub fn build_generations() -> anyhow::Result<GenerationsResponse> {
 /// `GET /api/generations` -- `200` with the generation list, or `500` naming
 /// the real path that failed.
 pub async fn get_generations() -> impl IntoResponse {
-    match build_generations() {
-        Ok(doc) => (StatusCode::OK, Json(doc)).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response(),
+    // A directory walk plus an lstat per generation, on the blocking pool
+    // rather than on the executor thread -- see main.rs's run_blocking.
+    match crate::run_blocking(build_generations).await {
+        Ok(Ok(doc)) => (StatusCode::OK, Json(doc)).into_response(),
+        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response(),
+        Err(status) => status.into_response(),
     }
 }
 

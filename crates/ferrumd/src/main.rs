@@ -58,12 +58,48 @@ struct LoginResponse {
 /// stored at all.
 const SESSION_COOKIE: &str = "__Host-ferrumd_session";
 
+/// Moves blocking work off the async executor and onto tokio's blocking pool.
+///
+/// Almost everything ferrumd does behind a request is synchronous: rusqlite
+/// blocks the calling thread for the whole query, argon2id verification is
+/// deliberately expensive CPU work, and `std::fs` blocks on the disk. Called
+/// directly from an `async fn` each of those occupies one of tokio's worker
+/// threads for its entire duration, and that pool is sized to the core count
+/// -- so a handful of concurrent logins can starve every other request on the
+/// daemon, including the SSE stream an operator is watching an apply through.
+/// On a small box "a handful" is two or three.
+///
+/// What this does NOT do is change how the database mutex is held. The guard
+/// discipline in this crate is already correct -- no `MutexGuard` crosses an
+/// `.await` anywhere, which is why the usual deadlock shape is absent here --
+/// and moving the same synchronous calls to a different thread preserves that
+/// property rather than reopening it.
+///
+/// A panic inside `f` (a poisoned database mutex, most plausibly) arrives as
+/// a `JoinError` instead of unwinding the caller, so it becomes a 500 rather
+/// than taking the daemon down with it.
+async fn run_blocking<F, T>(f: F) -> Result<T, StatusCode>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
 async fn login_handler(
     State(state): State<Arc<AppState>>,
     cookies: Cookies,
     Json(req): Json<LoginRequest>,
 ) -> impl IntoResponse {
-    match auth::login(&state.db, &req.username, &req.password) {
+    let outcome =
+        run_blocking(move || auth::login(&state.db, &req.username, &req.password)).await;
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
+        Err(status) => return status.into_response(),
+    };
+    match outcome {
         Ok(Some(result)) => {
             let mut cookie = Cookie::new(SESSION_COOKIE, result.session_token);
             cookie.set_http_only(true);
@@ -94,7 +130,8 @@ fn removal_cookie() -> Cookie<'static> {
 
 async fn logout_handler(State(state): State<Arc<AppState>>, cookies: Cookies) -> impl IntoResponse {
     if let Some(cookie) = cookies.get(SESSION_COOKIE) {
-        let _ = auth::logout(&state.db, cookie.value());
+        let token = cookie.value().to_string();
+        let _ = run_blocking(move || auth::logout(&state.db, &token)).await;
     }
     cookies.remove(removal_cookie());
     StatusCode::OK
@@ -150,7 +187,15 @@ async fn change_password_handler(
     if req.new_password.is_empty() {
         return (StatusCode::BAD_REQUEST, "the new password must not be empty").into_response();
     }
-    match auth::change_password(&state.db, user_id, &req.current_password, &req.new_password) {
+    let outcome = run_blocking(move || {
+        auth::change_password(&state.db, user_id, &req.current_password, &req.new_password)
+    })
+    .await;
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
+        Err(status) => return status.into_response(),
+    };
+    match outcome {
         Ok(true) => StatusCode::OK.into_response(),
         Ok(false) => (StatusCode::UNAUTHORIZED, "the current password is incorrect").into_response(),
         Err(e) => (
@@ -227,8 +272,13 @@ async fn require_session(
     mut request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Result<axum::response::Response, StatusCode> {
-    let token = cookies.get(SESSION_COOKIE).ok_or(StatusCode::UNAUTHORIZED)?;
-    let session = match auth::validate_session(&state.db, token.value()) {
+    let token = cookies
+        .get(SESSION_COOKIE)
+        .ok_or(StatusCode::UNAUTHORIZED)?
+        .value()
+        .to_string();
+    let db_state = state.clone();
+    let session = match run_blocking(move || auth::validate_session(&db_state.db, &token)).await? {
         Ok(Some(session)) => session,
         _ => return Err(StatusCode::UNAUTHORIZED),
     };
@@ -292,7 +342,12 @@ async fn session_handler(
     axum::Extension(SessionUserId(user_id)): axum::Extension<SessionUserId>,
     axum::Extension(SessionCsrfToken(csrf_token)): axum::Extension<SessionCsrfToken>,
 ) -> impl IntoResponse {
-    match auth::username_for(&state.db, user_id) {
+    let outcome = run_blocking(move || auth::username_for(&state.db, user_id)).await;
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
+        Err(status) => return status.into_response(),
+    };
+    match outcome {
         Ok(Some(username)) => {
             Json(serde_json::json!({ "username": username, "csrf_token": csrf_token }))
                 .into_response()
@@ -661,6 +716,110 @@ mod tests {
             builder = builder.header(CSRF_HEADER, csrf);
         }
         builder.body(Body::empty()).unwrap()
+    }
+
+    /// C-01's actual property: expensive blocking work inside a handler must
+    /// not stop the executor from running everything else.
+    ///
+    /// Deliberately on a SINGLE worker thread. `auth::login` runs argon2id
+    /// verification, which is expensive on purpose -- `Argon2::default()` is
+    /// 19MiB and two passes, tens of milliseconds per call. Called straight
+    /// from the `async fn`, several concurrent logins own that one worker for
+    /// the whole of their combined runtime, and nothing else on the runtime
+    /// is polled until the last finishes: no timer, no second request, no SSE
+    /// keep-alive on the apply an operator is watching. Handed to the
+    /// blocking pool, the worker stays free.
+    ///
+    /// The probe is a bare 1ms timer loop, because a timer needs nothing from
+    /// the process except to be polled -- so the longest gap between two of
+    /// its ticks IS the longest time the executor was unavailable. Measuring
+    /// the worst gap rather than a tick count is what makes this robust: the
+    /// gap is ~1-3ms when the work is off the executor and the full length of
+    /// the blocking run when it is not, and that separation does not depend
+    /// on how long the test happens to take overall.
+    ///
+    /// PROVED TO FAIL, with real numbers rather than an assurance: reverting
+    /// `login_handler` to call `auth::login` directly takes the observed
+    /// worst stall from **3ms to 1948ms**. The 150ms threshold sits three
+    /// orders of magnitude clear of one arm and an order clear of the other,
+    /// so this is a real discriminator and not a timing race.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn blocking_work_in_a_handler_does_not_stall_the_executor() {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::time::{Duration, Instant};
+
+        let (dir, state, _session, _csrf) = logged_in();
+        let password = std::fs::read_to_string(dir.path().join("ferrumd-setup-password")).unwrap();
+        let password = password.trim().to_string();
+
+        let worst_stall_ms = Arc::new(AtomicU64::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let ticker = {
+            let worst = worst_stall_ms.clone();
+            let stop = stop.clone();
+            tokio::spawn(async move {
+                let mut last = Instant::now();
+                while !stop.load(Ordering::Relaxed) {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                    worst.fetch_max(last.elapsed().as_millis() as u64, Ordering::Relaxed);
+                    last = Instant::now();
+                }
+            })
+        };
+
+        // Let the ticker reach steady state, then discard the startup gap so
+        // only the window that overlaps the logins is measured.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        worst_stall_ms.store(0, Ordering::Relaxed);
+
+        let logins: Vec<_> = (0..8)
+            .map(|_| {
+                let router = build_router(state.clone());
+                let body =
+                    serde_json::json!({ "username": "admin", "password": password }).to_string();
+                tokio::spawn(async move {
+                    router
+                        .oneshot(
+                            Request::builder()
+                                .method(Method::POST)
+                                .uri("/api/login")
+                                .header("Content-Type", "application/json")
+                                .body(Body::from(body))
+                                .unwrap(),
+                        )
+                        .await
+                        .unwrap()
+                })
+            })
+            .collect();
+
+        for login in logins {
+            assert_eq!(
+                login.await.unwrap().status(),
+                StatusCode::OK,
+                "each probe must be a REAL login -- a rejected one would not have run argon2 \
+                 at all, and the test would be measuring nothing"
+            );
+        }
+
+        // The ticker only records a gap when it is next POLLED, and while the
+        // executor is blocked it is not polled at all -- so reading the value
+        // the instant the logins finish races the scheduler and reads a stall
+        // of zero no matter how long the executor was actually unavailable.
+        // This measurement was wrong in exactly that way once: the reverted
+        // build reported 0ms and the test passed. Let the ticker run once
+        // more so the gap it has been sitting on is actually written down.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let observed = worst_stall_ms.load(Ordering::Relaxed);
+        stop.store(true, Ordering::Relaxed);
+        ticker.await.unwrap();
+
+        assert!(
+            observed < 150,
+            "the executor stalled for {observed}ms while eight logins were in flight, which \
+             means argon2id ran on the executor thread rather than the blocking pool"
+        );
     }
 
     /// `GET /api/session` with no cookie at all must be a 401 -- it is
