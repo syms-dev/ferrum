@@ -161,7 +161,6 @@ pub async fn create_job(
 /// concurrently. `profiles_dir` arrives as the `Result` its lookup
 /// produced, because an unresolvable profile directory is not a detail to
 /// paper over here -- see the rollback guard below.
-#[allow(clippy::too_many_arguments)]
 async fn create_job_in(
     dir: &std::path::Path,
     profiles_dir: anyhow::Result<std::path::PathBuf>,
