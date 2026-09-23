@@ -9,6 +9,24 @@
   summary = "Free media server for streaming movies, TV, and music.";
 
   defaultPort = 8096;
+
+  # Jellyfin binds 8096/8920 and nothing ferrum does can move it -- the
+  # header above already says so, and this is the machine-readable half.
+  #
+  # nixpkgs' services.jellyfin exposes no port option (confirmed by reading
+  # the module: `options.services.jellyfin ? port` evaluates to false); the
+  # ports are configured through Jellyfin's own web UI, in its own state
+  # directory, after it is running. So modules/apps/jellyfin/service.nix has
+  # nothing to wire the uniform ferrum.apps.jellyfin.port through to.
+  #
+  # Which would be merely untidy if the option were inert, and it is not:
+  # modules/proxy/nginx.nix generates `proxy_pass http://127.0.0.1:${port}`
+  # from it. Measured before this field existed -- jellyfin.port = 9998
+  # produced `proxy_pass http://127.0.0.1:9998` with zero failed assertions
+  # while Jellyfin carried on serving 8096. The operator gets a 502 and a
+  # failing health check with nothing said at eval time.
+  portIsFixed = true;
+
   defaultSubdomain = "jellyfin";
   defaultMediaAccess = "read";
   # "bypass", not one_factor, and this is a correctness matter rather than

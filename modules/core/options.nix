@@ -575,10 +575,107 @@ in
       };
     };
 
+    extraUnfreePackages = mkOption {
+      # Package NAMES, compared with lib.getName inside
+      # nixpkgs.config.allowUnfreePredicate. This is the one list in
+      # ferrum.* that does not reach a generated file at all -- no tmpfiles
+      # rule, no unit field, no directive -- so types.str is correct here
+      # and modules/lib/hostnames.nix has nothing to say about it. A value
+      # that is not a real package name simply never matches.
+      type = types.listOf types.str;
+      default = [ ];
+      example = [ "steam-run" ];
+      description = ''
+        Additional unfree package names to allow, beyond the ones the app
+        catalog already needs.
+
+        This option exists because nixpkgs.config.allowUnfreePredicate is a
+        single FUNCTION value, and the module system does not compose two of
+        them the way it composes a list -- so a predicate written in
+        /etc/ferrum/custom/ does not add to ferrum's, it REPLACES it, and
+        silently: a host that allowed plexmediaserver and unrar stops
+        allowing either, and the first sign is a build failure naming a
+        package the operator never touched.
+
+        modules/core/overlays.nix folds this list into the same union it
+        builds from every app's meta.nix, so an operator who needs one more
+        unfree package adds a name here instead of writing a predicate that
+        would take the catalog's out with it.
+      '';
+    };
+
     apps = mkOption {
       type = appsType;
       default = { };
       description = "The uniform application catalog. See modules/lib/app-submodule.nix.";
     };
   };
+
+  # A uniform option has to be uniformly HONOURED, or it is a lie the UI
+  # renders a text field for.
+  #
+  # ferrum.apps.<id>.port is one option shape across the whole catalog,
+  # which is what lets the web UI render one form instead of seven. Four of
+  # the seven apps wire it through to their service (sonarr, radarr,
+  # prowlarr's `port`, qbittorrent's `webuiPort`). Plex and Jellyfin cannot:
+  # nixpkgs' modules for them expose no port option at all, because neither
+  # application has a configuration-file setting for it, so
+  # modules/apps/*/service.nix has nothing to assign.
+  #
+  # The option is not inert on those two, which is what makes this a defect
+  # rather than a documentation gap. modules/proxy/nginx.nix generates
+  # `proxy_pass http://127.0.0.1:${port}` from the same value, so changing
+  # it produces a vhost pointed at a port nothing listens on: measured,
+  # plex.port = 9999 rendered `proxy_pass http://127.0.0.1:9999` while Plex
+  # went on serving 32400, with zero failed assertions. The operator gets a
+  # 502, a failing reconciler health check, and no explanation from the
+  # layer that knew.
+  #
+  # Keyed on the catalog's own `portIsFixed` rather than on a list of app
+  # ids here, for the reason every other per-app capability
+  # (mediaCategory, downloadSubdir, unfreePackages, authBypassPaths) is
+  # declared in meta.nix: adding an app must stay "add a directory under
+  # modules/apps", and a second place to register one is a second place to
+  # forget.
+  #
+  # It refuses a CHANGED port, not a fixed one, so the default keeps working
+  # and the catalog default stays the single source of the real number.
+  config.assertions =
+    let
+      fixedPortViolations = lib.mapAttrsToList
+        (name: app:
+          "ferrum.apps.${name}.port = ${toString app.port} "
+          + "(${catalog.${name}.displayName} always listens on "
+          + "${toString catalog.${name}.defaultPort})")
+        (lib.filterAttrs
+          (name: app:
+            app.enable
+            && (catalog.${name}.portIsFixed or false)
+            && app.port != catalog.${name}.defaultPort)
+          config.ferrum.apps);
+    in
+    [
+      {
+        assertion = fixedPortViolations == [ ];
+        message = ''
+          An app has been given a port it cannot honour, and ferrum would
+          proxy to it anyway: ${lib.concatStringsSep "; " fixedPortViolations}.
+
+          These applications have no port setting -- not in ferrum, and not
+          in the NixOS modules underneath it, because the applications
+          themselves have none. The process binds its own fixed port
+          whatever this option says. What DOES follow the option is the
+          reverse proxy: modules/proxy/nginx.nix generates
+          `proxy_pass http://127.0.0.1:<this value>`, so the vhost ends up
+          pointed at a port nothing is listening on. The result is a 502 in
+          the browser and a failing health check, with nothing in the apply
+          output to connect them to this setting.
+
+          Leave the port at its catalog default. If you need the app on a
+          different port, that is a change to the application's own
+          configuration (Jellyfin's network settings, for instance), and
+          ferrum has no way to make it declaratively today.
+        '';
+      }
+    ];
 }

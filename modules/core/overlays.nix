@@ -43,8 +43,26 @@ let
   # referenced (a disabled app) is never built regardless of whether its
   # name appears in this allowlist.
   catalog = import ../lib/catalog.nix { inherit lib; };
+  #
+  # ferrum.extraUnfreePackages joins the SAME union rather than being
+  # allowed a predicate of its own, and the predicate below stays without
+  # lib.mkDefault. Both of those are deliberate.
+  #
+  # nixpkgs.config is types.attrs, so definitions of it merge with `//` and
+  # a later one WINS -- silently, with no conflict error. Measured at
+  # 03d569f: a /etc/ferrum/custom/ module setting its own
+  # allowUnfreePredicate produced a host where the predicate answered
+  # plexmediaserver = false and unrar = false. The operator added one
+  # package and took Plex and SABnzbd out, and the only symptom is a build
+  # failure naming a package they never touched.
+  #
+  # lib.mkDefault does not fix that; it blesses it. It would let the custom
+  # definition win CLEANLY, which is the same silent loss with a tidier
+  # mechanism. The composable thing is the LIST, so the list is what this
+  # option extends.
   unfreePackageNames = lib.unique (
     lib.concatMap (app: app.unfreePackages or [ ]) (lib.attrValues catalog)
+    ++ ferrum.extraUnfreePackages
   );
 
   # Only the three servarr apps ferrum-apply's secrets.rs module actually

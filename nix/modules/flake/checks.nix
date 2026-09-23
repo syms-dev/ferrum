@@ -287,6 +287,111 @@
           inherit defaultFailures notRejected;
         };
 
+      # The storage collision assertions ask about PATH NESTING, so they must
+      # not be answered with a substring test.
+      #
+      # Both of them used `lib.hasInfix a b`, and it is wrong in both
+      # directions. Measured against the module at 03d569f:
+      #
+      #   * snapshotDir = "<stateDir>-snaps" -- a SIBLING -- was rejected as
+      #     nested, because the parent's string is a substring of the
+      #     child's. Same for journalDir = "<mediaDir>-journal". Two legal
+      #     layouts refused at apply time, with a message saying something
+      #     untrue about them.
+      #   * stateDir nested inside snapshotDir was missed entirely. That is
+      #     the same hazard with the arguments swapped, and
+      #     modules/core/state-restore.nix cares about it in both directions
+      #     -- it swaps @state and @snapshots as two subvolumes of ONE
+      #     volume, which one containing the other is not.
+      #
+      # Deliberately two lists rather than one. A check that only listed
+      # values that must be REFUSED is passed by an assertion that refuses
+      # everything, which is precisely the failure mode the old condition
+      # had; a check that only listed values that must be ACCEPTED is passed
+      # by deleting the assertion. Each list is the other's anti-vacuity
+      # floor, and the `legal` list is the half this repo did not have.
+      #
+      # Scoped to these assertions' own messages, and to phrases they keep
+      # on one line, for the reason journalDirCollision above spells out at
+      # length.
+      storagePathNesting =
+        let
+          hostWith = storage: ferrumLib.mkHost {
+            inherit system;
+            settings = {
+              schemaVersion = realMigrations.currentVersion;
+              inherit storage;
+            };
+            modules = [ ../../../examples/hosts/minimal/configuration.nix ];
+          };
+
+          phrases = [
+            "ferrum.storage.journalDir must not be"
+            "separate paths, with neither equal to nor nested"
+          ];
+          rejected = storage:
+            let
+              probe = builtins.tryEval (
+                builtins.filter
+                  (m: lib.any (phrase: lib.hasInfix phrase m) phrases)
+                  (map (a: a.message)
+                    (builtins.filter (a: !a.assertion) (hostWith storage).config.assertions))
+              );
+            in
+            # A value the option TYPE refuses throws rather than returning a
+            # message; that is still a refusal, and counting it as one keeps
+            # a type-level control from reading as a missing assertion.
+            if probe.success then probe.value != [ ] else true;
+
+          defaults = (hostWith { }).config.ferrum.storage;
+
+          # Siblings and unrelated paths. Every one of these is a legal
+          # layout and must evaluate clean.
+          legal = {
+            "snapshotDir is a sibling of stateDir" = {
+              snapshotDir = "${defaults.stateDir}-snaps";
+            };
+            "journalDir is a sibling of mediaDir" = {
+              journalDir = "${defaults.mediaDir}-journal";
+            };
+            "journalDir is a sibling of stateDir" = {
+              journalDir = "${defaults.stateDir}-journal";
+            };
+            "the declared defaults" = { };
+          };
+
+          # Real containment, in both directions, plus equality.
+          illegal = {
+            "snapshotDir inside stateDir" = {
+              snapshotDir = "${defaults.stateDir}/snapshots";
+            };
+            "stateDir inside snapshotDir" = {
+              stateDir = "${defaults.snapshotDir}/state";
+              snapshotDir = defaults.snapshotDir;
+            };
+            "stateDir equals snapshotDir" = {
+              stateDir = "/srv/ferrum-both";
+              snapshotDir = "/srv/ferrum-both";
+            };
+            "journalDir inside mediaDir" = {
+              journalDir = "${defaults.mediaDir}/journal";
+            };
+            "journalDir equals stateDir" = {
+              journalDir = defaults.stateDir;
+            };
+          };
+
+          wronglyRejected = builtins.attrNames (lib.filterAttrs (_: rejected) legal);
+          wronglyAccepted = builtins.attrNames (lib.filterAttrs (_: s: !(rejected s)) illegal);
+        in
+        {
+          ok = wronglyRejected == [ ] && wronglyAccepted == [ ];
+          message =
+            "modules/core/storage.nix's path-collision assertions do not "
+            + "test path nesting";
+          inherit wronglyRejected wronglyAccepted;
+        };
+
       # Every schema shape the real settings-schema.json contains must have a
       # control in ui/forms.js.
       #
@@ -1655,6 +1760,106 @@
           reserved = colliding;
         };
 
+      # The app-vs-app half of the same hazard, which the check above never
+      # covered: two ENABLED apps claiming one hostname.
+      #
+      # Proven before the assertion existed, by evaluating a host with
+      # sonarr.subdomain = radarr.subdomain = "tv": exactly ONE vhost
+      # (tv.example.test) whose `locations."/".proxyPass` was
+      # http://127.0.0.1:7878 -- Radarr's port -- while Sonarr was enabled,
+      # certificated and reported as published on that same name.
+      # lib.listToAttrs keeps the FIRST entry for a duplicated key and
+      # attribute sets iterate sorted, so the alphabetically-earlier app
+      # always wins. Same evaluation produced ten Authelia access_control
+      # rules for the one domain.
+      #
+      # Three properties, and the third is the one that would have been
+      # easiest to omit:
+      #
+      #   1. a host with distinct subdomains is NOT rejected (the
+      #      anti-vacuity floor -- without it this check passes with the
+      #      assertion inverted, or with `subdomain` ignored entirely),
+      #   2. a host with two apps on one name IS rejected, by a message
+      #      naming both apps and the hostname,
+      #   3. both of the above hold with ferrum.proxy.enable = FALSE.
+      #
+      # (3) is the regression guard for the hoist out of `lib.mkIf
+      # proxyEnabled`. The assertion's own reasoning is that a collision
+      # must be reported before it is published -- "a trap armed for
+      # whenever someone publishes it" -- and while it lived inside that
+      # mkIf, that was true across the exposure axis and false across the
+      # proxy axis, which is the axis an operator actually crosses when
+      # they turn the proxy on. A check that only ever built proxy-on hosts
+      # could not see the difference.
+      duplicateSubdomainCollision =
+        let
+          hostWith = { proxy, sonarrSubdomain }: ferrumLib.mkHost {
+            inherit system;
+            settings = {
+              schemaVersion = realMigrations.currentVersion;
+              proxy = { enable = proxy; }
+                // lib.optionalAttrs proxy {
+                baseDomain = "example.test";
+                acme.email = "a@example.test";
+              };
+              apps = {
+                radarr = { enable = true; subdomain = "tv"; };
+                sonarr = { enable = true; subdomain = sonarrSubdomain; };
+              };
+            };
+            modules = [ ../../../examples/hosts/minimal/configuration.nix ];
+          };
+
+          # Scoped to this assertion's own message, and to a phrase it keeps
+          # on ONE line, for both reasons the reserved check above gives: an
+          # unscoped filter reports a host as "rejected" for any reason at
+          # all, and an infix spanning a line break in a multi-line Nix
+          # string never matches.
+          failuresFor = args:
+            let
+              probe = builtins.tryEval (
+                builtins.filter (m: lib.hasInfix "claim the same hostname" m)
+                  (map (a: a.message)
+                    (builtins.filter (a: !a.assertion) (hostWith args).config.assertions))
+              );
+            in
+            if probe.success then probe.value else [ "evaluation threw" ];
+
+          axes = [ true false ];
+
+          # (1) Distinct names must pass. This is the floor that makes the
+          # rest of the check mean something.
+          distinctRejected = builtins.filter
+            (proxy: failuresFor { inherit proxy; sonarrSubdomain = "shows"; } != [ ])
+            axes;
+
+          # (2)+(3) One name, two apps, on a proxy-on AND a proxy-off host.
+          collidingAccepted = builtins.filter
+            (proxy: failuresFor { inherit proxy; sonarrSubdomain = "tv"; } == [ ])
+            axes;
+
+          # The message has to name both apps and the hostname, or an
+          # operator cannot act on it. Checked on the proxy-ON host, where
+          # the vhost name is a real one rather than the bare "tv." a host
+          # with no baseDomain renders.
+          collisionMessages = failuresFor { proxy = true; sonarrSubdomain = "tv"; };
+          namesBothApps = builtins.any
+            (m: lib.hasInfix "ferrum.apps.sonarr.subdomain" m
+              && lib.hasInfix "ferrum.apps.radarr.subdomain" m)
+            collisionMessages;
+          namesTheHostname = builtins.any (m: lib.hasInfix "tv.example.test" m) collisionMessages;
+        in
+        {
+          ok = distinctRejected == [ ]
+            && collidingAccepted == [ ]
+            && namesBothApps
+            && namesTheHostname;
+          message =
+            "two enabled apps may claim one hostname, and only the "
+            + "alphabetically-earlier one is published";
+          inherit distinctRejected collidingAccepted namesBothApps namesTheHostname;
+        };
+
       # A3/D5, leg 2: nginx emits no CORS header either.
       #
       # ferrumd's own test matrix cannot see this. After R13 nginx is a
@@ -2453,6 +2658,491 @@
           expectedCount = builtins.length expected;
         };
 
+      # modules/core/pool.nix's own assertions must be able to FIRE.
+      #
+      # Both of them used to live inside `lib.mkIf (pool.enable &&
+      # pool.branches != [ ])`, which meant the one configuration they most
+      # needed to refuse was the one that switched them off. Measured
+      # against the module at 03d569f: `pool.enable = true` with `branches =
+      # [ ]` evaluated with failedAssertions = [] and NO entry at all for
+      # mediaDir in config.fileSystems -- an operator told the host to pool
+      # its disks, was told nothing, and got a single-disk host writing the
+      # library to the OS disk.
+      #
+      # Written against the GENERATED filesystem rather than the options,
+      # because "is there a pool on this host" is a question about
+      # config.fileSystems, and an options-level check would have passed on
+      # the broken module too (pool.enable really was `true`; that was the
+      # whole problem).
+      #
+      # The anti-vacuity half is the `working` case, and it is load-bearing
+      # in both directions: it pins that a legitimate two-branch pool is NOT
+      # refused (an assertion that fires on everything protects nothing) and
+      # that it really does produce a fuse.mergerfs mount (so the
+      # "mediaFsType == null" evidence in the other rows means something).
+      poolAssertionsCanFire =
+        let
+          hostWith = pool: ferrumLib.mkHost {
+            inherit system;
+            settings = {
+              schemaVersion = realMigrations.currentVersion;
+              storage.pool = pool;
+            };
+            modules = [ ../../../examples/hosts/minimal/configuration.nix ];
+          };
+          probe = pool:
+            let
+              cfg = (hostWith pool).config;
+              r = builtins.tryEval {
+                failed = map (a: a.message) (builtins.filter (a: !a.assertion) cfg.assertions);
+                mediaFsType = cfg.fileSystems.${cfg.ferrum.storage.mediaDir}.fsType or null;
+              };
+            in
+            if r.success then r.value else { failed = [ "evaluation threw" ]; mediaFsType = null; };
+
+          # Scoped to the ONE message each case is supposed to produce, and
+          # to a phrase that message keeps on a single line.
+          #
+          # Both halves of that are load-bearing and both were got wrong
+          # while writing this. An unscoped "was anything rejected" passes
+          # identically with these assertions deleted and some unrelated
+          # assertion failing instead. A filter on "ferrum.storage.pool"
+          # looks correctly scoped and silently misses the
+          # mediaDir-is-a-branch message, whose first line names
+          # ferrum.storage.mediaDir and never spells the pool option at all
+          # -- which made this check report that assertion as dead when it
+          # was working. And an infix spanning a line break never matches at
+          # all, because these are multi-line Nix strings.
+          failuresMatching = phrase: p:
+            builtins.filter (m: lib.hasInfix phrase m) (probe p).failed;
+          emptyPhrase = "is on and ferrum.storage.pool.branches";
+          singlePhrase = "A pool of one disk is a mount";
+          selfBranchPhrase = "is also listed as a pool";
+          anyPoolFailure = p:
+            lib.concatMap (phrase: failuresMatching phrase p)
+              [ emptyPhrase singlePhrase selfBranchPhrase ];
+
+          empty = { enable = true; branches = [ ]; };
+          single = { enable = true; branches = [ "/mnt/ferrum-check-a" ]; };
+          selfBranch = {
+            enable = true;
+            branches = [ "/mnt/ferrum-check-a" "/data" ];
+          };
+          working = {
+            enable = true;
+            branches = [ "/mnt/ferrum-check-a" "/mnt/ferrum-check-b" ];
+          };
+
+          emptyRejected = failuresMatching emptyPhrase empty != [ ];
+          # The defect's signature, kept as evidence rather than inferred:
+          # the empty-branch host has no pool filesystem at all.
+          emptyHasNoPool = (probe empty).mediaFsType == null;
+          singleRejected = failuresMatching singlePhrase single != [ ];
+          selfBranchRejected = failuresMatching selfBranchPhrase selfBranch != [ ];
+          workingAccepted = anyPoolFailure working == [ ];
+          workingIsAPool = (probe working).mediaFsType == "fuse.mergerfs";
+        in
+        {
+          ok = emptyRejected
+            && emptyHasNoPool
+            && singleRejected
+            && selfBranchRejected
+            && workingAccepted
+            && workingIsAPool;
+          message =
+            "modules/core/pool.nix's assertions do not fire on a pool "
+            + "configuration they are supposed to refuse";
+          inherit emptyRejected emptyHasNoPool singleRejected selfBranchRejected
+            workingAccepted workingIsAPool;
+        };
+
+      # The self-signed certificate follows ferrum.proxy.baseDomain.
+      #
+      # Its CN and both SANs are built from that option, and the unit that
+      # generates it used to be gated on `ConditionPathExists =
+      # "!<certDir>/cert.pem"` -- "is there a certificate", never "is it the
+      # right one". So changing baseDomain, which is one field in the
+      # settings UI, left every lan-exposure vhost and (on a host with no
+      # public app) the auth vhost itself serving a certificate for the OLD
+      # name. The browser refuses it, and since the auth vhost is where
+      # Authelia's forward-auth redirect lands, it presents as "SSO broke
+      # after an apply that succeeded" rather than as anything pointing at a
+      # certificate.
+      #
+      # Read off the GENERATED unit, because the stale gate was a unit
+      # directive and the new gate is script text. Three properties:
+      #
+      #   1. the unit is not gated on the mere existence of a path,
+      #   2. its script records the domain beside the certificate, so a
+      #      later start can compare rather than assume,
+      #   3. the script is domain-SENSITIVE -- two hosts differing only in
+      #      baseDomain must not generate the same script. Without (3) a
+      #      hardcoded marker path would satisfy (2) while regenerating
+      #      nothing.
+      #
+      # Anti-vacuity: the unit must exist on the proxy-on host at all
+      # (otherwise every property above holds of an empty string), and must
+      # NOT exist on a proxy-off host, which is what makes its presence a
+      # real property rather than a constant.
+      selfSignedCertTracksItsDomain =
+        let
+          hostWith = { domain, proxy ? true }: ferrumLib.mkHost {
+            inherit system;
+            settings = {
+              schemaVersion = realMigrations.currentVersion;
+              proxy = { enable = proxy; }
+                // lib.optionalAttrs proxy {
+                baseDomain = domain;
+                acme.email = "a@example.test";
+              };
+              apps.sonarr = { enable = true; exposure = "lan"; };
+            };
+            modules = [ ../../../examples/hosts/minimal/configuration.nix ];
+          };
+          unitOf = args:
+            let cfg = (hostWith args).config; in
+            if cfg.systemd.units ? "ferrum-proxy-selfsigned-cert.service"
+            then {
+              present = true;
+              text = cfg.systemd.units."ferrum-proxy-selfsigned-cert.service".text;
+              script = cfg.systemd.services.ferrum-proxy-selfsigned-cert.script;
+            }
+            else { present = false; text = ""; script = ""; };
+
+          a = unitOf { domain = "a.example.test"; };
+          b = unitOf { domain = "b.example.test"; };
+          off = unitOf { domain = "a.example.test"; proxy = false; };
+        in
+        {
+          ok = a.present
+            && !off.present
+            && !(lib.hasInfix "ConditionPathExists=!" a.text)
+            && lib.hasInfix "/domain" a.script
+            && a.script != b.script;
+          message =
+            "the self-signed certificate is not regenerated when "
+            + "ferrum.proxy.baseDomain changes";
+          unitPresent = a.present;
+          absentWithProxyOff = !off.present;
+          gatedOnMereExistence = lib.hasInfix "ConditionPathExists=!" a.text;
+          recordsDomain = lib.hasInfix "/domain" a.script;
+          domainSensitive = a.script != b.script;
+        };
+
+      # ferrum.extraUnfreePackages ADDS to the catalog's allowances rather
+      # than replacing them.
+      #
+      # nixpkgs.config.allowUnfreePredicate is a single FUNCTION value and
+      # nixpkgs.config is types.attrs, so two definitions merge with `//`
+      # and the later one wins -- silently, with no conflict error.
+      # Measured at 03d569f: a /etc/ferrum/custom/ module setting its own
+      # predicate produced a host whose predicate answered plexmediaserver =
+      # false and unrar = false. The operator added one package and took
+      # Plex and SABnzbd out with it, and the only symptom is a build
+      # failure naming a package they never touched.
+      #
+      # The composable thing is the LIST, so ferrum.extraUnfreePackages
+      # joins the same union modules/core/overlays.nix builds from every
+      # meta.nix, and the predicate keeps its non-mkDefault definition. This
+      # check is what pins that: it calls the GENERATED predicate, which is
+      # the thing nixpkgs actually consults, rather than inspecting the list
+      # the module composed.
+      #
+      # Anti-vacuity, and it is the whole check: the baseline must answer
+      # FALSE for the extra package. A predicate that returned true for
+      # everything -- which is what a careless `allowUnfree = true` would
+      # amount to -- satisfies every other row here.
+      extraUnfreePackagesCompose =
+        let
+          hostWith = extra: ferrumLib.mkHost {
+            inherit system;
+            settings = {
+              schemaVersion = realMigrations.currentVersion;
+              extraUnfreePackages = extra;
+            };
+            modules = [ ../../../examples/hosts/minimal/configuration.nix ];
+          };
+          allows = extra: name:
+            (hostWith extra).config.nixpkgs.config.allowUnfreePredicate {
+              pname = name;
+              version = "0";
+            };
+
+          catalogNames = lib.unique
+            (lib.concatMap (meta: meta.unfreePackages or [ ]) (lib.attrValues catalog));
+          extra = "ferrum-check-not-a-real-package";
+
+          baselineMissing = builtins.filter (n: !(allows [ ] n)) catalogNames;
+          extendedMissing = builtins.filter (n: !(allows [ extra ] n)) catalogNames;
+        in
+        {
+          ok = catalogNames != [ ]
+            && baselineMissing == [ ]
+            && !(allows [ ] extra)
+            && extendedMissing == [ ]
+            && allows [ extra ] extra;
+          message =
+            "ferrum.extraUnfreePackages does not compose with the catalog's "
+            + "own unfree allowances";
+          inherit catalogNames baselineMissing extendedMissing;
+          baselineAllowsTheExtra = allows [ ] extra;
+          extendedAllowsTheExtra = allows [ extra ] extra;
+        };
+
+      # Recyclarr with nothing to sync is a timer that succeeds at nothing.
+      #
+      # `configuration` in modules/core/recyclarr.nix is built from
+      # ferrum.apps.sonarr and ferrum.apps.radarr and from nothing else, so
+      # with neither enabled it is the empty attrset and the host still gets
+      # an enabled services.recyclarr: a timer that wakes on schedule, syncs
+      # nothing, and SUCCEEDS. Measured at 03d569f -- `configuration = { }`,
+      # `systemd.timers ? recyclarr` true, zero failed assertions. A green
+      # unit is indistinguishable from a working feature, which is why this
+      # one is worth an assertion rather than a warning.
+      #
+      # The anti-vacuity half is the sonarr row: with one *arr enabled the
+      # host must be accepted. Without it this passes with an assertion that
+      # refuses Recyclarr outright.
+      recyclarrNeedsAnArr =
+        let
+          hostWith = apps: ferrumLib.mkHost {
+            inherit system;
+            settings = {
+              schemaVersion = realMigrations.currentVersion;
+              recyclarr.enable = true;
+              inherit apps;
+            };
+            modules = [ ../../../examples/hosts/minimal/configuration.nix ];
+          };
+          rejects = apps:
+            let
+              probe = builtins.tryEval (
+                builtins.filter (m: lib.hasInfix "neither ferrum.apps.sonarr" m)
+                  (map (a: a.message)
+                    (builtins.filter (a: !a.assertion) (hostWith apps).config.assertions))
+              );
+            in
+            if probe.success then probe.value != [ ] else true;
+
+          # The defect's signature, kept as evidence rather than inferred.
+          emptyTimer =
+            let cfg = (hostWith { }).config; in
+            cfg.services.recyclarr.configuration == { };
+        in
+        {
+          ok = rejects { }
+            && emptyTimer
+            && !(rejects { sonarr.enable = true; })
+            && !(rejects { radarr.enable = true; });
+          message =
+            "ferrum.recyclarr.enable with no *arr installs a timer that "
+            + "syncs nothing";
+          noArrsRejected = rejects { };
+          inherit emptyTimer;
+          sonarrRejected = rejects { sonarr.enable = true; };
+          radarrRejected = rejects { radarr.enable = true; };
+        };
+
+      # An app the catalog marks `portIsFixed` really cannot honour a port,
+      # and ferrum refuses to be pointed at one it cannot reach.
+      #
+      # ferrum.apps.<id>.port is one uniform option across the catalog --
+      # that uniformity is what lets the UI render one form rather than
+      # seven -- but only four of the seven apps wire it through. Plex and
+      # Jellyfin have no port setting at any layer: not in ferrum, not in
+      # nixpkgs' modules, not in the applications. The option was not inert
+      # on them, though, because modules/proxy/nginx.nix generates
+      # `proxy_pass http://127.0.0.1:${port}` from the same value. Measured
+      # before the catalog carried this field: plex.port = 9999 rendered
+      # `proxy_pass http://127.0.0.1:9999` with ZERO failed assertions while
+      # Plex went on serving 32400 -- a 502 and a failing reconciler health
+      # check, with nothing said at eval time by the layer that knew.
+      #
+      # Two properties, and the second is what stops this from being a
+      # comment that agrees with itself:
+      #
+      #   1. a changed port on a portIsFixed app is REFUSED, and the catalog
+      #      default is not,
+      #   2. the mark is TRUE -- the generated systemd units of a host with
+      #      that app's port moved carry no trace of the new number, read
+      #      off the rendered unit text with the proxy OFF so nginx's own
+      #      proxy_pass cannot supply a false positive.
+      #
+      # (2) is what makes this survive nixpkgs. If a future nixpkgs adds a
+      # port option and modules/apps/<id>/service.nix wires it, the port
+      # appears in the units, this check fails, and the answer is to drop
+      # the mark rather than to keep refusing a port the app can now honour.
+      #
+      # The anti-vacuity floor is `sonarr`, which is NOT marked: moving its
+      # port must be accepted AND must show up in the generated units. Half
+      # of that is the positive control for the detector in (2) -- without
+      # it, a detector that always answered "false" would pass every marked
+      # app triumphantly. Plus a non-empty floor on the marked set itself,
+      # since a check over nothing checks nothing.
+      #
+      # Deliberately NOT covered, and named here so it stays visible rather
+      # than becoming a silence: `sabnzbd` also fails to carry its port into
+      # the generated units, and is not marked portIsFixed. Its port is not
+      # fixed -- SABnzbd is perfectly capable of listening elsewhere -- it
+      # is configured by crates/, outside this module tree, so the honest
+      # fix is there and marking it here would assert something false.
+      fixedPortsAreEnforced =
+        let
+          movedPort = 9111;
+
+          hostWith = { id, port, proxy }: ferrumLib.mkHost {
+            inherit system;
+            settings = {
+              schemaVersion = realMigrations.currentVersion;
+              proxy = { enable = proxy; }
+                // lib.optionalAttrs proxy {
+                baseDomain = "example.test";
+                acme.email = "a@example.test";
+              };
+              apps.${id} = { enable = true; inherit port; };
+            };
+            modules = [ ../../../examples/hosts/minimal/configuration.nix ];
+          };
+
+          # Scoped to this assertion's own message, on a phrase it keeps to
+          # one line -- the same discipline every tryEval probe in this file
+          # uses, for the same reason.
+          refuses = id: port:
+            let
+              probe = builtins.tryEval (
+                builtins.filter (m: lib.hasInfix "a port it cannot honour" m)
+                  (map (a: a.message)
+                    (builtins.filter (a: !a.assertion)
+                      (hostWith { inherit id port; proxy = true; }).config.assertions))
+              );
+            in
+            if probe.success then probe.value != [ ] else true;
+
+          # Does the port reach the GENERATED system at all? Proxy off, so
+          # the only thing that could carry it is the app's own service.
+          unitsCarry = id: port:
+            let
+              units = (hostWith { inherit id port; proxy = false; }).config.systemd.units;
+            in
+            builtins.any (u: lib.hasInfix (toString port) (u.text or ""))
+              (builtins.attrValues units);
+
+          fixedApps = builtins.attrNames
+            (lib.filterAttrs (_: meta: meta.portIsFixed or false) catalog);
+
+          notRefused = builtins.filter (id: !(refuses id movedPort)) fixedApps;
+          refusedAtDefault = builtins.filter
+            (id: refuses id catalog.${id}.defaultPort)
+            fixedApps;
+          markedButWired = builtins.filter (id: unitsCarry id movedPort) fixedApps;
+
+          # The positive control.
+          controlRefused = refuses "sonarr" movedPort;
+          controlWired = unitsCarry "sonarr" movedPort;
+        in
+        {
+          ok = fixedApps != [ ]
+            && notRefused == [ ]
+            && refusedAtDefault == [ ]
+            && markedButWired == [ ]
+            && !controlRefused
+            && controlWired;
+          message =
+            "the catalog's portIsFixed marks do not match what the generated "
+            + "system actually does with ferrum.apps.<id>.port";
+          inherit fixedApps notRefused refusedAtDefault markedButWired
+            controlRefused controlWired;
+        };
+
+      # The media tree is seeded AFTER the data mounts, not alongside them.
+      #
+      # Every ferrum data mount carries `nofail`, and per systemd.mount(5)
+      # `nofail` means the mount is only WANTED by local-fs.target and is
+      # explicitly not ordered before it. systemd-tmpfiles-setup.service is
+      # `After=local-fs.target`, so the tree can be created on the ROOT
+      # filesystem under the mountpoint and then shadowed by the mount that
+      # lands on top of it. On pool branches that produces exactly the state
+      # poolBranchesAreAllSeeded above exists to prevent: empty branches,
+      # and under epmfs the whole library on one disk.
+      #
+      # Read off the GENERATED unit text rather than the option tree,
+      # because the ordering directives are the entire fix and NixOS is what
+      # renders them. (The one exception is the tmpfiles invocation, read
+      # from `.script`: NixOS spills that to a separate store derivation, so
+      # the unit text carries only an ExecStart path. It is the verbatim
+      # source of that derivation, one step from generated rather than an
+      # option describing an intention.)
+      #
+      # Two anti-vacuity floors, and the second is the one worth having:
+      #
+      #   * a host with no declared media mount must produce NO unit -- so
+      #     "present" below is a real property rather than one that holds
+      #     unconditionally, and so a no-data-disk host keeps its current
+      #     behaviour exactly.
+      #   * a POOLED host must wait for every BRANCH, not merely for the
+      #     mergerfs mount on top of them. A check that only looked at
+      #     mediaDir would pass while the case that matters most -- the
+      #     per-branch tree -- went unwaited and unseeded.
+      mediaTreeWaitsForItsMounts =
+        let
+          nofailDisk = mountPoint: label: {
+            fileSystems.${mountPoint} = {
+              device = "/dev/disk/by-label/${label}";
+              fsType = "btrfs";
+              options = [ "nofail" ];
+            };
+          };
+
+          hostWith = { storage ? { }, extra ? [ ] }: ferrumLib.mkHost {
+            inherit system;
+            settings = {
+              schemaVersion = realMigrations.currentVersion;
+              inherit storage;
+            };
+            modules = [ ../../../examples/hosts/minimal/configuration.nix ] ++ extra;
+          };
+
+          unitOf = args:
+            let cfg = (hostWith args).config; in
+            if cfg.systemd.units ? "ferrum-media-tree.service"
+            then {
+              present = true;
+              text = cfg.systemd.units."ferrum-media-tree.service".text;
+              script = cfg.systemd.services.ferrum-media-tree.script;
+            }
+            else { present = false; text = ""; script = ""; };
+
+          waitsFor = u: root: lib.hasInfix "\nRequiresMountsFor=${root}\n" u.text;
+          seeds = u: root: lib.hasInfix "--prefix=${root}" u.script;
+
+          bare = unitOf { };
+          single = unitOf { extra = [ (nofailDisk "/data" "ferrum-data") ]; };
+          pooled = unitOf {
+            storage.pool = { enable = true; branches = [ "/mnt/d0" "/mnt/d1" ]; };
+            extra = [ (nofailDisk "/mnt/d0" "d0") (nofailDisk "/mnt/d1" "d1") ];
+          };
+          pooledRoots = [ "/mnt/d0" "/mnt/d1" "/data" ];
+        in
+        {
+          ok = !bare.present
+            && single.present
+            && waitsFor single "/data"
+            && seeds single "/data"
+            && pooled.present
+            && lib.all (waitsFor pooled) pooledRoots
+            && lib.all (seeds pooled) pooledRoots;
+          message =
+            "the ferrum media tree is not ordered after the data mounts it "
+            + "is written to";
+          bareHostHasNoUnit = !bare.present;
+          singlePresent = single.present;
+          singleWaits = waitsFor single "/data";
+          singleSeeds = seeds single "/data";
+          pooledPresent = pooled.present;
+          pooledUnwaited = builtins.filter (r: !(waitsFor pooled r)) pooledRoots;
+          pooledUnseeded = builtins.filter (r: !(seeds pooled r)) pooledRoots;
+        };
+
       # ferrum.daemon.publish: the daemon RUNS and is reachable from
       # nowhere but a tunnel.
       #
@@ -2631,6 +3321,8 @@
         nginx-config-parses = nginxConfigParses;
         reserved-subdomain-collision =
           mkAssertionCheck "reserved-subdomain-collision" reservedSubdomainCollision;
+        duplicate-subdomain-collision =
+          mkAssertionCheck "duplicate-subdomain-collision" duplicateSubdomainCollision;
         nginx-emits-no-cors-headers =
           mkAssertionCheck "nginx-emits-no-cors-headers" nginxEmitsNoCorsHeaders;
         root-folders-reach-the-apps = rootFoldersReachTheApps;
@@ -2641,6 +3333,18 @@
           mkAssertionCheck "ui-renders-every-schema-type" uiRendersEverySchemaType;
         pool-branches-are-all-seeded =
           mkAssertionCheck "pool-branches-are-all-seeded" poolBranchesAreAllSeeded;
+        pool-assertions-can-fire =
+          mkAssertionCheck "pool-assertions-can-fire" poolAssertionsCanFire;
+        media-tree-waits-for-its-mounts =
+          mkAssertionCheck "media-tree-waits-for-its-mounts" mediaTreeWaitsForItsMounts;
+        fixed-ports-are-enforced =
+          mkAssertionCheck "fixed-ports-are-enforced" fixedPortsAreEnforced;
+        selfsigned-cert-tracks-its-domain =
+          mkAssertionCheck "selfsigned-cert-tracks-its-domain" selfSignedCertTracksItsDomain;
+        recyclarr-needs-an-arr =
+          mkAssertionCheck "recyclarr-needs-an-arr" recyclarrNeedsAnArr;
+        extra-unfree-packages-compose =
+          mkAssertionCheck "extra-unfree-packages-compose" extraUnfreePackagesCompose;
         settings-schema-covers-every-option =
           mkAssertionCheck "settings-schema-covers-every-option" schemaCoversEveryOption;
         installer-offers-every-catalog-app =
@@ -2648,6 +3352,7 @@
         sopsfile-are-paths = mkAssertionCheck "sopsfile-are-paths" sopsFilesArePaths;
         migration-mechanism = mkAssertionCheck "migration-mechanism" migrationMechanism;
         journaldir-collision = mkAssertionCheck "journaldir-collision" journalDirCollision;
+        storage-path-nesting = mkAssertionCheck "storage-path-nesting" storagePathNesting;
         mkhost-applies-migration = mkAssertionCheck "mkhost-applies-migration" mkHostAppliesMigration;
         directive-separators-never-reach-a-generated-file =
           mkAssertionCheck "directive-separators-never-reach-a-generated-file"
