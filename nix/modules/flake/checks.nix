@@ -2553,6 +2553,104 @@
           expectedCount = builtins.length expected;
         };
 
+      # modules/core/pool.nix's own assertions must be able to FIRE.
+      #
+      # Both of them used to live inside `lib.mkIf (pool.enable &&
+      # pool.branches != [ ])`, which meant the one configuration they most
+      # needed to refuse was the one that switched them off. Measured
+      # against the module at 03d569f: `pool.enable = true` with `branches =
+      # [ ]` evaluated with failedAssertions = [] and NO entry at all for
+      # mediaDir in config.fileSystems -- an operator told the host to pool
+      # its disks, was told nothing, and got a single-disk host writing the
+      # library to the OS disk.
+      #
+      # Written against the GENERATED filesystem rather than the options,
+      # because "is there a pool on this host" is a question about
+      # config.fileSystems, and an options-level check would have passed on
+      # the broken module too (pool.enable really was `true`; that was the
+      # whole problem).
+      #
+      # The anti-vacuity half is the `working` case, and it is load-bearing
+      # in both directions: it pins that a legitimate two-branch pool is NOT
+      # refused (an assertion that fires on everything protects nothing) and
+      # that it really does produce a fuse.mergerfs mount (so the
+      # "mediaFsType == null" evidence in the other rows means something).
+      poolAssertionsCanFire =
+        let
+          hostWith = pool: ferrumLib.mkHost {
+            inherit system;
+            settings = {
+              schemaVersion = realMigrations.currentVersion;
+              storage.pool = pool;
+            };
+            modules = [ ../../../examples/hosts/minimal/configuration.nix ];
+          };
+          probe = pool:
+            let
+              cfg = (hostWith pool).config;
+              r = builtins.tryEval {
+                failed = map (a: a.message) (builtins.filter (a: !a.assertion) cfg.assertions);
+                mediaFsType = cfg.fileSystems.${cfg.ferrum.storage.mediaDir}.fsType or null;
+              };
+            in
+            if r.success then r.value else { failed = [ "evaluation threw" ]; mediaFsType = null; };
+
+          # Scoped to the ONE message each case is supposed to produce, and
+          # to a phrase that message keeps on a single line.
+          #
+          # Both halves of that are load-bearing and both were got wrong
+          # while writing this. An unscoped "was anything rejected" passes
+          # identically with these assertions deleted and some unrelated
+          # assertion failing instead. A filter on "ferrum.storage.pool"
+          # looks correctly scoped and silently misses the
+          # mediaDir-is-a-branch message, whose first line names
+          # ferrum.storage.mediaDir and never spells the pool option at all
+          # -- which made this check report that assertion as dead when it
+          # was working. And an infix spanning a line break never matches at
+          # all, because these are multi-line Nix strings.
+          failuresMatching = phrase: p:
+            builtins.filter (m: lib.hasInfix phrase m) (probe p).failed;
+          emptyPhrase = "is on and ferrum.storage.pool.branches";
+          singlePhrase = "A pool of one disk is a mount";
+          selfBranchPhrase = "is also listed as a pool";
+          anyPoolFailure = p:
+            lib.concatMap (phrase: failuresMatching phrase p)
+              [ emptyPhrase singlePhrase selfBranchPhrase ];
+
+          empty = { enable = true; branches = [ ]; };
+          single = { enable = true; branches = [ "/mnt/ferrum-check-a" ]; };
+          selfBranch = {
+            enable = true;
+            branches = [ "/mnt/ferrum-check-a" "/data" ];
+          };
+          working = {
+            enable = true;
+            branches = [ "/mnt/ferrum-check-a" "/mnt/ferrum-check-b" ];
+          };
+
+          emptyRejected = failuresMatching emptyPhrase empty != [ ];
+          # The defect's signature, kept as evidence rather than inferred:
+          # the empty-branch host has no pool filesystem at all.
+          emptyHasNoPool = (probe empty).mediaFsType == null;
+          singleRejected = failuresMatching singlePhrase single != [ ];
+          selfBranchRejected = failuresMatching selfBranchPhrase selfBranch != [ ];
+          workingAccepted = anyPoolFailure working == [ ];
+          workingIsAPool = (probe working).mediaFsType == "fuse.mergerfs";
+        in
+        {
+          ok = emptyRejected
+            && emptyHasNoPool
+            && singleRejected
+            && selfBranchRejected
+            && workingAccepted
+            && workingIsAPool;
+          message =
+            "modules/core/pool.nix's assertions do not fire on a pool "
+            + "configuration they are supposed to refuse";
+          inherit emptyRejected emptyHasNoPool singleRejected selfBranchRejected
+            workingAccepted workingIsAPool;
+        };
+
       # ferrum.daemon.publish: the daemon RUNS and is reachable from
       # nowhere but a tunnel.
       #
@@ -2743,6 +2841,8 @@
           mkAssertionCheck "ui-renders-every-schema-type" uiRendersEverySchemaType;
         pool-branches-are-all-seeded =
           mkAssertionCheck "pool-branches-are-all-seeded" poolBranchesAreAllSeeded;
+        pool-assertions-can-fire =
+          mkAssertionCheck "pool-assertions-can-fire" poolAssertionsCanFire;
         settings-schema-covers-every-option =
           mkAssertionCheck "settings-schema-covers-every-option" schemaCoversEveryOption;
         installer-offers-every-catalog-app =

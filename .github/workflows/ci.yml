@@ -58,7 +58,8 @@ jobs:
             .#checks.x86_64-linux.journaldir-collision \
             .#checks.x86_64-linux.schema-refuses-every-separator-payload \
             .#checks.x86_64-linux.directive-separators-never-reach-a-generated-file \
-            .#checks.x86_64-linux.pool-branches-are-all-seeded
+            .#checks.x86_64-linux.pool-branches-are-all-seeded \
+            .#checks.x86_64-linux.pool-assertions-can-fire
 
       # A check nobody runs protects nothing, and this repo has now written
       # one and left it unwired twice. Sixteen of the thirty-one defined
