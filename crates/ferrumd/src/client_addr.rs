@@ -17,18 +17,45 @@
 //     proxy_set_header  X-Forwarded-For $proxy_add_x_forwarded_for;
 //
 // Those two differ in exactly the way that matters. `X-Real-IP` is SET from
-// nginx's own view of the peer, so whatever the caller sent under that name
-// is overwritten and cannot survive. `X-Forwarded-For` is APPENDED to what
-// the caller sent, so its left-hand entries are attacker-chosen. This file
-// therefore uses X-Real-IP and deliberately never reads X-Forwarded-For.
+// nginx's own view of the peer, so whatever a REMOTE caller sent under that
+// name is overwritten and cannot survive. `X-Forwarded-For` is APPENDED to
+// what the caller sent, so its left-hand entries are attacker-chosen. This
+// file therefore uses X-Real-IP and deliberately never reads
+// X-Forwarded-For.
 //
-// The second half of the rule is that X-Real-IP is only meaningful if nginx
-// really is what produced it. modules/core/daemon.nix asserts at eval time
-// that ferrum.daemon.listenAddress is a loopback address, so nginx is the
-// only thing that can reach ferrumd at all -- which makes "the socket peer
-// is loopback" a real proxy check rather than a guess. If that assertion
-// ever stops holding, a request arriving from somewhere else is Direct and
-// its X-Real-IP is ignored, automatically, with no second place to update.
+// WHAT THE LOOPBACK CHECK DOES NOT PROVE (SEC-03).
+//
+// This file used to say that a loopback socket peer proved a request "came
+// through nginx". It does not, and the claim was the defect. ferrumd binds
+// an AF_INET loopback port and catalog apps run in no network namespace of
+// their own, so ANY process on this host -- including a compromised sibling
+// app, which the spec's own threat model enumerates -- can open
+// 127.0.0.1:7788 and send whatever X-Real-IP it likes.
+// modules/proxy/nginx.nix:170-178 already reaches exactly this conclusion
+// for `Remote-User`; the same reasoning applies three files away and had
+// not been carried across.
+//
+// There is no distinguisher available inside this crate. nginx and a local
+// process present the identical socket peer, and every address in
+// 127.0.0.0/8 is bindable by an unprivileged local process, so the peer
+// cannot separate them even in principle. A shared secret that nginx sets
+// and a sibling app cannot read would be a real distinguisher, but it lives
+// in the proxy configuration, not here.
+//
+// So this file does two things instead, and neither pretends otherwise:
+//
+//   1. It reports the CLAIM as a claim. `source()` says
+//      `x-real-ip-claimed`, and the audit line carries the real socket peer
+//      beside it. An operator reading the journal sees what ferrumd knows
+//      rather than what it hoped.
+//
+//   2. It gives the throttle a second axis the caller cannot choose.
+//      `peer_key` folds the whole of 127.0.0.0/8 into ONE identity, because
+//      "something on this box" is the finest distinction that is actually
+//      true. A local caller rotating X-Real-IP to escape its own throttle
+//      bucket cannot rotate out of that one -- see auth.rs's
+//      distinct-claim rule, which turns the rotation itself into the
+//      signal.
 //
 // Note for the D4 scan in main.rs: X-Real-IP is not a forward-auth identity
 // header and is not on that forbid-list. Nothing here influences WHO the
@@ -41,6 +68,16 @@ use std::net::{IpAddr, SocketAddr};
 /// The header nginx sets from its own view of the peer.
 const REAL_IP_HEADER: &str = "x-real-ip";
 
+/// The one throttle identity every on-box caller shares.
+///
+/// Deliberately coarse. `127.0.0.0/8` is routed entirely to `lo`, so an
+/// unprivileged local process can bind `127.0.0.2`, `127.0.0.3`, and so on
+/// at will; keying anything on the specific loopback address would hand that
+/// process a fresh bucket per connection. Folding the range into a single
+/// identity is the honest statement of what ferrumd can tell apart: on-box
+/// from off-box, and nothing finer.
+const LOOPBACK_TRUST_DOMAIN: &str = "loopback";
+
 /// A request's origin, carrying how it was determined.
 ///
 /// The provenance is part of the value rather than dropped on the floor,
@@ -48,11 +85,17 @@ const REAL_IP_HEADER: &str = "x-real-ip";
 /// address came from reads as authoritative whether or not it is.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ClientAddr {
-    /// nginx's `X-Real-IP`, trusted because the request arrived over
-    /// loopback and so came through the proxy.
-    Proxied(IpAddr),
-    /// The socket peer itself -- either a direct loopback caller, or a
-    /// request that reached ferrumd without passing through nginx.
+    /// An `X-Real-IP` sent by an on-box caller.
+    ///
+    /// Both halves are kept. `claimed` is nginx's view of the remote client
+    /// when nginx really is the sender -- useful, and the only way to tell
+    /// two remote clients apart. `peer` is the socket peer, which is all
+    /// ferrumd genuinely observed. The variant carries both so no caller has
+    /// to choose between useful and true: the audit line prints both, and
+    /// the throttle counts against both.
+    Proxied { claimed: IpAddr, peer: IpAddr },
+    /// The socket peer itself -- either an on-box caller that sent no usable
+    /// `X-Real-IP`, or a request that reached ferrumd from off-box.
     Direct(IpAddr),
     /// No peer address was available. In production this does not happen;
     /// it is what the test harness sees, since it drives the router with no
@@ -77,12 +120,12 @@ impl ClientAddr {
         };
         let peer_ip = peer.ip();
         if peer_ip.is_loopback() {
-            if let Some(real) = headers
+            if let Some(claimed) = headers
                 .get(REAL_IP_HEADER)
                 .and_then(|value| value.to_str().ok())
                 .and_then(|value| value.trim().parse::<IpAddr>().ok())
             {
-                return ClientAddr::Proxied(real);
+                return ClientAddr::Proxied { claimed, peer: peer_ip };
             }
         }
         ClientAddr::Direct(peer_ip)
@@ -91,23 +134,47 @@ impl ClientAddr {
     /// The address itself, for a log field.
     pub fn address(&self) -> String {
         match self {
-            ClientAddr::Proxied(ip) | ClientAddr::Direct(ip) => ip.to_string(),
+            ClientAddr::Proxied { claimed, .. } => claimed.to_string(),
+            ClientAddr::Direct(ip) => ip.to_string(),
             ClientAddr::Unknown => "unknown".to_string(),
         }
     }
 
     /// How `address` was determined, logged beside it so an operator reading
-    /// the journal can tell a proxied address from a direct one rather than
-    /// having to assume.
+    /// the journal can tell a claimed address from an observed one rather
+    /// than having to assume.
+    ///
+    /// `x-real-ip-claimed` rather than `x-real-ip`, because the suffix IS
+    /// the finding: any local process can send that header, so the value is
+    /// an assertion by its sender and the journal must not read as though
+    /// ferrumd verified it.
     pub fn source(&self) -> &'static str {
         match self {
-            ClientAddr::Proxied(_) => "x-real-ip",
+            ClientAddr::Proxied { .. } => "x-real-ip-claimed",
             ClientAddr::Direct(_) => "peer",
             ClientAddr::Unknown => "none",
         }
     }
 
+    /// The socket peer ferrumd actually observed, for the audit line.
+    ///
+    /// Always printed beside `address`, including when the two are the same,
+    /// so a claimed address never appears in the journal without the thing
+    /// that would contradict it sitting next to it.
+    pub fn peer(&self) -> String {
+        match self {
+            ClientAddr::Proxied { peer, .. } => peer.to_string(),
+            ClientAddr::Direct(ip) => ip.to_string(),
+            ClientAddr::Unknown => "none".to_string(),
+        }
+    }
+
     /// The key the login throttle counts against.
+    ///
+    /// Claim-derived on purpose: it is what keeps two remote clients in
+    /// separate buckets, which is the whole of M-02's fix. It is therefore
+    /// also rotatable by an on-box caller, which is why it is never the only
+    /// axis -- see `peer_key`.
     ///
     /// Deliberately the same string for every `Unknown` caller. That case
     /// does not arise on a real host (there is always a socket), and making
@@ -115,6 +182,23 @@ impl ClientAddr {
     /// rather than exempt.
     pub fn throttle_key(&self) -> String {
         format!("{}:{}", self.source(), self.address())
+    }
+
+    /// The trust domain the request arrived from, which the caller cannot
+    /// choose.
+    ///
+    /// Every on-box peer collapses to one value (see
+    /// `LOOPBACK_TRUST_DOMAIN`), so a local process gains nothing by binding
+    /// a different `127.x` source address or by rewriting `X-Real-IP`. An
+    /// off-box peer is its own domain, so the coarse key never lumps the
+    /// whole internet into one bucket.
+    pub fn peer_key(&self) -> String {
+        match self {
+            ClientAddr::Proxied { .. } => LOOPBACK_TRUST_DOMAIN.to_string(),
+            ClientAddr::Direct(ip) if ip.is_loopback() => LOOPBACK_TRUST_DOMAIN.to_string(),
+            ClientAddr::Direct(ip) => format!("peer:{ip}"),
+            ClientAddr::Unknown => "none".to_string(),
+        }
     }
 }
 
@@ -141,9 +225,29 @@ mod tests {
     fn a_loopback_peer_with_a_real_ip_header_is_the_proxied_client() {
         let resolved =
             ClientAddr::resolve(peer("127.0.0.1:53124"), &headers(&[("x-real-ip", "203.0.113.7")]));
-        assert_eq!(resolved, ClientAddr::Proxied("203.0.113.7".parse().unwrap()));
+        assert_eq!(
+            resolved,
+            ClientAddr::Proxied {
+                claimed: "203.0.113.7".parse().unwrap(),
+                peer: "127.0.0.1".parse().unwrap(),
+            }
+        );
         assert_eq!(resolved.address(), "203.0.113.7");
-        assert_eq!(resolved.source(), "x-real-ip");
+        assert_eq!(resolved.source(), "x-real-ip-claimed");
+    }
+
+    /// SEC-03. The claim must never erase the thing that would contradict
+    /// it: whatever `X-Real-IP` says, the socket peer is still recorded.
+    #[test]
+    fn a_proxied_client_still_carries_the_socket_peer_it_actually_came_from() {
+        let resolved =
+            ClientAddr::resolve(peer("127.0.0.1:53124"), &headers(&[("x-real-ip", "203.0.113.7")]));
+        assert_eq!(resolved.address(), "203.0.113.7");
+        assert_eq!(
+            resolved.peer(),
+            "127.0.0.1",
+            "a claimed address must not replace the peer ferrumd really observed"
+        );
     }
 
     /// The whole point of the loopback condition. A request that did NOT
@@ -214,6 +318,7 @@ mod tests {
         assert_eq!(resolved, ClientAddr::Unknown);
         assert_eq!(resolved.address(), "unknown");
         assert_eq!(resolved.source(), "none");
+        assert_eq!(resolved.peer(), "none");
     }
 
     /// Two different proxied clients must not share a throttle bucket, or
@@ -221,8 +326,49 @@ mod tests {
     /// exists to fix, reintroduced one level down.
     #[test]
     fn different_clients_get_different_throttle_keys() {
-        let a = ClientAddr::Proxied("203.0.113.7".parse().unwrap());
-        let b = ClientAddr::Proxied("203.0.113.8".parse().unwrap());
+        let a = ClientAddr::resolve(peer("127.0.0.1:1"), &headers(&[("x-real-ip", "203.0.113.7")]));
+        let b = ClientAddr::resolve(peer("127.0.0.1:2"), &headers(&[("x-real-ip", "203.0.113.8")]));
         assert_ne!(a.throttle_key(), b.throttle_key());
+    }
+
+    /// SEC-03's unforgeable axis, at this level.
+    ///
+    /// Every route onto the box -- a different claimed address, a different
+    /// loopback source address, no header at all -- resolves to the SAME
+    /// peer key, because on-box versus off-box is the only distinction
+    /// ferrumd can actually make. If this ever starts returning different
+    /// values for these, auth.rs's distinct-claim rule stops binding and an
+    /// on-box caller can rotate out of its own throttle again.
+    #[test]
+    fn every_on_box_caller_shares_one_peer_key_however_it_dresses_itself_up() {
+        let rotated_claim =
+            ClientAddr::resolve(peer("127.0.0.1:1"), &headers(&[("x-real-ip", "203.0.113.7")]));
+        let other_claim =
+            ClientAddr::resolve(peer("127.0.0.1:2"), &headers(&[("x-real-ip", "198.51.100.9")]));
+        // 127.0.0.0/8 is routed entirely to lo, so an unprivileged process
+        // can bind any of it: a different loopback source is not a different
+        // caller.
+        let rotated_peer =
+            ClientAddr::resolve(peer("127.0.0.9:3"), &headers(&[("x-real-ip", "203.0.113.7")]));
+        let no_header = ClientAddr::resolve(peer("127.0.0.5:4"), &headers(&[]));
+
+        for other in [&other_claim, &rotated_peer, &no_header] {
+            assert_eq!(
+                rotated_claim.peer_key(),
+                other.peer_key(),
+                "an on-box caller must not be able to change its peer key: {other:?}"
+            );
+        }
+    }
+
+    /// The converse: an off-box caller is genuinely a distinct domain, so
+    /// the coarse key does not lump the whole internet together.
+    #[test]
+    fn an_off_box_peer_is_its_own_trust_domain() {
+        let remote = ClientAddr::Direct("198.51.100.4".parse().unwrap());
+        let other_remote = ClientAddr::Direct("198.51.100.5".parse().unwrap());
+        let local = ClientAddr::Direct("127.0.0.1".parse().unwrap());
+        assert_ne!(remote.peer_key(), other_remote.peer_key());
+        assert_ne!(remote.peer_key(), local.peer_key());
     }
 }
