@@ -38,9 +38,37 @@ Last updated at HEAD `288f2b3`, branch `grounding-and-install-path`. Nothing pus
         `SEC-M03…`, each bound to accepting person, evidence hash and commit, each going stale
         automatically if the code moves.
 
-- [ ] **2. Decide: a failed stage 2 now leaves no web UI at all.** Stage 1 turns the daemon off so
-      it cannot be published without auth. Correct for security; it means recovery from a failed
-      install is SSH-only. Your call, and it bears directly on the hands-off requirement.
+- [~] **2. A failed stage 2 leaves no web UI.** DECIDED 2026-09-23: **keep the daemon
+      unpublished, but keep it RUNNING on loopback** so the SSH-tunnel route reaches a real
+      dashboard. Scoped below; not yet built.
+      - **Why it happens.** `modules/core/daemon.nix:60` wraps the whole module in
+        `lib.mkIf ferrum.daemon.enable`, so stage 1's `daemon.enable = false`
+        (`render.rs:670`) does not merely unpublish the daemon — it stops it existing. No
+        service, nothing on loopback, nothing to tunnel to.
+      - **Why `enable = false` was right anyway.** `daemonPublished = daemon.enable &&
+        proxy.enable && baseDomain != ""` (`modules/proxy/lib.nix:76`), and stage 1 writes
+        `proxy.enable` and a `baseDomain` because ACME needs them. Stage 1 also cannot enable
+        Authelia (its sops secrets cannot exist before the host does). So omitting the key would
+        publish settings, apply and rollback at `ferrum.<domain>`, on a real certificate that
+        makes the hostname easy to find, with `auth_request` absent. Not theoretical — stage 2
+        has failed on real hardware here more than once.
+      - **The fix: split running from publishing.** Add `ferrum.daemon.publish` (default true).
+        `daemonPublished` becomes `enable && publish && proxy.enable && baseDomain != ""`.
+        Stage 1 then writes `{ enable = true; publish = false; }` — ferrumd runs, bound to
+        loopback (already asserted loopback-only, `daemon.nix:58,82-90`), unreachable from the
+        network, and still behind its own `__Host-ferrumd_session` login, so an SSH tunnel is
+        not an unauthenticated back door.
+      - **This also closes R13 deferred ticket #1.** That ticket wants `dns.nix` `daemonRecords`
+        gated on `proxyLib.daemonPublished ferrum` instead of publishing a record for a hostname
+        nginx closes. The same predicate change fixes both, so they should land together rather
+        than one reversing the other.
+      - **Touches:** `modules/core/options.nix`, `modules/lib/settings-schema.json`,
+        `modules/proxy/lib.nix`, `modules/proxy/dns.nix`, `crates/ferrum-install/src/render.rs`,
+        plus the `checks.nix` anti-vacuity guard that currently depends on ticket #1 staying
+        unfixed. Feature-shaped: wants the pipeline, not a patch.
+      - **Lands with item 11** (confirm the SSH-tunnel route in a real browser), which is the
+        acceptance test for exactly this.
+
 - [ ] **3. Push the branch and open the PR.** 141+ commits, no upstream set. Needs your explicit
       go-ahead — this is the only step that leaves your machine.
 
