@@ -2651,6 +2651,117 @@
             workingAccepted workingIsAPool;
         };
 
+      # An app the catalog marks `portIsFixed` really cannot honour a port,
+      # and ferrum refuses to be pointed at one it cannot reach.
+      #
+      # ferrum.apps.<id>.port is one uniform option across the catalog --
+      # that uniformity is what lets the UI render one form rather than
+      # seven -- but only four of the seven apps wire it through. Plex and
+      # Jellyfin have no port setting at any layer: not in ferrum, not in
+      # nixpkgs' modules, not in the applications. The option was not inert
+      # on them, though, because modules/proxy/nginx.nix generates
+      # `proxy_pass http://127.0.0.1:${port}` from the same value. Measured
+      # before the catalog carried this field: plex.port = 9999 rendered
+      # `proxy_pass http://127.0.0.1:9999` with ZERO failed assertions while
+      # Plex went on serving 32400 -- a 502 and a failing reconciler health
+      # check, with nothing said at eval time by the layer that knew.
+      #
+      # Two properties, and the second is what stops this from being a
+      # comment that agrees with itself:
+      #
+      #   1. a changed port on a portIsFixed app is REFUSED, and the catalog
+      #      default is not,
+      #   2. the mark is TRUE -- the generated systemd units of a host with
+      #      that app's port moved carry no trace of the new number, read
+      #      off the rendered unit text with the proxy OFF so nginx's own
+      #      proxy_pass cannot supply a false positive.
+      #
+      # (2) is what makes this survive nixpkgs. If a future nixpkgs adds a
+      # port option and modules/apps/<id>/service.nix wires it, the port
+      # appears in the units, this check fails, and the answer is to drop
+      # the mark rather than to keep refusing a port the app can now honour.
+      #
+      # The anti-vacuity floor is `sonarr`, which is NOT marked: moving its
+      # port must be accepted AND must show up in the generated units. Half
+      # of that is the positive control for the detector in (2) -- without
+      # it, a detector that always answered "false" would pass every marked
+      # app triumphantly. Plus a non-empty floor on the marked set itself,
+      # since a check over nothing checks nothing.
+      #
+      # Deliberately NOT covered, and named here so it stays visible rather
+      # than becoming a silence: `sabnzbd` also fails to carry its port into
+      # the generated units, and is not marked portIsFixed. Its port is not
+      # fixed -- SABnzbd is perfectly capable of listening elsewhere -- it
+      # is configured by crates/, outside this module tree, so the honest
+      # fix is there and marking it here would assert something false.
+      fixedPortsAreEnforced =
+        let
+          movedPort = 9111;
+
+          hostWith = { id, port, proxy }: ferrumLib.mkHost {
+            inherit system;
+            settings = {
+              schemaVersion = realMigrations.currentVersion;
+              proxy = { enable = proxy; }
+                // lib.optionalAttrs proxy {
+                baseDomain = "example.test";
+                acme.email = "a@example.test";
+              };
+              apps.${id} = { enable = true; inherit port; };
+            };
+            modules = [ ../../../examples/hosts/minimal/configuration.nix ];
+          };
+
+          # Scoped to this assertion's own message, on a phrase it keeps to
+          # one line -- the same discipline every tryEval probe in this file
+          # uses, for the same reason.
+          refuses = id: port:
+            let
+              probe = builtins.tryEval (
+                builtins.filter (m: lib.hasInfix "a port it cannot honour" m)
+                  (map (a: a.message)
+                    (builtins.filter (a: !a.assertion)
+                      (hostWith { inherit id port; proxy = true; }).config.assertions))
+              );
+            in
+            if probe.success then probe.value != [ ] else true;
+
+          # Does the port reach the GENERATED system at all? Proxy off, so
+          # the only thing that could carry it is the app's own service.
+          unitsCarry = id: port:
+            let
+              units = (hostWith { inherit id port; proxy = false; }).config.systemd.units;
+            in
+            builtins.any (u: lib.hasInfix (toString port) (u.text or ""))
+              (builtins.attrValues units);
+
+          fixedApps = builtins.attrNames
+            (lib.filterAttrs (_: meta: meta.portIsFixed or false) catalog);
+
+          notRefused = builtins.filter (id: !(refuses id movedPort)) fixedApps;
+          refusedAtDefault = builtins.filter
+            (id: refuses id catalog.${id}.defaultPort)
+            fixedApps;
+          markedButWired = builtins.filter (id: unitsCarry id movedPort) fixedApps;
+
+          # The positive control.
+          controlRefused = refuses "sonarr" movedPort;
+          controlWired = unitsCarry "sonarr" movedPort;
+        in
+        {
+          ok = fixedApps != [ ]
+            && notRefused == [ ]
+            && refusedAtDefault == [ ]
+            && markedButWired == [ ]
+            && !controlRefused
+            && controlWired;
+          message =
+            "the catalog's portIsFixed marks do not match what the generated "
+            + "system actually does with ferrum.apps.<id>.port";
+          inherit fixedApps notRefused refusedAtDefault markedButWired
+            controlRefused controlWired;
+        };
+
       # The media tree is seeded AFTER the data mounts, not alongside them.
       #
       # Every ferrum data mount carries `nofail`, and per systemd.mount(5)
@@ -2934,6 +3045,8 @@
           mkAssertionCheck "pool-assertions-can-fire" poolAssertionsCanFire;
         media-tree-waits-for-its-mounts =
           mkAssertionCheck "media-tree-waits-for-its-mounts" mediaTreeWaitsForItsMounts;
+        fixed-ports-are-enforced =
+          mkAssertionCheck "fixed-ports-are-enforced" fixedPortsAreEnforced;
         settings-schema-covers-every-option =
           mkAssertionCheck "settings-schema-covers-every-option" schemaCoversEveryOption;
         installer-offers-every-catalog-app =
