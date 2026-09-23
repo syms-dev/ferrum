@@ -35,7 +35,7 @@ mistakes, and a blanket strip would delete exactly them.
   is kept. A comment narrating **what** the next line does is cut.
 - **A2.** Survivors are rewritten with the `humanizer` skill against the 25 patterns, and ferrum's
   own voice layer.
-- **A3.** `.claude/rules/documentation.md`'s requirements still hold: every file keeps a module
+- **A3.** The project's documentation rules still hold: every file keeps a module
   header, every public function keeps a docstring. This is a trim, not a strip.
 - **A4.** No behaviour changes. The test count before and after is identical, and the diff is
   comments only — provable with `git diff --stat` on non-comment lines.
@@ -178,7 +178,7 @@ together, atomically — is invisible until something breaks. It cannot be argue
 
 ## Operational task, not a requirement: the git history rewrite
 
-Owner approved on 2026-09-21, with the inventory: **226 commits, 186 carrying the Claude trailer,
+Owner approved on 2026-09-21, with the inventory: **226 commits, 186 carrying an assistant trailer,
 across `main`, `grounding-and-install-path` and 6 stale `worktree-agent-*` branches; 0 tags; 20+
 commit SHAs referenced inside docs and evidence files.** Nobody else has cloned the repo.
 
@@ -193,7 +193,7 @@ Sequence, and it must not start early:
 5. Force-push `main` and `grounding-and-install-path`.
 6. Owner re-clones or resets: `git fetch && git reset --hard origin/<branch>`.
 
-From this point on, **no commit or PR in this repository carries Claude attribution in any form.**
+From this point on, **no commit or PR in this repository carries assistant attribution in any form.**
 
 ## Sequencing
 

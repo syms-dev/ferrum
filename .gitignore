@@ -16,6 +16,22 @@ Thumbs.db
 
 # Local agent/tooling config -- not part of the ferrum project
 .claude/
+
+# Agent/SDLC tooling is how ferrum is BUILT, not part of what ferrum IS.
+# ferrum is a NixOS media-server appliance; a reader cloning it wants the
+# modules, the crates and the installer, not a development pipeline's
+# scaffolding. Keeping it out also stops two specific embarrassments:
+# .ckit/config/stack-catalog.snapshot.yaml records python/fastapi/postgres
+# for a repo with zero .py files, and the agent-memory store is a running
+# commentary on the project's own mistakes. Both are useful locally and
+# neither belongs in front of a stranger.
+#
+# All of it still works -- these files live on disk and the hooks read
+# them. They are simply not distributed.
+.ckit/
+AGENTS.md
+README.claude-sdlc.md
+.design-sync/NOTES.md
 .serena/
 .superpowers/
 CLAUDE.md

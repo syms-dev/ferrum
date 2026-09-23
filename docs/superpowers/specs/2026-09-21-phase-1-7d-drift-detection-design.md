@@ -5,7 +5,7 @@ until that runs, and not until the Phase 1.7 R1 pipeline run finishes (one run p
 
 ## Why this exists
 
-The dashboard design produced in Claude Design put configuration drift at the top of the apps
+The dashboard design put configuration drift at the top of the apps
 screen — the first and largest thing an operator sees — and it is right to. But `grep -rn "drift"
 crates modules` returns only incidental uses of the word in comments. **Nothing in ferrum detects
 drift.** The dashboard's best screen is blocked on a capability Phase 1 never specced.

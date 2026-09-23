@@ -177,7 +177,7 @@ say it.
 - Numbers, paths and names stay exact. Precision is never traded for friendliness.
 - A failure says what broke, what it means, and what to do. Nothing else.
 - No element explains what ferrum is. The operator installed it.
-- The voice is `.claude/skills/humanize` plus the installed `humanizer` skill.
+- The voice is the project's own voice guide plus the installed `humanizer` skill.
 
 ## How to tell if a render is right
 
