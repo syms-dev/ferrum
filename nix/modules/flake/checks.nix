@@ -2829,6 +2829,60 @@
           domainSensitive = a.script != b.script;
         };
 
+      # Recyclarr with nothing to sync is a timer that succeeds at nothing.
+      #
+      # `configuration` in modules/core/recyclarr.nix is built from
+      # ferrum.apps.sonarr and ferrum.apps.radarr and from nothing else, so
+      # with neither enabled it is the empty attrset and the host still gets
+      # an enabled services.recyclarr: a timer that wakes on schedule, syncs
+      # nothing, and SUCCEEDS. Measured at 03d569f -- `configuration = { }`,
+      # `systemd.timers ? recyclarr` true, zero failed assertions. A green
+      # unit is indistinguishable from a working feature, which is why this
+      # one is worth an assertion rather than a warning.
+      #
+      # The anti-vacuity half is the sonarr row: with one *arr enabled the
+      # host must be accepted. Without it this passes with an assertion that
+      # refuses Recyclarr outright.
+      recyclarrNeedsAnArr =
+        let
+          hostWith = apps: ferrumLib.mkHost {
+            inherit system;
+            settings = {
+              schemaVersion = realMigrations.currentVersion;
+              recyclarr.enable = true;
+              inherit apps;
+            };
+            modules = [ ../../../examples/hosts/minimal/configuration.nix ];
+          };
+          rejects = apps:
+            let
+              probe = builtins.tryEval (
+                builtins.filter (m: lib.hasInfix "neither ferrum.apps.sonarr" m)
+                  (map (a: a.message)
+                    (builtins.filter (a: !a.assertion) (hostWith apps).config.assertions))
+              );
+            in
+            if probe.success then probe.value != [ ] else true;
+
+          # The defect's signature, kept as evidence rather than inferred.
+          emptyTimer =
+            let cfg = (hostWith { }).config; in
+            cfg.services.recyclarr.configuration == { };
+        in
+        {
+          ok = rejects { }
+            && emptyTimer
+            && !(rejects { sonarr.enable = true; })
+            && !(rejects { radarr.enable = true; });
+          message =
+            "ferrum.recyclarr.enable with no *arr installs a timer that "
+            + "syncs nothing";
+          noArrsRejected = rejects { };
+          inherit emptyTimer;
+          sonarrRejected = rejects { sonarr.enable = true; };
+          radarrRejected = rejects { radarr.enable = true; };
+        };
+
       # An app the catalog marks `portIsFixed` really cannot honour a port,
       # and ferrum refuses to be pointed at one it cannot reach.
       #
@@ -3227,6 +3281,8 @@
           mkAssertionCheck "fixed-ports-are-enforced" fixedPortsAreEnforced;
         selfsigned-cert-tracks-its-domain =
           mkAssertionCheck "selfsigned-cert-tracks-its-domain" selfSignedCertTracksItsDomain;
+        recyclarr-needs-an-arr =
+          mkAssertionCheck "recyclarr-needs-an-arr" recyclarrNeedsAnArr;
         settings-schema-covers-every-option =
           mkAssertionCheck "settings-schema-covers-every-option" schemaCoversEveryOption;
         installer-offers-every-catalog-app =

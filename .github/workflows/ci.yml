@@ -63,7 +63,8 @@ jobs:
             .#checks.x86_64-linux.pool-assertions-can-fire \
             .#checks.x86_64-linux.media-tree-waits-for-its-mounts \
             .#checks.x86_64-linux.fixed-ports-are-enforced \
-            .#checks.x86_64-linux.selfsigned-cert-tracks-its-domain
+            .#checks.x86_64-linux.selfsigned-cert-tracks-its-domain \
+            .#checks.x86_64-linux.recyclarr-needs-an-arr
 
       # A check nobody runs protects nothing, and this repo has now written
       # one and left it unwired twice. Sixteen of the thirty-one defined
