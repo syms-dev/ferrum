@@ -2291,6 +2291,65 @@
           outcomes = map (p: "${p.name}: ${p.outcome}") (injections ++ controls);
         };
 
+      # EVERY pool branch carries the whole TRaSH tree, not just the first.
+      #
+      # `modules/core/storage.nix` seeds the tree on each branch rather than
+      # only on mediaDir, and the reason is mergerfs' default create policy.
+      # `epmfs` means "existing path, most free space": it will only place a
+      # new file on a branch that ALREADY has the parent directory. Seed the
+      # tree on one disk and that disk is the only candidate forever -- a
+      # fresh multi-disk install puts the entire library on one disk, and a
+      # disk added later stays inert. That was a real defect here, fixed in
+      # `0993b7b`, and nothing pinned it afterwards.
+      #
+      # It is the same shape as every other pairing this file guards: two
+      # things that must agree, with no mechanical check between them. The
+      # expected subdirectory list is deliberately NOT written out here --
+      # it is derived from the generated rules for the first branch, and the
+      # other branches are required to match it. A hardcoded copy would be a
+      # third list to drift, and it would keep passing while storage.nix
+      # stopped seeding anything at all.
+      poolBranchesAreAllSeeded =
+        let
+          branches = [ "/mnt/ferrum-check-a" "/mnt/ferrum-check-b" "/mnt/ferrum-check-c" ];
+          host = ferrumLib.mkHost {
+            inherit system;
+            settings = {
+              schemaVersion = realMigrations.currentVersion;
+              storage.pool = { enable = true; inherit branches; };
+            };
+            modules = [ ../../../examples/hosts/minimal/configuration.nix ];
+          };
+          rules = host.config.systemd.tmpfiles.rules;
+
+          # The subpaths a given root is seeded with, read off the GENERATED
+          # rules rather than off the option tree -- the same discipline the
+          # separator checks use, and for the same reason: the generated text
+          # is what the host actually acts on.
+          seededUnder = root:
+            let
+              prefix = "d ${root}/";
+              width = builtins.stringLength prefix;
+              mine = builtins.filter (r: builtins.substring 0 width r == prefix) rules;
+              subpathOf = r:
+                builtins.head (lib.splitString " " (builtins.substring width 9999 r));
+            in
+            lib.naturalSort (map subpathOf mine);
+
+          perBranch = map (b: { branch = b; subpaths = seededUnder b; }) branches;
+          expected = (builtins.head perBranch).subpaths;
+          divergent = builtins.filter (b: b.subpaths != expected) perBranch;
+        in
+        {
+          # The length floor is the anti-vacuity half. Without it this check
+          # passes triumphantly when storage.nix seeds NOTHING, because three
+          # empty lists agree with each other perfectly.
+          ok = divergent == [ ] && builtins.length expected >= 5;
+          seededPerBranch = map (b: { inherit (b) branch; count = builtins.length b.subpaths; }) perBranch;
+          divergentBranches = map (b: b.branch) divergent;
+          expectedCount = builtins.length expected;
+        };
+
       mkAssertionCheck = name: result:
         pkgs.runCommand "ferrum-check-${name}" { } (
           if result.ok then
@@ -2314,6 +2373,8 @@
         schema-uniformity = mkAssertionCheck "schema-uniformity" schemaUniformity;
         ui-renders-every-schema-type =
           mkAssertionCheck "ui-renders-every-schema-type" uiRendersEverySchemaType;
+        pool-branches-are-all-seeded =
+          mkAssertionCheck "pool-branches-are-all-seeded" poolBranchesAreAllSeeded;
         settings-schema-covers-every-option =
           mkAssertionCheck "settings-schema-covers-every-option" schemaCoversEveryOption;
         installer-offers-every-catalog-app =
