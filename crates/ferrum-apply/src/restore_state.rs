@@ -65,6 +65,56 @@ fn validate_snapshot_name(snapshot: &str) -> anyhow::Result<()> {
     }
 }
 
+/// `FERRUM_ROOT_DEVICE` becomes an argv entry of `mount`, run as root from
+/// a `DefaultDependencies = false` unit ordered before `local-fs.target`.
+/// Reject anything that cannot be a device path.
+///
+/// The leading `-` is the whole finding. Until this existed the only guard
+/// was `is_empty()`, so a value starting with `-` was not passed to `mount`
+/// as a device at all -- `mount` parses it as an option, and `-o` takes the
+/// NEXT argv entry as its argument, which here is the scratch mount point.
+/// One environment value therefore rewrote the shape of a privileged
+/// early-boot command. Requiring an absolute path covers that and every
+/// other non-device value in one rule, which beats a denylist of leading
+/// `-`: `dev/sda1` is not a device either.
+///
+/// This is `validate_snapshot_name`'s sibling. That one guards the other
+/// externally-supplied component of the same operation, and the two
+/// together are the whole of what `restore-state` accepts from outside.
+///
+/// Nothing is taken away from a working host:
+/// `modules/core/state-restore.nix` asserts at evaluation time that
+/// `fileSystems.<stateDir>.device` resolves to "a concrete block device",
+/// and refuses to build otherwise.
+///
+/// # Arguments
+/// * `root_device` - the value of `FERRUM_ROOT_DEVICE`, possibly empty
+///   when NixOS omitted the variable.
+///
+/// # Errors
+/// An `anyhow::Error` naming `FERRUM_ROOT_DEVICE` when the value is empty,
+/// is not an absolute path, or carries a NUL or a newline.
+fn validate_root_device(root_device: &str) -> anyhow::Result<()> {
+    if root_device.is_empty() {
+        anyhow::bail!(
+            "FERRUM_ROOT_DEVICE is not set (or resolved empty) -- cannot mount the \
+             top-level btrfs volume to perform the restore"
+        );
+    }
+    if !root_device.starts_with('/') {
+        anyhow::bail!(
+            "FERRUM_ROOT_DEVICE must be an absolute device path, got {root_device:?} -- \
+             a value that is not a path reaches mount as an option rather than a device"
+        );
+    }
+    if root_device.contains('\0') || root_device.contains('\n') {
+        anyhow::bail!(
+            "FERRUM_ROOT_DEVICE must not contain a NUL or a newline, got {root_device:?}"
+        );
+    }
+    Ok(())
+}
+
 /// Performs the validated snapshot-and-rename swap (Phase 1.0 probe 0.2)
 /// against the top-level btrfs volume mounted at `scratch_mount`.
 fn perform_swap(scratch_mount: &Path, snapshot: &str) -> anyhow::Result<PathBuf> {
@@ -110,12 +160,7 @@ fn perform_swap(scratch_mount: &Path, snapshot: &str) -> anyhow::Result<PathBuf>
 /// normal fail-closed flow, not a special case checked before the marker is
 /// written.
 fn attempt_restore(root_device: &str, snapshot: &str, target_generation: u32) -> anyhow::Result<()> {
-    if root_device.is_empty() {
-        anyhow::bail!(
-            "FERRUM_ROOT_DEVICE is not set (or resolved empty) -- cannot mount the \
-             top-level btrfs volume to perform the restore"
-        );
-    }
+    validate_root_device(root_device)?;
 
     // rollback::prepare writes the intent before `nix-env --switch-generation`
     // runs, so it's possible in principle for what actually booted to differ
@@ -298,6 +343,48 @@ mod tests {
         assert!(validate_snapshot_name("").is_err());
         assert!(validate_snapshot_name(".").is_err());
         assert!(validate_snapshot_name("..").is_err());
+    }
+
+    /// R2/SEC3. `FERRUM_ROOT_DEVICE` is interpolated straight into
+    /// `mount`'s argv, as root, from a `DefaultDependencies = false` unit
+    /// ordered before `local-fs.target` -- about as early and as privileged
+    /// as code on this host gets. The only guard was `is_empty()`, so a
+    /// value beginning with `-` is not a device at all: `mount` parses it
+    /// as an option, and `-o` in particular takes the NEXT argv entry as
+    /// its argument, which here is the scratch mount point. That silently
+    /// reshapes the whole command.
+    ///
+    /// Asserted through `attempt_restore` rather than the validator alone,
+    /// because the property is about ORDER: the refusal has to land before
+    /// anything else is attempted, exactly as the `is_empty()` check did.
+    /// `modules/core/state-restore.nix`'s own assertions already require
+    /// `fileSystems.<stateDir>.device` to be "a concrete block device", so
+    /// requiring an absolute path takes nothing away that a working host
+    /// has.
+    #[test]
+    fn a_root_device_that_is_really_an_option_never_reaches_mount() {
+        for bad in ["-o", "--bind", "-o subvolid=5", "", "dev/sda1", "/dev/sda\n-o"] {
+            let err = attempt_restore(bad, "1000-gen1", 1).unwrap_err();
+            let message = format!("{err:#}");
+            assert!(
+                message.contains("FERRUM_ROOT_DEVICE"),
+                "root device {bad:?} was not refused as a device -- it failed later, \
+                 with: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_real_block_device_path_is_still_accepted() {
+        for good in [
+            "/dev/sda1",
+            "/dev/nvme0n1p2",
+            "/dev/disk/by-uuid/0a1b2c3d-4e5f-6071-8293-a4b5c6d7e8f9",
+            "/dev/mapper/cryptroot",
+        ] {
+            validate_root_device(good)
+                .unwrap_or_else(|e| panic!("rejected a real device path {good:?}: {e}"));
+        }
     }
 
     /// The single most safety-critical property in this module: a malformed
