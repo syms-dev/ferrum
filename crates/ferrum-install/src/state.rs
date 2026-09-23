@@ -148,10 +148,58 @@ pub fn read(dir: &Path) -> anyhow::Result<Option<InstallState>> {
 /// # Errors
 /// Any filesystem failure.
 pub fn write(dir: &Path, state: &InstallState) -> anyhow::Result<()> {
-    let p = path_in(dir);
-    let tmp = p.with_extension("json.tmp");
-    std::fs::write(&tmp, serde_json::to_string_pretty(state)?)?;
-    std::fs::rename(&tmp, &p)?;
+    write_json_atomically(&path_in(dir), state)
+}
+
+/// Writes a JSON document so that a crash leaves either the old file or the
+/// new one, never a truncated one.
+///
+/// Temp file, fsync, rename, fsync the directory. The first three steps were
+/// already here; the two fsyncs were not, and without them "atomically" was
+/// a claim about `rename` alone. `rename` is atomic with respect to other
+/// processes, which is a different guarantee from durability across a crash:
+/// the rename can reach the journal while the temp file's CONTENTS are still
+/// only in page cache, so a power loss can leave the name pointing at a file
+/// that is empty or partly written -- precisely the "partially written
+/// record of a destructive action" the docstring above says is worse than no
+/// record. Syncing the file before the rename orders the data ahead of the
+/// name; syncing the parent directory afterwards makes the rename itself
+/// durable, since a directory entry is metadata and needs its own flush.
+///
+/// This is a record of whether a disk has been repartitioned, so the cost of
+/// two fsyncs at a handful of phase transitions is not worth weighing
+/// against reading it wrong.
+///
+/// # Arguments
+/// * `path` - the final path. The temp file is written beside it, which is
+///   required: a rename is only atomic within one filesystem.
+/// * `value` - the document to serialize.
+///
+/// # Errors
+/// Any serialization or filesystem failure.
+pub fn write_json_atomically<T: serde::Serialize>(
+    path: &Path,
+    value: &T,
+) -> anyhow::Result<()> {
+    let tmp = path.with_extension("json.tmp");
+    let body = serde_json::to_string_pretty(value)?;
+
+    {
+        use std::io::Write as _;
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(body.as_bytes())?;
+        // Contents before the name, or the name can arrive first.
+        f.sync_all()?;
+    }
+
+    std::fs::rename(&tmp, path)?;
+
+    // The rename is a directory-entry change, and that entry needs its own
+    // flush to survive a crash. Opening a directory read-only and fsyncing
+    // it is the standard way to do that.
+    if let Some(parent) = path.parent() {
+        std::fs::File::open(parent)?.sync_all()?;
+    }
     Ok(())
 }
 
@@ -283,6 +331,45 @@ pub fn effective_reached(resume: &Resume) -> Option<Phase> {
 
 #[cfg(test)]
 mod tests {
+    /// The observable half of the atomic-write contract: the final file has
+    /// the whole document and the temp file is not left behind.
+    ///
+    /// The durability half -- that the contents are fsynced before the
+    /// rename and the directory entry after it -- cannot be observed from
+    /// inside the process that performed it; it is asserted at the syscall
+    /// level instead, and that evidence is recorded in this change's commit
+    /// message rather than in a test that would only be re-asserting
+    /// `sync_all` returned `Ok`.
+    #[test]
+    fn a_written_record_reads_back_whole_and_leaves_no_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("install-inventory.json");
+        write_json_atomically(&path, &serde_json::json!({"device": "sdb"})).unwrap();
+
+        let back: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(back["device"], "sdb");
+        assert!(
+            !path.with_extension("json.tmp").exists(),
+            "the temp file is consumed by the rename"
+        );
+    }
+
+    /// Replacing an existing record is the case that matters: the old
+    /// content must never be observable half-overwritten.
+    #[test]
+    fn a_rewritten_record_replaces_the_previous_one_completely() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("install-state.json");
+        write_json_atomically(&path, &serde_json::json!({"phase": "Generated"})).unwrap();
+        write_json_atomically(&path, &serde_json::json!({"phase": "Verified"})).unwrap();
+
+        let back: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(back["phase"], "Verified");
+        assert_eq!(back.as_object().unwrap().len(), 1, "no residue: {back}");
+    }
+
     /// The IP changing after an install is NORMAL -- the install sets the
     /// hostname, so the machine requests a new DHCP lease and comes back
     /// on a different address. It happened on the first real install
