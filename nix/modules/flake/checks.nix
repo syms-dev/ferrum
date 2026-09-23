@@ -1971,6 +1971,326 @@
           echo ok > $out
         '';
 
+      # The other half of the two-layer control, and the half nothing in the
+      # repo pinned until now.
+      #
+      # modules/lib/hostnames.nix refuses a bad value at EVALUATION;
+      # modules/lib/settings-schema.json refuses the WRITE, which is what
+      # stops ferrumd's PUT /api/settings composing it in the first place.
+      # The difference matters to an operator: refused at the schema they
+      # get an error and their old settings; refused at evaluation they get
+      # a saved settings.json and an apply that fails.
+      #
+      # crates/ferrumd/src/settings.rs does test these patterns, but against
+      # constants TRANSCRIBED into Rust -- its own comment says so, and
+      # explains why: every Rust derivation in nix/ filters `src` down to
+      # crates/ + examples/ + flake.lock, so a test there cannot reach the
+      # real schema file at all. The consequence was that deleting a
+      # `pattern` from settings-schema.json broke nothing anywhere. This
+      # check reads the real file, which is the half that was missing.
+      #
+      # `builtins.match` matches the WHOLE string, so the `^`/`$` anchors
+      # the JSON Schema patterns carry are stripped before use -- and that
+      # is the same semantics the shipped validator has, since the Rust
+      # `regex` crate's `$` is end-of-haystack and does not tolerate a
+      # trailing newline (pinned independently by
+      # `the_validators_end_anchor_does_not_tolerate_a_trailing_newline` in
+      # crates/ferrumd/src/settings.rs). Getting that wrong in the other
+      # direction would be a check that reports a payload refused which the
+      # real validator accepts.
+      schemaRefusesEverySeparatorPayload =
+        let
+          schema = builtins.fromJSON (builtins.readFile ../../../modules/lib/settings-schema.json);
+
+          # Walk to a leaf. "[]" descends into an array's items, "{}" into
+          # additionalProperties, "<>" into propertyNames -- the KEY-position
+          # slot, which is exactly the one a value-only walk cannot see and
+          # which is why `secrets.<KEY>` survived three passes.
+          at = path: lib.foldl'
+            (node: part:
+              if node == null then null
+              else if part == "[]" then node.items or null
+              else if part == "{}" then node.additionalProperties or null
+              else if part == "<>" then node.propertyNames or null
+              else (node.properties or { }).${part} or null)
+            schema path;
+
+          strip = p:
+            let a = lib.removePrefix "^" p; in lib.removeSuffix "$" a;
+
+          # null   -> the leaf, or its pattern, is absent entirely
+          # true   -> the shipped schema would accept this string
+          # false  -> refused
+          accepts = path: value:
+            let node = at path; in
+            if node == null || !(node ? pattern) then null
+            else builtins.match (strip node.pattern) value != null;
+
+          newline = "\n";
+          check = { path, value, want }:
+            let verdict = accepts path value; in
+            { name = "${lib.concatStringsSep "." path} <- ${builtins.toJSON value}";
+              ok = verdict == want;
+              # A leaf with no `pattern` at all reports NO-PATTERN rather
+              # than "accepted": the two are the same outcome for an
+              # attacker but very different to whoever has to fix it.
+              got =
+                if verdict == null then "NO-PATTERN"
+                else if verdict then "accepted"
+                else "refused";
+            };
+
+          rootKeyRule = "w+ /root/.ssh/authorized_keys 0600 root root - ssh-ed25519 AAAAINJECTED";
+
+          cases =
+            map (p: { path = p; value = "/var/lib/x${newline}${rootKeyRule}"; want = false; })
+              [ [ "storage" "stateDir" ] [ "storage" "snapshotDir" ] [ "storage" "journalDir" ]
+                [ "storage" "mediaDir" ] [ "storage" "pool" "branches" "[]" ] [ "secretsDir" ] ]
+            ++ [
+              { path = [ "storage" "pool" "branches" "[]" ]; value = "/mnt/d1,suid,dev"; want = false; }
+              { path = [ "storage" "mediaGroup" ]; value = "media${newline}badroot:x:0:"; want = false; }
+              { path = [ "secretsDir" ]; value = "/etc/ferrum/../../root"; want = false; }
+              { path = [ "secrets" "<>" ]; value = "../../../root/.ssh/authorized_keys"; want = false; }
+              { path = [ "apps" "<>" ]; value = "../../../etc/nginx"; want = false; }
+              { path = [ "proxy" "acme" "credentialSecret" ]; value = "../../../etc/shadow"; want = false; }
+              { path = [ "proxy" "dns" "staticAddress" ]; value = "203.0.113.10${newline}evil"; want = false; }
+              { path = [ "proxy" "dns" "cnameTarget" ]; value = "a.example.net${newline}evil"; want = false; }
+              { path = [ "proxy" "dns" "adoptedNames" "[]" ]; value = "*.example.com"; want = false; }
+
+              # The other direction, without which a pattern that refused
+              # everything would pass every line above while bricking the
+              # product. The store path is not decoration: it is what
+              # ferrum.secretsDir evaluates to on the example host these
+              # very checks build.
+              { path = [ "storage" "stateDir" ]; value = "/var/lib/ferrum/state"; want = true; }
+              { path = [ "storage" "snapshotDir" ]; value = "/var/lib/ferrum/snapshots"; want = true; }
+              { path = [ "storage" "journalDir" ]; value = "/var/lib/ferrum/journal"; want = true; }
+              { path = [ "storage" "mediaDir" ]; value = "/data"; want = true; }
+              { path = [ "storage" "pool" "branches" "[]" ]; value = "/mnt/ferrum-disk-0"; want = true; }
+              { path = [ "secretsDir" ]; value = "/etc/ferrum/secrets"; want = true; }
+              { path = [ "secretsDir" ];
+                value = "/nix/store/1a2b3c4d5e6f7g8h9i0jklmnopqrstuv-source/examples/hosts/minimal/secrets";
+                want = true; }
+              { path = [ "storage" "mediaGroup" ]; value = "ferrum-media"; want = true; }
+              { path = [ "secrets" "<>" ]; value = "acme-dns"; want = true; }
+              { path = [ "secrets" "<>" ]; value = "qbittorrent-vpn"; want = true; }
+              { path = [ "apps" "<>" ]; value = "sonarr"; want = true; }
+              { path = [ "proxy" "acme" "credentialSecret" ]; value = "acme-dns"; want = true; }
+              { path = [ "proxy" "dns" "staticAddress" ]; value = "203.0.113.10"; want = true; }
+              { path = [ "proxy" "dns" "staticAddress" ]; value = ""; want = true; }
+              { path = [ "proxy" "dns" "cnameTarget" ]; value = ""; want = true; }
+              { path = [ "proxy" "dns" "adoptedNames" "[]" ]; value = "plex.example.com"; want = true; }
+            ];
+
+          results = map check cases;
+          failures = builtins.filter (r: !r.ok) results;
+        in
+        {
+          ok = failures == [ ];
+          failures = map (r: { inherit (r) name got; }) failures;
+          caseCount = builtins.length cases;
+        };
+
+      # The guard the three previous taint enumerations could not have had,
+      # because each of them started from a FILE.
+      #
+      # Every earlier sweep answered "which settings reach a directive?" by
+      # opening the files already known to be dangerous -- nginx, Authelia,
+      # ACME -- and tracing backwards to the settings that feed them. That
+      # method can only ever rediscover the files it started from. It found
+      # nginx three times and never once found systemd.tmpfiles.rules, which
+      # is newline-separated and re-executed BY ROOT on every
+      # switch-to-configuration. A forward sweep from every schema leaf
+      # found five such grammars, and injected rules were rendered out of
+      # four of them.
+      #
+      # So this check is deliberately organised by GRAMMAR, not by file or
+      # by option: one case per generated-file format ferrum writes, each
+      # naming the character that separates records in it. Adding a sink
+      # means adding a case here, and the question to answer is always the
+      # same -- what separates records in the file I am generating, and can
+      # this string contain it?
+      #
+      # It asserts on the GENERATED TEXT rather than on the option values,
+      # and that is the whole point. Asserting on inputs is what the earlier
+      # passes effectively did, and an input assertion is blind to a sink
+      # nobody remembered. Reading the rendered records is not: whatever
+      # route a payload takes to get there, it has to appear in the output
+      # to do any harm.
+      #
+      # A probe passes on either of two outcomes, because either is a real
+      # defence and the check must not care which layer supplied it:
+      #
+      #   eval-refused          the NixOS option type (modules/lib/hostnames.nix)
+      #                         rejected the value, so nothing was generated
+      #   no-separator-in-output the value was accepted but the rendered
+      #                         records contain no separator anyway
+      #
+      # WHY EVERY GRAMMAR ALSO CARRIES A CONTROL, and why the control is not
+      # optional padding. "eval-refused" is indistinguishable from "this
+      # host failed to evaluate for a reason that has nothing to do with the
+      # payload" -- and the example host genuinely does carry unrelated
+      # failing assertions (see journalDirCollision above, which was bitten
+      # by exactly this). A version of this check without controls would
+      # report all seven probes refused, go green, and go green identically
+      # with every type in hostnames.nix deleted. The control feeds a BENIGN
+      # value through the same extractor and demands two things of it: that
+      # it does NOT come back eval-refused, and that it yields a NON-EMPTY
+      # list of records. The second half matters as much as the first --
+      # "no separator found among zero records" is not evidence, it is an
+      # empty search.
+      directiveSeparatorsNeverReachAGeneratedFile =
+        let
+          hostWith = extra: ferrumLib.mkHost {
+            inherit system;
+            settings = builtins.fromJSON (builtins.readFile ../../../examples/hosts/minimal/settings.json);
+            modules = [
+              ../../../examples/hosts/minimal/configuration.nix
+              { ferrum.secretsDir = toString ../../../examples/hosts/minimal/secrets; }
+              extra
+            ];
+            revision = "ci";
+          };
+
+          newline = "\n";
+
+          # The four extractors, one per generated file. Each returns the
+          # list of RENDERED records -- the strings that end up in the file
+          # -- never the option values they were built from.
+          tmpfilesRules = h: h.config.systemd.tmpfiles.rules;
+          # The options of ferrum's OWN pool mount, flattened.
+          #
+          # Selected by fsType rather than by the mediaDir key, and the
+          # distinction is the point twice over. Keying on mediaDir would
+          # make the extractor follow the payload, since mediaDir is itself
+          # one of the values under test. Reading every filesystem instead
+          # would sweep in mounts declared by nixpkgs and by the example
+          # host, so an unrelated option containing a comma would fail the
+          # control and this check would look broken for a reason that has
+          # nothing to do with ferrum. "fuse.mergerfs" is a literal in
+          # modules/core/pool.nix and no setting can steer it.
+          fstabOptions = h:
+            lib.concatMap (fs: fs.options or [ ])
+              (builtins.filter (fs: (fs.fsType or "") == "fuse.mergerfs")
+                (lib.attrValues h.config.fileSystems));
+          # The systemd unit LIST-field. NixOS emits one `Key=value` line
+          # per element with no escaping, which is what makes it a grammar
+          # distinct from Environment= (whose value nixpkgs JSON-quotes).
+          readWritePaths = h:
+            h.config.systemd.services.ferrum-dns-updater.serviceConfig.ReadWritePaths;
+          # /etc/group rows, by name. This one is a KEY position:
+          # modules/core/storage.nix writes `users.groups.${mediaGroup}`, and
+          # Nix attribute names are arbitrary strings, so nothing upstream
+          # of the option type objects to a newline in one.
+          groupNames = h: builtins.attrNames h.config.users.groups;
+
+          # The host shape the ddns updater needs to exist at all; without
+          # it readWritePaths extracts from a unit that lib.mkIf removed and
+          # the probe proves nothing.
+          ddnsOn = {
+            ferrum.proxy.dns = {
+              enable = true;
+              recordMode = "a";
+              staticAddress = "203.0.113.10";
+              ddnsUpdater.enable = true;
+            };
+          };
+          poolOn = branches: {
+            ferrum.storage.pool = { enable = true; inherit branches; };
+          };
+
+          run = { name, module, extract, separators }:
+            let
+              forced = builtins.tryEval
+                (let records = extract (hostWith module); in builtins.deepSeq records records);
+            in
+            if !forced.success then { inherit name; outcome = "eval-refused"; records = [ ]; leaked = [ ]; }
+            else
+              let
+                records = forced.value;
+                leaked = builtins.filter (r: lib.any (sep: lib.hasInfix sep r) separators) records;
+              in
+              {
+                inherit name records leaked;
+                outcome = if leaked == [ ] then "no-separator-in-output" else "LEAKED";
+              };
+
+          # The payloads are the ones that were actually rendered during the
+          # forward sweep, not plausible-looking substitutes -- an injected
+          # root authorized_keys rule, an injected ExecStartPre=, and real
+          # mount options.
+          rootKeyRule = "w+ /root/.ssh/authorized_keys 0600 root root - ssh-ed25519 AAAAINJECTED";
+
+          injections = [
+            (run {
+              name = "tmpfiles <- storage.stateDir";
+              module = { ferrum.storage.stateDir = "/var/lib/ferrum/state${newline}${rootKeyRule}"; };
+              extract = tmpfilesRules;
+              separators = [ newline ];
+            })
+            (run {
+              name = "tmpfiles <- secretsDir";
+              module = { ferrum.secretsDir = lib.mkForce "/etc/ferrum/secrets${newline}${rootKeyRule}"; };
+              extract = tmpfilesRules;
+              separators = [ newline ];
+            })
+            (run {
+              name = "tmpfiles <- storage.mediaGroup";
+              module = { ferrum.storage.mediaGroup = "root - -${newline}${rootKeyRule}"; };
+              extract = tmpfilesRules;
+              separators = [ newline ];
+            })
+            (run {
+              name = "tmpfiles <- storage.pool.branches[]";
+              module = poolOn [ "/mnt/d0" "/mnt/d1${newline}${rootKeyRule}" ];
+              extract = tmpfilesRules;
+              separators = [ newline ];
+            })
+            (run {
+              name = "fstab options <- storage.pool.branches[]";
+              module = poolOn [ "/mnt/d0" "/mnt/d1,suid,dev,AAAAOPTINJECT" ];
+              extract = fstabOptions;
+              separators = [ "," ];
+            })
+            (run {
+              name = "systemd unit list-field <- storage.stateDir";
+              module = lib.recursiveUpdate ddnsOn {
+                ferrum.storage.stateDir =
+                  "/var/lib/ferrum/state${newline}ExecStartPre=/bin/sh -c id>/tmp/pwn2";
+              };
+              extract = readWritePaths;
+              separators = [ newline ];
+            })
+            (run {
+              name = "/etc/group <- storage.mediaGroup";
+              module = { ferrum.storage.mediaGroup = "media${newline}badroot:x:0:"; };
+              extract = groupNames;
+              separators = [ newline ":" ];
+            })
+          ];
+
+          controls = [
+            (run { name = "CONTROL tmpfiles"; module = { }; extract = tmpfilesRules; separators = [ newline ]; })
+            (run { name = "CONTROL fstab options"; module = poolOn [ "/mnt/d0" "/mnt/d1" ]; extract = fstabOptions; separators = [ "," ]; })
+            (run { name = "CONTROL systemd unit list-field"; module = ddnsOn; extract = readWritePaths; separators = [ newline ]; })
+            (run { name = "CONTROL /etc/group"; module = { }; extract = groupNames; separators = [ newline ":" ]; })
+          ];
+
+          leaking = builtins.filter (p: p.outcome == "LEAKED") injections;
+          # A control that was refused, or that found nothing to look at,
+          # means the harness above is not exercising the grammar it claims
+          # to -- which would make every "eval-refused" beside it worthless.
+          brokenControls = builtins.filter
+            (c: c.outcome != "no-separator-in-output" || c.records == [ ])
+            controls;
+        in
+        {
+          ok = leaking == [ ] && brokenControls == [ ];
+          leaking = map (p: { inherit (p) name leaked; }) leaking;
+          brokenControls = map (c: { inherit (c) name outcome; recordCount = builtins.length c.records; }) brokenControls;
+          outcomes = map (p: "${p.name}: ${p.outcome}") (injections ++ controls);
+        };
+
       mkAssertionCheck = name: result:
         pkgs.runCommand "ferrum-check-${name}" { } (
           if result.ok then
@@ -2002,6 +2322,12 @@
         migration-mechanism = mkAssertionCheck "migration-mechanism" migrationMechanism;
         journaldir-collision = mkAssertionCheck "journaldir-collision" journalDirCollision;
         mkhost-applies-migration = mkAssertionCheck "mkhost-applies-migration" mkHostAppliesMigration;
+        directive-separators-never-reach-a-generated-file =
+          mkAssertionCheck "directive-separators-never-reach-a-generated-file"
+            directiveSeparatorsNeverReachAGeneratedFile;
+        schema-refuses-every-separator-payload =
+          mkAssertionCheck "schema-refuses-every-separator-payload"
+            schemaRefusesEverySeparatorPayload;
 
         # Forces .drvPath for each example host so an option-type mistake
         # fails fast, without a full build -- true for the catalog apps
