@@ -46,8 +46,22 @@ Last updated at HEAD `288f2b3`, branch `grounding-and-install-path`. Nothing pus
 
 ## Phase 2 — Bugs that affect a real host
 
-- [ ] **4. R17 — settings saves are broken on a pooled host.** A live bug on your own box, and the
-      dashboard is the product's face. Highest-value item after R13.
+- [x] **4. R17 — settings saves on a pooled host.** ALREADY FIXED, verified 2026-09-23 with the
+      same method the audit used to prove it broken. The original F1: `storage` had
+      `additionalProperties: false` and no `pool` key, while the installer writes `storage.pool`
+      for any host with >1 data disk — so every dashboard save on your box failed validation
+      because of what was already in the file, not what you changed.
+      Now: `storage.properties` includes `pool` (`enable`, `branches`, `minFreeGiB`, `policy`).
+      Proved end-to-end by validating the installer's exact two-disk output
+      (`{"schemaVersion":1,"storage":{"pool":{"enable":true,"branches":["/mnt/ferrum-disk-0",
+      "/mnt/ferrum-disk-1"]}}}`, from `render.rs:606-616` + `branch_path`) against the shipped
+      schema with `Draft202012Validator`: **ACCEPTED**.
+      F2's root cause is closed too — `settings-schema-covers-every-option`
+      (`nix/modules/flake/checks.nix:2317`) is the missing option-tree-vs-schema check the audit
+      said the repo needed and lacked, and it passes. **Worth re-testing on the real host** once
+      this branch is deployed, since the proof here is against the schema, not against your
+      running daemon.
+
 - [ ] **5. R21/A1 — a fresh multi-disk install puts the whole library on one disk.** Reproduced
       against real mergerfs: `epmfs` only picks a branch that already has the parent path, so a
       blank second disk stays inert. Your host escapes it only because both disks already held
