@@ -107,17 +107,30 @@ const FERRUM_APPLY_PATTERN: &str = "ferrum-apply@*.service";
 /// `apply` job can switch to a generation containing a new ferrumd, which
 /// restarts ferrumd *while its own job is still running*: the restarted
 /// process would otherwise believe nothing is in flight and admit a second,
-/// concurrent job. Seeding the flag from this query at startup closes that
-/// window. It deliberately does not try to recover the running job's UUID
-/// or reattach its progress stream -- the only guarantee being restored is
-/// "refuse a new job while one is genuinely still running".
+/// concurrent job. Seeding the flag from this query closes that window. It
+/// deliberately does not try to recover the running job's UUID or reattach
+/// its progress stream -- the only guarantee being restored is "refuse a
+/// new job while one is genuinely still running".
+///
+/// M3. This takes an EXISTING proxy rather than opening its own connection,
+/// and that is the whole point of the signature. The answer it returns is
+/// only durable if the caller is already subscribed to `JobRemoved` when it
+/// is asked: a job that finishes between the query and the subscription
+/// sends its signal to nobody, and the interlock this seeds then stays
+/// closed for the rest of the process lifetime. Handing the proxy in makes
+/// "subscribe first, then ask" something the caller has to have already
+/// done to be able to call this at all -- see `main.rs`'s `attach_and_watch`.
 ///
 /// An empty `states` filter is passed on purpose: the state classification
 /// lives in `is_running_state` here, where it is unit-tested, rather than
 /// depending on systemd's own filter semantics matching what we mean.
-pub async fn ferrum_apply_job_is_running() -> anyhow::Result<bool> {
-    let connection = Connection::system().await?;
-    let proxy = SystemdManagerProxy::new(&connection).await?;
+///
+/// # Arguments
+/// * `proxy` - a systemd manager proxy that has already called `subscribe`.
+///
+/// # Errors
+/// Any D-Bus failure listing units.
+pub async fn ferrum_apply_job_is_running(proxy: &SystemdManagerProxy<'_>) -> anyhow::Result<bool> {
     let units = proxy
         .list_units_by_patterns(&[], &[FERRUM_APPLY_PATTERN])
         .await

@@ -19,17 +19,20 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tower_cookies::{Cookie, CookieManagerLayer, Cookies};
 
 pub struct AppState {
     pub db: db::Db,
-    /// ferrumd's own single-job interlock -- see jobs::create_job. Seeded
-    /// at startup from systemd's real view of whether a
-    /// `ferrum-apply@*.service` is currently running (see
-    /// dbus::ferrum_apply_job_is_running), so a ferrumd restarted mid-apply
-    /// by its own generation switch does not admit a second job. Cleared
-    /// both by ferrum-apply finishing (via systemd's JobRemoved signal,
-    /// below) and, on the failure paths, by create_job itself.
+    /// ferrumd's own single-job interlock -- see jobs::create_job.
+    /// Reconciled against systemd's real view of whether a
+    /// `ferrum-apply@*.service` is running (see `reconcile_interlock` and
+    /// dbus::ferrum_apply_job_is_running) from inside the JobRemoved
+    /// subscription, so a ferrumd restarted mid-apply by its own generation
+    /// switch does not admit a second job -- and so a completion missed
+    /// while the listener was detached does not leave it held forever.
+    /// Cleared both by ferrum-apply finishing (via systemd's JobRemoved
+    /// signal, below) and, on the failure paths, by create_job itself.
     pub job_running: Mutex<bool>,
 }
 
@@ -691,14 +694,124 @@ fn check_writable_paths(settings_path: &std::path::Path, secrets_dir: &std::path
     Ok(())
 }
 
-/// Clears `job_running` when the real ferrum-apply unit's systemd job
-/// finishes, whatever its result -- including the case ferrum-apply
-/// crashed before writing a "complete" line to its own progress file.
-async fn watch_job_completions(state: Arc<AppState>) -> anyhow::Result<()> {
+/// Fires exactly once, however many times it is told to.
+///
+/// `main` waits on this before it binds the listener, so the interlock has
+/// been reconciled against systemd's real view before the first request can
+/// ask for a job. It has to fire on a FAILED first attempt too -- a box
+/// whose system bus is unreachable must still serve the dashboard, which is
+/// the only surface an operator has to diagnose it from.
+struct ReadySignal(Mutex<Option<tokio::sync::oneshot::Sender<()>>>);
+
+impl ReadySignal {
+    fn new(tx: tokio::sync::oneshot::Sender<()>) -> Self {
+        Self(Mutex::new(Some(tx)))
+    }
+
+    /// Releases `main`'s wait. Later calls do nothing.
+    fn fire(&self) {
+        if let Some(tx) = self.0.lock().unwrap().take() {
+            // The receiver being gone means main stopped waiting (its own
+            // timeout elapsed); the watcher carries on regardless.
+            let _ = tx.send(());
+        }
+    }
+}
+
+/// How long to wait before re-attaching, after `consecutive_failures`
+/// attempts in a row have failed or ended.
+///
+/// Doubling from one second to a thirty-second ceiling. The ceiling matters
+/// more than the curve: a bus that is down stays down for a while, and a
+/// listener retrying in a tight loop would spend the daemon's whole runtime
+/// failing to connect. It must never return zero -- that IS the tight loop.
+fn reconnect_delay(consecutive_failures: u32) -> Duration {
+    const CEILING_SECS: u64 = 30;
+    let secs = 1u64 << consecutive_failures.min(5);
+    Duration::from_secs(secs.min(CEILING_SECS))
+}
+
+/// Sets the interlock from systemd's own answer about what is running.
+///
+/// The in-process flag is authoritative for admission but systemd is
+/// authoritative for reality, and they can disagree in both directions: an
+/// apply that switched to a generation carrying a new ferrumd restarts this
+/// process mid-run (flag says no, systemd says yes), and a `JobRemoved`
+/// that arrived while the listener was detached is gone forever (flag says
+/// yes, systemd says no). Both are corrected here.
+///
+/// The correction is only sound because the caller is already subscribed
+/// when it asks -- see `attach_and_watch`.
+///
+/// There is one narrow window this can get wrong: a re-attach whose query
+/// lands in the few milliseconds between `create_job` claiming the flag and
+/// systemd having a unit to report would clear a flag that is legitimately
+/// held, admitting a second job. That is a rare race with a bounded,
+/// self-correcting cost, and it replaces a wedge that was permanent.
+///
+/// # Arguments
+/// * `state` - the daemon state holding the interlock.
+/// * `systemd_says_running` - whether systemd currently reports a running
+///   `ferrum-apply@*.service`.
+fn reconcile_interlock(state: &AppState, systemd_says_running: bool) {
+    let mut running = state.job_running.lock().unwrap();
+    if *running == systemd_says_running {
+        return;
+    }
+    if systemd_says_running {
+        eprintln!(
+            "ferrumd: a ferrum-apply job is still running -- holding the single-job \
+             interlock; new jobs will be refused until it finishes"
+        );
+    } else {
+        eprintln!(
+            "ferrumd: systemd reports no ferrum-apply job running -- releasing the \
+             single-job interlock"
+        );
+    }
+    *running = systemd_says_running;
+}
+
+/// One attachment to systemd's `JobRemoved` signal, held until it breaks.
+///
+/// Only ever returns an error: either the attachment could not be made, or
+/// the signal stream ended. `supervise_job_watch` is what makes that
+/// survivable.
+///
+/// **The order of the first four statements is the fix for M3 and is not
+/// interchangeable.** Subscribing and opening the stream come first, and
+/// only then is systemd asked what is running. The other order -- which is
+/// what `main` used to do, querying before this task had even been spawned
+/// -- loses any completion that lands in between: `JobRemoved` fires while
+/// nothing is listening, the query has already returned "running", and the
+/// interlock stays closed for the rest of the process lifetime, answering
+/// every `POST /api/jobs` with 409. The one situation this whole path
+/// exists for is an apply that restarts ferrumd mid-run, which is exactly
+/// the situation that finishes inside that window. Nothing in the UI could
+/// clear it either, because clearing it would need a job.
+///
+/// Clearing twice is harmless, so the safe order costs nothing.
+///
+/// # Arguments
+/// * `state` - the daemon state holding the interlock.
+/// * `ready` - released once the interlock has been reconciled.
+///
+/// # Errors
+/// Any D-Bus failure connecting, subscribing, or querying; and the normal
+/// end of the signal stream, which is a fault here rather than an ending.
+async fn attach_and_watch(
+    state: &AppState,
+    ready: &ReadySignal,
+) -> anyhow::Result<std::convert::Infallible> {
     let connection = zbus::Connection::system().await?;
     let proxy = dbus::SystemdManagerProxy::new(&connection).await?;
     proxy.subscribe().await?;
     let mut stream = proxy.receive_job_removed().await?;
+
+    // Safe to ask only now: any completion from here on has a listener.
+    reconcile_interlock(state, dbus::ferrum_apply_job_is_running(&proxy).await?);
+    ready.fire();
+
     use futures::StreamExt;
     while let Some(signal) = stream.next().await {
         let Ok(args) = signal.args() else { continue };
@@ -718,6 +831,46 @@ async fn watch_job_completions(state: Arc<AppState>) -> anyhow::Result<()> {
         }
     }
     anyhow::bail!("the systemd JobRemoved signal stream ended unexpectedly")
+}
+
+/// Keeps `attach` attached, forever, however often it fails.
+///
+/// M3. This used to be `if let Err(e) = watch_job_completions(state).await`
+/// in `main` -- log once, exit, never try again. The comment on it was
+/// right about the consequence and wrong that logging was an answer to it:
+/// with no listener, the interlock can only ever be cleared by
+/// `create_job`'s own failure paths, so the first job that actually STARTS
+/// holds it for the rest of the process lifetime and every later job is
+/// refused with 409. The daemon is then unrecoverable from its own UI,
+/// because the recovery is a restart and a restart is a job.
+///
+/// Failing to attach is an ordinary startup outcome, not an exotic one:
+/// `modules/core/daemon.nix` orders ferrumd `after = network.target` only,
+/// not after the system bus.
+///
+/// `attach` is a parameter rather than a direct call so that this
+/// supervision -- the part that has to survive -- is testable without a
+/// system bus. It only ever yields an error: an attachment that is working
+/// has not returned yet.
+///
+/// # Arguments
+/// * `attach` - makes one attachment attempt and holds it until it breaks.
+async fn supervise_job_watch<A, Fut>(mut attach: A) -> std::convert::Infallible
+where
+    A: FnMut() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Error>,
+{
+    let mut consecutive_failures: u32 = 0;
+    loop {
+        let e = attach().await;
+        let delay = reconnect_delay(consecutive_failures);
+        eprintln!(
+            "ferrumd: job-completion listener detached: {e} -- re-attaching in {}s",
+            delay.as_secs()
+        );
+        tokio::time::sleep(delay).await;
+        consecutive_failures = consecutive_failures.saturating_add(1);
+    }
 }
 
 #[tokio::main]
@@ -744,41 +897,22 @@ async fn main() -> anyhow::Result<()> {
     let db = db::Db::open(&state_dir.join("ferrumd.db"))?;
     auth::ensure_first_user(&db, state_dir)?;
 
-    // The interlock is in-process state, so it would otherwise start every
-    // process lifetime believing nothing is running. That is wrong in one
-    // real, reachable case: an `apply` job can switch to a generation
-    // carrying a new ferrumd, which restarts ferrumd WHILE that same apply
-    // is still executing -- and the restarted daemon would then happily
-    // admit a second, concurrent job. Ask systemd (the only durable source
-    // of truth about what is actually running) before serving anything.
+    // The interlock is in-process state, so it starts every process
+    // lifetime believing nothing is running. That is wrong in one real,
+    // reachable case: an `apply` job can switch to a generation carrying a
+    // new ferrumd, which restarts ferrumd WHILE that same apply is still
+    // executing -- and the restarted daemon would then happily admit a
+    // second, concurrent job. Systemd is the only durable source of truth
+    // about what is actually running, so it is asked before anything is
+    // served.
     //
-    // On a query failure this seeds `false` rather than `true`: a failed
-    // query is not evidence that a job is running, and seeding `true` would
-    // leave the daemon refusing every job forever with no way to clear the
-    // flag (nothing would ever start, so no JobRemoved would ever arrive).
-    // The failure is logged loudly instead.
-    let job_running = match dbus::ferrum_apply_job_is_running().await {
-        Ok(running) => {
-            if running {
-                eprintln!(
-                    "ferrumd: a ferrum-apply job is still running -- starting with the \
-                     single-job interlock already held; new jobs will be refused until it \
-                     finishes"
-                );
-            }
-            running
-        }
-        Err(e) => {
-            eprintln!(
-                "ferrumd: could not ask systemd whether a ferrum-apply job is running: {e} -- \
-                 assuming none is. If ferrumd was just restarted by an in-flight apply, a \
-                 second concurrent job could be admitted."
-            );
-            false
-        }
-    };
-
-    let state = Arc::new(AppState { db, job_running: Mutex::new(job_running) });
+    // M3: that question is no longer asked here. It belongs inside
+    // `attach_and_watch`, after the JobRemoved subscription exists, because
+    // asking it first loses any completion that lands before the listener
+    // is up and wedges the interlock closed for good. `false` is the
+    // starting value; `reconcile_interlock` corrects it, in both
+    // directions, from within the subscription.
+    let state = Arc::new(AppState { db, job_running: Mutex::new(false) });
 
     // Independently confirms job completion via systemd's own JobRemoved
     // D-Bus signal, so `job_running` is cleared even if ferrum-apply
@@ -792,19 +926,40 @@ async fn main() -> anyhow::Result<()> {
     // listener would clear the interlock the moment any unrelated unit
     // finished -- defeating the serialization jobs::create_job exists to
     // provide.
+    //
+    // M3: the listener no longer gives up. It used to log once and exit on
+    // any error, which wedged the interlock exactly as badly as the race
+    // did -- the very first job would be refused forever, and every one
+    // after it. `modules/core/daemon.nix` orders ferrumd only `after =
+    // network.target`, so "the system bus was not ready yet" is an ordinary
+    // startup outcome, not an exotic one. It now re-attaches, and each
+    // fresh attachment re-reconciles the flag against systemd, because
+    // signals that arrived while it was detached are gone.
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     {
         let state = state.clone();
         tokio::spawn(async move {
-            if let Err(e) = watch_job_completions(state).await {
-                // Deliberately loud rather than silent: if this listener
-                // never comes up, the single-job interlock can only ever
-                // be cleared on create_job's own failure paths, so the
-                // daemon would refuse every job after the first. That is a
-                // real, operator-visible degradation and belongs in the
-                // journal, not swallowed by an `if let Ok` chain.
-                eprintln!("ferrumd: job-completion listener stopped: {e}");
-            }
+            let ready = ReadySignal::new(ready_tx);
+            let (state, ready) = (&state, &ready);
+            supervise_job_watch(move || async move {
+                attach_and_watch(state, ready).await.unwrap_err()
+            })
+            .await;
         });
+    }
+    // The listener reconciles the interlock before this fires, so the first
+    // request cannot be answered from an unreconciled flag. Bounded,
+    // because a bus that never answers must delay the dashboard, not
+    // withhold it: this is the surface an operator diagnoses a broken bus
+    // from.
+    match tokio::time::timeout(Duration::from_secs(5), ready_rx).await {
+        Ok(_) => {}
+        Err(_) => eprintln!(
+            "ferrumd: systemd did not answer within 5s -- serving anyway with the \
+             single-job interlock unreconciled. If ferrumd was just restarted by an \
+             in-flight apply, a second concurrent job could be admitted until the \
+             listener attaches."
+        ),
     }
 
     let app = build_router(state);
@@ -2656,5 +2811,152 @@ mod tests {
         assert!(!csrf_header_is_valid(None, ""));
         assert!(!csrf_header_is_valid(Some("anything"), ""));
         assert!(csrf_header_is_valid(Some("real"), "real"));
+    }
+
+    /// M3, the interlock watcher. See `attach_and_watch`.
+    mod job_watch {
+        use super::*;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        fn state() -> AppState {
+            let dir = tempfile::tempdir().unwrap();
+            let db = db::Db::open(&dir.path().join("test.db")).unwrap();
+            // The TempDir is dropped here on purpose: SQLite keeps the open
+            // handle, and nothing in these tests touches the file again.
+            AppState { db, job_running: Mutex::new(false) }
+        }
+
+        /// The half of M3 that needs no race at all.
+        ///
+        /// The listener used to log its error once and return. Anything
+        /// that made the first attachment fail -- and ferrumd is ordered
+        /// only `after = network.target`, so "the system bus is not up
+        /// yet" is an ordinary startup, not an exotic one -- left the
+        /// daemon with no listener for the rest of its lifetime. The first
+        /// job then set the interlock, nothing ever cleared it, and every
+        /// subsequent `POST /api/jobs` answered 409 forever. Nothing in
+        /// the UI could recover it, because recovering it meant restarting
+        /// ferrumd, and restarting ferrumd meant running a job.
+        ///
+        /// The fake attachment always fails, which is what a real one does
+        /// against a bus that is not there. The assertion is simply that
+        /// the supervisor tried again: one attempt is the defect, two is
+        /// the fix.
+        ///
+        /// Real time rather than a paused clock, deliberately -- pausing
+        /// would need tokio's `test-util` feature, and this is not worth a
+        /// change to the crate's dependencies. The first retry is due one
+        /// second in (`reconnect_delay(0)`), so the wait below settles in
+        /// about that long when the supervisor is correct, and burns its
+        /// whole deadline only when it has already given up.
+        #[tokio::test]
+        async fn the_listener_re_attaches_after_a_failed_attempt() {
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let counter = attempts.clone();
+            let watcher = tokio::spawn(async move {
+                supervise_job_watch(move || {
+                    let counter = counter.clone();
+                    async move {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        anyhow::anyhow!("the system bus is not up yet")
+                    }
+                })
+                .await;
+            });
+
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while attempts.load(Ordering::SeqCst) < 2 && std::time::Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            watcher.abort();
+
+            assert!(
+                attempts.load(Ordering::SeqCst) >= 2,
+                "a failed attachment must be retried, not surrendered to: a listener that \
+                 exits leaves the single-job interlock with nothing to clear it, and the \
+                 first job then wedges the daemon permanently. Attempts observed: {}",
+                attempts.load(Ordering::SeqCst)
+            );
+        }
+
+        /// The retry must not become a busy loop against a bus that is
+        /// down -- and must not stall forever either.
+        #[test]
+        fn the_reconnect_delay_is_never_zero_and_never_unbounded() {
+            assert_eq!(reconnect_delay(0), Duration::from_secs(1));
+            assert_eq!(reconnect_delay(1), Duration::from_secs(2));
+            for attempt in 0..64 {
+                let delay = reconnect_delay(attempt);
+                assert!(delay >= Duration::from_secs(1), "attempt {attempt} would spin");
+                assert!(delay <= Duration::from_secs(30), "attempt {attempt} would stall");
+            }
+        }
+
+        /// Reconciliation corrects the flag in both directions. The
+        /// "systemd says nothing is running" direction is the one that
+        /// undoes a missed `JobRemoved`; without it a re-attachment would
+        /// restore the listener but not the state it was supposed to be
+        /// keeping.
+        #[test]
+        fn reconciling_sets_the_interlock_from_systemds_answer_in_both_directions() {
+            let state = state();
+
+            reconcile_interlock(&state, true);
+            assert!(*state.job_running.lock().unwrap(), "a running apply must hold the interlock");
+
+            reconcile_interlock(&state, true);
+            assert!(*state.job_running.lock().unwrap(), "reconciling twice must not flip it");
+
+            reconcile_interlock(&state, false);
+            assert!(
+                !*state.job_running.lock().unwrap(),
+                "a completion missed while detached is gone forever, so systemd's own answer \
+                 has to be able to release the interlock"
+            );
+        }
+
+        /// The ordering half of M3, pinned against the source itself.
+        ///
+        /// The defect is a sequence of awaits inside one function, and the
+        /// failure it produces needs a real system bus and a completion
+        /// landing in a window of microseconds -- there is no honest
+        /// timing test for it. What there IS is the thing that makes it
+        /// safe: `attach_and_watch` subscribes and opens the signal stream
+        /// BEFORE it asks systemd what is running, so no completion can
+        /// fall between the question and the listener. That is a property
+        /// of the source, and this reads the source.
+        ///
+        /// Same technique, and the same reason, as
+        /// `no_source_file_reads_a_forward_auth_header` above: the
+        /// property is about what the code does and does not do, not about
+        /// what a call returns.
+        #[test]
+        fn the_watcher_subscribes_before_it_asks_systemd_what_is_running() {
+            let body = include_str!("main.rs")
+                .split_once("async fn attach_and_watch(")
+                .expect("attach_and_watch must still exist")
+                .1
+                .split_once("\nasync fn ")
+                .map(|(body, _)| body)
+                .expect("attach_and_watch must be followed by another async fn");
+
+            let subscribe = body.find("proxy.subscribe()").expect("it must still subscribe");
+            let stream = body
+                .find("proxy.receive_job_removed()")
+                .expect("it must still open the signal stream");
+            let query = body
+                .find("ferrum_apply_job_is_running(")
+                .expect("it must still ask systemd what is running");
+
+            assert!(
+                subscribe < query && stream < query,
+                "the JobRemoved subscription and its stream must be established BEFORE \
+                 systemd is asked what is running (subscribe at {subscribe}, stream at \
+                 {stream}, query at {query}). Asking first loses any completion that lands \
+                 in between -- the signal goes to nobody, the query has already said \
+                 'running', and the interlock stays closed for the process lifetime, \
+                 answering every POST /api/jobs with 409"
+            );
+        }
     }
 }

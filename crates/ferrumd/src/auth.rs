@@ -420,6 +420,16 @@ pub fn login(
         return Ok(LoginOutcome::Throttled);
     }
 
+    // `QueryReturnedNoRows` -- and ONLY that -- means "no such user". Every
+    // other rusqlite error is a real fault and propagates, which is what
+    // `LoginOutcome`'s doc above means by reserving `Err` for "the daemon
+    // genuinely failed". A blanket `.ok()` here collapsed an unreadable
+    // database (SQLITE_IOERR off a failing disk, SQLITE_CORRUPT, a
+    // half-applied migration) into the absent-user branch, so an operator
+    // holding the CORRECT password was answered 401 and audited as
+    // `outcome=failure detail="bad credentials"` -- the one report that
+    // guarantees they look for the problem somewhere it is not. Same shape
+    // as `validate_session` below and `jobs::summarize`.
     let row: Option<(i64, String)> = db
         .conn()
         .query_row(
@@ -427,7 +437,14 @@ pub fn login(
             rusqlite::params![username],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
-        .ok();
+        .map(Some)
+        .or_else(|e| {
+            if matches!(e, rusqlite::Error::QueryReturnedNoRows) {
+                Ok(None)
+            } else {
+                Err(anyhow::Error::from(e))
+            }
+        })?;
 
     let succeeded = match &row {
         Some((_, hash)) => {
@@ -636,6 +653,11 @@ pub fn change_password(
         return Ok(PasswordChangeOutcome::Throttled);
     }
 
+    // As in `login`: only `QueryReturnedNoRows` means the row is absent.
+    // With a blanket `.ok()` the branch below fired on an unreadable
+    // database too, so its comment -- which promises the row has vanished --
+    // was asserting something the code had not established, and the
+    // operator was told their correct current password was wrong.
     let stored: Option<String> = db
         .conn()
         .query_row(
@@ -643,7 +665,14 @@ pub fn change_password(
             rusqlite::params![user_id],
             |row| row.get(0),
         )
-        .ok();
+        .map(Some)
+        .or_else(|e| {
+            if matches!(e, rusqlite::Error::QueryReturnedNoRows) {
+                Ok(None)
+            } else {
+                Err(anyhow::Error::from(e))
+            }
+        })?;
     // An authenticated session whose user row has vanished is not a wrong
     // password, but it is also not something to hand a 500 for: there is
     // nothing to rotate, and refusing is the only safe answer.
@@ -676,7 +705,17 @@ pub fn change_password(
         .hash_password(new_password.as_bytes(), &salt)
         .map_err(|e| anyhow::anyhow!("failed to hash the new password: {e}"))?
         .to_string();
-    db.conn().execute(
+    // L8. One transaction, because the rotation and the revocation are one
+    // remedy. They used to be two autocommitted statements, so a DELETE
+    // that failed left the worst combination available: the password
+    // rotated, every other session still alive -- including the stolen one
+    // the revocation exists to kill -- and the caller told the change
+    // failed. An operator acting on a suspected compromise would then be
+    // told the remedy did not apply, while the only half that did apply is
+    // the half that does nothing to the attacker.
+    let mut conn = db.conn();
+    let tx = conn.transaction()?;
+    tx.execute(
         "UPDATE users SET password_hash = ?1 WHERE id = ?2",
         rusqlite::params![hash, user_id],
     )?;
@@ -686,10 +725,11 @@ pub fn change_password(
     // good for the rest of its week. Every OTHER session for this account
     // goes; the caller's own stays, so the operator is not logged out of the
     // tab they just used.
-    db.conn().execute(
+    tx.execute(
         "DELETE FROM sessions WHERE user_id = ?1 AND token != ?2",
         rusqlite::params![user_id, keep_token],
     )?;
+    tx.commit()?;
     Ok(PasswordChangeOutcome::Changed)
 }
 
@@ -1497,5 +1537,111 @@ mod tests {
             "the same password hashed twice must differ -- a fresh salt per rotation"
         );
         assert!(login(&db, "admin", "same-value", &test_client()).unwrap().session().is_some());
+    }
+
+    /// Makes the `users` table unreadable without deleting a single row.
+    ///
+    /// Renaming rather than dropping is deliberate: the rows still exist, so
+    /// the account genuinely still has its correct password, and any answer
+    /// of "your credentials are bad" is a statement the database is in no
+    /// position to make. What SQLite raises here is a plain
+    /// `SqliteFailure`/`no such table` -- categorically NOT
+    /// `QueryReturnedNoRows` -- which is precisely the distinction the fixed
+    /// code turns on, and the one a bare `.ok()` erases. It stands in for
+    /// the faults that actually happen on an appliance: `SQLITE_IOERR` off a
+    /// failing disk, `SQLITE_CORRUPT`, or a migration that got half applied.
+    fn break_the_users_table(db: &Db) {
+        db.conn().execute_batch("ALTER TABLE users RENAME TO users_moved_away").unwrap();
+    }
+
+    /// L8. Rotating the credential and revoking the account's other
+    /// sessions must be one operation or neither.
+    ///
+    /// They were two statements with nothing binding them. If the DELETE
+    /// failed the UPDATE had already committed, so the outcome was the
+    /// worst available combination: the password is rotated, every other
+    /// session stays alive -- including the stolen one the revocation
+    /// exists to kill -- and the caller is told the change failed. An
+    /// operator acting on a suspected compromise is then told the remedy
+    /// did not apply, while the half of it that protects the attacker's
+    /// access is the half that did.
+    ///
+    /// Renaming `sessions` fails the DELETE and nothing before it, which
+    /// is the shape of any real failure of that statement.
+    #[test]
+    fn a_failed_revocation_does_not_leave_the_password_rotated() {
+        let (_dir, db, password, user_id) = bootstrapped();
+        let before = stored_hash(&db, user_id);
+        db.conn().execute_batch("ALTER TABLE sessions RENAME TO sessions_moved_away").unwrap();
+
+        let result =
+            change_password(&db, user_id, &password, "a-new-one", KEPT_SESSION, &test_client());
+        assert!(result.is_err(), "a failed revocation must be reported as a failure");
+        assert_eq!(
+            before,
+            stored_hash(&db, user_id),
+            "the caller was told the change failed, so the credential must not have been \
+             rotated: telling an operator their compromise remedy did not apply while \
+             silently applying the half of it that does not revoke the attacker's session \
+             is the one outcome worse than either"
+        );
+    }
+
+    /// M1. A database that cannot be read must never be reported as a wrong
+    /// password.
+    ///
+    /// The operator holds the correct credential; with the read collapsed
+    /// into `None` they are told it is wrong, the audit log agrees with the
+    /// lie (`outcome=failure detail="bad credentials"`), and nothing
+    /// anywhere says the database is broken. `LoginOutcome`'s own
+    /// documentation reserves `Err` for "the daemon genuinely failed" --
+    /// this is that case, so this is the outcome it has to produce.
+    #[test]
+    fn a_login_against_a_broken_database_is_an_error_not_bad_credentials() {
+        let (_dir, db, password, _user_id) = bootstrapped();
+        break_the_users_table(&db);
+        let result = login(&db, "admin", &password, &test_client());
+        assert!(
+            result.is_err(),
+            "a failed read of the users table must surface as Err so the handler answers 500; \
+             reporting the operator's CORRECT password as bad credentials sends them hunting \
+             for a password problem that does not exist"
+        );
+    }
+
+    /// M1, the same swallow in `change_password`.
+    ///
+    /// Its absent-user branch carries a comment claiming the row has
+    /// vanished. A broken read reaches that branch too, and the caller is
+    /// told their current password is wrong.
+    #[test]
+    fn a_rotation_against_a_broken_database_is_an_error_not_a_wrong_password() {
+        let (_dir, db, password, user_id) = bootstrapped();
+        break_the_users_table(&db);
+        let result = change_password(&db, user_id, &password, "new-password", KEPT_SESSION, &test_client());
+        assert!(
+            result.is_err(),
+            "a failed read of the users table must surface as Err, not as WrongPassword: the \
+             comment on that branch promises it means the user row vanished, and a caller told \
+             their correct password is wrong has no way to learn otherwise"
+        );
+    }
+
+    /// The other half of M1: the branch the `.ok()` was standing in for is
+    /// still reached, by the error that really does mean "no such row".
+    ///
+    /// Without this, a fix could pass the two tests above by propagating
+    /// everything, turning a genuinely absent user into a 500 -- and
+    /// `login` would then answer a probe for a nonexistent username with a
+    /// different status than a wrong password, which is the account-
+    /// enumeration oracle SEC-07's constant-time branch exists to close.
+    #[test]
+    fn an_absent_user_is_still_bad_credentials_rather_than_an_error() {
+        let (_dir, db, _password, _user_id) = bootstrapped();
+        let result = login(&db, "no-such-operator", "whatever", &test_client());
+        assert!(
+            matches!(result.unwrap(), LoginOutcome::BadCredentials),
+            "QueryReturnedNoRows is the expected outcome for an unknown username, not a fault"
+        );
     }
 }

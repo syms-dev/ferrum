@@ -11,8 +11,19 @@
 // `rollbackable: true` is a PRECHECK, NOT A GUARANTEE. ferrum-apply's
 // gc.rs:105-132 deletes a snapshot subvolume BEFORE its journal entry, so a
 // crash between the two leaves an entry pointing at nothing; rollback.rs:43-49
-// catches exactly that and fails loudly. `POST /api/jobs` remains the
-// authority on whether a rollback can actually proceed.
+// catches exactly that and fails loudly.
+//
+// `POST /api/jobs` is the authority on one specific part of that question:
+// `current_generation` below is what `jobs::refuse_unrunnable_rollback`
+// checks a submitted target against, so a rollback to the generation this
+// host is already running is refused before it becomes a privileged
+// request. This comment used to claim `POST /api/jobs` was the authority
+// on whether a rollback could proceed AT ALL, which was simply untrue --
+// `create_job` wrote `{"kind":"rollback","to":<u32>}` through without
+// looking at it, and the current-generation guard existed only in the
+// `rollbackable` display field this file hands the UI. Everything else
+// about whether a rollback can proceed is still ferrum-apply's to decide
+// at prepare time, and is still not checked here.
 use anyhow::Context;
 use axum::{http::StatusCode, response::IntoResponse, Json};
 use ferrum_state::generations::{correlate, is_rollbackable};
@@ -137,15 +148,7 @@ pub fn build_response(profiles_dir: &Path, journal_dir: &Path) -> anyhow::Result
             // design -- so the crate's "no state snapshot ... or its snapshot
             // was pruned" message would be actively false here.
             let (rollbackable, reason) = if info.current {
-                (
-                    false,
-                    Some(format!(
-                        "generation {} is the generation this host is already running -- rolling back \
-                         to it would restore every app's state directory from the last apply's \
-                         snapshot and reboot, without changing the system closure",
-                        info.generation
-                    )),
-                )
+                (false, Some(rollback_to_current_reason(info.generation)))
             } else {
                 match is_rollbackable(&info) {
                     Ok(()) => (true, None),
@@ -170,17 +173,64 @@ pub fn build_response(profiles_dir: &Path, journal_dir: &Path) -> anyhow::Result
     })
 }
 
+/// The Nix profile directory, from the environment.
+///
+/// # Errors
+/// An unset `FERRUM_PROFILES_DIR` names the variable, following the error
+/// style `catalog.rs` established.
+pub fn profiles_dir() -> anyhow::Result<std::path::PathBuf> {
+    std::env::var("FERRUM_PROFILES_DIR")
+        .map(std::path::PathBuf::from)
+        .map_err(|_| anyhow::anyhow!("FERRUM_PROFILES_DIR not set"))
+}
+
+/// The generation this host is currently running, or `None` when the
+/// `system` symlink points somewhere that is not a generation link.
+///
+/// Separate from `build_response` because the caller that needs it -- the
+/// rollback guard in `jobs::create_job` -- needs this one number and not a
+/// journal walk, and must not be made to depend on the journal being
+/// readable to decide whether a rollback is pointless.
+///
+/// # Arguments
+/// * `profiles_dir` - the Nix profile directory.
+///
+/// # Errors
+/// Propagates `list_profile_generations`.
+/// Why rolling back to the generation already running is refused.
+///
+/// One string, used in two places that must not drift apart: the
+/// `rollbackable: false` reason this file hands the UI, and the 400
+/// `jobs::create_job` answers when a caller asks for it anyway. The reason
+/// M4 existed at all is that only the first of those two existed.
+///
+/// # Arguments
+/// * `generation` - the generation the host is currently running.
+pub fn rollback_to_current_reason(generation: u32) -> String {
+    format!(
+        "generation {generation} is the generation this host is already running -- rolling back \
+         to it would restore every app's state directory from the last apply's snapshot and \
+         reboot, without changing the system closure"
+    )
+}
+
+pub fn current_generation(profiles_dir: &Path) -> anyhow::Result<Option<u32>> {
+    Ok(list_profile_generations(profiles_dir)?
+        .into_iter()
+        .find(|(_, _, current)| *current)
+        .map(|(generation, _, _)| generation))
+}
+
 /// Resolves both directories from the environment and builds the response.
 ///
 /// # Errors
 /// An unset `FERRUM_PROFILES_DIR` or `FERRUM_JOURNAL_DIR` names the variable,
 /// following the error style `catalog.rs` established.
 pub fn build_generations() -> anyhow::Result<GenerationsResponse> {
-    let profiles_dir = std::env::var("FERRUM_PROFILES_DIR")
-        .map_err(|_| anyhow::anyhow!("FERRUM_PROFILES_DIR not set"))?;
+    let profiles_dir = profiles_dir()?;
     let journal_dir = std::env::var("FERRUM_JOURNAL_DIR")
         .map_err(|_| anyhow::anyhow!("FERRUM_JOURNAL_DIR not set"))?;
-    build_response(Path::new(&profiles_dir), Path::new(&journal_dir))
+    build_response(&profiles_dir, Path::new(&journal_dir))
 }
 
 /// `GET /api/generations` -- `200` with the generation list, or `500` naming
