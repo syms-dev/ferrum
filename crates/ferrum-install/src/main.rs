@@ -273,6 +273,13 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
 
     // --- Stage 2. The host exists now, so the things that could not exist
     //     before it can be created. ---
+    // Carried out of the stage-2 block and into the final report. An install
+    // that finished with a degraded apply is still an install, but the closing
+    // screen must not describe it as a clean one: the operator would otherwise
+    // read "is installed" and have no way to know their apps have no DNS
+    // records yet. Declared here rather than inside the block because a
+    // resumed run skips the block entirely and must still report honestly.
+    let mut degraded_apply = false;
     if reached.unwrap_or(state::Phase::Generated) < state::Phase::Stage2Applied {
         ensure_cloudflare_token(
             &mut answers,
@@ -330,7 +337,19 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
                 // guess whether it has hung -- which, in this feature's
                 // history, it sometimes had.
                 println!("  (building on the host -- this is the long step)");
-                collect::run_streaming(&pre.target, &pre.ssh_auth, &command)?;
+                let code = collect::run_streaming_code(&pre.target, &pre.ssh_auth, &command)?;
+                // Exit 3 is not a failed install. See
+                // stage2::interpret_apply_exit -- the host has switched and is
+                // running the new generation; something ferrum-apply manages,
+                // most often the DNS reconcile, did not come up. Cloudflare
+                // being rate-limited during an install is not a reason to tell
+                // the operator their machine is broken.
+                if stage2::interpret_apply_exit(code)? == stage2::ApplyOutcome::Degraded {
+                    degraded_apply = true;
+                    println!(
+                        "\n  The system switched, but the apply reported a problem (its own \n                           output is above). The host is running the new generation.\n                           Re-run `ferrum-apply apply` on it once the cause is cleared."
+                    );
+                }
             } else {
                 collect::run(&pre.target, &pre.ssh_auth, &command)?;
             }
@@ -359,6 +378,7 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
         &evidence,
         &adoption,
         zone_not_serving_yet.as_deref(),
+        degraded_apply,
     )?;
     Ok(())
 }
@@ -1136,11 +1156,32 @@ fn final_report(
     evidence: &preflight::Evidence,
     adoption: &dns::Adoption,
     zone_not_serving_yet: Option<&str>,
+    degraded_apply: bool,
 ) -> anyhow::Result<()> {
     println!("\n{}", "=".repeat(64));
-    println!("{} is installed.", answers.hostname);
+    // The headline tells the truth about which of the two endings this was.
+    // "is installed" over a degraded apply is the false-success shape this
+    // project keeps finding: a host that looks finished and has published
+    // nothing, with the one line that could have said so spent on
+    // congratulation.
+    if degraded_apply {
+        println!("{} is installed, with one thing unfinished.", answers.hostname);
+    } else {
+        println!("{} is installed.", answers.hostname);
+    }
     println!("{}", "=".repeat(64));
     println!("\nproof: {}", evidence.describe());
+
+    if degraded_apply {
+        println!(
+            "\nThe apply reported a problem and its output is above. The host \n\
+             switched and is running the new generation, so this is not a \n\
+             half-installed machine -- but something ferrum manages did not \n\
+             come up, most often the DNS records for the addresses below. If \n\
+             a hostname does not resolve, that is why.\n\n  \
+             Fix the cause, then on the host:  ferrum-apply apply"
+        );
+    }
 
     for line in url_report(answers, adoption, zone_not_serving_yet) {
         println!("{line}");

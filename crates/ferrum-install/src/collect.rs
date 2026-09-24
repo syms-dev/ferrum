@@ -118,7 +118,7 @@ pub fn run(target: &Target, auth: &SshAuth, command: &str) -> anyhow::Result<Str
 /// Returns an error carrying ssh's own stderr. The payload is never
 /// included in an error message.
 /// Runs a command on the target with its output going STRAIGHT to the
-/// operator's terminal.
+/// operator's terminal, and returns its EXIT CODE.
 ///
 /// `run` captures output and returns it, which is right for the short
 /// commands whose result is inspected. It is wrong for the stage-2 apply:
@@ -132,14 +132,28 @@ pub fn run(target: &Target, auth: &SshAuth, command: &str) -> anyhow::Result<Str
 /// working install looked identical until the logs were dug out
 /// afterwards.
 ///
+/// The exit code is returned rather than collapsed into a boolean because
+/// one remote command -- `ferrum-apply apply` -- has more than two outcomes.
+/// `ferrum-apply` gives `Degraded` its own code precisely so a caller can
+/// distinguish "switched, but something is not healthy" from a clean success
+/// "without parsing stderr text" (its own words, at
+/// `crates/ferrum-apply/src/main.rs:110-112`). This function previously
+/// wrapped that in a `!status.success()` check, which threw the distinction
+/// away one layer above the place that went to the trouble of making it.
+///
 /// # Arguments
 /// * `target` - the machine to run on.
 /// * `auth` - the operator's credential.
 /// * `command` - the remote command.
 ///
+/// # Returns
+/// The remote command's exit code. 255 if ssh itself failed to report one,
+/// which is ssh's own convention for its own errors.
+///
 /// # Errors
-/// If ssh cannot start, or the remote command exits non-zero.
-pub fn run_streaming(target: &Target, auth: &SshAuth, command: &str) -> anyhow::Result<()> {
+/// Only if ssh could not be started at all. A remote command that ran and
+/// failed is a return value here, not an error -- that is the whole point.
+pub fn run_streaming_code(target: &Target, auth: &SshAuth, command: &str) -> anyhow::Result<i32> {
     let status = Command::new("ssh")
         .args(base_args_in(
             auth,
@@ -150,10 +164,7 @@ pub fn run_streaming(target: &Target, auth: &SshAuth, command: &str) -> anyhow::
         .arg(command)
         .status()
         .map_err(|e| anyhow::anyhow!("could not run ssh: {e}"))?;
-    if !status.success() {
-        anyhow::bail!("ssh {target} failed running {command:?} ({status})");
-    }
-    Ok(())
+    Ok(status.code().unwrap_or(255))
 }
 
 pub fn run_with_stdin(

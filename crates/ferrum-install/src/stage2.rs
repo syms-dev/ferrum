@@ -160,9 +160,98 @@ pub fn acme_payload(token: &str) -> String {
     format!("CLOUDFLARE_DNS_API_TOKEN={token}")
 }
 
+/// What `ferrum-apply apply` reported, as the installer needs to act on it.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ApplyOutcome {
+    /// Exit 0. The switch completed and everything it manages is healthy.
+    Clean,
+    /// Exit 3. The system closure switched, but something `ferrum-apply`
+    /// manages is not healthy -- most often a DNS reconcile that could not
+    /// reach Cloudflare. The host is running the new generation.
+    Degraded,
+}
+
+/// Exit code `ferrum-apply` uses for "switched, but degraded".
+///
+/// Defined at `crates/ferrum-apply/src/main.rs:116-119`, and given its own
+/// code deliberately so a caller can tell it apart from a clean success
+/// without parsing stderr.
+const APPLY_DEGRADED: i32 = 3;
+
+/// Interprets `ferrum-apply apply`'s exit code.
+///
+/// A degraded apply is NOT an install failure. The distinction matters off
+/// the test bench: `ferrum.proxy.dns.enable` is on for any host the installer
+/// gave a domain, so the apply reconciles DNS against Cloudflare on its way
+/// through. If Cloudflare is rate-limiting, having an outage, or the token
+/// has since expired, the reconcile comes back degraded -- and the machine is
+/// otherwise perfectly installed. Failing the whole install there reports a
+/// working host as a broken one, and tells the operator to do nothing useful,
+/// because the thing that went wrong belongs to a third party and will very
+/// likely be fine in an hour.
+///
+/// What the operator needs instead is the truth: the install finished, one
+/// named thing did not, and re-running the apply is how to pick it up.
+///
+/// # Arguments
+/// * `code` - the exit code from `ferrum-apply apply`.
+///
+/// # Returns
+/// [`ApplyOutcome::Clean`] for 0, [`ApplyOutcome::Degraded`] for 3.
+///
+/// # Errors
+/// Any other code. `ferrum-apply` has already printed the reason to stderr,
+/// which the installer streams, so this names the code rather than inventing
+/// an explanation it does not have.
+pub fn interpret_apply_exit(code: i32) -> anyhow::Result<ApplyOutcome> {
+    match code {
+        0 => Ok(ApplyOutcome::Clean),
+        APPLY_DEGRADED => Ok(ApplyOutcome::Degraded),
+        other => anyhow::bail!(
+            "ferrum-apply exited {other} on the target. The output above is \
+             its own; it names what failed."
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A degraded apply must not fail the install.
+    ///
+    /// `ferrum.proxy.dns.enable` is on for every host the installer gives a
+    /// domain, so the apply reconciles DNS against Cloudflare. A rate limit,
+    /// an outage or an expired token makes that reconcile degrade -- on a
+    /// machine that is otherwise installed and running the new generation.
+    /// Reporting that as a failed install is a working host described as a
+    /// broken one, over something belonging to a third party.
+    #[test]
+    fn a_degraded_apply_is_not_an_install_failure() {
+        assert_eq!(
+            interpret_apply_exit(3).expect("a degraded apply must not fail the install"),
+            ApplyOutcome::Degraded
+        );
+    }
+
+    /// And a clean apply is still clean -- so the case above cannot be
+    /// satisfied by accepting everything.
+    #[test]
+    fn a_clean_apply_is_clean() {
+        assert_eq!(interpret_apply_exit(0).unwrap(), ApplyOutcome::Clean);
+    }
+
+    /// Every other code is still fatal. Without this the fix above would be
+    /// indistinguishable from deleting the error handling.
+    #[test]
+    fn any_other_exit_code_still_fails_the_install() {
+        for code in [1, 2, 4, 101, 255] {
+            let err = interpret_apply_exit(code)
+                .expect_err("only 0 and 3 are survivable")
+                .to_string();
+            assert!(err.contains(&code.to_string()), "the code must be named: {err}");
+        }
+    }
     use crate::sso::SsoDecision;
 
     fn answers(apps: &[&str], sso: bool) -> Answers {
