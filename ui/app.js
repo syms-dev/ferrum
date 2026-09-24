@@ -746,11 +746,23 @@ function renderUpdateReport(target, report, catalogApps, jobId) {
       el("dd", { text: `${orUnknown(candidate.inputName)} — ${orUnknown(candidate.inputUrl)}` }),
       el("dt", { text: "Tracked reference" }),
       el("dd", { text: orUnknown(candidate.reference) }),
-      el("dt", { text: "Revision this host runs" }),
+      // Named as the pin, not as the running revision. This value is read
+      // out of /etc/ferrum/flake.lock, which is the pin the NEXT build would
+      // start from; the pin the running generation was actually built from is
+      // recorded nowhere -- not in the journal, not anywhere else -- so the
+      // two can differ and ferrum has no way to tell. Declining to report the
+      // difference is honest; asserting the equality in a label was not, and
+      // it landed on the one field the operator is asked to read and refuse
+      // in place of a signature check.
+      el("dt", { text: "Revision pinned in /etc/ferrum/flake.lock" }),
       el("dd", {}, [el("code", { class: "rev", text: orUnknown(candidate.currentRev) })]),
       el("dt", { text: "Candidate revision" }),
       el("dd", {}, [el("code", { class: "rev", text: orUnknown(candidate.rev || ferrum.candidateRev) })]),
     ]),
+    el("p", {
+      class: "hint",
+      text: "That is the pin on disk. ferrum cannot confirm the generation now running was built from it — nothing records the pin a generation was built with.",
+    }),
 
     el("h3", { text: "ferrum itself" }),
     el("p", {
@@ -802,7 +814,46 @@ async function updatesView() {
   const report = el("div", {});
   const log = el("pre", { class: "log", hidden: true });
 
+  // Whether a check this view started or reattached to is still in flight.
+  //
+  // This flag is the ONLY bound on concurrent checks anywhere in the system,
+  // which is why it is a closure variable rather than a read of the button's
+  // own disabled state: the daemon exempts check_update from its single-job
+  // interlock on purpose (a rollback must never be blocked by a read-only
+  // check), POST /api/jobs is not rate limited, and the systemd template puts
+  // no limit on concurrent instances. Each check is roughly 2N+2 whole
+  // module-system nix evaluations as root on an N-app host, and nix eval is
+  // memory-heavy -- so an impatient double-click is a real self-DoS against
+  // the very apps this page is reporting on.
+  //
+  // A UI latch is not a substitute for a daemon-side bound. It is the part of
+  // the mitigation that belongs here.
+  let checking = false;
+
+  /// Moves the check control in or out of its in-flight state.
+  ///
+  /// @param {boolean} inFlight - Whether a check is running right now.
+  /// @returns {void}
+  function setChecking(inFlight) {
+    checking = inFlight;
+    check.disabled = inFlight;
+    check.setAttribute("aria-busy", String(inFlight));
+    // The label carries the state, so it survives without colour and is read
+    // out by anything that reaches the button. The dimming in style.css is
+    // the secondary cue, never the only one. The live `pending` region below
+    // announces the same fact to a screen reader that is not on the button.
+    check.textContent = inFlight ? "Checking for updates…" : "Check for updates";
+  }
+
   function attach(id) {
+    // A previous stream is closed rather than dropped. `attach` is reachable
+    // twice for one job -- this view paints before its two awaits, so a click
+    // can land first and the reattach finder below then finds that same job
+    // still running -- and overwriting state.stream without closing it left
+    // two EventSources tailing one job: every log line twice, and one
+    // connection leaked for as long as the tab lives.
+    closeStream();
+    setChecking(true);
     log.hidden = false;
     log.textContent = "";
     // Written for slow, not for instant. The real cost of a candidate check
@@ -833,7 +884,27 @@ async function updatesView() {
           // answer, so it stays in the error line rather than replacing the
           // report region with "nobody has looked yet".
           error.textContent = err.message;
+        } finally {
+          // Whatever the report fetch did, the job itself is over. Re-enabling
+          // only on the success branch would leave a host whose check failed
+          // with a control that never comes back -- a worse fault than the one
+          // this latch exists to prevent.
+          setChecking(false);
         }
+      },
+      onError: () => {
+        // EventSource reconnects by itself, so an error is not terminal and
+        // re-enabling on every one would hand out a second root job to an
+        // operator whose check is merely blinking. The exception is a stream
+        // the browser has closed for good -- a 404 or a non-event-stream
+        // reply -- where `complete` is never coming and the latch would
+        // otherwise be stuck for the life of the view.
+        if (state.stream?.readyState !== EventSource.CLOSED) return;
+        closeStream();
+        pending.textContent = "";
+        error.textContent =
+          "Lost the connection to this check's progress log. The check may still be running on the host — reload this page to pick it up again.";
+        setChecking(false);
       },
     });
   }
@@ -842,7 +913,19 @@ async function updatesView() {
     type: "button",
     text: "Check for updates",
     onclick: async () => {
+      // The guard, not the disabled attribute, is what makes a second click
+      // harmless: `disabled` is the affordance an operator sees, this is the
+      // thing that holds even if a click arrives some other way.
+      if (checking) return;
       error.textContent = "";
+      // Latched here, synchronously, BEFORE the await -- the handler stays
+      // live across it, so anything set afterwards would leave the window a
+      // double-click already fits through.
+      setChecking(true);
+      // Announced, not merely shown: disabling the button takes focus off it,
+      // so the live region above is what tells a screen-reader user that the
+      // click landed. `attach` replaces this with the longer wait message.
+      pending.textContent = "Starting an update check…";
       // No 409 branch, unlike the Apply view. A read-only check deliberately
       // does not claim the daemon's single-job interlock: the one path that
       // has to keep working on a host an update just broke is the rollback a
@@ -853,6 +936,10 @@ async function updatesView() {
         attach(id);
       } catch (err) {
         error.textContent = err.message;
+        pending.textContent = "";
+        // Deliberately not a `finally`: on the success path the latch is
+        // handed to `attach`, which holds it until the stream ends.
+        setChecking(false);
       }
     },
   });
@@ -914,6 +1001,11 @@ async function updatesView() {
     error.textContent = err.message;
   }
   pending.textContent = "";
+
+  // Nothing to reattach to when this view is already following a check: a
+  // click that landed while the two awaits above were outstanding has already
+  // attached to the very job this finder would go looking for.
+  if (checking) return;
 
   // Reattach to a check still running from a previous page load. Filtered on
   // kind as well as status, unlike the Apply view's finder above: an
