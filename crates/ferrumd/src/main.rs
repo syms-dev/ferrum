@@ -9,6 +9,7 @@ mod jobs;
 mod secrets_api;
 mod settings;
 mod static_files;
+mod updates;
 
 use axum::{
     extract::State,
@@ -544,6 +545,7 @@ fn build_router(state: Arc<AppState>) -> Router {
     let protected = Router::new()
         .route("/api/catalog", axum::routing::get(catalog::get_catalog))
         .route("/api/generations", axum::routing::get(generations::get_generations))
+        .route("/api/updates", axum::routing::get(updates::get_updates))
         .route("/api/settings", axum::routing::get(settings::get_settings).put(settings::put_settings))
         .route("/api/secrets/:name", axum::routing::post(secrets_api::write_secret))
         .route("/api/session", axum::routing::get(session_handler))
@@ -2122,6 +2124,7 @@ mod tests {
         ("secrets_api.rs", include_str!("secrets_api.rs")),
         ("settings.rs", include_str!("settings.rs")),
         ("static_files.rs", include_str!("static_files.rs")),
+        ("updates.rs", include_str!("updates.rs")),
     ];
 
     /// The behavioural tests above prove the routes they drive ignore a
@@ -2292,6 +2295,165 @@ mod tests {
             declared, scanned,
             "CRATE_SOURCES must list every module main.rs declares, in order"
         );
+    }
+
+    /// R3's second criterion, held as data rather than as a promise:
+    /// ferrumd never shells out to `nix` and never opens the flake.
+    ///
+    /// The update check is dispatched to privileged `ferrum-apply` as an
+    /// ordinary job precisely so the daemon needs neither -- a subprocess
+    /// would put the whole Nix closure on the unprivileged daemon's PATH
+    /// (modules/core/daemon.nix gives ferrumd exactly `pkgs.sops` and
+    /// `pkgs.ssh-to-age`), and reading `/etc/ferrum/flake.nix` or
+    /// `flake.lock` would make ferrumd a second reader of the privileged
+    /// side's inputs. `updates.rs` serves a document somebody else
+    /// produced, and this is what keeps it that way after the next edit.
+    #[test]
+    fn no_source_file_invokes_nix_or_opens_the_flake() {
+        let mut found = Vec::new();
+        for (name, source) in CRATE_SOURCES {
+            for (number, line) in source.lines().enumerate() {
+                if let Some(needle) = nix_reach_named_on(line) {
+                    found.push(format!("{name}:{}: {needle}: {}", number + 1, line.trim()));
+                }
+            }
+        }
+        assert!(
+            found.is_empty(),
+            "ferrumd must never run a subprocess or read the flake (R3); found:\n{}",
+            found.join("\n")
+        );
+    }
+
+    /// Every way a source line could reach the privileged side's tooling.
+    ///
+    /// `Command::new(` rather than the word "nix": the daemon runs NO
+    /// subprocess at all today, which is both the stronger claim and the
+    /// one with no false positives -- `/nix/var/nix/profiles` is a path
+    /// generations.rs reads on purpose, and a scan keyed on the word would
+    /// have to exempt it, then be one careless exemption away from missing
+    /// the real thing.
+    const NIX_REACH: &[&str] = &[
+        "Command::new(",
+        "process::Command",
+        "flake.nix",
+        "flake.lock",
+    ];
+
+    /// The reach a line makes, if it makes one.
+    ///
+    /// Split out so the recogniser can be exercised directly, for the same
+    /// reason `forward_auth_header_named_on` was: the scan it feeds asserts
+    /// an ABSENCE, and a broken matcher reports exactly what a clean crate
+    /// reports.
+    ///
+    /// # Arguments
+    /// * `line` - one source line, exactly as written.
+    ///
+    /// # Returns
+    /// The matched entry of `NIX_REACH`, or `None` -- including for this
+    /// crate's own prose about why it does none of these things, and for
+    /// the fixture tables below, which are exempted by their leading quote
+    /// exactly as the forward-auth scan's are.
+    fn nix_reach_named_on(line: &str) -> Option<&'static str> {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("//") || trimmed.starts_with('"') {
+            return None;
+        }
+        NIX_REACH.iter().copied().find(|needle| line.contains(needle))
+    }
+
+    /// Lines the recogniser must match. Each begins with a quote so the
+    /// scan above skips this table while reading main.rs -- the same
+    /// exemption `READS_A_HEADER` relies on, and for the same reason: a
+    /// positive control must not be reported as a violation.
+    const REACHES_FOR_NIX: &[&str] = &[
+        "    let out = std::process::Command::new(\"nix\").arg(\"eval\").output();",
+        "        Command::new(\"nix-env\").arg(\"--set\").status()",
+        "    let raw = std::fs::read_to_string(\"/etc/ferrum/flake.nix\")?;",
+        "    let pins = std::fs::read(dir.join(\"flake.lock\"))?;",
+    ];
+
+    /// The crate's own prose about the rule, and ordinary code.
+    const REACHES_FOR_NOTHING: &[&str] = &[
+        "// ferrumd must never shell out to nix; see updates.rs",
+        "    let dir = std::path::PathBuf::from(\"/nix/var/nix/profiles\");",
+        "    let doc = crate::updates::get_updates(query).await;",
+    ];
+
+    /// `GET /api/updates` really is inside the session-gated router, and
+    /// really serves the report that is on disk.
+    ///
+    /// The module's own tests drive `updates_response_in` directly, which
+    /// says nothing about whether the handler was ever wired up or whether
+    /// an anonymous caller can reach it. This drives the REAL router, so
+    /// both are observed rather than assumed.
+    #[tokio::test]
+    async fn updates_is_session_gated_and_serves_the_report_on_disk() {
+        let (dir, state, session, _csrf) = logged_in();
+        let reports = dir.path().join("reports");
+        std::fs::create_dir(&reports).unwrap();
+        let job = "11111111-2222-3333-4444-555555555555";
+        std::fs::write(
+            reports.join(format!("{job}.update-check.json")),
+            serde_json::json!({
+                "schemaVersion": 1,
+                "checkedAt": 1758700000u64,
+                "candidate": { "state": "update-available" }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        // Only this test reads or writes this variable, so unlike
+        // FERRUM_JOBS_DIR -- which jobs.rs's own tests already contend over
+        // (jobs.rs:827-832) -- it cannot race another test in this binary.
+        std::env::set_var("FERRUM_UPDATE_REPORT_DIR", &reports);
+
+        let anonymous = build_router(state.clone())
+            .oneshot(Request::builder().uri("/api/updates").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            anonymous.status(),
+            StatusCode::UNAUTHORIZED,
+            "an unauthenticated read of the update report must be refused"
+        );
+
+        // No CSRF header, on purpose: require_session checks the token on
+        // mutating methods only, and this read must not need one.
+        let response = build_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/updates")
+                    .header("Cookie", format!("{SESSION_COOKIE}={session}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["status"], "report");
+        assert_eq!(body["jobId"], job);
+        assert_eq!(body["report"]["candidate"]["state"], "update-available");
+
+        std::env::remove_var("FERRUM_UPDATE_REPORT_DIR");
+    }
+
+    /// The positive control the scan above has none of on its own.
+    #[test]
+    fn a_reach_for_nix_is_recognised_however_it_is_spelled() {
+        for line in REACHES_FOR_NIX {
+            assert!(nix_reach_named_on(line).is_some(), "the scan's matcher misses: {line}");
+        }
+        for line in REACHES_FOR_NOTHING {
+            assert_eq!(
+                nix_reach_named_on(line),
+                None,
+                "the scan's matcher over-matches: {line}"
+            );
+        }
     }
 
     /// The shapes `module_declared_on` has to recognise, and the ones it
@@ -2478,6 +2640,11 @@ mod tests {
             ("POST", "/api/logout", "/api/logout"),
             ("GET", "/api/catalog", "/api/catalog"),
             ("GET", "/api/generations", "/api/generations"),
+            // No `?job=`: the probe asks for the most recent report, the
+            // shape the Updates view uses on first paint, and the one that
+            // answers 200 on a host that has never been checked rather
+            // than the 400 a non-UUID `job` would earn.
+            ("GET", "/api/updates", "/api/updates"),
             ("GET", "/api/settings", "/api/settings"),
             ("PUT", "/api/settings", "/api/settings"),
             ("POST", "/api/secrets/:name", "/api/secrets/cors-probe"),
