@@ -2325,7 +2325,19 @@ mod tests {
         );
     }
 
-    /// Every way a source line could reach the privileged side's tooling.
+    /// The spellings a careless addition would use to reach the privileged
+    /// side's tooling.
+    ///
+    /// Four literal substrings, and deliberately described as what they are:
+    /// this is a TRIPWIRE, not a proof of absence. An aliased import
+    /// (`use std::process::Command as Cmd;` then `Cmd::new(...)`), a direct
+    /// `libc::execve`, or a flake path assembled at runtime rather than
+    /// written as a literal all walk past it clean. It catches the way the
+    /// code would most plausibly be written on a hurried afternoon, which is
+    /// worth having; it does not catch an author who is working around it.
+    /// The real guarantee is structural -- ferrumd is given exactly
+    /// `pkgs.sops` and `pkgs.ssh-to-age` on its PATH by
+    /// modules/core/daemon.nix -- and this only makes a regression noisy.
     ///
     /// `Command::new(` rather than the word "nix": the daemon runs NO
     /// subprocess at all today, which is both the stronger claim and the
@@ -2404,9 +2416,18 @@ mod tests {
             .to_string(),
         )
         .unwrap();
-        // Only this test reads or writes this variable, so unlike
-        // FERRUM_JOBS_DIR -- which jobs.rs's own tests already contend over
-        // (jobs.rs:827-832) -- it cannot race another test in this binary.
+        // This is the only test that asserts anything about this
+        // variable, but it is NOT the only code that reads it: the
+        // API_ROUTES matrix drives `GET /api/updates` through the real
+        // router, so `report_dir()` reads it on other threads of this same
+        // binary while this line runs. That is safe for the specific reason
+        // that those probes assert on CORS headers and on not-404, neither
+        // of which depends on which directory the handler reads -- not
+        // because nothing else looks. The distinction matters: a `set_var`
+        // defended by "nobody else reads it" invites the next person to add
+        // a test that does. (`FERRUM_JOBS_DIR` is the cautionary case, in
+        // jobs.rs's
+        // `handlers_skip_non_uuid_files_clamp_limit_and_reject_traversal_ids`.)
         std::env::set_var("FERRUM_UPDATE_REPORT_DIR", &reports);
 
         let anonymous = build_router(state.clone())

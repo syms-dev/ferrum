@@ -56,9 +56,12 @@ fn report_dir() -> PathBuf {
 /// The fallback chain itself, with the environment already read.
 ///
 /// Split out so it can be tested without `set_var`/`remove_var`: this binary's
-/// tests share one process, `jobs.rs` has its own `FERRUM_JOBS_DIR` test, and
-/// jobs.rs:827-832 already records a real flake caused by exactly that
-/// collision. A pure function has no such hazard.
+/// tests share one process, and `jobs.rs`'s
+/// `handlers_skip_non_uuid_files_clamp_limit_and_reject_traversal_ids`
+/// records a real flake caused by exactly that collision -- an earlier
+/// version of it set `FERRUM_JOBS_DIR` while that module's own `jobs_dir()`
+/// default test called `remove_var` concurrently. A pure function has no
+/// such hazard.
 ///
 /// # Arguments
 /// * `update_var` - `FERRUM_UPDATE_REPORT_DIR`, if set.
@@ -165,6 +168,16 @@ fn report_job_id(name: &str) -> Option<Option<String>> {
 /// listed, when an entry's metadata cannot be read for any reason other than
 /// the entry having vanished mid-scan, or when the winning file cannot be
 /// read or parsed.
+///
+/// # Known limitation
+/// "Most recent" means the newest mtime, so a host clock that steps BACKWARDS
+/// between two checks -- NTP correcting a fast clock -- makes the newer report
+/// look older, and this serves the previous one. Accepted rather than fixed:
+/// the alternative is trusting the document's own `checkedAt`, which would
+/// make ferrumd parse a document it deliberately treats as opaque, and buy
+/// nothing against a clock that was wrong when `checkedAt` was written either.
+/// What keeps it from being silent is the UI rendering `checkedAt`, so a stale
+/// answer is at least visibly stale.
 fn newest_report(dir: &Path) -> Result<Option<FoundReport>, String> {
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
