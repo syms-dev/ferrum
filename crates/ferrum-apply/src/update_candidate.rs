@@ -32,10 +32,18 @@
 // knows the history, so the comparison is on `lastModified`: the candidate's
 // from `nix flake metadata --json` (read-only, and against the remote
 // flakeref directly -- it never touches /etc/ferrum), the current one from
-// the host's own flake.lock, which already records it. When that comparison
-// cannot be made the result is `CheckFailed` with the real text, never an
-// optimistic "update available" -- R1 forbids reporting a candidate that is
-// not newer as an update, and guessing is how that rule gets broken.
+// the host's own flake.lock, which already records it.
+//
+// Both sides of that comparison are commit metadata, chosen by whoever
+// authored the commit, and no ancestry is ever established -- establishing
+// it needs history, which needs a fetch, which this check does not do. So
+// the ordering is a useful signal and not a proof, and the module says so
+// rather than implying otherwise: when it cannot be made, the result is
+// `OrderUnknown` carrying both timestamps and both revisions for the
+// operator to judge, never an optimistic "update available" and never a
+// silent "not newer". R1 forbids reporting a candidate that is not newer
+// as an update, and it equally forbids an undecidable check being
+// indistinguishable from a clean one.
 use crate::update_check::{CandidateReport, CandidateState, CommandRunner};
 use std::path::Path;
 
@@ -59,8 +67,13 @@ pub struct InputRef {
     /// operator changes the pin themselves, and the check says so.
     pub pinned: bool,
     /// The flake URL without any ref, e.g. `github:owner/repo`, minus any
-    /// userinfo.
+    /// userinfo and minus the query.
     pub base_url: String,
+    /// Every query parameter that is not the ref -- `dir=`, `submodules=`
+    /// and so on. These decide what is evaluated, so they are carried
+    /// rather than dropped when the flakeref is rebuilt at an exact
+    /// revision.
+    pub extra_params: Vec<String>,
     /// True when the URL in `flake.nix` carried `user[:password]@` that
     /// this parse removed. The operator is told, because it changes what
     /// the check can reach.
@@ -75,12 +88,20 @@ impl InputRef {
     /// * `rev` - the revision to pin, normally the resolved candidate.
     ///
     /// # Returns
-    /// A flake URL Nix will resolve to exactly that revision.
+    /// A flake URL Nix will resolve to exactly that revision, carrying
+    /// every parameter the operator pinned except the ref this revision
+    /// supersedes.
     pub fn flakeref_for_rev(&self, rev: &str) -> String {
+        let mut params = self.extra_params.clone();
         if self.base_url.starts_with("git+") {
-            format!("{}?rev={rev}", self.base_url)
+            params.push(format!("rev={rev}"));
+            return format!("{}?{}", self.base_url, params.join("&"));
+        }
+        let pinned = format!("{}/{rev}", self.base_url);
+        if params.is_empty() {
+            pinned
         } else {
-            format!("{}/{rev}", self.base_url)
+            format!("{pinned}?{}", params.join("&"))
         }
     }
 }
@@ -164,6 +185,12 @@ pub const GITHUB_HOST: &str = "github.com";
 /// LAST `@` inside it -- a password containing `@` or `:` therefore does
 /// not shorten the cut, which a first-`@` reading would get wrong.
 ///
+/// One transport is treated differently. Over ssh the login name is not a
+/// secret: it is how the transport selects an account, and `git@` is what
+/// every ssh forge expects. Removing it would break the remote while
+/// protecting nothing, so for ssh the user is kept and only a password
+/// beside it -- which means nothing to ssh -- is dropped.
+///
 /// # Arguments
 /// * `url` - a URL, with or without userinfo.
 ///
@@ -186,20 +213,46 @@ pub fn redact_userinfo(url: &str) -> String {
     };
     let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
     let (authority, tail) = rest.split_at(end);
-    format!("{scheme}{}{tail}", strip_userinfo(authority))
+    let keep_user = transport_keeps_user(scheme.trim_end_matches(&['/', ':'][..]));
+    format!("{scheme}{}{tail}", sanitize_authority(authority, keep_user))
 }
 
-/// The authority with any `user[:password]@` removed.
+/// True for a transport whose login name is part of addressing rather than
+/// a secret.
+///
+/// # Arguments
+/// * `scheme` - a scheme with no trailing separator, possibly compound
+///   (`git+ssh`).
+///
+/// # Returns
+/// True for ssh in any spelling, false otherwise.
+fn transport_keeps_user(scheme: &str) -> bool {
+    scheme
+        .rsplit('+')
+        .next()
+        .is_some_and(|t| t.eq_ignore_ascii_case("ssh"))
+}
+
+/// The authority with its userinfo removed, or reduced to a login name.
 ///
 /// # Arguments
 /// * `authority` - the part of a URL between the scheme and the path.
+/// * `keep_user` - keep the login name and drop only the password, for a
+///   transport where the name is addressing rather than a secret.
 ///
 /// # Returns
-/// The host and port; the whole of `authority` when it carries no userinfo.
-fn strip_userinfo(authority: &str) -> &str {
-    match authority.rfind('@') {
-        Some(at) => &authority[at + 1..],
-        None => authority,
+/// The host and port, optionally still prefixed by `user@`; the whole of
+/// `authority` when it carries no userinfo.
+fn sanitize_authority(authority: &str, keep_user: bool) -> String {
+    let Some(at) = authority.rfind('@') else {
+        return authority.to_string();
+    };
+    let (userinfo, host) = (&authority[..at], &authority[at + 1..]);
+    let user = userinfo.split(':').next().unwrap_or("");
+    if keep_user && !user.is_empty() {
+        format!("{user}@{host}")
+    } else {
+        host.to_string()
     }
 }
 
@@ -232,7 +285,14 @@ pub fn redact_urls_in(text: &str) -> String {
             .find(|c: char| c.is_whitespace() || "/?#'\"`,;)".contains(c))
             .unwrap_or(tail.len());
         let (authority, after) = tail.split_at(end);
-        out.push_str(strip_userinfo(authority));
+        // The scheme is the run of scheme characters immediately before
+        // the `://` just consumed, so an ssh URL quoted inside prose is
+        // treated the same way as one this module parsed itself.
+        let before = &head[..head.len() - 3];
+        let scheme_at = before
+            .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '+' || c == '.' || c == '-'))
+            .map_or(0, |i| i + 1);
+        out.push_str(&sanitize_authority(authority, transport_keeps_user(&before[scheme_at..])));
         rest = after;
     }
     out.push_str(rest);
@@ -255,7 +315,19 @@ pub fn redact_urls_in(text: &str) -> String {
 ///
 /// # Errors
 /// When the repository or the ref begins with `-`.
+/// The transports `git+` may name.
+///
+/// Nothing that comes back from the fetch is signed, so the transport is
+/// the whole of the trust chain. Plaintext `http` lets a network attacker
+/// choose both the revision and the metadata that would make it look
+/// newer, and there is no second control that would catch it. `file` is
+/// kept because a local path cannot be rewritten in flight and is how this
+/// is tested against a real repository.
+const GIT_TRANSPORTS: [&str; 3] = ["https", "ssh", "file"];
+
 fn refuse_option_like(input: InputRef) -> Result<InputRef, String> {
+    // The repository slot is additionally constrained by `GIT_TRANSPORTS`,
+    // which no `-` can satisfy; the ref slot is the one this reaches today.
     for (slot, value) in [("repository", &input.git_url), ("ref", &input.reference)] {
         if value.starts_with('-') {
             return Err(format!(
@@ -293,13 +365,42 @@ pub fn decompose(name: &str, url: &str) -> Result<InputRef, String> {
     let safe = redact_userinfo(url);
     let credentials_redacted = safe != url;
     let url = safe.as_str();
-    if let Some(rest) = url.strip_prefix(GITHUB_SCHEME) {
+
+    // The query is split off once, for both forms. Everything in it that
+    // is not the ref survives into `extra_params`, because a parameter
+    // like `dir=` decides WHICH flake inside the repository is evaluated:
+    // dropping it would point a root-privileged `nix` at something the
+    // operator never pinned.
+    let (bare_url, query) = match url.split_once('?') {
+        Some((b, q)) => (b, Some(q)),
+        None => (url, None),
+    };
+    let params: Vec<&str> = query
+        .map(|q| q.split('&').filter(|kv| !kv.is_empty()).collect())
+        .unwrap_or_default();
+    let param = |key: &str| -> Option<&str> {
+        params
+            .iter()
+            .find_map(|kv| kv.strip_prefix(&format!("{key}=")))
+    };
+    let extra_params: Vec<String> = params
+        .iter()
+        .filter(|kv| !kv.starts_with("rev=") && !kv.starts_with("ref="))
+        .map(|kv| (*kv).to_string())
+        .collect();
+    let query_reference = param("rev").or_else(|| param("ref"));
+
+    if let Some(rest) = bare_url.strip_prefix(GITHUB_SCHEME) {
         let parts: Vec<&str> = rest.splitn(3, '/').collect();
         if parts.len() < 2 || parts[0].is_empty() || parts[1].is_empty() {
             return Err(format!("this host's `{name}.url` names no owner and repository: {url}"));
         }
         let (owner, repo) = (parts[0], parts[1]);
-        let reference = parts.get(2).copied().filter(|r| !r.is_empty());
+        let reference = parts
+            .get(2)
+            .copied()
+            .filter(|r| !r.is_empty())
+            .or(query_reference);
         let base_url = format!("{GITHUB_SCHEME}{owner}/{repo}");
         return refuse_option_like(InputRef {
             name: name.to_string(),
@@ -308,27 +409,33 @@ pub fn decompose(name: &str, url: &str) -> Result<InputRef, String> {
             reference: reference.unwrap_or("HEAD").to_string(),
             pinned: reference.map(is_full_rev).unwrap_or(false),
             base_url,
+            extra_params,
             credentials_redacted,
         });
     }
-    if let Some(rest) = url.strip_prefix("git+") {
-        let (bare, query) = match rest.split_once('?') {
-            Some((b, q)) => (b, Some(q)),
-            None => (rest, None),
-        };
-        let param = |key: &str| -> Option<&str> {
-            query?
-                .split('&')
-                .find_map(|kv| kv.strip_prefix(&format!("{key}=")))
-        };
-        let reference = param("rev").or_else(|| param("ref"));
+    if let Some(bare) = bare_url.strip_prefix("git+") {
+        let transport = bare.split_once("://").map(|(t, _)| t).unwrap_or("");
+        if !GIT_TRANSPORTS.contains(&transport) {
+            return Err(format!(
+                "this host's `{name}.url` names the transport `{transport}://`, which this check \
+                 will not fetch over: nothing it returns is signed, so a transport that can be \
+                 rewritten in flight would let someone else choose both the revision and the \
+                 metadata that makes it look newer. Use one of: {}",
+                GIT_TRANSPORTS
+                    .iter()
+                    .map(|t| format!("{t}://"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
         return refuse_option_like(InputRef {
             name: name.to_string(),
             url: url.to_string(),
             git_url: bare.to_string(),
-            reference: reference.unwrap_or("HEAD").to_string(),
-            pinned: reference.map(is_full_rev).unwrap_or(false),
+            reference: query_reference.unwrap_or("HEAD").to_string(),
+            pinned: query_reference.map(is_full_rev).unwrap_or(false),
             base_url: format!("git+{bare}"),
+            extra_params,
             credentials_redacted,
         });
     }
@@ -430,6 +537,12 @@ pub fn ls_remote_argv(git_url: &str, reference: &str) -> Vec<String> {
 /// itself, because the commit is what gets built. Otherwise a branch beats
 /// a tag of the same name, which is git's own precedence.
 ///
+/// Nothing else counts. `git ls-remote <url> main` also answers with any
+/// ref whose tail is `main` -- `refs/heads/feature/main` among them -- so
+/// taking the first row would let a ref the operator never named decide
+/// what a root-privileged process fetches. An answer that matches none of
+/// the four forms is the ref not existing, and is reported as such.
+///
 /// # Arguments
 /// * `stdout` - the raw `git ls-remote` output.
 /// * `reference` - the ref that was asked for, used for precedence and for
@@ -463,7 +576,10 @@ pub fn parse_ls_remote(stdout: &str, reference: &str) -> Result<String, String> 
             return Ok((*sha).to_string());
         }
     }
-    Ok(rows[0].0.to_string())
+    Err(format!(
+        "the ref `{reference}` this host tracks does not exist in that repository -- the refs \
+         it answered with match no branch, tag or exact name of that ref"
+    ))
 }
 
 /// The argv that asks Nix when a candidate revision was made.
@@ -493,8 +609,10 @@ pub fn metadata_argv(flakeref: &str) -> Vec<String> {
 /// The timestamp is the whole basis for calling a candidate newer, so a
 /// timestamp belonging to some other revision would silently decide an
 /// update. Nix reports the revision it actually resolved, so the two are
-/// compared; a mismatch fails closed to `CheckFailed`, which is already the
-/// right default for "this check could not establish its answer".
+/// compared, and an answer that names NO revision is refused for the same
+/// reason a mismatched one is: it cannot be shown to describe the
+/// candidate. Both route to `OrderUnknown` -- a candidate was resolved, so
+/// the check did not fail; only the ordering is unavailable.
 ///
 /// # Arguments
 /// * `stdout` - the raw `nix flake metadata --json` output.
@@ -504,27 +622,28 @@ pub fn metadata_argv(flakeref: &str) -> Vec<String> {
 /// The candidate revision's `lastModified`.
 ///
 /// # Errors
-/// When the output is unparseable, carries no `lastModified`, or describes
-/// a different revision than the one that was asked about.
+/// When the output is unparseable, names no revision, carries no
+/// `lastModified`, or describes a different revision than the one that was
+/// asked about.
 pub fn parse_metadata_last_modified(stdout: &str, expected_rev: &str) -> Result<i64, String> {
     let doc: serde_json::Value = serde_json::from_str(stdout.trim())
         .map_err(|e| format!("nix flake metadata returned output this check could not parse: {e}"))?;
-    // `revision` is absent for a flake with no VCS revision at all, which
-    // is not a mismatch and must not be treated as one; a PRESENT and
-    // different revision is.
-    if let Some(reported) = doc
+    let reported = doc
         .get("revision")
         .or_else(|| doc.pointer("/locked/rev"))
         .and_then(|v| v.as_str())
-    {
-        if reported != expected_rev {
-            return Err(format!(
-                "nix flake metadata answered about revision {} when this check asked about \
-                 {} -- refusing to order two revisions using a third one's timestamp",
-                short_rev(reported),
-                short_rev(expected_rev)
-            ));
-        }
+        .ok_or_else(|| {
+            "nix flake metadata named no revision, so its timestamp cannot be shown to describe \
+             the candidate this check asked about"
+                .to_string()
+        })?;
+    if reported != expected_rev {
+        return Err(format!(
+            "nix flake metadata answered about revision {} when this check asked about \
+             {} -- refusing to order two revisions using a third one's timestamp",
+            short_rev(reported),
+            short_rev(expected_rev)
+        ));
     }
     doc.get("lastModified")
         .and_then(|v| v.as_i64())
@@ -544,11 +663,16 @@ pub struct CandidateOutcome {
 
 /// The one constructor for a failed check.
 ///
-/// Every failure path goes through here, which is what makes "an
-/// unreachable check can never read as up to date" a structural property
-/// rather than a promise: there is no other way to build a failed outcome,
-/// and this one always sets `CheckFailed`.
-fn check_failed(input: Option<&InputRef>, current_rev: Option<String>, error: String) -> CandidateOutcome {
+/// Every path that resolved NO candidate goes through here, and this one
+/// always sets `CheckFailed`; a path that resolved a candidate but could
+/// not order it goes through `order_unknown` instead. Between them there
+/// is no way to build an outcome that reads as up to date from a failure,
+/// which is what makes that a structural property rather than a promise.
+fn check_failed(
+    input: Option<&InputRef>,
+    locked: Option<&LockedInput>,
+    error: String,
+) -> CandidateOutcome {
     CandidateOutcome {
         report: CandidateReport {
             state: CandidateState::CheckFailed,
@@ -556,11 +680,46 @@ fn check_failed(input: Option<&InputRef>, current_rev: Option<String>, error: St
             input_url: input.map(|i| i.url.clone()),
             reference: input.map(|i| i.reference.clone()),
             rev: None,
-            current_rev,
+            current_rev: locked.map(|l| l.rev.clone()),
+            last_modified: None,
+            current_last_modified: locked.map(|l| l.last_modified),
             error: Some(error),
         },
         warnings: Vec::new(),
         input: input.cloned(),
+    }
+}
+
+/// The one constructor for "a candidate was resolved, but it could not be
+/// shown to be newer".
+///
+/// Separate from `check_failed` for the same structural reason that one
+/// exists: a check that resolved a candidate did not fail, and a state
+/// that cannot be reached by accident is worth more than a promise not to
+/// set it. Both timestamps travel with it, because the operator is being
+/// asked to judge something this module could not.
+fn order_unknown(
+    input: &InputRef,
+    locked: &LockedInput,
+    candidate_rev: &str,
+    candidate_last_modified: Option<i64>,
+    error: String,
+    warnings: Vec<String>,
+) -> CandidateOutcome {
+    CandidateOutcome {
+        report: CandidateReport {
+            state: CandidateState::OrderUnknown,
+            input_name: Some(FERRUM_INPUT.to_string()),
+            input_url: Some(input.url.clone()),
+            reference: Some(input.reference.clone()),
+            rev: Some(candidate_rev.to_string()),
+            current_rev: Some(locked.rev.clone()),
+            last_modified: candidate_last_modified,
+            current_last_modified: Some(locked.last_modified),
+            error: Some(error),
+        },
+        warnings,
+        input: Some(input.clone()),
     }
 }
 
@@ -570,6 +729,9 @@ fn check_failed(input: Option<&InputRef>, current_rev: Option<String>, error: St
 /// * `runner` - the subprocess seam; `git` and `nix` both go through it.
 /// * `flake_nix` - the host's own root-owned `flake.nix`.
 /// * `flake_lock` - the host's own `flake.lock`.
+/// * `now` - the host clock, as seconds since the epoch. Only the ordering
+///   uses it, and only to notice that the installed revision claims to have
+///   been made in the future.
 ///
 /// # Returns
 /// Exactly one first-class state, never an absence: up to date, not newer,
@@ -578,15 +740,16 @@ fn check_failed(input: Option<&InputRef>, current_rev: Option<String>, error: St
 /// # Errors
 /// None -- a failure is a reported state, not an `Err`. A check that could
 /// not reach the network still owes the operator every other fact it has.
-pub fn resolve(runner: &dyn CommandRunner, flake_nix: &Path, flake_lock: &Path) -> CandidateOutcome {
+pub fn resolve(
+    runner: &dyn CommandRunner,
+    flake_nix: &Path,
+    flake_lock: &Path,
+    now: u64,
+) -> CandidateOutcome {
     let flake_nix_text = match std::fs::read_to_string(flake_nix) {
         Ok(t) => t,
         Err(e) => {
-            return check_failed(
-                None,
-                None,
-                format!("could not read {}: {e}", flake_nix.display()),
-            )
+            return check_failed(None, None, format!("could not read {}: {e}", flake_nix.display()))
         }
     };
     let input = match parse_input(&flake_nix_text, FERRUM_INPUT) {
@@ -601,7 +764,6 @@ pub fn resolve(runner: &dyn CommandRunner, flake_nix: &Path, flake_lock: &Path) 
         Ok(l) => l,
         Err(e) => return check_failed(Some(&input), None, e),
     };
-    let current_rev = Some(locked.rev.clone());
 
     let mut warnings = Vec::new();
     if input.credentials_redacted {
@@ -633,12 +795,12 @@ pub fn resolve(runner: &dyn CommandRunner, flake_nix: &Path, flake_lock: &Path) 
     } else {
         let out = match runner.run("git", &ls_remote_argv(&input.git_url, &input.reference)) {
             Ok(o) => o,
-            Err(e) => return check_failed(Some(&input), current_rev, e),
+            Err(e) => return check_failed(Some(&input), Some(&locked), e),
         };
         if !out.success {
             return check_failed(
                 Some(&input),
-                current_rev,
+                Some(&locked),
                 format!(
                     "could not reach {}: {}",
                     input.git_url,
@@ -648,7 +810,7 @@ pub fn resolve(runner: &dyn CommandRunner, flake_nix: &Path, flake_lock: &Path) 
         }
         match parse_ls_remote(&out.stdout, &input.reference) {
             Ok(rev) => rev,
-            Err(e) => return check_failed(Some(&input), current_rev, e),
+            Err(e) => return check_failed(Some(&input), Some(&locked), e),
         }
     };
 
@@ -658,7 +820,9 @@ pub fn resolve(runner: &dyn CommandRunner, flake_nix: &Path, flake_lock: &Path) 
         input_url: Some(input.url.clone()),
         reference: Some(input.reference.clone()),
         rev: Some(candidate_rev.clone()),
-        current_rev: current_rev.clone(),
+        current_rev: Some(locked.rev.clone()),
+        last_modified: None,
+        current_last_modified: Some(locked.last_modified),
         error: None,
     };
 
@@ -669,23 +833,53 @@ pub fn resolve(runner: &dyn CommandRunner, flake_nix: &Path, flake_lock: &Path) 
     let flakeref = input.flakeref_for_rev(&candidate_rev);
     let out = match runner.run("nix", &metadata_argv(&flakeref)) {
         Ok(o) => o,
-        Err(e) => return check_failed(Some(&input), current_rev, e),
+        Err(e) => return order_unknown(&input, &locked, &candidate_rev, None, e, warnings),
     };
     if !out.success {
-        return check_failed(
-            Some(&input),
-            current_rev,
+        return order_unknown(
+            &input,
+            &locked,
+            &candidate_rev,
+            None,
             format!(
                 "could not establish whether {} is newer than what this host runs: {}",
                 short_rev(&candidate_rev),
                 redact_urls_in(out.stderr.trim())
             ),
+            warnings,
         );
     }
     let candidate_last_modified = match parse_metadata_last_modified(&out.stdout, &candidate_rev) {
         Ok(v) => v,
-        Err(e) => return check_failed(Some(&input), current_rev, e),
+        Err(e) => return order_unknown(&input, &locked, &candidate_rev, None, e, warnings),
     };
+    report.last_modified = Some(candidate_last_modified);
+
+    // The silent-forever case, and the only one here that needs no
+    // attacker at all: if the installed revision claims a commit time in
+    // the future, every genuine later release compares as older and this
+    // host reports "nothing to do" for good. R1 forbids exactly that, so
+    // an anchor the clock contradicts orders nothing and says why.
+    if locked.last_modified > now as i64 {
+        let said = format!(
+            "this host's flake.lock records the revision it runs as made at {} (epoch seconds), \
+             which is later than this host's clock reads now ({now}); the candidate {} reports \
+             {}. Nothing can be ordered against an anchor from the future, so this check will \
+             not say whether that candidate is newer until the two agree",
+            locked.last_modified,
+            short_rev(&candidate_rev),
+            candidate_last_modified
+        );
+        warnings.push(said.clone());
+        return order_unknown(
+            &input,
+            &locked,
+            &candidate_rev,
+            Some(candidate_last_modified),
+            said,
+            warnings,
+        );
+    }
 
     report.state = if candidate_last_modified > locked.last_modified {
         CandidateState::UpdateAvailable
@@ -699,6 +893,20 @@ pub fn resolve(runner: &dyn CommandRunner, flake_nix: &Path, flake_lock: &Path) 
 mod tests {
     use super::*;
     use crate::update_check::testing::{fail, ok, FakeRunner};
+
+    /// A fixed host clock for the tests. Every fixture's timestamps sit
+    /// far below it, so only the tests that mean to exercise clock skew do.
+    const NOW: u64 = 1_700_000_000;
+
+    /// `resolve` at `NOW`; the clock is only interesting to the two tests
+    /// that set out to move it.
+    fn resolve_at(
+        runner: &dyn CommandRunner,
+        flake_nix: &std::path::Path,
+        flake_lock: &std::path::Path,
+    ) -> CandidateOutcome {
+        resolve(runner, flake_nix, flake_lock, NOW)
+    }
 
     const OLD: &str = "1111111111111111111111111111111111111111";
     const NEW: &str = "2222222222222222222222222222222222222222";
@@ -879,7 +1087,7 @@ mod tests {
     fn a_newer_candidate_is_an_update_carrying_its_exact_revision() {
         let h = host(&gh("syms-dev/ferrum"), OLD, 100);
         let runner = FakeRunner::new(vec![ls_remote_ok(NEW), metadata_ok_for(NEW, 200)]);
-        let outcome = resolve(&runner, &h.flake_nix, &h.flake_lock);
+        let outcome = resolve_at(&runner, &h.flake_nix, &h.flake_lock);
         assert_eq!(outcome.report.state, CandidateState::UpdateAvailable);
         assert_eq!(outcome.report.rev.as_deref(), Some(NEW));
         assert_eq!(outcome.report.current_rev.as_deref(), Some(OLD));
@@ -906,7 +1114,7 @@ mod tests {
     fn a_candidate_equal_to_the_installed_revision_is_explicitly_up_to_date() {
         let h = host(&gh("syms-dev/ferrum"), OLD, 100);
         let runner = FakeRunner::new(vec![ls_remote_ok(OLD)]);
-        let outcome = resolve(&runner, &h.flake_nix, &h.flake_lock);
+        let outcome = resolve_at(&runner, &h.flake_nix, &h.flake_lock);
         assert_eq!(outcome.report.state, CandidateState::UpToDate);
         assert_eq!(outcome.report.rev.as_deref(), Some(OLD));
         // No ordering question to ask, so no second call is made.
@@ -920,14 +1128,14 @@ mod tests {
     fn a_candidate_that_is_not_newer_is_not_an_update() {
         let h = host(&gh("syms-dev/ferrum"), NEW, 200);
         let runner = FakeRunner::new(vec![ls_remote_ok(OLD), metadata_ok_for(OLD, 100)]);
-        let outcome = resolve(&runner, &h.flake_nix, &h.flake_lock);
+        let outcome = resolve_at(&runner, &h.flake_nix, &h.flake_lock);
         assert_eq!(outcome.report.state, CandidateState::NotNewer);
         assert_eq!(outcome.report.rev.as_deref(), Some(OLD));
 
         // Same commit time is not newer either.
         let runner = FakeRunner::new(vec![ls_remote_ok(OLD), metadata_ok_for(OLD, 200)]);
         assert_eq!(
-            resolve(&runner, &h.flake_nix, &h.flake_lock).report.state,
+            resolve_at(&runner, &h.flake_nix, &h.flake_lock).report.state,
             CandidateState::NotNewer
         );
     }
@@ -942,31 +1150,34 @@ mod tests {
     #[test]
     fn no_failure_anywhere_in_the_resolution_can_produce_up_to_date() {
         let h = host(&gh("syms-dev/ferrum"), OLD, 100);
-        let cases: Vec<(&str, FakeRunner)> = vec![
-            ("the remote is unreachable", FakeRunner::new(vec![(
+        let cases: Vec<(&str, CandidateState, FakeRunner)> = vec![
+            ("the remote is unreachable", CandidateState::CheckFailed, FakeRunner::new(vec![(
                 "ls-remote",
                 fail("fatal: unable to access 'https://...': Could not resolve host"),
             )])),
-            ("the ref is gone", FakeRunner::new(vec![("ls-remote", ok(""))])),
-            ("git itself is missing", FakeRunner::new(vec![])),
-            ("the ordering probe fails", FakeRunner::new(vec![
+            ("the ref is gone", CandidateState::CheckFailed, FakeRunner::new(vec![("ls-remote", ok(""))])),
+            ("git itself is missing", CandidateState::CheckFailed, FakeRunner::new(vec![])),
+            ("the ordering probe fails", CandidateState::OrderUnknown, FakeRunner::new(vec![
                 ls_remote_ok(NEW),
                 ("flake metadata", fail("error: unable to download: HTTP error 403")),
             ])),
-            ("the ordering probe answers nonsense", FakeRunner::new(vec![
+            ("the ordering probe answers nonsense", CandidateState::OrderUnknown, FakeRunner::new(vec![
                 ls_remote_ok(NEW),
                 ("flake metadata", ok("not json")),
             ])),
         ];
-        for (what, runner) in cases {
-            let outcome = resolve(&runner, &h.flake_nix, &h.flake_lock);
-            assert_eq!(
-                outcome.report.state,
-                CandidateState::CheckFailed,
-                "{what} must be a named failure"
-            );
-            assert_ne!(outcome.report.state, CandidateState::UpToDate, "{what}");
-            assert!(outcome.report.rev.is_none(), "{what} must offer no candidate");
+        for (what, expected, runner) in cases {
+            let outcome = resolve_at(&runner, &h.flake_nix, &h.flake_lock);
+            assert_eq!(outcome.report.state, expected, "{what} must be a named non-clean state");
+            // The whole point: not one of the three states an operator
+            // would read as "there is nothing to do here".
+            for clean in [
+                CandidateState::UpToDate,
+                CandidateState::NotNewer,
+                CandidateState::UpdateAvailable,
+            ] {
+                assert_ne!(outcome.report.state, clean, "{what}");
+            }
             let error = outcome.report.error.as_deref().unwrap_or("");
             assert!(!error.is_empty(), "{what} must carry a real error");
             assert!(
@@ -979,7 +1190,7 @@ mod tests {
         // the failures and not of the harness.
         let runner = FakeRunner::new(vec![ls_remote_ok(OLD)]);
         assert_eq!(
-            resolve(&runner, &h.flake_nix, &h.flake_lock).report.state,
+            resolve_at(&runner, &h.flake_nix, &h.flake_lock).report.state,
             CandidateState::UpToDate
         );
     }
@@ -993,7 +1204,7 @@ mod tests {
             "ls-remote",
             fail("fatal: could not read Username for 'https://x': terminal prompts disabled"),
         )]);
-        let outcome = resolve(&runner, &h.flake_nix, &h.flake_lock);
+        let outcome = resolve_at(&runner, &h.flake_nix, &h.flake_lock);
         assert!(
             outcome
                 .report
@@ -1013,7 +1224,7 @@ mod tests {
     fn a_hand_pinned_host_is_up_to_date_and_told_why_nothing_will_ever_change() {
         let h = host(&gh(&format!("syms-dev/ferrum/{OLD}")), OLD, 100);
         let runner = FakeRunner::new(vec![]);
-        let outcome = resolve(&runner, &h.flake_nix, &h.flake_lock);
+        let outcome = resolve_at(&runner, &h.flake_nix, &h.flake_lock);
         assert_eq!(outcome.report.state, CandidateState::UpToDate);
         assert!(runner.programs().is_empty(), "a pinned host queries nothing");
         assert!(
@@ -1032,7 +1243,7 @@ mod tests {
     fn a_pin_edited_ahead_of_the_lock_is_an_update_with_no_nothing_will_change_warning() {
         let h = host(&gh(&format!("syms-dev/ferrum/{NEW}")), OLD, 100);
         let runner = FakeRunner::new(vec![metadata_ok_for(NEW, 200)]);
-        let outcome = resolve(&runner, &h.flake_nix, &h.flake_lock);
+        let outcome = resolve_at(&runner, &h.flake_nix, &h.flake_lock);
         assert_eq!(outcome.report.state, CandidateState::UpdateAvailable);
         assert_eq!(outcome.report.rev.as_deref(), Some(NEW));
         assert_eq!(outcome.report.current_rev.as_deref(), Some(OLD));
@@ -1055,8 +1266,8 @@ mod tests {
         // commit and claims it is much newer.
         let third = "3333333333333333333333333333333333333333";
         let runner = FakeRunner::new(vec![ls_remote_ok(NEW), metadata_ok_for(third, 9_999)]);
-        let outcome = resolve(&runner, &h.flake_nix, &h.flake_lock);
-        assert_eq!(outcome.report.state, CandidateState::CheckFailed);
+        let outcome = resolve_at(&runner, &h.flake_nix, &h.flake_lock);
+        assert_eq!(outcome.report.state, CandidateState::OrderUnknown);
         let error = outcome.report.error.as_deref().unwrap();
         assert!(error.contains("3333333") && error.contains("2222222"), "{error}");
 
@@ -1065,17 +1276,25 @@ mod tests {
         // the parser refusing everything.
         let runner = FakeRunner::new(vec![ls_remote_ok(NEW), metadata_ok_for(NEW, 200)]);
         assert_eq!(
-            resolve(&runner, &h.flake_nix, &h.flake_lock).report.state,
+            resolve_at(&runner, &h.flake_nix, &h.flake_lock).report.state,
             CandidateState::UpdateAvailable
         );
     }
 
-    /// A flake with no VCS revision at all reports none, and that is not a
-    /// mismatch -- failing closed on an absence would turn a working check
-    /// into a permanent error.
+    /// An answer that names no revision cannot be shown to be about the
+    /// candidate, so its timestamp cannot order anything. Accepting it at
+    /// face value -- which this check used to do -- meant an unrelated
+    /// flake's timestamp could decide an update.
     #[test]
-    fn metadata_with_no_revision_field_is_not_treated_as_a_mismatch() {
+    fn metadata_that_names_no_revision_cannot_order_and_says_so() {
         let doc = serde_json::json!({"lastModified": 200}).to_string();
+        let err = parse_metadata_last_modified(&doc, NEW).unwrap_err();
+        assert!(err.contains("revision"), "{err}");
+
+        // The control: an answer that DOES name the right revision still
+        // orders, so this is about the missing field and not a parser that
+        // refuses everything.
+        let doc = serde_json::json!({"lastModified": 200, "revision": NEW}).to_string();
         assert_eq!(parse_metadata_last_modified(&doc, NEW).unwrap(), 200);
     }
 
@@ -1085,7 +1304,7 @@ mod tests {
         let flake_nix = dir.path().join("flake.nix");
         std::fs::write(&flake_nix, template_flake(&gh("syms-dev/ferrum"))).unwrap();
         let runner = FakeRunner::new(vec![]);
-        let outcome = resolve(&runner, &flake_nix, &dir.path().join("flake.lock"));
+        let outcome = resolve_at(&runner, &flake_nix, &dir.path().join("flake.lock"));
         assert_eq!(outcome.report.state, CandidateState::CheckFailed);
         assert!(outcome.report.error.as_deref().unwrap().contains("flake.lock"));
     }
@@ -1154,8 +1373,11 @@ mod tests {
             "the fixture does not actually contain a credential"
         );
 
-        let runner = FakeRunner::new(vec![ls_remote_ok(NEW), metadata_ok_for(NEW, 200)]);
-        let outcome = resolve(&runner, &h.flake_nix, &h.flake_lock);
+        let runner = FakeRunner::new(vec![
+            ("ls-remote", ok(&format!("{NEW}\trefs/heads/main\n"))),
+            metadata_ok_for(NEW, 200),
+        ]);
+        let outcome = resolve_at(&runner, &h.flake_nix, &h.flake_lock);
         assert_eq!(outcome.report.state, CandidateState::UpdateAvailable);
 
         let json = serde_json::to_string(&outcome.report).unwrap();
@@ -1180,17 +1402,17 @@ mod tests {
             "ls-remote",
             fail(&format!("fatal: could not read Username for {}", credentialled_url())),
         )]);
-        let outcome = resolve(&unreachable, &h.flake_nix, &h.flake_lock);
+        let outcome = resolve_at(&unreachable, &h.flake_nix, &h.flake_lock);
         assert_eq!(outcome.report.state, CandidateState::CheckFailed);
         let json = serde_json::to_string(&outcome.report).unwrap();
         assert!(!leaks(&json), "the unreachable-remote report leaks: {json}");
 
         let bad_metadata = FakeRunner::new(vec![
-            ls_remote_ok(NEW),
+            ("ls-remote", ok(&format!("{NEW}\trefs/heads/main\n"))),
             ("flake metadata", fail(&format!("error: unable to fetch {}", credentialled_url()))),
         ]);
-        let outcome = resolve(&bad_metadata, &h.flake_nix, &h.flake_lock);
-        assert_eq!(outcome.report.state, CandidateState::CheckFailed);
+        let outcome = resolve_at(&bad_metadata, &h.flake_nix, &h.flake_lock);
+        assert_eq!(outcome.report.state, CandidateState::OrderUnknown);
         let json = serde_json::to_string(&outcome.report).unwrap();
         assert!(!leaks(&json), "the metadata-failure report leaks: {json}");
 
@@ -1267,5 +1489,192 @@ mod tests {
             ls_remote_argv("https://code.example/x.git", "main"),
             vec!["ls-remote", "--", "https://code.example/x.git", "main"]
         );
+    }
+
+    // ---- C: the three transport and resolution defects ----
+
+    /// Nothing that comes back is signed, so the transport IS the trust
+    /// chain: on plaintext http a network attacker picks both the revision
+    /// and the metadata that would make it look newer.
+    #[test]
+    fn a_transport_that_can_be_rewritten_in_flight_is_refused() {
+        let err = decompose("ferrum", "git+http://code.example/ferrum.git").unwrap_err();
+        assert!(err.contains("http://"), "the error must name the transport: {err}");
+
+        // Anti-vacuity: the transports that cannot be rewritten in flight
+        // are all accepted, so the refusal above is about `http` and not a
+        // guard that rejects every `git+` form.
+        for url in [
+            "git+https://code.example/ferrum.git",
+            "git+ssh://git@code.example/ferrum.git",
+            "git+file:///srv/ferrum",
+        ] {
+            assert!(decompose("ferrum", url).is_ok(), "{url} must be accepted");
+        }
+    }
+
+    /// An ssh login name is not a secret -- it is how the transport picks
+    /// an account, and `git@` is what every ssh forge expects. Stripping it
+    /// would break the remote while protecting nothing. A password in an
+    /// ssh URL means nothing to ssh and is still dropped.
+    #[test]
+    fn an_ssh_login_name_survives_but_a_password_beside_it_does_not() {
+        let input = decompose("ferrum", "git+ssh://git@code.example/ferrum.git").unwrap();
+        assert_eq!(input.git_url, "ssh://git@code.example/ferrum.git");
+        assert!(!input.credentials_redacted, "nothing was redacted, so nothing should be claimed");
+
+        let input = decompose("ferrum", "git+ssh://git:hunter2@code.example/ferrum.git").unwrap();
+        assert_eq!(input.git_url, "ssh://git@code.example/ferrum.git");
+        assert!(input.credentials_redacted);
+        for value in [input.url.clone(), input.git_url.clone(), input.base_url.clone()] {
+            assert!(!value.contains("hunter2"), "the password survived: {value}");
+        }
+    }
+
+    /// `git ls-remote <url> main` matches any ref whose tail is `main`, so
+    /// falling through to the first row let a ref the operator never named
+    /// decide what a root-privileged process fetches.
+    #[test]
+    fn a_ref_the_operator_did_not_name_cannot_decide_the_revision() {
+        let stdout = format!("{NEW}\trefs/heads/feature/main\n");
+        let err = parse_ls_remote(&stdout, "main").unwrap_err();
+        assert!(err.contains("main"), "the error must name the ref that was asked for: {err}");
+
+        // Anti-vacuity: every form that IS an exact match still resolves.
+        assert_eq!(parse_ls_remote(&format!("{NEW}\trefs/heads/main\n"), "main").unwrap(), NEW);
+        assert_eq!(parse_ls_remote(&format!("{NEW}\trefs/tags/main\n"), "main").unwrap(), NEW);
+        assert_eq!(parse_ls_remote(&format!("{NEW}\tHEAD\n"), "HEAD").unwrap(), NEW);
+    }
+
+    /// `dir=` decides WHICH FLAKE inside the repository is evaluated, and
+    /// the rebuilt flakeref is what a root-privileged `nix` is pointed at.
+    /// Dropping it meant evaluating something the operator never pinned.
+    #[test]
+    fn a_subdirectory_pin_survives_into_what_nix_is_asked_to_fetch() {
+        let input = decompose("ferrum", "git+https://code.example/ferrum.git?dir=nix&ref=main").unwrap();
+        assert_eq!(input.reference, "main");
+        let flakeref = input.flakeref_for_rev(NEW);
+        assert!(flakeref.contains("dir=nix"), "the pinned subdirectory was dropped: {flakeref}");
+        assert!(flakeref.contains(&format!("rev={NEW}")), "{flakeref}");
+        // The ref is superseded by the exact revision, not carried beside it.
+        assert!(!flakeref.contains("ref=main"), "{flakeref}");
+
+        // And a URL with no parameters is rebuilt exactly as before.
+        let plain = decompose("ferrum", "git+https://code.example/ferrum.git").unwrap();
+        assert_eq!(
+            plain.flakeref_for_rev(NEW),
+            format!("git+https://code.example/ferrum.git?rev={NEW}")
+        );
+    }
+
+    // ---- A: ordering that does not claim more than it knows ----
+
+    /// The wire value the UI reads. Asserted on the serialization, not on
+    /// the variant name, because the vocabulary is the contract.
+    #[test]
+    fn the_undecidable_ordering_state_has_the_wire_value_the_ui_reads() {
+        assert_eq!(
+            serde_json::to_string(&CandidateState::OrderUnknown).unwrap(),
+            "\"order-unknown\""
+        );
+    }
+
+    /// R1's silent-forever case, and the only one here reachable with no
+    /// attacker at all: one commit carrying a future timestamp becomes the
+    /// anchor, and every genuine later release then reports "not newer"
+    /// for good. A silent false "you are current" is precisely what R1
+    /// forbids, so it is loud and it names both numbers.
+    #[test]
+    fn an_installed_timestamp_from_the_future_is_loud_rather_than_silently_not_newer() {
+        let future = NOW as i64 + 86_400;
+        let h = host(&gh("syms-dev/ferrum"), OLD, future);
+        let runner = FakeRunner::new(vec![ls_remote_ok(NEW), metadata_ok_for(NEW, NOW as i64)]);
+        let outcome = resolve(&runner, &h.flake_nix, &h.flake_lock, NOW);
+
+        assert_eq!(outcome.report.state, CandidateState::OrderUnknown);
+        assert_eq!(outcome.report.rev.as_deref(), Some(NEW), "the candidate is still reported");
+        let warned = outcome.warnings.join(" | ");
+        assert!(warned.contains(&future.to_string()), "both timestamps must be named: {warned}");
+        assert!(warned.contains(&NOW.to_string()), "both timestamps must be named: {warned}");
+
+        // The control: the same fixture with a sane installed timestamp
+        // orders normally, so this is about the future date and not about
+        // the ordering having been disabled.
+        let h = host(&gh("syms-dev/ferrum"), OLD, 100);
+        let runner = FakeRunner::new(vec![ls_remote_ok(NEW), metadata_ok_for(NEW, 200)]);
+        assert_eq!(
+            resolve(&runner, &h.flake_nix, &h.flake_lock, NOW).report.state,
+            CandidateState::UpdateAvailable
+        );
+    }
+
+    /// Every way the ordering probe can fail to answer. None of them may
+    /// become `UpdateAvailable` (an unproven update) or `NotNewer` (a
+    /// silent "nothing to do"), and each keeps the candidate it did
+    /// resolve plus the real text.
+    #[test]
+    fn an_ordering_probe_that_cannot_answer_is_order_unknown_not_an_update() {
+        let h = host(&gh("syms-dev/ferrum"), OLD, 100);
+        let third = "3333333333333333333333333333333333333333";
+        let cases: Vec<(&str, FakeRunner)> = vec![
+            (
+                "the probe itself failed",
+                FakeRunner::new(vec![
+                    ls_remote_ok(NEW),
+                    ("flake metadata", fail("error: unable to fetch")),
+                ]),
+            ),
+            (
+                "the answer carried no lastModified",
+                FakeRunner::new(vec![
+                    ls_remote_ok(NEW),
+                    ("flake metadata", ok(&serde_json::json!({"revision": NEW}).to_string())),
+                ]),
+            ),
+            (
+                "the answer named no revision at all",
+                FakeRunner::new(vec![
+                    ls_remote_ok(NEW),
+                    ("flake metadata", ok(&serde_json::json!({"lastModified": 200}).to_string())),
+                ]),
+            ),
+            (
+                "the answer was about a different revision",
+                FakeRunner::new(vec![ls_remote_ok(NEW), metadata_ok_for(third, 9_999)]),
+            ),
+        ];
+        for (label, runner) in cases {
+            let outcome = resolve_at(&runner, &h.flake_nix, &h.flake_lock);
+            assert_eq!(outcome.report.state, CandidateState::OrderUnknown, "{label}");
+            assert_eq!(outcome.report.rev.as_deref(), Some(NEW), "{label}: candidate still reported");
+            assert!(outcome.report.error.is_some(), "{label}: the real text must survive");
+        }
+
+        // Anti-vacuity: a usable answer still orders, so `OrderUnknown`
+        // above is a finding rather than the only state left reachable.
+        let runner = FakeRunner::new(vec![ls_remote_ok(NEW), metadata_ok_for(NEW, 200)]);
+        assert_eq!(
+            resolve_at(&runner, &h.flake_nix, &h.flake_lock).report.state,
+            CandidateState::UpdateAvailable
+        );
+    }
+
+    /// The ordering rests on self-reported commit metadata, so the report
+    /// shows the operator the numbers it used rather than only the verdict
+    /// it drew from them.
+    #[test]
+    fn the_report_carries_both_timestamps_and_both_revisions() {
+        let h = host(&gh("syms-dev/ferrum"), OLD, 100);
+        let runner = FakeRunner::new(vec![ls_remote_ok(NEW), metadata_ok_for(NEW, 200)]);
+        let outcome = resolve_at(&runner, &h.flake_nix, &h.flake_lock);
+
+        assert_eq!(outcome.report.current_last_modified, Some(100));
+        assert_eq!(outcome.report.last_modified, Some(200));
+        assert_eq!(outcome.report.current_rev.as_deref(), Some(OLD));
+        assert_eq!(outcome.report.rev.as_deref(), Some(NEW));
+
+        let json = serde_json::to_string(&outcome.report).unwrap();
+        assert!(json.contains("\"lastModified\":200"), "{json}");
+        assert!(json.contains("\"currentLastModified\":100"), "{json}");
     }
 }

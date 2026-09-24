@@ -470,6 +470,61 @@ fn check_update_outcome(
     }
 }
 
+/// Everything the update check reads out of the environment, resolved once.
+///
+/// Split from the run below so that the run is a function of its inputs and
+/// nothing else. The composition it performs -- capture the tripwire, build
+/// the report, hand the tripwire's real output to the outcome, publish,
+/// exit -- is the part with no second chance if it is wrong, and it was not
+/// reachable from a test while it read the environment and constructed a
+/// `RealRunner` inline.
+struct CheckUpdateJob {
+    /// The flake directory, e.g. `/etc/ferrum`.
+    flake_dir: String,
+    /// The configuration attribute path up to and including `.config`.
+    config_attr: String,
+    /// The host's `settings.json`.
+    settings_path: std::path::PathBuf,
+    /// The two files the read-only guarantee is measured against.
+    flake_nix: std::path::PathBuf,
+    flake_lock: std::path::PathBuf,
+    /// Where the report document is published.
+    report_dir: std::path::PathBuf,
+    /// The report's file name, from `$FERRUM_JOB_ID`.
+    report_file: String,
+    /// The host clock, as seconds since the epoch.
+    now: u64,
+}
+
+impl CheckUpdateJob {
+    /// Resolve the job from the environment ferrumd sets.
+    ///
+    /// # Returns
+    /// The paths and identifiers the run below needs.
+    fn from_env() -> Self {
+        let flake_ref = std::env::var("FERRUM_FLAKE_REF").unwrap_or_else(|_| {
+            "/etc/ferrum#nixosConfigurations.default.config.system.build.toplevel".to_string()
+        });
+        let (flake_dir, config_attr) = update_check::split_flake_ref(&flake_ref);
+        let settings_path = std::env::var("FERRUM_SETTINGS_PATH")
+            .unwrap_or_else(|_| "/etc/ferrum/settings.json".to_string());
+        let job_id = std::env::var("FERRUM_JOB_ID").ok();
+        Self {
+            flake_nix: std::path::Path::new(&flake_dir).join("flake.nix"),
+            flake_lock: std::path::Path::new(&flake_dir).join("flake.lock"),
+            settings_path: settings_path.into(),
+            report_dir: update_check::report_dir(),
+            report_file: update_check::report_file_name(job_id.as_deref()),
+            now: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            flake_dir,
+            config_attr,
+        }
+    }
+}
+
 /// Runs the read-only update check and leaves its report where ferrumd can
 /// read it.
 ///
@@ -477,55 +532,51 @@ fn check_update_outcome(
 /// `run_preview_migration`, which is CLI-only -- because this one is
 /// dispatched as a job and `GET /api/jobs` renders its stream.
 ///
+/// # Arguments
+/// * `job` - the resolved paths and clock.
+/// * `runner` - the subprocess seam, so a test can drive the whole
+///   composition without a real `nix` or `git`.
+/// * `progress` - the job's event stream.
+///
 /// # Returns
 /// A process exit code: 0 when a report was produced and written, 1 when it
 /// could not be, or when the read-only guarantee was broken.
-fn run_check_update() -> i32 {
-    let mut progress = progress::Progress::open();
-    let flake_ref = std::env::var("FERRUM_FLAKE_REF").unwrap_or_else(|_| {
-        "/etc/ferrum#nixosConfigurations.default.config.system.build.toplevel".to_string()
-    });
-    let (flake_dir, config_attr) = update_check::split_flake_ref(&flake_ref);
-    let settings_path = std::env::var("FERRUM_SETTINGS_PATH")
-        .unwrap_or_else(|_| "/etc/ferrum/settings.json".to_string());
-    let flake_nix = std::path::Path::new(&flake_dir).join("flake.nix");
-    let flake_lock = std::path::Path::new(&flake_dir).join("flake.lock");
-
+fn run_check_update_job(
+    job: &CheckUpdateJob,
+    runner: &dyn update_check::CommandRunner,
+    progress: &mut progress::Progress,
+) -> i32 {
     // Captured BEFORE the first subprocess, released after the last: the
     // window this covers is the whole check.
-    let guard = update_check::ReadOnlyGuard::capture(&[&flake_nix, &flake_lock]);
+    let guard = update_check::ReadOnlyGuard::capture(&[&job.flake_nix, &job.flake_lock]);
     progress.event(
         "check-update",
-        "reading this host's resolved configuration -- nothing is written",
+        "reading this host's resolved configuration -- neither flake.nix nor flake.lock is \
+         written",
     );
 
     let inputs = update_check::CheckInputs {
-        flake_dir: &flake_dir,
-        config_attr: &config_attr,
-        settings_path: std::path::Path::new(&settings_path),
-        flake_nix: &flake_nix,
-        flake_lock: &flake_lock,
-        now: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0),
+        flake_dir: &job.flake_dir,
+        config_attr: &job.config_attr,
+        settings_path: &job.settings_path,
+        flake_nix: &job.flake_nix,
+        flake_lock: &job.flake_lock,
+        now: job.now,
     };
-    let mut report = update_check::build_report(&inputs, &update_check::RealRunner);
+    let mut report = update_check::build_report(&inputs, runner);
 
     let violations = guard.violations();
     report.warnings.extend(violations.iter().cloned());
 
-    let job_id = std::env::var("FERRUM_JOB_ID").ok();
-    let written = update_check::write_report(
-        &update_check::report_dir(),
-        &update_check::report_file_name(job_id.as_deref()),
-        &report,
-    )
-    .map_err(|e| e.to_string());
+    let written = update_check::write_report(&job.report_dir, &job.report_file, &report)
+        .map_err(|e| e.to_string());
 
     // stdout carries the whole document, so a bare `ferrum-apply
     // check-update` over SSH is useful on its own -- the same way
-    // `preview-migration` prints its summary.
+    // `preview-migration` prints its summary. Nothing in it is a secret:
+    // `update_candidate` strips userinfo at the parse precisely because
+    // this line, and the journal behind it, are below the trust level of
+    // the root-only file the URL came from.
     match serde_json::to_string(&report) {
         Ok(body) => println!("{body}"),
         Err(e) => eprintln!("check-update: could not serialize the report: {e}"),
@@ -538,6 +589,19 @@ fn run_check_update() -> i32 {
     }
     progress.complete(result, &detail);
     code
+}
+
+/// The environment-reading wrapper the CLI and the dispatcher both call.
+///
+/// # Returns
+/// The process exit code from `run_check_update_job`.
+fn run_check_update() -> i32 {
+    let mut progress = progress::Progress::open();
+    run_check_update_job(
+        &CheckUpdateJob::from_env(),
+        &update_check::RealRunner,
+        &mut progress,
+    )
 }
 
 /// A real GC pass: prunes state snapshots beyond `ferrum.storage.keepGenerations`.
@@ -1148,5 +1212,157 @@ mod tests {
             1
         );
         assert_eq!(handle_apply_result(Err(anyhow::anyhow!("boom"))), 1);
+    }
+
+    /// The one function that composes the whole check -- tripwire, report,
+    /// publication, exit code -- and the only place the tripwire's output
+    /// is connected to the job's outcome.
+    ///
+    /// It had no test at all: a mutation that replaced `guard.violations()`
+    /// with an empty vector, disconnecting the read-only tripwire from the
+    /// job outcome entirely, left the whole suite green. These two tests
+    /// are what makes that mutation fail.
+    mod check_update_composition {
+        use super::*;
+        use crate::update_check::{CommandOutput, CommandRunner};
+        use std::cell::RefCell;
+
+        const INSTALLED: &str = "1111111111111111111111111111111111111111";
+        const CANDIDATE: &str = "2222222222222222222222222222222222222222";
+
+        /// A runner that answers the check's questions, and -- when asked
+        /// to -- writes to `flake.nix` while doing it, which is exactly the
+        /// event the tripwire exists to catch.
+        struct Saboteur {
+            writes_to: Option<std::path::PathBuf>,
+            calls: RefCell<usize>,
+        }
+
+        impl CommandRunner for Saboteur {
+            fn run(&self, _program: &str, args: &[String]) -> Result<CommandOutput, String> {
+                *self.calls.borrow_mut() += 1;
+                if let Some(path) = &self.writes_to {
+                    // A pin advanced behind the operator's back: the whole
+                    // reason this job is defined by what it must not do.
+                    std::fs::write(path, "{ inputs.ferrum.url = \"github:someone/else\"; }\n")
+                        .unwrap();
+                }
+                let joined = args.join(" ");
+                let body = if joined.contains("ferrum.apps") {
+                    r#"{"sonarr":{"enable":true}}"#.to_string()
+                } else if joined.contains("ferrum.schemaVersion") {
+                    "2".to_string()
+                } else if joined.contains("package.version") {
+                    "\"4.0.1\"".to_string()
+                } else if joined.contains("ls-remote") {
+                    format!("{CANDIDATE}\tHEAD\n")
+                } else {
+                    serde_json::json!({"lastModified": 200, "revision": CANDIDATE}).to_string()
+                };
+                Ok(CommandOutput { success: true, stdout: body, stderr: String::new() })
+            }
+        }
+
+        struct Host {
+            _dir: tempfile::TempDir,
+            job: CheckUpdateJob,
+            progress_path: std::path::PathBuf,
+        }
+
+        fn host() -> Host {
+            let dir = tempfile::tempdir().unwrap();
+            let flake_dir = dir.path().join("etc");
+            std::fs::create_dir_all(&flake_dir).unwrap();
+            let flake_nix = flake_dir.join("flake.nix");
+            std::fs::write(&flake_nix, "{ inputs.ferrum.url = \"github:syms-dev/ferrum\"; }\n")
+                .unwrap();
+            let flake_lock = flake_dir.join("flake.lock");
+            std::fs::write(
+                &flake_lock,
+                serde_json::json!({
+                    "nodes": {
+                        "root": {"inputs": {"ferrum": "ferrum"}},
+                        "ferrum": {"locked": {"rev": INSTALLED, "lastModified": 100}}
+                    },
+                    "version": 7
+                })
+                .to_string(),
+            )
+            .unwrap();
+            let settings_path = dir.path().join("settings.json");
+            std::fs::write(&settings_path, r#"{"schemaVersion":2,"apps":{}}"#).unwrap();
+            let report_dir = dir.path().join("jobs");
+            Host {
+                progress_path: dir.path().join("job.jsonl"),
+                job: CheckUpdateJob {
+                    flake_dir: flake_dir.to_string_lossy().into_owned(),
+                    config_attr: "nixosConfigurations.saltbox.config".to_string(),
+                    settings_path,
+                    flake_nix,
+                    flake_lock,
+                    report_dir,
+                    report_file: "job-1.update-check.json".to_string(),
+                    now: 1_758_700_000,
+                },
+                _dir: dir,
+            }
+        }
+
+        /// The clean path: a report is published and the job succeeds.
+        /// Without this, the failing case below could pass simply because
+        /// the composition never succeeds at anything.
+        #[test]
+        fn a_check_that_touches_nothing_publishes_its_report_and_exits_zero() {
+            let h = host();
+            let runner = Saboteur { writes_to: None, calls: RefCell::new(0) };
+            let mut progress = progress::Progress::to_path(&h.progress_path);
+
+            let code = run_check_update_job(&h.job, &runner, &mut progress);
+
+            assert_eq!(code, 0, "a clean check must exit zero");
+            assert!(*runner.calls.borrow() > 0, "the check ran no subprocess at all");
+            let published = h.job.report_dir.join(&h.job.report_file);
+            let body = std::fs::read_to_string(&published).expect("no report was published");
+            let doc: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(doc["candidate"]["state"], "update-available");
+            let stream = std::fs::read_to_string(&h.progress_path).unwrap();
+            assert!(stream.contains("succeeded"), "{stream}");
+        }
+
+        /// The case with no second chance: the check moved a protected
+        /// file. The tripwire's real output must reach the job outcome --
+        /// a non-zero exit, a `failed` progress line, and the violation
+        /// recorded in the report's own warnings.
+        #[test]
+        fn a_check_that_moved_a_protected_file_fails_the_job_with_the_tripwires_own_words() {
+            let h = host();
+            let before = std::fs::read_to_string(&h.job.flake_nix).unwrap();
+            let runner = Saboteur {
+                writes_to: Some(h.job.flake_nix.clone()),
+                calls: RefCell::new(0),
+            };
+            let mut progress = progress::Progress::to_path(&h.progress_path);
+
+            let code = run_check_update_job(&h.job, &runner, &mut progress);
+
+            // Positive control on the fixture: the file really did move,
+            // so a passing tripwire below would be a finding and not an
+            // artefact of nothing having happened.
+            let after = std::fs::read_to_string(&h.job.flake_nix).unwrap();
+            assert_ne!(before, after, "the saboteur did not actually write the file");
+
+            assert_eq!(code, 1, "a broken read-only guarantee must fail the job");
+            let stream = std::fs::read_to_string(&h.progress_path).unwrap();
+            assert!(stream.contains("failed"), "the job did not report failure: {stream}");
+            assert!(
+                stream.contains("flake.nix"),
+                "the terminal line must name the file that moved: {stream}"
+            );
+            let body = std::fs::read_to_string(h.job.report_dir.join(&h.job.report_file)).unwrap();
+            assert!(
+                body.contains("flake.nix"),
+                "the published report must carry the violation: {body}"
+            );
+        }
     }
 }

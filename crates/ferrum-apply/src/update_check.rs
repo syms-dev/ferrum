@@ -1,5 +1,5 @@
 // The read-only update check: what this host runs today, what it would
-// become, and nothing written anywhere.
+// become, and neither of the two files that decide it touched.
 //
 // This is the `CheckUpdate` request kind -- the one privileged capability
 // that is defined by what it must NOT do. It shells out to `nix eval` and
@@ -17,6 +17,16 @@
 // fails the job if they moved. It cannot undo a write, so it is what
 // catches a prevention that was wrong, not the guarantee itself. The tests
 // use it as a proof; production uses it as an alarm.
+//
+// The scope of that claim, stated exactly. "Read-only" here means
+// /etc/ferrum/flake.nix and /etc/ferrum/flake.lock are byte-identical
+// afterwards, and the guard measures precisely those two files. It does
+// NOT mean nothing is written anywhere: evaluating the candidate populates
+// the Nix store, and pure evaluation still permits import-from-derivation
+// and fixed-output fetches, so the candidate's own code is evaluated as
+// root before the operator has reviewed anything. Store writes and
+// evaluation-time resource use are outside both the prevention and the
+// tripwire. That is a real residual, named here rather than implied away.
 //
 // Everything that decides an argv or shapes the report is a pure function
 // over an injected `CommandRunner`, because there is no `nix`, no `git` and
@@ -92,8 +102,10 @@ impl CommandRunner for RealRunner {
 /// `CheckFailed` is deliberately a distinct value from `UpToDate`: "we
 /// could not look" and "we looked and there is nothing" are different
 /// facts, and collapsing them is exactly the failure R1's unreachable-check
-/// edge case forbids. There is no "unknown" value, because every code path
-/// that reaches this report has already resolved to one of these four.
+/// edge case forbids. `OrderUnknown` is the third of those facts -- "we
+/// looked, we found something, and we cannot tell you whether it is newer"
+/// -- which is distinct again from both. Every code path that reaches this
+/// report has already resolved to exactly one of these five.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum CandidateState {
@@ -103,6 +115,13 @@ pub enum CandidateState {
     NotNewer,
     /// A newer candidate was resolved; `rev` names it exactly.
     UpdateAvailable,
+    /// A candidate was resolved and differs from the installed revision,
+    /// but ferrum could not establish that it is NEWER. Distinct from
+    /// `NotNewer`, which is a positive finding, and from `CheckFailed`,
+    /// which means no candidate was resolved at all. `lastModified` and
+    /// `currentLastModified` carry whatever the ordering attempt did learn,
+    /// so the operator can judge instead of being told.
+    OrderUnknown,
     /// The check could not be performed; `error` carries the real text.
     CheckFailed,
 }
@@ -124,7 +143,16 @@ pub struct CandidateReport {
     pub rev: Option<String>,
     /// The revision the running host's `flake.lock` pins today.
     pub current_rev: Option<String>,
-    /// The real error text when `state` is `CheckFailed`.
+    /// The candidate revision's own `lastModified`, when the ordering
+    /// attempt got that far. Self-reported commit metadata, which is
+    /// exactly why it is shown rather than merely acted on.
+    pub last_modified: Option<i64>,
+    /// The installed revision's `lastModified`, as this host's own
+    /// `flake.lock` records it.
+    pub current_last_modified: Option<i64>,
+    /// The real error text when `state` is `CheckFailed` or
+    /// `OrderUnknown` -- what could not be done, in the words of whatever
+    /// could not do it.
     pub error: Option<String>,
 }
 
@@ -598,7 +626,8 @@ pub fn build_report(inputs: &CheckInputs, runner: &dyn CommandRunner) -> UpdateR
     let schema_migration =
         schema_migration_report(current_schema_version(inputs.settings_path), target);
 
-    let outcome = crate::update_candidate::resolve(runner, inputs.flake_nix, inputs.flake_lock);
+    let outcome =
+        crate::update_candidate::resolve(runner, inputs.flake_nix, inputs.flake_lock, inputs.now);
     warnings.extend(outcome.warnings.clone());
     let candidate = outcome.report.clone();
     // ferrum's release version on a host IS the revision its flake.lock
@@ -686,7 +715,8 @@ pub fn report_file_name(job_id: Option<&str>) -> String {
     }
 }
 
-/// Write the report where ferrumd can read it, world-readable.
+/// Write the report where ferrumd can read it, readable by the `ferrum`
+/// group.
 ///
 /// Written to a temporary file and renamed, so a reader that arrives
 /// mid-write sees either the previous document or the complete new one,
@@ -720,7 +750,10 @@ pub fn write_report(dir: &Path, file_name: &str, report: &UpdateReport) -> std::
         use std::os::unix::fs::PermissionsExt;
         // ferrumd runs as an unprivileged user and this file is written by
         // root; without an explicit mode a restrictive umask would leave
-        // the daemon unable to read the answer it asked for.
+        // the daemon unable to read the answer it asked for. 0644 is not
+        // world-readable in practice: the directory is 0750 ferrum:ferrum
+        // (modules/core/daemon.nix), so the reachable audience is root and
+        // the ferrum group.
         std::fs::set_permissions(&temp_path, std::fs::Permissions::from_mode(0o644))?;
     }
     std::fs::rename(&temp_path, &final_path)?;
@@ -746,6 +779,10 @@ pub fn summary_line(report: &UpdateReport) -> String {
             Some(rev) => format!("update available: {rev}"),
             None => "update available".to_string(),
         },
+        CandidateState::OrderUnknown => format!(
+            "a candidate was found but could not be shown to be newer: {}",
+            report.candidate.error.as_deref().unwrap_or("unknown reason")
+        ),
         CandidateState::CheckFailed => format!(
             "could not check for updates: {}",
             report.candidate.error.as_deref().unwrap_or("unknown error")
@@ -941,7 +978,7 @@ mod tests {
             ("ls-remote", ok(&format!("{CANDIDATE_REV}\tHEAD\n"))),
             (
                 "flake metadata",
-                ok(&serde_json::json!({"lastModified": 200}).to_string()),
+                ok(&serde_json::json!({"lastModified": 200, "revision": CANDIDATE_REV}).to_string()),
             ),
         ])
     }
@@ -1120,7 +1157,7 @@ mod tests {
         answers.push(("ls-remote", ok(&format!("{CANDIDATE_REV}\tHEAD\n"))));
         answers.push((
             "flake metadata",
-            ok(&serde_json::json!({"lastModified": 200}).to_string()),
+            ok(&serde_json::json!({"lastModified": 200, "revision": CANDIDATE_REV}).to_string()),
         ));
         let runner = FakeRunner::new(answers);
         let report = report_for(&runner, &f);
@@ -1272,7 +1309,10 @@ mod tests {
         cand.sort_unstable();
         assert_eq!(
             cand,
-            vec!["currentRev", "error", "inputName", "inputUrl", "reference", "rev", "state"]
+            vec![
+                "currentLastModified", "currentRev", "error", "inputName", "inputUrl",
+                "lastModified", "reference", "rev", "state"
+            ]
         );
 
         let mut ferrum: Vec<&str> = value["ferrum"].as_object().unwrap().keys().map(|s| s.as_str()).collect();

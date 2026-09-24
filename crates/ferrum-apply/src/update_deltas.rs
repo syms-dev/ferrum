@@ -8,7 +8,10 @@
 // app the pin change does not move, and a catalog-only lookup would flag it
 // as changing when it does not. Evaluating the real configuration gets that
 // right for free, because `custom/` is already part of what is being
-// evaluated.
+// evaluated. That is a property of the real evaluation and only of the
+// real evaluation: the tests below drive an injected runner, so they can
+// show what this module does with an answer, never that a real `nix` would
+// give that answer for a `custom/`-pinned app.
 //
 // One `nix eval` per app, and the argv is the control. `--override-input`
 // takes the exact revision the candidate resolution already showed the
@@ -166,6 +169,12 @@ pub fn mark_no_delta(rows: &mut [AppReport], candidate: CandidateState) {
              runs, so no update was evaluated -- this is not a statement that this app is up \
              to date",
         ),
+        CandidateState::OrderUnknown => (
+            AppState::NotChecked,
+            "a candidate revision was resolved but could not be shown to be newer than what \
+             this host runs, so no update was evaluated -- this is not a statement that this \
+             app is up to date",
+        ),
         // UpdateAvailable cannot reach here, and treating it as "nothing
         // known" is the safe way to be wrong if it ever did.
         CandidateState::CheckFailed | CandidateState::UpdateAvailable => (
@@ -309,9 +318,13 @@ mod tests {
         assert_eq!(sonarr.current_version.as_deref(), Some("4.0.18.2971"));
         assert_eq!(sonarr.candidate_version.as_deref(), Some("4.0.19.1"));
 
-        // R1's `custom/` edge case: an app the pin change does not move is
-        // reported unaffected, because the fully resolved configuration --
-        // which already includes custom/ -- is what was evaluated.
+        // An app whose two evaluations return the same version is
+        // reported `up-to-date` rather than as a delta. This is what R1's
+        // `custom/` edge case looks like from inside this module -- but
+        // the runner is told to answer "10.11.10" twice, so what is proved
+        // here is the rendering of equal versions, not that a real `nix`
+        // would return equal versions for a `custom/`-pinned app. That
+        // half is real-host-only.
         let jellyfin = r.iter().find(|a| a.id == "jellyfin").unwrap();
         assert_eq!(jellyfin.state, AppState::UpToDate);
         assert_eq!(jellyfin.candidate_version.as_deref(), Some("10.11.10"));
