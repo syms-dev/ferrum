@@ -162,7 +162,7 @@ checks that the two agree — so where they disagree, the router is right.
 |--------|------|--------------|------|
 | POST | `/api/login` | Exchanges a username and password for a session cookie and a CSRF token | none |
 | POST | `/api/logout` | Clears the session | none (see `logout_is_still_unguarded_and_the_ui_still_depends_on_that`) |
-| GET | `/api/session` | The current session's user | session |
+| GET | `/api/session` | The current session's user and CSRF token | session |
 | POST | `/api/password` | Changes the signed-in user's password | session + CSRF |
 | GET | `/api/catalog` | The app catalog and the settings JSON Schema the UI renders its form from | session |
 | GET | `/api/settings` | The host's current `settings.json` | session |
