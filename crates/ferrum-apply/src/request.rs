@@ -16,6 +16,12 @@ pub enum Request {
     Rollback { to: u32 },
     RestoreState,
     Gc,
+    /// The read-only update check. Zero fields, deliberately: this is the
+    /// one kind that reaches the network, and any field would be content
+    /// ferrumd (or whoever compromised it) chose for a root process to
+    /// fetch. What is checked comes from the operator's own root-owned
+    /// /etc/ferrum/flake.nix, which ferrumd cannot write.
+    CheckUpdate,
 }
 
 impl Request {
@@ -36,6 +42,7 @@ impl Request {
             Request::Rollback { .. } => "rollback",
             Request::RestoreState => "restore_state",
             Request::Gc => "gc",
+            Request::CheckUpdate => "check_update",
         }
     }
 }
@@ -65,6 +72,7 @@ mod tests {
             (r#"{"kind":"rollback","to":3}"#, "rollback"),
             (r#"{"kind":"restore_state"}"#, "restore_state"),
             (r#"{"kind":"gc"}"#, "gc"),
+            (r#"{"kind":"check_update"}"#, "check_update"),
         ] {
             let path = dir.path().join("req.json");
             std::fs::write(&path, json).unwrap();
@@ -94,6 +102,28 @@ mod tests {
             Request::Rollback { to } => assert_eq!(to, 42),
             other => panic!("expected Rollback, got {other:?}"),
         }
+    }
+
+    /// The read-only check carries no fields at all, deliberately: it is
+    /// the one request kind that reaches the network, and a field would be
+    /// operator- or attacker-supplied content deciding what a root process
+    /// fetches. The repo and ref come from the operator's own root-owned
+    /// flake.nix instead, which ferrumd cannot write.
+    #[test]
+    fn check_update_carries_no_fields_and_ignores_any_that_are_injected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("req.json");
+        std::fs::write(&path, r#"{"kind":"check_update"}"#).unwrap();
+        assert!(matches!(read_request(&path).unwrap(), Request::CheckUpdate));
+
+        // An extra field on the wire changes nothing about what runs: the
+        // variant has nowhere to put it.
+        std::fs::write(
+            &path,
+            r#"{"kind":"check_update","flakeRef":"https://evil.example/repo"}"#,
+        )
+        .unwrap();
+        assert!(matches!(read_request(&path).unwrap(), Request::CheckUpdate));
     }
 
     #[test]
