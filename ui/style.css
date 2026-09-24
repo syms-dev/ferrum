@@ -110,6 +110,18 @@ tr.current td { font-weight: 600; }
    so a backwards clock step can hand the operator a stale one -- the age of
    what they are reading is the mitigation, and a muted footnote is not read. */
 .checked-at { font-weight: 600; margin: .25rem 0 .75rem; }
+/* A warning that reads like body text does not get read, and the one this
+   exists for -- a future-dated lock timestamp, which makes every genuine
+   later release report "not newer" forever -- is the only thing on the page
+   naming a cause the operator can act on. The border and the heading are what
+   make it conspicuous; colour is the third cue and never the only one, so it
+   still reads in monochrome. --danger on the edge rather than the text: a
+   warning about the check is not a failure of it. */
+.callout { border: 1px solid var(--line); border-left: .25rem solid var(--accent);
+           border-radius: .4rem; padding: .5rem .75rem; margin: .75rem 0; background: var(--panel); }
+.callout h3 { margin: 0 0 .35rem; font-size: 1rem; }
+.callout ul { margin: 0; padding-left: 1.25rem; }
+.callout.warn { border-left-color: var(--danger); }
 .updates table { min-width: 34rem; }
 .updates caption { text-align: left; padding: .25rem .5rem; }
 /* A 40-character hex revision has to be readable in full without pushing the

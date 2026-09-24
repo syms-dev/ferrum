@@ -471,10 +471,18 @@ async function generationsView() {
 /// look identical when a branch is missing.
 ///
 /// There is no `not-checked` here, unlike APP_STATES below. Every code path
-/// that produces a candidate report has already resolved one of these four;
+/// that produces a candidate report has already resolved one of these five;
 /// "this host has never checked at all" is not a candidate state, it is the
 /// endpoint's own `never-checked` envelope status, rendered separately.
-const CANDIDATE_STATES = ["up-to-date", "not-newer", "update-available", "check-failed"];
+///
+/// `order-unknown` is the newest of them and the one that carries the most
+/// weight. Ordering rests entirely on the `lastModified` each side reports
+/// for itself, and no ancestry is ever established, so there are real cases
+/// -- an unparseable probe, or a locked timestamp sitting in this host's
+/// future -- where ferrum knows the candidate DIFFERS and cannot honestly say
+/// which way. Collapsing that into `not-newer` is what turns one skewed clock
+/// into a permanent, silent "nothing to do".
+const CANDIDATE_STATES = ["up-to-date", "not-newer", "update-available", "check-failed", "order-unknown"];
 
 /// The five values an entry in `apps[]`'s `state` can carry. Same file, same
 /// flake check, same cross-check against `AppState`.
@@ -534,10 +542,11 @@ function stateText(label, prose) {
 // unreachable check that reads as a clean result is precisely the confusion
 // R1's edge cases name.
 const CANDIDATE_STATE_TEXT = {
-  "up-to-date": stateText("Up to date", "The tracked reference resolves to the revision this host is already running. There is nothing to apply."),
-  "not-newer": stateText("Candidate is not newer — not an update", "The tracked reference resolves to a revision that is not newer than the one this host runs. ferrum will not offer it, the same way preview-migration refuses to call a lower schema version a migration."),
-  "update-available": stateText("Update available", "A newer revision exists. Nothing has been fetched, built, or applied — a check only reads."),
+  "up-to-date": stateText("Up to date", "The tracked reference resolves to the revision this host already pins. There is nothing to apply."),
+  "not-newer": stateText("Candidate is not newer — not an update", "The tracked reference resolves to a revision that is older than the pinned one by the commit dates the two carry. ferrum will not offer it, the same way preview-migration refuses to call a lower schema version a migration."),
+  "update-available": stateText("Update available", "A revision later than the pinned one exists, by the commit dates the two carry. Nothing has been fetched, built, or applied — a check only reads."),
   "check-failed": stateText("Could not check for updates", "The check did not complete, so this host's update state is unknown. That is not the same as being up to date."),
+  "order-unknown": stateText("A different revision — ferrum cannot tell whether it is newer", "The tracked reference resolves to a revision this host does not pin, and ferrum could not establish which of the two came later. This is NOT a statement that you are up to date: there may well be an update here, and ferrum is declining to guess rather than answering. Both revisions are shown below; the judgement is yours."),
 };
 
 // "Would change" rather than "Update available" for a single app, deliberately.
@@ -679,6 +688,25 @@ function renderUpdateReport(target, report, catalogApps, jobId) {
   const rows = el("tbody");
   for (const app of apps) rows.appendChild(appRow(app, catalogApps));
 
+  // Warnings moved to the top of the report and given a callout of their own,
+  // rather than sitting last as a plain list. The case that forced it: one
+  // future-dated `lastModified` in the lock makes every genuinely later
+  // release compare as older, so the screen says "not newer" forever and
+  // nothing else on it ever looks wrong. The warning is the only thing on the
+  // page that names a cause an operator can act on, and a footnote below the
+  // apps table is not where it gets read.
+  //
+  // Deliberately NOT string-matched for the future-dated case: sniffing the
+  // producer's wording for one warning would silently demote every warning it
+  // failed to recognise, and the producer's text is not this file's to depend
+  // on. Every warning is treated as conspicuous instead.
+  const warningsBlock = warnings.length
+    ? el("section", { class: "callout warn" }, [
+        el("h3", { text: warnings.length === 1 ? "A warning about this check" : "Warnings about this check" }),
+        el("ul", {}, warnings.map((w) => el("li", { text: String(w) }))),
+      ])
+    : null;
+
   // A report carrying no apps at all is a fact worth stating. An empty table
   // body would read as "nothing changes", which is a different claim.
   const appsBlock = apps.length
@@ -738,8 +766,22 @@ function renderUpdateReport(target, report, catalogApps, jobId) {
         })
       : null,
 
+    warningsBlock,
+
     el("h3", { text: "The candidate" }),
     stateCell(CANDIDATE_STATE_TEXT[candidate.state], candidate.state, candidate.error || null, CANDIDATE_STATES),
+
+    // Said once, under every ordering verdict, rather than qualified into
+    // each state's own sentence. "Newer" here means nothing but: the commit
+    // date the candidate reports for itself is later than the one the lock
+    // records. Git commit dates are chosen by whoever makes the commit and
+    // ferrum establishes no ancestry between the two revisions, so this is
+    // self-reported metadata, not proof. It belongs in the same voice as the
+    // trust section at the foot of this screen.
+    el("p", {
+      class: "hint",
+      text: "Newer and older here mean only that one commit date is later than the other. Those dates are set by whoever made the commit, and ferrum does not establish that either revision descends from the other.",
+    }),
 
     el("dl", { class: "facts" }, [
       el("dt", { text: "Tracked input" }),
@@ -793,12 +835,6 @@ function renderUpdateReport(target, report, catalogApps, jobId) {
         "ferrum cannot tell you whether you have seen this migration before: the step that would record having shown it is not built. A pending migration therefore reappears on every check, and seeing it twice is not evidence that anything went wrong.",
     }),
 
-    warnings.length
-      ? el("section", {}, [
-          el("h3", { text: "Warnings" }),
-          el("ul", {}, warnings.map((w) => el("li", { text: String(w) }))),
-        ])
-      : null,
   );
 }
 
