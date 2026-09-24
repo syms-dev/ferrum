@@ -7,7 +7,7 @@
 //
 // Note what ferrumd never does here: it never builds, never switches, never
 // touches the Nix profile, and never runs anything as root. The entire
-// privileged surface is the closed five-variant request enum below, which
+// privileged surface is the closed six-variant request enum below, which
 // mirrors crates/ferrum-apply/src/request.rs exactly.
 use axum::{
     extract::{Path, Query, State},
@@ -34,6 +34,10 @@ pub enum JobRequest {
     Rollback { to: u32 },
     RestoreState,
     Gc,
+    /// The read-only update check. Mirrors `request::Request::CheckUpdate`
+    /// -- zero fields, so nothing an API caller supplies ever decides what
+    /// the root process fetches.
+    CheckUpdate,
 }
 
 fn jobs_dir() -> std::path::PathBuf {
@@ -118,6 +122,7 @@ fn request_body(req: &JobRequest) -> serde_json::Value {
         JobRequest::Rollback { to } => serde_json::json!({"kind": "rollback", "to": to}),
         JobRequest::RestoreState => serde_json::json!({"kind": "restore_state"}),
         JobRequest::Gc => serde_json::json!({"kind": "gc"}),
+        JobRequest::CheckUpdate => serde_json::json!({"kind": "check_update"}),
     }
 }
 
@@ -201,7 +206,7 @@ async fn create_job_in(
     // It fails closed: if the current generation cannot be established, the
     // one thing certain is that we cannot say the target is not it, and the
     // operation being guarded reboots the machine. Only rollback pays for
-    // this lookup -- the other four kinds have no target to check.
+    // this lookup -- the other five kinds have no target to check.
     if let JobRequest::Rollback { to } = req {
         let target = to;
         // A directory walk plus an lstat per generation, so it goes to the
@@ -232,7 +237,21 @@ async fn create_job_in(
             Err(status) => return status.into_response(),
         }
     }
-    {
+    // DA-7. The read-only check is the one kind exempt from the interlock,
+    // and the invariant that decides it is: *a rollback must never be
+    // blocked by a read-only check.* The flag has no timeout and no cancel,
+    // a candidate check evaluates the whole module system twice and can
+    // take minutes, and the one path that has to work on a host an update
+    // just broke is the rollback a shared flag would refuse for the whole
+    // of that time.
+    //
+    // This is a change INSIDE the critical section, not a bypass bolted
+    // beside it: for every kind that does take the interlock, the check and
+    // the set are still one lock acquisition, because two concurrent POSTs
+    // that both read `false` before either wrote `true` would otherwise
+    // both be admitted.
+    let takes_interlock = !matches!(req, JobRequest::CheckUpdate);
+    if takes_interlock {
         let mut running = state.job_running.lock().unwrap();
         if *running {
             audit_job("denied", &format!("kind={kind} a job is already running"));
@@ -244,8 +263,13 @@ async fn create_job_in(
     let uuid = Uuid::new_v4().to_string();
     let body = request_body(&req);
 
+    // Releasing is conditional for the same reason claiming is: a failed
+    // check must not clear an interlock it never claimed, which would let a
+    // second apply in alongside the one still running.
     let release = || {
-        *state.job_running.lock().unwrap() = false;
+        if takes_interlock {
+            *state.job_running.lock().unwrap() = false;
+        }
     };
 
     if let Err(e) = tokio::fs::create_dir_all(dir).await {
@@ -960,6 +984,15 @@ mod tests {
             r#"{"kind":"restore_state"}"#
         );
         assert_eq!(request_body(&JobRequest::Gc).to_string(), r#"{"kind":"gc"}"#);
+        // The read-only check is a bare tag and nothing else. Asserted as
+        // the exact serialized bytes, because "no field crosses the
+        // privilege boundary" is the whole security property of this
+        // variant -- a field silently added to `JobRequest` would show up
+        // here as a changed string.
+        assert_eq!(
+            request_body(&JobRequest::CheckUpdate).to_string(),
+            r#"{"kind":"check_update"}"#
+        );
     }
 
     #[test]
@@ -1069,10 +1102,22 @@ mod tests {
             profiles: anyhow::Result<std::path::PathBuf>,
             req: JobRequest,
         ) -> (StatusCode, String, Vec<String>) {
+            dispatch_with(requests, profiles, state(), req).await
+        }
+
+        /// `dispatch`, with the shared state handed in so a test can drive
+        /// the handler against an interlock that is ALREADY claimed, and
+        /// can inspect the flag afterwards.
+        async fn dispatch_with(
+            requests: &std::path::Path,
+            profiles: anyhow::Result<std::path::PathBuf>,
+            state: Arc<AppState>,
+            req: JobRequest,
+        ) -> (StatusCode, String, Vec<String>) {
             let response = create_job_in(
                 requests,
                 profiles,
-                state(),
+                state,
                 Some("operator".to_string()),
                 crate::client_addr::ClientAddr::Direct("127.0.0.1".parse().unwrap()),
                 req,
@@ -1206,8 +1251,89 @@ mod tests {
             assert!(written.is_empty(), "found: {written:?}");
         }
 
+        /// DA-7, asserted rather than commented.
+        ///
+        /// The invariant: *a rollback must never be blocked by a read-only
+        /// check.* `job_running` has no timeout and no cancel, and a
+        /// candidate check can take minutes -- so if the check claimed it,
+        /// the one path that has to work on a host an update just broke is
+        /// exactly the path a shared interlock would block.
+        ///
+        /// Both halves are asserted together, because either alone is
+        /// vacuous: an exemption that also exempted `Apply` would pass a
+        /// test that only looked at `CheckUpdate`.
+        #[tokio::test]
+        async fn a_read_only_check_is_not_blocked_by_a_running_job_but_an_apply_still_is() {
+            let requests = tempfile::tempdir().unwrap();
+            let shared = state();
+            *shared.job_running.lock().unwrap() = true;
+
+            let (status, body, _) = dispatch_with(
+                requests.path(),
+                Err(anyhow::anyhow!("unused")),
+                shared.clone(),
+                JobRequest::CheckUpdate,
+            )
+            .await;
+            assert_ne!(
+                status,
+                StatusCode::CONFLICT,
+                "a read-only check must not be refused because another job holds the \
+                 interlock -- it would make a rollback unreachable on a broken host: {body}"
+            );
+            // It got as far as the D-Bus start, which there is no system bus
+            // for here. That is the proof it reached the dispatch.
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+
+            let (status, body, _) = dispatch_with(
+                requests.path(),
+                Err(anyhow::anyhow!("unused")),
+                shared.clone(),
+                JobRequest::Apply,
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::CONFLICT,
+                "apply changes the running system and must still serialize: {body}"
+            );
+
+            // And the check neither claimed nor released someone else's
+            // claim: the flag is exactly as it was found.
+            assert!(
+                *shared.job_running.lock().unwrap(),
+                "the check must leave the running job's own interlock alone"
+            );
+        }
+
+        /// The other half of the exemption: a check on an idle host must
+        /// not leave the interlock claimed behind it, or the first check
+        /// would wedge every later apply.
+        #[tokio::test]
+        async fn a_read_only_check_never_claims_the_interlock_on_an_idle_host() {
+            let requests = tempfile::tempdir().unwrap();
+            let shared = state();
+            let _ = dispatch_with(
+                requests.path(),
+                Err(anyhow::anyhow!("unused")),
+                shared.clone(),
+                JobRequest::CheckUpdate,
+            )
+            .await;
+            assert!(
+                !*shared.job_running.lock().unwrap(),
+                "a read-only check must leave the interlock unclaimed"
+            );
+
+            // Anti-vacuity: this probe really can observe a claimed
+            // interlock, so "unclaimed" above is a finding rather than a
+            // matcher that never fires.
+            *shared.job_running.lock().unwrap() = true;
+            assert!(*shared.job_running.lock().unwrap());
+        }
+
         /// The guard is scoped to rollback and must not cost the other
-        /// four kinds a profile-directory lookup they have no use for.
+        /// five kinds a profile-directory lookup they have no use for.
         #[tokio::test]
         async fn the_other_job_kinds_do_not_need_a_readable_profile_directory() {
             let requests = tempfile::tempdir().unwrap();
