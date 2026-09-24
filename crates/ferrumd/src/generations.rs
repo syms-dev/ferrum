@@ -184,19 +184,6 @@ pub fn profiles_dir() -> anyhow::Result<std::path::PathBuf> {
         .map_err(|_| anyhow::anyhow!("FERRUM_PROFILES_DIR not set"))
 }
 
-/// The generation this host is currently running, or `None` when the
-/// `system` symlink points somewhere that is not a generation link.
-///
-/// Separate from `build_response` because the caller that needs it -- the
-/// rollback guard in `jobs::create_job` -- needs this one number and not a
-/// journal walk, and must not be made to depend on the journal being
-/// readable to decide whether a rollback is pointless.
-///
-/// # Arguments
-/// * `profiles_dir` - the Nix profile directory.
-///
-/// # Errors
-/// Propagates `list_profile_generations`.
 /// Why rolling back to the generation already running is refused.
 ///
 /// One string, used in two places that must not drift apart: the
@@ -214,6 +201,19 @@ pub fn rollback_to_current_reason(generation: u32) -> String {
     )
 }
 
+/// The generation this host is currently running, or `None` when the
+/// `system` symlink points somewhere that is not a generation link.
+///
+/// Separate from `build_response` because the caller that needs it -- the
+/// rollback guard in `jobs::create_job` -- needs this one number and not a
+/// journal walk, and must not be made to depend on the journal being
+/// readable to decide whether a rollback is pointless.
+///
+/// # Arguments
+/// * `profiles_dir` - the Nix profile directory.
+///
+/// # Errors
+/// Propagates `list_profile_generations`.
 pub fn current_generation(profiles_dir: &Path) -> anyhow::Result<Option<u32>> {
     Ok(list_profile_generations(profiles_dir)?
         .into_iter()

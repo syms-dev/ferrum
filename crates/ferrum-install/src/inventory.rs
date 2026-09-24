@@ -194,18 +194,6 @@ fn strip_controls(s: &str) -> String {
     }
 }
 
-/// `clean` for a field that is always present, such as a device name.
-///
-/// `name` reaches the operator's table like every other field and was NOT
-/// being cleaned at all. That is the whole of SEC-C1: see `clean`.
-///
-/// # Arguments
-/// * `v` - the raw field.
-///
-/// # Returns
-/// The value with control characters removed, or `"?"` if nothing is left
-/// -- never an empty cell, which would be indistinguishable from a
-/// rendering bug.
 /// Makes a `Device` recovered from disk satisfy what `parse_lsblk` would
 /// have established -- refusing where a field drives a decision, and
 /// normalising where it only renders.
@@ -348,6 +336,24 @@ fn check_device_name(name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `clean` for a field that is always present, such as a device name.
+///
+/// `name` reaches the operator's table like every other field and was NOT
+/// being cleaned at all. That is the whole of SEC-C1: see `clean`.
+///
+/// This comment sat 150 lines from the function it describes, directly above
+/// `check_recovered_device`'s own. Two doc comments with no item between them
+/// merge, so rustdoc attached all of it to `check_recovered_device` -- whose
+/// parameter is a `&mut Device`, not the `v: the raw field` this `# Arguments`
+/// section describes -- and left this function undocumented.
+///
+/// # Arguments
+/// * `v` - the raw field.
+///
+/// # Returns
+/// The value with control characters removed, or `"?"` if nothing is left
+/// -- never an empty cell, which would be indistinguishable from a
+/// rendering bug.
 fn clean_required(v: String) -> String {
     let c = strip_controls(&v);
     if c.is_empty() {

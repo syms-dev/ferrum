@@ -408,31 +408,6 @@ pub fn plan(desired: &[DesiredRecord], existing: &ZoneListing) -> Vec<RecordActi
     plan_with_adoptions(desired, existing, &AdoptedNames::none())
 }
 
-/// Computes the reconcile plan, honouring the names the operator explicitly
-/// adopted (A3's opt-in half).
-///
-/// This is the whole public surface of adoption: there is no way to obtain a
-/// [`ManagedRecordId`] for a foreign record except by passing an
-/// [`AdoptedNames`] set that names it here. A caller holding a client, a zone
-/// and a listing still cannot write to the operator's record -- it has to go
-/// through this function, with a name the operator actually gave.
-///
-/// # Arguments
-/// * `desired` - every record ferrum wants, from the published-app set.
-/// * `existing` - the **whole** listing, as [`plan`] requires, including the
-///   records of other types it carries alongside the A/CNAMEs.
-/// * `adopted` - the names the operator handed to ferrum at the install gate,
-///   carried to the host in `ferrum.proxy.dns.adoptedNames`. Matching is per
-///   name: a set containing `plex.example.com` changes nothing about
-///   `sonarr.example.com`.
-///
-/// # Returns
-/// The same plan as [`plan`], except that a desired name occupied by a
-/// foreign record the operator adopted becomes [`RecordAction::Adopt`]
-/// instead of [`RecordAction::SkipForeign`]. Every other guarantee is
-/// unchanged -- in particular a foreign record at a name nobody adopted is
-/// still never written to, and a foreign record at a name nothing wants is
-/// still never deleted whether it was adopted or not.
 /// Appends a [`RecordAction::SkipForeignBeside`] for each record ferrum does
 /// not own that shares a wanted name with something ferrum already described.
 ///
@@ -459,6 +434,31 @@ fn disclose_foreign_beside<'a>(
     }
 }
 
+/// Computes the reconcile plan, honouring the names the operator explicitly
+/// adopted (A3's opt-in half).
+///
+/// This is the whole public surface of adoption: there is no way to obtain a
+/// [`ManagedRecordId`] for a foreign record except by passing an
+/// [`AdoptedNames`] set that names it here. A caller holding a client, a zone
+/// and a listing still cannot write to the operator's record -- it has to go
+/// through this function, with a name the operator actually gave.
+///
+/// # Arguments
+/// * `desired` - every record ferrum wants, from the published-app set.
+/// * `existing` - the **whole** listing, as [`plan`] requires, including the
+///   records of other types it carries alongside the A/CNAMEs.
+/// * `adopted` - the names the operator handed to ferrum at the install gate,
+///   carried to the host in `ferrum.proxy.dns.adoptedNames`. Matching is per
+///   name: a set containing `plex.example.com` changes nothing about
+///   `sonarr.example.com`.
+///
+/// # Returns
+/// The same plan as [`plan`], except that a desired name occupied by a
+/// foreign record the operator adopted becomes [`RecordAction::Adopt`]
+/// instead of [`RecordAction::SkipForeign`]. Every other guarantee is
+/// unchanged -- in particular a foreign record at a name nobody adopted is
+/// still never written to, and a foreign record at a name nothing wants is
+/// still never deleted whether it was adopted or not.
 #[must_use]
 pub fn plan_with_adoptions(
     desired: &[DesiredRecord],
