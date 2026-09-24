@@ -144,6 +144,24 @@ export const jobs = (limit) =>
   request("GET", `/api/jobs${limit ? `?limit=${encodeURIComponent(limit)}` : ""}`);
 export const job = (id) => request("GET", `/api/jobs/${encodeURIComponent(id)}`);
 
+/// The most recent check_update report this host holds.
+///
+/// @returns {Promise<object>} The report document, whose `candidate.state` is
+///   `not-checked` when no check has ever run -- an absent report is a state,
+///   not an error.
+export const updates = () => request("GET", "/api/updates");
+
+/// The report produced by one specific check_update job.
+///
+/// Deliberately the ONLY place the per-job query shape is spelled out. The
+/// Updates view calls this once, after its own job reports complete, so when
+/// the daemon settles that shape exactly one line here changes.
+///
+/// @param {string} jobId - The uuid `POST /api/jobs` returned.
+/// @returns {Promise<object>} That job's report document.
+export const updatesForJob = (jobId) =>
+  request("GET", `/api/updates?job=${encodeURIComponent(jobId)}`);
+
 // --- writes --------------------------------------------------------------
 
 /// Writes settings. NEVER triggers an apply -- that is a separate, explicit
@@ -160,7 +178,11 @@ export const putSecret = (name, value) =>
   });
 
 /// Starts a privileged job. `kind` is one of the daemon's closed set:
-/// preflight, apply, rollback, restore_state, gc.
+/// preflight, apply, rollback, restore_state, gc, check_update.
+///
+/// Every kind but `check_update` can come back 409 from the daemon's
+/// single-job interlock. `check_update` deliberately does not claim it, so a
+/// read-only check can never stand between an operator and a rollback.
 export const startJob = (kind, extra = {}) =>
   request("POST", "/api/jobs", { body: { kind, ...extra } });
 
