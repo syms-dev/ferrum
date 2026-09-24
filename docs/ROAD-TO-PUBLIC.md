@@ -252,7 +252,29 @@ Last updated at HEAD `288f2b3`, branch `grounding-and-install-path`. Nothing pus
         subjective rules (6–8) run **file by file**, never repo-wide. Docstrings required by the
         project's documentation rule are explicitly protected.
 
-- [ ] **13. De-verbose the comments**, via the `humanize` skill (which runs `humanizer` first).
+- [x] **13. The comment sweep.** DONE 2026-09-24 — measured, and the style half had nothing to do.
+      - **The mechanical rules found zero.** Scaffolding phrases (`It is worth noting`,
+        `Importantly`, `As mentioned above`, …): **0**. Short comments merely restating the code
+        below: **0 of 181** checked. That matches the rubric's own finding — this codebase's
+        comments are reasoning, not narration — so a de-verbose sweep would have changed nothing
+        while putting real decision records in the hands of a taste judgement.
+      - **A precise detector found three real defects instead.** Two doc comments with no item
+        between them **merge**, and rustdoc attaches the whole thing to whatever follows. Three
+        instances, each leaving one function documented twice and another with none:
+        `check_recovered_device` carried an `# Arguments` for `v: the raw field` (its parameter is
+        `&mut Device`); `rollback_to_current_reason` appeared to take a `profiles_dir` and to
+        propagate a listing error (neither is true); `disclose_foreign_beside` had acquired
+        `plan_with_adoptions`' whole adoption explanation. Meanwhile `clean_required`,
+        `current_generation` and `plan_with_adoptions` had **no documentation at all** — their
+        words stranded up to 150 lines away. Fixed by moving each block to its function; nothing
+        rewritten, because the words were right and only the position was wrong.
+      - **One of the three was introduced the same day** by a bug-hunt fix lane, so this is not
+        only historical drift.
+      - **The detector is the durable part.** Two earlier attempts found nothing, which is equally
+        consistent with a clean codebase and with a broken search. The one that works cannot be
+        fooled: a single doc block cannot legitimately contain two `# Arguments` or two
+        `# Returns` sections. It reported three, and reports zero now.
+
 - [x] **14. Remove AI mentions from the working tree.** DONE. Most vanished with their files —
       see item 19; the two were one decision. The five that remained were in real design docs and
       were **reworded, not deleted**, because each carried meaning the vendor name was incidental
