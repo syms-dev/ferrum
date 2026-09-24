@@ -131,6 +131,27 @@ ok
 
 step "run the installer end to end (sonarr + sabnzbd, SSO on)"
 # Answers, in the order answers::collect and confirm::confirm ask for them.
+#
+# THE ELEVEN PROMPTS THIS PATH HITS, with where each lives. Check this list
+# before assuming an answer is wrong -- twice now a question was added to the
+# installer, this block was not updated, and the resulting error named an
+# answer that was perfectly correct and merely in the wrong slot.
+#
+#    1  answers.rs:595  Hostname for this machine
+#    2  answers.rs:602  Base domain (empty for none)
+#    3  answers.rs:610  Email for Let's Encrypt expiry notices
+#    4  answers.rs:619  Apps to enable
+#    5  sso.rs:179      Enable single sign-on? [Y/n]
+#    6  sso.rs:265      Admin email address for single sign-on
+#    7  answers.rs:642  Cloudflare API token
+#    8  answers.rs:515  Record target ('a' or 'cname')        <- added by R1
+#    9  answers.rs:445  Public IPv4 address for the A records <- added by R1
+#   10  answers.rs:563  Keep the records up to date? [Y/n]    <- added by R1
+#   11  confirm.rs:121  Type the SERIAL of the disk to erase
+#
+# Prompts 8-10 are asked only when a base domain is set, and 10 only for A
+# records rather than CNAME. Regenerate this list with a grep for io.ask,
+# io.ask_secret and ask_valid across answers.rs, sso.rs and confirm.rs.
 # The token is a placeholder and is checked for real: A5 sends it to the
 # stand-in API above, which requires a bearer token and would refuse an
 # empty one. ACME itself is not exercised here, but the secret must exist
@@ -157,6 +178,14 @@ step "run the installer end to end (sonarr + sabnzbd, SSO on)"
   # recorded answer differ between runs for no benefit. 192.0.2.10 is
   # TEST-NET-1, reserved by RFC 5737 for exactly this and routable nowhere.
   echo "192.0.2.10"              # A-record address
+  # Asked only for A records, which is the mode above. "n" rather than the
+  # recommended default: saying yes installs an hourly updater that reaches
+  # the REAL Cloudflare from the guest with the placeholder token. The
+  # stand-in serves the installer on this machine, not the host, so the
+  # updater would be the one component in this test still talking to the
+  # internet -- and a test whose behaviour depends on a third party is not
+  # a test. Nothing in stage 2's acceptance criteria covers the updater.
+  echo "n"                       # keep records up to date automatically?
   echo "$SERIAL"                 # the disk to erase, by typed serial
 } > "$WORK/answers"
 
@@ -190,6 +219,19 @@ RC=${PIPESTATUS[0]}
 set -e
 kill $HEARTBEAT 2>/dev/null || true
 
+if [ "$RC" -ne 0 ] && grep -q "input closed while waiting for an answer" "$WORK/install.log"; then
+  # Third time this has happened. The fixture is POSITIONAL, so a question
+  # added to the installer does not produce a missing answer at the end --
+  # it shifts every answer after it by one, and the installer then rejects
+  # whichever answer landed in the wrong slot. The reported error names that
+  # answer, which is the one thing that was not wrong. Saying so here costs
+  # nothing and saves the next person the two CI cycles it cost this time.
+  die "the installer ran out of answers -- the fixture above is behind the \
+installer's questions. Do NOT trust the last error it printed: answers are \
+positional, so an added question shifts every later answer by one and the \
+complaint lands on whichever value fell into the wrong slot. Diff the prompts \
+in $WORK/install.log against the answers block in this script."
+fi
 [ "$RC" -eq 0 ] || die "the installer exited $RC"
 ok
 
