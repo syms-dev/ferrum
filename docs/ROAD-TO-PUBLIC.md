@@ -228,9 +228,26 @@ Last updated at HEAD `288f2b3`, branch `grounding-and-install-path`. Nothing pus
         14:46 on 22 Sep; the last green run was 13:56. `nginx -t` **binds** every listen address,
         and a CI builder is unprivileged.
 
-- [ ] **10. A real install on real hardware, start to finish, no manual steps.** The standing test:
-      from a bare machine, does the operator end up with a working, published, logged-in system
-      without being told to do anything by hand?
+- [ ] **10. A real install on real hardware, start to finish, no manual steps.** The standing
+      test: from a bare machine, does the operator end up with a working, published, logged-in
+      system without being told to do anything by hand?
+      - **Audited 2026-09-24. The installer's own output is clean** — no "do this by hand", no
+        "then log in to", no residual instructions in the closing report.
+      - **One genuine gap found: Plex is never claimed.** `modules/apps/plex/service.nix:48` wires
+        `PLEX_CLAIM` from `apps.plex.settings.claimToken`, and `meta.nix:87` defaults it to `""` —
+        but **the installer never asks for it**, and nothing else supplies it. `plex` appears in
+        `answers.rs` only as a selectable app name. So a fresh install with Plex enabled ends with
+        an unclaimed server the operator must claim in Plex's own web UI, which is the exact step
+        this requirement forbids.
+      - **Why it is awkward rather than an oversight:** a Plex claim token is fetched from plex.tv
+        while signed in and expires in about four minutes, so it cannot be pre-seeded or derived.
+        That argues for asking during the install — the one moment the operator is present and the
+        token can be used immediately — rather than for automating it away.
+      - **Not fixed here.** It needs a new installer question plus a secret write, and it is a
+        product decision about how to prompt for a credential the operator has to go and fetch
+        mid-install. Worth settling before the hardware run, because it is the difference between
+        that run proving the hands-off claim and quietly disproving it.
+
 - [ ] **11. Confirm the SSH-tunnel recovery route in a real browser.** The `__Host-` cookie
       prefix over `http://127.0.0.1` is correct per spec and unexercised. It is the only way in
       when the proxy is broken — exactly when you need it.
