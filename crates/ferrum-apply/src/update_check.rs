@@ -2,8 +2,8 @@
 // become, and nothing written anywhere.
 //
 // This is the `CheckUpdate` request kind -- the one privileged capability
-// that is defined by what it must NOT do. It shells out to `nix eval` (and,
-// from R14-S2, `git ls-remote`) as root, and it must leave
+// that is defined by what it must NOT do. It shells out to `nix eval` and
+// `git ls-remote` as root, and it must leave
 // /etc/ferrum/flake.nix and /etc/ferrum/flake.lock byte-identical: an
 // update check that advanced a pin would move the host without anyone
 // asking, and the operator's review step would be reviewing a decision
@@ -18,7 +18,7 @@
 // directories.
 //
 // Cost, stated rather than hidden: one `nix eval` per enabled app per side
-// (current, and -- from R14-S3 -- candidate). Each is a full module-system
+// (what it runs now, and what it would become). Each is a full module-system
 // evaluation. This is the cost DA-6 tracks in the Phase 1.6 spec as an
 // unmeasured Low, and per-app evaluation is what buys the per-app failure
 // attribution R1 requires ("a loud, specific, per-app failure ... not a
@@ -500,7 +500,7 @@ pub fn build_report(inputs: &CheckInputs, runner: &dyn CommandRunner) -> UpdateR
             Err(e) => (Vec::new(), Some(e)),
         };
 
-    let rows: Vec<AppReport> = apps
+    let mut rows: Vec<AppReport> = apps
         .iter()
         .map(|(id, enabled)| {
             if !enabled {
@@ -538,8 +538,8 @@ pub fn build_report(inputs: &CheckInputs, runner: &dyn CommandRunner) -> UpdateR
         schema_migration_report(current_schema_version(inputs.settings_path), target);
 
     let outcome = crate::update_candidate::resolve(runner, inputs.flake_nix, inputs.flake_lock);
-    warnings.extend(outcome.warnings);
-    let candidate = outcome.report;
+    warnings.extend(outcome.warnings.clone());
+    let candidate = outcome.report.clone();
     // ferrum's release version on a host IS the revision its flake.lock
     // pins, so both halves of R1's "current vs candidate" come straight out
     // of the resolution rather than from a second, drift-prone lookup.
@@ -549,6 +549,28 @@ pub fn build_report(inputs: &CheckInputs, runner: &dyn CommandRunner) -> UpdateR
         candidate_version: candidate.rev.as_deref().map(crate::update_candidate::short_rev),
         candidate_rev: candidate.rev.clone(),
     };
+
+    // The candidate deltas, only where there is a candidate to compare
+    // against. Every other case goes through `mark_no_delta`, which keeps
+    // "nothing is known" and "nothing would change" distinguishable --
+    // inferring the second from the first is exactly what R1 forbids.
+    match (&outcome.input, candidate.state, candidate.rev.as_deref()) {
+        (Some(input), CandidateState::UpdateAvailable, Some(rev)) => {
+            crate::update_deltas::apply_candidate_versions(
+                runner,
+                &mut rows,
+                &input.name,
+                &input.flakeref_for_rev(rev),
+                inputs.flake_dir,
+                inputs.config_attr,
+                &crate::update_candidate::short_rev(rev),
+            );
+        }
+        _ => crate::update_deltas::mark_no_delta(
+            &mut rows,
+            candidate.state == CandidateState::UpToDate,
+        ),
+    }
 
     if let Some(e) = &apps_error {
         warnings.push(format!(
@@ -857,8 +879,13 @@ mod tests {
             vec!["jellyfin", "radarr", "sabnzbd", "sonarr"]
         );
         for app in &enabled {
-            assert_eq!(app.state, AppState::NotChecked, "{}", app.id);
             assert!(app.current_version.is_some(), "{} has no current version", app.id);
+            assert!(
+                matches!(app.state, AppState::UpToDate | AppState::UpdateAvailable),
+                "{} must carry a real delta state, got {:?}",
+                app.id,
+                app.state
+            );
         }
         assert_eq!(
             enabled
@@ -966,6 +993,11 @@ mod tests {
             ),
         ];
         answers.push(("package.version", ok("\"1.0\"")));
+        answers.push(("ls-remote", ok(&format!("{CANDIDATE_REV}\tHEAD\n"))));
+        answers.push((
+            "flake metadata",
+            ok(&serde_json::json!({"lastModified": 200}).to_string()),
+        ));
         let runner = FakeRunner::new(answers);
         let report = report_for(&runner, &f);
 
@@ -981,7 +1013,7 @@ mod tests {
         assert_eq!(report.apps.len(), 7);
         assert_eq!(
             report.apps.iter().find(|a| a.id == "radarr").unwrap().state,
-            AppState::NotChecked
+            AppState::UpToDate
         );
     }
 

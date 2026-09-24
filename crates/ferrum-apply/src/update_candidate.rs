@@ -281,6 +281,10 @@ pub fn parse_metadata_last_modified(stdout: &str) -> Result<i64, String> {
 pub struct CandidateOutcome {
     pub report: CandidateReport,
     pub warnings: Vec<String>,
+    /// The resolved input, so the delta evaluation can build the
+    /// `--override-input` flakeref from the same parse rather than reading
+    /// and re-interpreting flake.nix a second time.
+    pub input: Option<InputRef>,
 }
 
 /// The one constructor for a failed check.
@@ -301,6 +305,7 @@ fn check_failed(input: Option<&InputRef>, current_rev: Option<String>, error: St
             error: Some(error),
         },
         warnings: Vec::new(),
+        input: input.cloned(),
     }
 }
 
@@ -380,7 +385,7 @@ pub fn resolve(runner: &dyn CommandRunner, flake_nix: &Path, flake_lock: &Path) 
     };
 
     if candidate_rev == locked.rev {
-        return CandidateOutcome { report, warnings };
+        return CandidateOutcome { report, warnings, input: Some(input) };
     }
 
     let flakeref = input.flakeref_for_rev(&candidate_rev);
@@ -409,7 +414,7 @@ pub fn resolve(runner: &dyn CommandRunner, flake_nix: &Path, flake_lock: &Path) 
     } else {
         CandidateState::NotNewer
     };
-    CandidateOutcome { report, warnings }
+    CandidateOutcome { report, warnings, input: Some(input) }
 }
 
 #[cfg(test)]

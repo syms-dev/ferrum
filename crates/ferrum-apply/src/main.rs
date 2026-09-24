@@ -12,6 +12,7 @@ mod rollback;
 mod secrets;
 mod update_candidate;
 mod update_check;
+mod update_deltas;
 
 #[derive(Parser)]
 #[command(name = "ferrum-apply")]
