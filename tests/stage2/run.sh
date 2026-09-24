@@ -143,6 +143,20 @@ step "run the installer end to end (sonarr + sabnzbd, SSO on)"
   echo ""                        # SSO: default yes
   echo "admin@s13.invalid"       # SSO admin
   echo "placeholder-cf-token"    # Cloudflare DNS-01 token
+  # R1 added two DNS questions after the token, and this fixture did not
+  # follow. The symptom was not a missing answer but a SHIFTED one: the
+  # serial below was consumed as the record mode, the installer rejected
+  # "ferrum-s13-target" as not being 'a' or 'cname', asked again, and hit
+  # end-of-input. Every answer after an added question is wrong, and the
+  # error names the last one rather than the gap, so it reads as a bad
+  # serial rather than a missing line.
+  echo ""                        # record target: empty takes the prompt's 'a'
+  # Explicit rather than empty, which would accept whatever the detector
+  # found by asking the guest over SSH. That address is whatever QEMU's
+  # user-mode networking handed out that morning, so it would make the
+  # recorded answer differ between runs for no benefit. 192.0.2.10 is
+  # TEST-NET-1, reserved by RFC 5737 for exactly this and routable nowhere.
+  echo "192.0.2.10"              # A-record address
   echo "$SERIAL"                 # the disk to erase, by typed serial
 } > "$WORK/answers"
 
