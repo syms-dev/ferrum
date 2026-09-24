@@ -15,6 +15,18 @@
 // `UpToDate`: there is literally no branch that turns a network error into
 // "nothing to do".
 //
+// Credentials. That same file is the only place a `git+` URL's
+// `user:password@` can come from, and it is root-only -- while everything
+// this module produces is not: the report document is served by an
+// unprivileged daemon, an argv is readable out of /proc by any local user,
+// and a remote's stderr is quoted into the report verbatim. So the userinfo
+// is stripped once, at the parse, before any field or error string exists
+// that could carry it. Stripping at the sinks instead would be a list that
+// has to stay complete forever; stripping at the source is a property of
+// the type. The cost is stated in the warning `resolve` emits: a private
+// repository has to be reachable through git's own credential
+// configuration, because this check will not hand a secret to a subprocess.
+//
 // Ordering. `git ls-remote` answers "what revision is that ref now", not
 // "is it newer". Two revisions cannot be ordered without asking someone who
 // knows the history, so the comparison is on `lastModified`: the candidate's
@@ -33,9 +45,10 @@ use std::path::Path;
 pub struct InputRef {
     /// The input's name in `flake.nix`, always `ferrum` today.
     pub name: String,
-    /// The URL exactly as written, for display.
+    /// The URL as written, minus any `user[:password]@` -- this is a
+    /// published field, so it carries no credential.
     pub url: String,
-    /// The URL `git ls-remote` is pointed at.
+    /// The URL `git ls-remote` is pointed at, minus any userinfo.
     pub git_url: String,
     /// The branch or tag to resolve, or `HEAD` when the URL names none.
     pub reference: String,
@@ -45,8 +58,13 @@ pub struct InputRef {
     /// error -- but it does mean no update can ever be discovered until the
     /// operator changes the pin themselves, and the check says so.
     pub pinned: bool,
-    /// The flake URL without any ref, e.g. `github:owner/repo`.
+    /// The flake URL without any ref, e.g. `github:owner/repo`, minus any
+    /// userinfo.
     pub base_url: String,
+    /// True when the URL in `flake.nix` carried `user[:password]@` that
+    /// this parse removed. The operator is told, because it changes what
+    /// the check can reach.
+    pub credentials_redacted: bool,
 }
 
 impl InputRef {
@@ -138,12 +156,128 @@ pub const GITHUB_SCHEME: &str = "github:";
 /// The host `GITHUB_SCHEME` resolves to for `git ls-remote`.
 pub const GITHUB_HOST: &str = "github.com";
 
+/// Remove `user[:password]@` from a URL's authority.
+///
+/// The boundary that keeps a root-only credential out of everything this
+/// module publishes. RFC 3986's own rule is used rather than a guess: the
+/// authority runs to the first `/`, `?` or `#`, and userinfo runs to the
+/// LAST `@` inside it -- a password containing `@` or `:` therefore does
+/// not shorten the cut, which a first-`@` reading would get wrong.
+///
+/// # Arguments
+/// * `url` - a URL, with or without userinfo.
+///
+/// # Returns
+/// The URL unchanged when it carries no userinfo, and without it otherwise.
+pub fn redact_userinfo(url: &str) -> String {
+    // Both spellings of a scheme: `git+https://host/..` and the opaque
+    // `github:owner/repo`. The second cannot carry a real credential, but a
+    // mistyped one still ends up in an error string, and this is the only
+    // place that can stop it.
+    let split = url
+        .split_once("://")
+        .map(|(scheme, rest)| (format!("{scheme}://"), rest))
+        .or_else(|| {
+            url.split_once(':')
+                .map(|(scheme, rest)| (format!("{scheme}:"), rest))
+        });
+    let Some((scheme, rest)) = split else {
+        return url.to_string();
+    };
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(end);
+    format!("{scheme}{}{tail}", strip_userinfo(authority))
+}
+
+/// The authority with any `user[:password]@` removed.
+///
+/// # Arguments
+/// * `authority` - the part of a URL between the scheme and the path.
+///
+/// # Returns
+/// The host and port; the whole of `authority` when it carries no userinfo.
+fn strip_userinfo(authority: &str) -> &str {
+    match authority.rfind('@') {
+        Some(at) => &authority[at + 1..],
+        None => authority,
+    }
+}
+
+/// The same removal, applied to every URL inside a free-text string.
+///
+/// For the one string in this module that is not built here: a
+/// subprocess's stderr, which the report republishes verbatim so the
+/// operator sees the real failure. `git` composes
+/// `Authentication failed for '<url>'` from the URL *after* credential
+/// filling, so root's own netrc or credential helper can put a secret in
+/// that line even though this module hands `git` a clean URL. The report
+/// is read at a lower trust level than root's credential store, so the
+/// line is cleaned on the way in.
+///
+/// # Arguments
+/// * `text` - arbitrary text, typically a subprocess's stderr.
+///
+/// # Returns
+/// The same text with the userinfo removed from every `scheme://` URL it
+/// contains.
+pub fn redact_urls_in(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find("://") {
+        let (head, tail) = rest.split_at(at + 3);
+        out.push_str(head);
+        // An authority ends at the path, the query, the fragment, or at
+        // whatever punctuation the surrounding prose put after it.
+        let end = tail
+            .find(|c: char| c.is_whitespace() || "/?#'\"`,;)".contains(c))
+            .unwrap_or(tail.len());
+        let (authority, after) = tail.split_at(end);
+        out.push_str(strip_userinfo(authority));
+        rest = after;
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Refuse an input whose argv slots `git` would read as options.
+///
+/// Both the repository and the ref become bare argv elements of a
+/// root-privileged `git ls-remote`, and `--upload-pack=<cmd>` in either
+/// slot makes git run `<cmd>`. `ls_remote_argv` already places the
+/// repository after `--`; this refuses the form outright as well, which is
+/// the same discipline `is_safe_app_id` applies for the same reason.
+///
+/// # Arguments
+/// * `input` - the freshly decomposed input.
+///
+/// # Returns
+/// The input unchanged when both slots are values rather than options.
+///
+/// # Errors
+/// When the repository or the ref begins with `-`.
+fn refuse_option_like(input: InputRef) -> Result<InputRef, String> {
+    for (slot, value) in [("repository", &input.git_url), ("ref", &input.reference)] {
+        if value.starts_with('-') {
+            return Err(format!(
+                "this host's `{}.url` gives a {slot} that begins with `-` ({value}), which git \
+                 would read as an option rather than a value",
+                input.name
+            ));
+        }
+    }
+    Ok(input)
+}
+
 /// Split a flake URL into the pieces `git ls-remote` and
 /// `--override-input` each need.
 ///
 /// Only the two forms ferrum hosts actually use are accepted. An
 /// unrecognised scheme is an error rather than a guess: this string decides
 /// what a root-privileged process fetches.
+///
+/// Any `user[:password]@` is removed first, so neither the returned input
+/// nor any error text below can carry it -- and neither, therefore, can
+/// anything built from them.
 ///
 /// # Arguments
 /// * `name` - the input's name, used only in the error text.
@@ -156,6 +290,9 @@ pub const GITHUB_HOST: &str = "github.com";
 /// When the URL names no owner and repository, or uses a scheme this check
 /// cannot query.
 pub fn decompose(name: &str, url: &str) -> Result<InputRef, String> {
+    let safe = redact_userinfo(url);
+    let credentials_redacted = safe != url;
+    let url = safe.as_str();
     if let Some(rest) = url.strip_prefix(GITHUB_SCHEME) {
         let parts: Vec<&str> = rest.splitn(3, '/').collect();
         if parts.len() < 2 || parts[0].is_empty() || parts[1].is_empty() {
@@ -164,13 +301,14 @@ pub fn decompose(name: &str, url: &str) -> Result<InputRef, String> {
         let (owner, repo) = (parts[0], parts[1]);
         let reference = parts.get(2).copied().filter(|r| !r.is_empty());
         let base_url = format!("{GITHUB_SCHEME}{owner}/{repo}");
-        return Ok(InputRef {
+        return refuse_option_like(InputRef {
             name: name.to_string(),
             url: url.to_string(),
             git_url: format!("https://{GITHUB_HOST}/{owner}/{repo}.git"),
             reference: reference.unwrap_or("HEAD").to_string(),
             pinned: reference.map(is_full_rev).unwrap_or(false),
             base_url,
+            credentials_redacted,
         });
     }
     if let Some(rest) = url.strip_prefix("git+") {
@@ -184,13 +322,14 @@ pub fn decompose(name: &str, url: &str) -> Result<InputRef, String> {
                 .find_map(|kv| kv.strip_prefix(&format!("{key}=")))
         };
         let reference = param("rev").or_else(|| param("ref"));
-        return Ok(InputRef {
+        return refuse_option_like(InputRef {
             name: name.to_string(),
             url: url.to_string(),
             git_url: bare.to_string(),
             reference: reference.unwrap_or("HEAD").to_string(),
             pinned: reference.map(is_full_rev).unwrap_or(false),
             base_url: format!("git+{bare}"),
+            credentials_redacted,
         });
     }
     Err(format!(
@@ -264,6 +403,12 @@ pub fn parse_locked(text: &str, name: &str) -> Result<LockedInput, String> {
 /// No `--exit-code`: an absent ref is reported by this module in words that
 /// name the ref, which is more useful than git's exit 2.
 ///
+/// `--` separates the options from the repository, so a repository that
+/// looks like an option is handled as a pathname rather than parsed as one
+/// -- git reports `strange pathname ... blocked` instead of honouring, say,
+/// `--upload-pack`. `decompose` already refuses that form; this is the
+/// second lock, and the one that holds for a form nobody anticipated.
+///
 /// # Arguments
 /// * `git_url` - the repository, from the operator's own `flake.nix`.
 /// * `reference` - the branch or tag to resolve, or `HEAD`.
@@ -271,7 +416,12 @@ pub fn parse_locked(text: &str, name: &str) -> Result<LockedInput, String> {
 /// # Returns
 /// The arguments for `git`, without the program name.
 pub fn ls_remote_argv(git_url: &str, reference: &str) -> Vec<String> {
-    vec!["ls-remote".to_string(), git_url.to_string(), reference.to_string()]
+    vec![
+        "ls-remote".to_string(),
+        "--".to_string(),
+        git_url.to_string(),
+        reference.to_string(),
+    ]
 }
 
 /// Pick the revision a `ls-remote` answer gives for one ref.
@@ -454,6 +604,18 @@ pub fn resolve(runner: &dyn CommandRunner, flake_nix: &Path, flake_lock: &Path) 
     let current_rev = Some(locked.rev.clone());
 
     let mut warnings = Vec::new();
+    if input.credentials_redacted {
+        // Said out loud because it changes what the check can reach: the
+        // operator's next question, when a private fork stops resolving,
+        // is why. The credential itself is not repeated here -- this text
+        // is published in the same report the stripping exists to protect.
+        warnings.push(format!(
+            "this host's `{}.url` embeds a username or password; the update check neither uses \
+             nor publishes it, so a private repository has to be reachable through git's own \
+             credential configuration for root",
+            input.name
+        ));
+    }
     let candidate_rev = if input.pinned {
         // Only when the pin is what this host is actually built from. An
         // operator who has just edited flake.nix forward is in a genuinely
@@ -480,7 +642,7 @@ pub fn resolve(runner: &dyn CommandRunner, flake_nix: &Path, flake_lock: &Path) 
                 format!(
                     "could not reach {}: {}",
                     input.git_url,
-                    out.stderr.trim()
+                    redact_urls_in(out.stderr.trim())
                 ),
             );
         }
@@ -516,7 +678,7 @@ pub fn resolve(runner: &dyn CommandRunner, flake_nix: &Path, flake_lock: &Path) 
             format!(
                 "could not establish whether {} is newer than what this host runs: {}",
                 short_rev(&candidate_rev),
-                out.stderr.trim()
+                redact_urls_in(out.stderr.trim())
             ),
         );
     }
@@ -730,6 +892,7 @@ mod tests {
             argvs[0],
             vec![
                 "ls-remote".to_string(),
+                "--".to_string(),
                 format!("https://{GITHUB_HOST}/syms-dev/ferrum.git"),
                 "HEAD".to_string()
             ]
@@ -925,5 +1088,184 @@ mod tests {
         let outcome = resolve(&runner, &flake_nix, &dir.path().join("flake.lock"));
         assert_eq!(outcome.report.state, CandidateState::CheckFailed);
         assert!(outcome.report.error.as_deref().unwrap().contains("flake.lock"));
+    }
+
+    // ---- M2 / L1: what the operator's own flake.nix must not republish ----
+
+    /// The credential a `git+` URL can carry, and the account name beside
+    /// it. Both are the operator's, and both live at the trust level of a
+    /// root-only file.
+    const TOKEN: &str = "ghp-S3CRET-cafebabe";
+    const ACCOUNT: &str = "ferrumbot";
+
+    /// The URL an operator with a private fork writes.
+    fn credentialled_url() -> String {
+        format!("git+https://{ACCOUNT}:{TOKEN}@code.example/ferrum.git?ref=main")
+    }
+
+    /// The one matcher every absence assertion below goes through, so that
+    /// a matcher which could never fire would fail the positive controls
+    /// rather than quietly reporting everything clean.
+    fn leaks(haystack: &str) -> bool {
+        haystack.contains(TOKEN) || haystack.contains(ACCOUNT)
+    }
+
+    /// The positive control on the matcher itself: it fires on the string
+    /// the operator actually wrote. Every `!leaks(..)` below is only worth
+    /// something because this passes.
+    #[test]
+    fn the_credential_matcher_fires_on_the_url_the_operator_actually_wrote() {
+        assert!(leaks(&credentialled_url()), "the matcher cannot find a credential that IS there");
+        assert!(leaks(&format!("fatal: could not read Username for {}", credentialled_url())));
+        assert!(!leaks("git+https://code.example/ferrum.git?ref=main"), "and it does not fire on a clean URL");
+    }
+
+    /// M2: userinfo is stripped where the URL is parsed, so no field of the
+    /// parsed input can carry it onward -- not the display URL, not the
+    /// argv the root-privileged fetch is built from, not the flakeref.
+    #[test]
+    fn no_field_of_a_parsed_input_carries_the_operators_credentials() {
+        let input = decompose("ferrum", &credentialled_url()).unwrap();
+        for (field, value) in [
+            ("url", input.url.clone()),
+            ("git_url", input.git_url.clone()),
+            ("base_url", input.base_url.clone()),
+            ("reference", input.reference.clone()),
+            ("flakeref_for_rev", input.flakeref_for_rev(NEW)),
+        ] {
+            assert!(!leaks(&value), "{field} still carries the operator's credential: {value}");
+        }
+        // And it still names the same repository and ref -- redaction that
+        // lost the repository would be a different bug.
+        assert_eq!(input.git_url, "https://code.example/ferrum.git");
+        assert_eq!(input.base_url, "git+https://code.example/ferrum.git");
+        assert_eq!(input.reference, "main");
+    }
+
+    /// M2, end to end through the resolver: the report document, the
+    /// warnings, and every argv a root-privileged process is handed.
+    #[test]
+    fn a_credentialled_input_publishes_no_credential_into_the_report_or_any_argv() {
+        let h = host(&credentialled_url(), OLD, 100);
+        // The positive control at the other end: the credential really is
+        // in the file this check reads.
+        assert!(
+            leaks(&std::fs::read_to_string(&h.flake_nix).unwrap()),
+            "the fixture does not actually contain a credential"
+        );
+
+        let runner = FakeRunner::new(vec![ls_remote_ok(NEW), metadata_ok_for(NEW, 200)]);
+        let outcome = resolve(&runner, &h.flake_nix, &h.flake_lock);
+        assert_eq!(outcome.report.state, CandidateState::UpdateAvailable);
+
+        let json = serde_json::to_string(&outcome.report).unwrap();
+        assert!(!leaks(&json), "the published report carries the credential: {json}");
+        for argv in runner.argvs() {
+            let joined = argv.join(" ");
+            assert!(!leaks(&joined), "a root-privileged argv carries the credential: {joined}");
+        }
+        for w in &outcome.warnings {
+            assert!(!leaks(w), "a warning carries the credential: {w}");
+        }
+    }
+
+    /// M2's failure paths, which is where an error string would otherwise
+    /// carry the URL verbatim: an unreachable remote, an unusable metadata
+    /// answer, and a scheme this check refuses outright.
+    #[test]
+    fn no_failure_path_puts_the_credential_into_the_reports_error_text() {
+        let h = host(&credentialled_url(), OLD, 100);
+
+        let unreachable = FakeRunner::new(vec![(
+            "ls-remote",
+            fail(&format!("fatal: could not read Username for {}", credentialled_url())),
+        )]);
+        let outcome = resolve(&unreachable, &h.flake_nix, &h.flake_lock);
+        assert_eq!(outcome.report.state, CandidateState::CheckFailed);
+        let json = serde_json::to_string(&outcome.report).unwrap();
+        assert!(!leaks(&json), "the unreachable-remote report leaks: {json}");
+
+        let bad_metadata = FakeRunner::new(vec![
+            ls_remote_ok(NEW),
+            ("flake metadata", fail(&format!("error: unable to fetch {}", credentialled_url()))),
+        ]);
+        let outcome = resolve(&bad_metadata, &h.flake_nix, &h.flake_lock);
+        assert_eq!(outcome.report.state, CandidateState::CheckFailed);
+        let json = serde_json::to_string(&outcome.report).unwrap();
+        assert!(!leaks(&json), "the metadata-failure report leaks: {json}");
+
+        // A scheme the check refuses still has to refuse it without
+        // quoting the credential back.
+        let err = decompose("ferrum", &format!("ftp://{ACCOUNT}:{TOKEN}@code.example/x")).unwrap_err();
+        assert!(!leaks(&err), "the unknown-scheme error leaks: {err}");
+        let err = decompose("ferrum", &format!("{GITHUB_SCHEME}{ACCOUNT}:{TOKEN}@x")).unwrap_err();
+        assert!(!leaks(&err), "the malformed-github error leaks: {err}");
+    }
+
+    /// The credential-less forms are what almost every host actually has,
+    /// and redaction must not touch them.
+    #[test]
+    fn a_url_with_no_credentials_is_carried_through_exactly_as_written() {
+        let input = decompose("ferrum", "git+https://code.example/ferrum.git?ref=main").unwrap();
+        assert_eq!(input.url, "git+https://code.example/ferrum.git?ref=main");
+        assert_eq!(input.git_url, "https://code.example/ferrum.git");
+        assert_eq!(input.base_url, "git+https://code.example/ferrum.git");
+        assert_eq!(input.reference, "main");
+
+        let input = decompose("ferrum", &gh("syms-dev/ferrum/release")).unwrap();
+        assert_eq!(input.url, gh("syms-dev/ferrum/release"));
+        assert_eq!(input.git_url, format!("https://{GITHUB_HOST}/syms-dev/ferrum.git"));
+        assert_eq!(input.reference, "release");
+    }
+
+    /// Userinfo with no password at all, and a password built from the
+    /// characters that break a first-`@`/first-`:` reading of a URL.
+    #[test]
+    fn userinfo_is_stripped_whether_or_not_it_has_a_password_and_whatever_it_contains() {
+        let input = decompose("ferrum", &format!("git+https://{ACCOUNT}@code.example/ferrum.git")).unwrap();
+        assert_eq!(input.git_url, "https://code.example/ferrum.git");
+        assert!(!leaks(&input.url), "{}", input.url);
+
+        // A password holding `@`, `:` and a percent-encoded `/`: the last
+        // `@` before the path is the boundary, not the first.
+        let awkward = format!("git+https://{ACCOUNT}:p@ss:w%2Frd@code.example/ferrum.git?ref=main");
+        let input = decompose("ferrum", &awkward).unwrap();
+        assert_eq!(input.git_url, "https://code.example/ferrum.git");
+        assert_eq!(input.reference, "main");
+        for value in [input.url.clone(), input.git_url.clone(), input.base_url.clone()] {
+            assert!(!value.contains("p@ss"), "a fragment of the password survived: {value}");
+            assert!(!leaks(&value), "{value}");
+        }
+    }
+
+    /// L1: both argv slots are operator text handed to a root-privileged
+    /// `git`, so a value that would be read as an option is refused at the
+    /// parse, and the repository argument is additionally placed after
+    /// `--`. Defence in depth: `/etc/ferrum/flake.nix` is root-owned and
+    /// ferrumd cannot write it, so this closes a form, not a live hole.
+    #[test]
+    fn a_value_that_git_would_read_as_an_option_never_becomes_one() {
+        for url in [
+            "git+--upload-pack=/bin/false",
+            "git+https://code.example/x.git?ref=--upload-pack=/bin/false",
+            &gh("syms-dev/ferrum/-upload-pack=/bin/false"),
+            "git+-o=x",
+        ] {
+            assert!(decompose("ferrum", url).is_err(), "{url} must be refused");
+        }
+        // Anti-vacuity: the same guard accepts every ordinary form, so the
+        // refusals above are about the leading dash and not a matcher that
+        // rejects everything.
+        assert!(decompose("ferrum", &gh("syms-dev/ferrum")).is_ok());
+        assert!(decompose("ferrum", &gh("syms-dev/ferrum/release")).is_ok());
+        assert!(decompose("ferrum", "git+https://code.example/ferrum.git?ref=main").is_ok());
+
+        // And the repository argument sits behind `--`, which makes `git`
+        // treat an option-looking repository as a pathname even if some
+        // form got past the guard above.
+        assert_eq!(
+            ls_remote_argv("https://code.example/x.git", "main"),
+            vec!["ls-remote", "--", "https://code.example/x.git", "main"]
+        );
     }
 }

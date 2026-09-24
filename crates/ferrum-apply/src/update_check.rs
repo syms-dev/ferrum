@@ -954,6 +954,15 @@ mod tests {
     }
 
     fn fixture(schema_version: i64) -> Fixture {
+        fixture_with_url(
+            schema_version,
+            &format!("{}syms-dev/ferrum", crate::update_candidate::GITHUB_SCHEME),
+        )
+    }
+
+    /// The same host, with the `ferrum` input spelled however the caller
+    /// needs -- the credential tests need a URL carrying userinfo.
+    fn fixture_with_url(schema_version: i64, ferrum_url: &str) -> Fixture {
         let dir = tempfile::tempdir().unwrap();
         let settings = dir.path().join("settings.json");
         std::fs::write(
@@ -962,14 +971,8 @@ mod tests {
         )
         .unwrap();
         let flake_nix = dir.path().join("flake.nix");
-        std::fs::write(
-            &flake_nix,
-            format!(
-                "{{\n  inputs.ferrum.url = \"{}syms-dev/ferrum\";\n}}\n",
-                crate::update_candidate::GITHUB_SCHEME
-            ),
-        )
-        .unwrap();
+        std::fs::write(&flake_nix, format!("{{\n  inputs.ferrum.url = \"{ferrum_url}\";\n}}\n"))
+            .unwrap();
         let flake_lock = dir.path().join("flake.lock");
         std::fs::write(
             &flake_lock,
@@ -1360,5 +1363,54 @@ mod tests {
             .filter(|n| n.ends_with(".tmp"))
             .collect();
         assert!(leftovers.is_empty(), "found: {leftovers:?}");
+    }
+
+    /// M2, at the sinks that actually leave this process: the published
+    /// report document (written 0644 and served by an unprivileged
+    /// daemon), the one-line summary that becomes the job's progress
+    /// event, and every argv a root-privileged subprocess is handed.
+    ///
+    /// The operator put that token at the trust level of a root-only file;
+    /// none of these three are at that level.
+    #[test]
+    fn a_credentialled_ferrum_input_reaches_no_report_no_summary_and_no_argv() {
+        const TOKEN: &str = "ghp-S3CRET-cafebabe";
+        let url = format!("git+https://ferrumbot:{TOKEN}@code.example/ferrum.git?ref=main");
+        let f = fixture_with_url(1, &url);
+        // Positive control: the credential really is in the file the check
+        // reads, so the absences below are findings and not a broken match.
+        let on_disk = std::fs::read_to_string(&f.flake_nix).unwrap();
+        assert!(on_disk.contains(TOKEN), "the fixture carries no credential: {on_disk}");
+
+        let runner = standard_runner();
+        let report = report_for(&runner, &f);
+
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(!json.contains(TOKEN), "the published report carries the credential: {json}");
+        assert!(!json.contains("ferrumbot"), "the published report carries the account: {json}");
+        let summary = summary_line(&report);
+        assert!(!summary.contains(TOKEN), "the progress summary carries the credential: {summary}");
+        let argvs = runner.argvs();
+        assert!(!argvs.is_empty(), "the check ran no command at all");
+        for argv in &argvs {
+            let joined = argv.join(" ");
+            assert!(!joined.contains(TOKEN), "a root-privileged argv carries it: {joined}");
+        }
+
+        // And the same again on the failure path, where the error text is
+        // built from the remote's own words.
+        let stderr = format!("fatal: could not read Username for '{url}'");
+        let runner = FakeRunner::new(vec![
+            ("ferrum.apps", ok(app_set_json())),
+            ("ferrum.schemaVersion", ok("2")),
+            ("package.version", ok("\"1.0\"")),
+            ("ls-remote", fail(&stderr)),
+        ]);
+        let report = report_for(&runner, &f);
+        assert_eq!(report.candidate.state, CandidateState::CheckFailed);
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(!json.contains(TOKEN), "the failed-check report carries the credential: {json}");
+        let summary = summary_line(&report);
+        assert!(!summary.contains(TOKEN), "the failed-check summary carries it: {summary}");
     }
 }
