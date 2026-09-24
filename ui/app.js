@@ -460,21 +460,28 @@ async function generationsView() {
 
 // --- updates -------------------------------------------------------------
 
-/// The five values `candidate.state` can carry on the check_update report,
-/// transcribed from the frozen wire contract in
-/// docs/superpowers/specs/2026-09-16-phase-1-6-updates-design.md.
+/// The four values `candidate.state` can carry on the check_update report.
 ///
 /// Kept on one line because the `updates-view-is-wired` flake check reads
-/// this file as text and cross-checks these names against
-/// CANDIDATE_STATE_TEXT's keys. A state added to the daemon and listed here
-/// without its own operator-facing prose fails the build instead of
-/// rendering as an empty cell -- which is the failure this view exists to
-/// prevent, since "we could not check" and "you are up to date" look
-/// identical when a branch is missing.
-const CANDIDATE_STATES = ["not-checked", "up-to-date", "not-newer", "update-available", "check-failed"];
+/// this file as text, cross-checks these names against CANDIDATE_STATE_TEXT's
+/// keys, AND cross-checks them against ferrum-apply's own `CandidateState`
+/// enum. A state the daemon can send with no branch here fails the build
+/// instead of rendering as an empty cell -- which is the failure this view
+/// exists to prevent, since "we could not check" and "you are up to date"
+/// look identical when a branch is missing.
+///
+/// There is no `not-checked` here, unlike APP_STATES below. Every code path
+/// that produces a candidate report has already resolved one of these four;
+/// "this host has never checked at all" is not a candidate state, it is the
+/// endpoint's own `never-checked` envelope status, rendered separately.
+const CANDIDATE_STATES = ["up-to-date", "not-newer", "update-available", "check-failed"];
 
-/// The five values an entry in `apps[]`'s `state` can carry. Same contract,
-/// same flake check, same reason.
+/// The five values an entry in `apps[]`'s `state` can carry. Same file, same
+/// flake check, same cross-check against `AppState`.
+///
+/// `not-checked` DOES exist on this side and is reachable: an enabled app
+/// whose current version is known while the candidate side never resolved.
+/// It is explicitly not a claim that the app is up to date.
 const APP_STATES = ["not-checked", "up-to-date", "update-available", "excluded", "evaluation-failed"];
 
 /// A state's short label and the sentence that explains it.
@@ -491,7 +498,6 @@ function stateText(label, prose) {
 // unreachable check that reads as a clean result is precisely the confusion
 // R1's edge cases name.
 const CANDIDATE_STATE_TEXT = {
-  "not-checked": stateText("Never checked", "This host has not looked for a candidate yet. Nothing on this page is a claim that you are up to date."),
   "up-to-date": stateText("Up to date", "The tracked reference resolves to the revision this host is already running. There is nothing to apply."),
   "not-newer": stateText("Candidate is not newer — not an update", "The tracked reference resolves to a revision that is not newer than the one this host runs. ferrum will not offer it, the same way preview-migration refuses to call a lower schema version a migration."),
   "update-available": stateText("Update available", "A newer revision exists. Nothing has been fetched, built, or applied — a check only reads."),
@@ -571,13 +577,38 @@ function appRow(app, catalogApps) {
   ]);
 }
 
+/// Render the "no check has ever run here" answer.
+///
+/// A separate branch rather than a candidate state, because the daemon
+/// answers it separately: `status: "never-checked"` carries no report at all,
+/// and `CandidateState` has no `not-checked` value to borrow. Saying it in
+/// prose keeps it visibly distinct from "up to date", which is the one
+/// confusion R1's edge cases single out.
+///
+/// @param {HTMLElement} target - The element whose children are replaced.
+/// @returns {void}
+function renderNeverChecked(target) {
+  target.replaceChildren(
+    el("h3", { text: "This host has never checked for updates" }),
+    el("p", {
+      text:
+        "No check has run here, so there is nothing to report. This is not a claim that you are up to date — nobody has looked yet.",
+    }),
+    el("p", { class: "hint", text: "Use “Check for updates” above. It reads only." }),
+  );
+}
+
 /// Render a whole check_update report into the view's report region.
 ///
 /// @param {HTMLElement} target - The element whose children are replaced.
-/// @param {object} report - The document `GET /api/updates` serves.
+/// @param {object} report - The producer's document, taken from the
+///   endpoint's envelope. ferrumd models none of its fields and serves it
+///   verbatim, so this is the only place its shape is read.
 /// @param {object} catalogApps - `/api/catalog`'s apps map.
+/// @param {string|null} jobId - The run this report came from, or null when
+///   it came from a bare CLI run. Shown as provenance; never used as a job id.
 /// @returns {void}
-function renderUpdateReport(target, report, catalogApps) {
+function renderUpdateReport(target, report, catalogApps, jobId) {
   const candidate = report.candidate || {};
   const ferrum = report.ferrum || {};
   const migration = report.schemaMigration || {};
@@ -613,6 +644,16 @@ function renderUpdateReport(target, report, catalogApps) {
       // and several of those (en-CA, en-GB 12-hour) end the string with "a.m."
       // -- a sentence period after one reads as a typo.
       text: `Last checked: ${report.checkedAt ? localTime(report.checkedAt) : "never"}`,
+    }),
+
+    el("p", {
+      class: "hint",
+      // Provenance, not a handle. A report written by a bare CLI run carries
+      // no job id at all, and the envelope says so with null rather than a
+      // placeholder -- so there is nothing here to feed back to /api/jobs.
+      text: jobId
+        ? `From check job ${jobId}`
+        : "From a check run on the host itself, not from a job started here",
     }),
 
     report.schemaVersion !== 1
@@ -702,9 +743,15 @@ async function updatesView() {
       onDone: async () => {
         pending.textContent = "";
         try {
-          renderUpdateReport(report, await api.updatesForJob(id), state.catalog?.apps || {});
+          const envelope = await api.updatesForJob(id);
+          renderUpdateReport(report, envelope.report, state.catalog?.apps || {}, envelope.jobId);
           setStatus("Check finished.", "ok");
         } catch (err) {
+          // A 404 here means THIS run wrote no report -- it failed before it
+          // could, or it is somehow still going. The daemon's own message
+          // says exactly that, and it is deliberately not the never-checked
+          // answer, so it stays in the error line rather than replacing the
+          // report region with "nobody has looked yet".
           error.textContent = err.message;
         }
       },
@@ -771,7 +818,15 @@ async function updatesView() {
 
   pending.textContent = "Loading the most recent check…";
   try {
-    renderUpdateReport(report, await api.updates(), state.catalog?.apps || {});
+    const envelope = await api.updates();
+    // Taken from `status`, never inferred from an absent or empty report:
+    // the daemon answers the question explicitly, and guessing it from the
+    // document's shape is how "never checked" starts reading as "up to date".
+    if (envelope.status === "never-checked") {
+      renderNeverChecked(report);
+    } else {
+      renderUpdateReport(report, envelope.report, state.catalog?.apps || {}, envelope.jobId);
+    }
   } catch (err) {
     error.textContent = err.message;
   }

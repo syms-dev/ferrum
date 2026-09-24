@@ -3320,6 +3320,13 @@
       # Everything else about this view is browser-only and is recorded as
       # such rather than pretended away.
       #
+      # It also reads crates/ferrum-apply/src/update_check.rs and asserts set
+      # equality between the UI's two vocabularies and the real serde variant
+      # names. That half is the one with a proven failure behind it: the
+      # candidate enum dropped NotChecked while ui/app.js still rendered a
+      # branch for it, and comparing the UI only against itself agreed
+      # perfectly with its own mistake.
+      #
       # Every structural lookup below throws rather than returning an empty
       # result. A check that grepped for a declaration, found nothing, and
       # passed would be worse than no check at all -- this tree has already
@@ -3328,33 +3335,49 @@
         let
           appSrc = builtins.readFile ../../../ui/app.js;
           lines = lib.splitString "\n" appSrc;
-          indexed = lib.imap0 (i: l: { inherit i l; }) lines;
 
-          indexOf = what: infix:
-            let hits = builtins.filter (e: lib.hasInfix infix e.l) indexed; in
+          # ferrum-apply OWNS the wire vocabulary; ui/app.js only transcribes
+          # it. Reading the real enums here is what turns that transcription
+          # from a comment into an invariant, and it is not hypothetical: the
+          # candidate side lost its NotChecked variant on the first day the
+          # two files existed apart, and nothing but this would have caught
+          # the UI still rendering a branch for it.
+          rustPath = "crates/ferrum-apply/src/update_check.rs";
+          rustLines = lib.splitString "\n" (builtins.readFile ../../../crates/ferrum-apply/src/update_check.rs);
+
+          # Both helpers take their source explicitly. This check now reads
+          # two files, and a helper closed over one of them is a trap for
+          # whoever adds the third.
+          indexIn = src: file: what: infix:
+            let
+              hits = builtins.filter (e: lib.hasInfix infix e.l) (lib.imap0 (i: l: { inherit i l; }) src);
+            in
             if hits == [ ] then
-              throw ("ui/app.js no longer has a line containing '" + infix
+              throw (file + " no longer has a line containing '" + infix
                 + "', so updates-view-is-wired cannot verify " + what
                 + ". A check that cannot find what it guards must fail, not pass.")
             else (builtins.head hits).i;
 
           # Every line after the one opening `startInfix`, up to but not
           # including the first line `isEnd` accepts.
-          blockAt = what: startInfix: isEnd:
+          blockIn = src: file: what: startInfix: isEnd:
             let
-              after = lib.drop ((indexOf what startInfix) + 1) lines;
+              after = lib.drop ((indexIn src file what startInfix) + 1) src;
               take = acc: rest:
                 if rest == [ ] then
-                  throw ("ui/app.js opens '" + startInfix
+                  throw (file + " opens '" + startInfix
                     + "' but updates-view-is-wired cannot find the line that closes it")
                 else if isEnd (builtins.head rest) then acc
                 else take (acc ++ [ (builtins.head rest) ]) (builtins.tail rest);
               block = take [ ] after;
             in
             if block == [ ] then
-              throw ("ui/app.js's '" + startInfix + "' block is empty, so every assertion "
+              throw (file + "'s '" + startInfix + "' block is empty, so every assertion "
                 + "updates-view-is-wired makes about " + what + " would be vacuously true")
             else block;
+
+          indexOf = indexIn lines "ui/app.js";
+          blockAt = blockIn lines "ui/app.js";
 
           quotedIn = re: line:
             map builtins.head (builtins.filter builtins.isList (builtins.split re line));
@@ -3387,6 +3410,63 @@
 
           unbranched = states: branches: builtins.filter (s: !(builtins.elem s branches)) states;
           orphaned = states: branches: builtins.filter (b: !(builtins.elem b states)) branches;
+
+          # serde's kebab-case rule, DERIVED rather than hand-listed: a
+          # variant `UpdateAvailable` is the wire value `update-available`.
+          #
+          # serde lowercases each character and inserts a separator before
+          # every uppercase after the first, so splitting on `[A-Z][a-z0-9]*`
+          # and joining with "-" is the same rule, including the cases that
+          # look like they would differ: `DNSUnreachable` gives
+          # `d-n-s-unreachable` both ways, and `V2Format` gives `v2-format`
+          # both ways. Checked against serde's RenameRule, not assumed.
+          #
+          # There is no "refuse to guess" branch here because nothing can
+          # reach it: `variantOf` below only ever admits `[A-Z][A-Za-z0-9]*`,
+          # and every such name round-trips through this split. The guard
+          # that CAN fire is `unparsed`, below.
+          kebabOf = variant:
+            lib.toLower (builtins.concatStringsSep "-"
+              (map builtins.head
+                (builtins.filter builtins.isList (builtins.split "([A-Z][a-z0-9]*)" variant))));
+
+          # The unit variants of one enum in update_check.rs, as wire values.
+          daemonStatesOf = enumName:
+            let
+              block = blockIn rustLines rustPath ("ferrum-apply's " + enumName + " variants")
+                "pub enum ${enumName} {" (l: l == "}");
+              variantOf = l: builtins.match "[[:space:]]*([A-Z][A-Za-z0-9]*),[[:space:]]*" l;
+              ignorable = l:
+                builtins.match "[[:space:]]*" l != null
+                || builtins.match "[[:space:]]*(//|#\\[).*" l != null;
+              names = lib.concatMap (l: let m = variantOf l; in if m == null then [ ] else m) block;
+
+              # A body line that is neither blank, nor a comment or attribute,
+              # nor a variant this check can read. Without this it would be
+              # dropped from the daemon's set, and the resulting diff would
+              # accuse the UI of inventing a state the daemon "never sends" --
+              # sending the reader to fix the wrong file. Measured: writing
+              # `Not_Newer,` into CandidateState produced exactly that
+              # misdirection before this guard existed.
+              unparsed = builtins.filter (l: variantOf l == null && !(ignorable l)) block;
+            in
+            if unparsed != [ ] then
+              throw (rustPath + "'s " + enumName + " has lines updates-view-is-wired cannot read "
+                + "as unit variants: " + builtins.toJSON unparsed + ". Silently dropping them "
+                + "would understate the daemon's vocabulary and blame the UI for the difference.")
+            else if names == [ ] then
+              throw (rustPath + " declares " + enumName + " but updates-view-is-wired parsed no "
+                + "variants out of it -- an empty variant set would make the UI's vocabulary "
+                + "agree with it vacuously")
+            else map kebabOf names;
+
+          daemonCandidateStates = daemonStatesOf "CandidateState";
+          daemonAppStates = daemonStatesOf "AppState";
+
+          # Set equality, reported as two separate lists so a failure says
+          # which side is ahead rather than just that they differ.
+          daemonOnly = daemon: ui: builtins.filter (v: !(builtins.elem v ui)) daemon;
+          uiOnly = daemon: ui: builtins.filter (v: !(builtins.elem v daemon)) ui;
 
           # The view's own source, delimited by the banner comments this file
           # already uses to separate its sections.
@@ -3432,7 +3512,11 @@
             && unbranched candidateStates candidateBranches == [ ]
             && orphaned candidateStates candidateBranches == [ ]
             && unbranched appStates appBranches == [ ]
-            && orphaned appStates appBranches == [ ];
+            && orphaned appStates appBranches == [ ]
+            && daemonOnly daemonCandidateStates candidateStates == [ ]
+            && uiOnly daemonCandidateStates candidateStates == [ ]
+            && daemonOnly daemonAppStates appStates == [ ]
+            && uiOnly daemonAppStates appStates == [ ];
 
           routeMissing = !routeWired;
           reattachNotKindFiltered = !reattachIsKindFiltered;
@@ -3442,6 +3526,16 @@
           candidateBranchesWithNoState = orphaned candidateStates candidateBranches;
           appStatesWithNoBranch = unbranched appStates appBranches;
           appBranchesWithNoState = orphaned appStates appBranches;
+
+          # Both sides named on every failure, so the message says what the
+          # daemon actually sends as well as what the UI believes.
+          inherit daemonCandidateStates daemonAppStates;
+          uiCandidateStates = candidateStates;
+          uiAppStates = appStates;
+          candidateStatesTheDaemonSendsAndTheUiLacks = daemonOnly daemonCandidateStates candidateStates;
+          candidateStatesTheUiExpectsAndTheDaemonNeverSends = uiOnly daemonCandidateStates candidateStates;
+          appStatesTheDaemonSendsAndTheUiLacks = daemonOnly daemonAppStates appStates;
+          appStatesTheUiExpectsAndTheDaemonNeverSends = uiOnly daemonAppStates appStates;
         };
 
       mkAssertionCheck = name: result:

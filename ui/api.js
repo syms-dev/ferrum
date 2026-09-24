@@ -146,19 +146,35 @@ export const job = (id) => request("GET", `/api/jobs/${encodeURIComponent(id)}`)
 
 /// The most recent check_update report this host holds.
 ///
-/// @returns {Promise<object>} The report document, whose `candidate.state` is
-///   `not-checked` when no check has ever run -- an absent report is a state,
-///   not an error.
+/// The daemon always answers with the same three-key envelope, so the caller
+/// never has to tell "no report" apart from "a report that happens to be
+/// empty": `status` says which, explicitly.
+///
+/// `jobId` is null when the report came from a bare CLI run rather than a
+/// dispatched job. It is a provenance label only -- never feed it to
+/// `job()`, which would 400 on a non-uuid.
+///
+/// @returns {Promise<{status: string, jobId: string|null, report: object|null}>}
+///   `status: "report"` with the producer's document verbatim under `report`,
+///   or `status: "never-checked"` with `report: null` when no check has ever
+///   run on this host.
 export const updates = () => request("GET", "/api/updates");
 
 /// The report produced by one specific check_update job.
 ///
-/// Deliberately the ONLY place the per-job query shape is spelled out. The
-/// Updates view calls this once, after its own job reports complete, so when
-/// the daemon settles that shape exactly one line here changes.
+/// Deliberately the ONLY place the per-job query shape is spelled out.
+///
+/// A 404 here is NOT the never-checked state. It means that particular run
+/// wrote no report -- it is still running, or it failed before writing one --
+/// and the daemon's own message says so. Answering "this host has never
+/// checked" to a question about one run would be answering a different
+/// question.
 ///
 /// @param {string} jobId - The uuid `POST /api/jobs` returned.
-/// @returns {Promise<object>} That job's report document.
+/// @returns {Promise<{status: string, jobId: string, report: object}>} The
+///   same envelope, carrying that run's document.
+/// @throws {ApiError} 404 when that run produced no report, 400 when `jobId`
+///   is not a uuid.
 export const updatesForJob = (jobId) =>
   request("GET", `/api/updates?job=${encodeURIComponent(jobId)}`);
 
