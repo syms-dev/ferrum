@@ -52,6 +52,12 @@ pub struct InputRef {
 impl InputRef {
     /// The flake URL naming one exact revision of this input, for
     /// `--override-input`.
+    ///
+    /// # Arguments
+    /// * `rev` - the revision to pin, normally the resolved candidate.
+    ///
+    /// # Returns
+    /// A flake URL Nix will resolve to exactly that revision.
     pub fn flakeref_for_rev(&self, rev: &str) -> String {
         if self.base_url.starts_with("git+") {
             format!("{}?rev={rev}", self.base_url)
@@ -68,6 +74,12 @@ fn is_full_rev(s: &str) -> bool {
 
 /// The first seven characters of a revision -- the short form the rest of
 /// this codebase already displays (`self.shortRev`).
+///
+/// # Arguments
+/// * `rev` - a full revision, or anything shorter.
+///
+/// # Returns
+/// At most the first seven characters; a shorter input is returned whole.
 pub fn short_rev(rev: &str) -> String {
     rev.chars().take(7).collect()
 }
@@ -93,7 +105,11 @@ pub const FERRUM_INPUT: &str = "ferrum";
 /// * `name` - the input name to find, normally `ferrum`.
 ///
 /// # Returns
-/// The decomposed input, or a message naming what could not be found.
+/// The decomposed input.
+///
+/// # Errors
+/// When no `<name>.url = "...";` line is present, or its URL uses a scheme
+/// this check cannot query.
 pub fn parse_input(text: &str, name: &str) -> Result<InputRef, String> {
     let needle = format!("{name}.url");
     let url = text
@@ -116,27 +132,42 @@ pub fn parse_input(text: &str, name: &str) -> Result<InputRef, String> {
     decompose(name, &url)
 }
 
+/// The flake-URL scheme a ferrum host's `ferrum` input normally uses.
+pub const GITHUB_SCHEME: &str = "github:";
+
+/// The host `GITHUB_SCHEME` resolves to for `git ls-remote`.
+pub const GITHUB_HOST: &str = "github.com";
+
 /// Split a flake URL into the pieces `git ls-remote` and
 /// `--override-input` each need.
 ///
 /// Only the two forms ferrum hosts actually use are accepted. An
 /// unrecognised scheme is an error rather than a guess: this string decides
 /// what a root-privileged process fetches.
+///
+/// # Arguments
+/// * `name` - the input's name, used only in the error text.
+/// * `url` - the URL exactly as the host's `flake.nix` spells it.
+///
+/// # Returns
+/// The decomposed input.
+///
+/// # Errors
+/// When the URL names no owner and repository, or uses a scheme this check
+/// cannot query.
 pub fn decompose(name: &str, url: &str) -> Result<InputRef, String> {
-    let gh = "gith".to_string() + "ub:";
-    if let Some(rest) = url.strip_prefix(gh.as_str()) {
+    if let Some(rest) = url.strip_prefix(GITHUB_SCHEME) {
         let parts: Vec<&str> = rest.splitn(3, '/').collect();
         if parts.len() < 2 || parts[0].is_empty() || parts[1].is_empty() {
             return Err(format!("this host's `{name}.url` names no owner and repository: {url}"));
         }
         let (owner, repo) = (parts[0], parts[1]);
         let reference = parts.get(2).copied().filter(|r| !r.is_empty());
-        let base_url = format!("{gh}{owner}/{repo}");
-        let host = "gith".to_string() + "ub.com";
+        let base_url = format!("{GITHUB_SCHEME}{owner}/{repo}");
         return Ok(InputRef {
             name: name.to_string(),
             url: url.to_string(),
-            git_url: format!("https://{host}/{owner}/{repo}.git"),
+            git_url: format!("https://{GITHUB_HOST}/{owner}/{repo}.git"),
             reference: reference.unwrap_or("HEAD").to_string(),
             pinned: reference.map(is_full_rev).unwrap_or(false),
             base_url,
@@ -170,6 +201,8 @@ pub fn decompose(name: &str, url: &str) -> Result<InputRef, String> {
 /// What the host's `flake.lock` pins for one input today.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LockedInput {
+    /// The full revision `flake.lock` pins, and the thing a candidate is
+    /// compared against for equality.
     pub rev: String,
     /// The locked revision's own commit time, as Nix recorded it. This is
     /// the anchor the candidate is ordered against.
@@ -182,6 +215,18 @@ pub struct LockedInput {
 /// node is keyed by the input's own name: Nix renames a node when two
 /// inputs would collide, and reading the wrong node would silently compare
 /// against some other repository's revision.
+///
+/// # Arguments
+/// * `text` - the contents of `/etc/ferrum/flake.lock`.
+/// * `name` - the input name, normally `ferrum`.
+///
+/// # Returns
+/// The pinned revision and its commit time.
+///
+/// # Errors
+/// When the lock is not JSON, does not pin that input, or pins it without a
+/// revision or without a `lastModified` -- each of which leaves nothing to
+/// compare a candidate against.
 pub fn parse_locked(text: &str, name: &str) -> Result<LockedInput, String> {
     let doc: serde_json::Value = serde_json::from_str(text)
         .map_err(|e| format!("this host's flake.lock is not valid JSON: {e}"))?;
@@ -218,6 +263,13 @@ pub fn parse_locked(text: &str, name: &str) -> Result<LockedInput, String> {
 ///
 /// No `--exit-code`: an absent ref is reported by this module in words that
 /// name the ref, which is more useful than git's exit 2.
+///
+/// # Arguments
+/// * `git_url` - the repository, from the operator's own `flake.nix`.
+/// * `reference` - the branch or tag to resolve, or `HEAD`.
+///
+/// # Returns
+/// The arguments for `git`, without the program name.
 pub fn ls_remote_argv(git_url: &str, reference: &str) -> Vec<String> {
     vec!["ls-remote".to_string(), git_url.to_string(), reference.to_string()]
 }
@@ -227,6 +279,18 @@ pub fn ls_remote_argv(git_url: &str, reference: &str) -> Vec<String> {
 /// A peeled annotated tag (`refs/tags/x^{}`) wins over the tag object
 /// itself, because the commit is what gets built. Otherwise a branch beats
 /// a tag of the same name, which is git's own precedence.
+///
+/// # Arguments
+/// * `stdout` - the raw `git ls-remote` output.
+/// * `reference` - the ref that was asked for, used for precedence and for
+///   the error text.
+///
+/// # Returns
+/// The revision that ref points at.
+///
+/// # Errors
+/// When the output names no revision at all, i.e. the ref does not exist in
+/// that repository.
 pub fn parse_ls_remote(stdout: &str, reference: &str) -> Result<String, String> {
     let rows: Vec<(&str, &str)> = stdout
         .lines()
@@ -257,6 +321,12 @@ pub fn parse_ls_remote(stdout: &str, reference: &str) -> Result<String, String> 
 /// Points at the remote flake URL directly, never at `/etc/ferrum`, so
 /// there is no local lock file in the conversation at all;
 /// `--no-write-lock-file` is belt and braces on top of that.
+///
+/// # Arguments
+/// * `flakeref` - the candidate input pinned at an exact revision.
+///
+/// # Returns
+/// The arguments for `nix`, without the program name.
 pub fn metadata_argv(flakeref: &str) -> Vec<String> {
     vec![
         "flake".to_string(),
@@ -267,10 +337,45 @@ pub fn metadata_argv(flakeref: &str) -> Vec<String> {
     ]
 }
 
-/// Read `lastModified` out of a `nix flake metadata --json` answer.
-pub fn parse_metadata_last_modified(stdout: &str) -> Result<i64, String> {
+/// Read `lastModified` out of a `nix flake metadata --json` answer, having
+/// first checked the answer is about the revision that was asked for.
+///
+/// The timestamp is the whole basis for calling a candidate newer, so a
+/// timestamp belonging to some other revision would silently decide an
+/// update. Nix reports the revision it actually resolved, so the two are
+/// compared; a mismatch fails closed to `CheckFailed`, which is already the
+/// right default for "this check could not establish its answer".
+///
+/// # Arguments
+/// * `stdout` - the raw `nix flake metadata --json` output.
+/// * `expected_rev` - the revision `git ls-remote` resolved.
+///
+/// # Returns
+/// The candidate revision's `lastModified`.
+///
+/// # Errors
+/// When the output is unparseable, carries no `lastModified`, or describes
+/// a different revision than the one that was asked about.
+pub fn parse_metadata_last_modified(stdout: &str, expected_rev: &str) -> Result<i64, String> {
     let doc: serde_json::Value = serde_json::from_str(stdout.trim())
         .map_err(|e| format!("nix flake metadata returned output this check could not parse: {e}"))?;
+    // `revision` is absent for a flake with no VCS revision at all, which
+    // is not a mismatch and must not be treated as one; a PRESENT and
+    // different revision is.
+    if let Some(reported) = doc
+        .get("revision")
+        .or_else(|| doc.pointer("/locked/rev"))
+        .and_then(|v| v.as_str())
+    {
+        if reported != expected_rev {
+            return Err(format!(
+                "nix flake metadata answered about revision {} when this check asked about \
+                 {} -- refusing to order two revisions using a third one's timestamp",
+                short_rev(reported),
+                short_rev(expected_rev)
+            ));
+        }
+    }
     doc.get("lastModified")
         .and_then(|v| v.as_i64())
         .ok_or_else(|| "nix flake metadata reported no lastModified for the candidate".to_string())
@@ -319,6 +424,10 @@ fn check_failed(input: Option<&InputRef>, current_rev: Option<String>, error: St
 /// # Returns
 /// Exactly one first-class state, never an absence: up to date, not newer,
 /// an update with its exact revision, or a named failure.
+///
+/// # Errors
+/// None -- a failure is a reported state, not an `Err`. A check that could
+/// not reach the network still owes the operator every other fact it has.
 pub fn resolve(runner: &dyn CommandRunner, flake_nix: &Path, flake_lock: &Path) -> CandidateOutcome {
     let flake_nix_text = match std::fs::read_to_string(flake_nix) {
         Ok(t) => t,
@@ -346,11 +455,18 @@ pub fn resolve(runner: &dyn CommandRunner, flake_nix: &Path, flake_lock: &Path) 
 
     let mut warnings = Vec::new();
     let candidate_rev = if input.pinned {
-        warnings.push(format!(
-            "this host pins the ferrum input at an exact commit ({}), so no newer release can \
-             be discovered until you change that pin yourself",
-            short_rev(&input.reference)
-        ));
+        // Only when the pin is what this host is actually built from. An
+        // operator who has just edited flake.nix forward is in a genuinely
+        // different position: there IS something newer waiting, and telling
+        // them nothing can ever be discovered would be false at the exact
+        // moment it matters.
+        if input.reference == locked.rev {
+            warnings.push(format!(
+                "this host pins the ferrum input at an exact commit ({}), so no newer release \
+                 can be discovered until you change that pin yourself",
+                short_rev(&input.reference)
+            ));
+        }
         input.reference.clone()
     } else {
         let out = match runner.run("git", &ls_remote_argv(&input.git_url, &input.reference)) {
@@ -404,7 +520,7 @@ pub fn resolve(runner: &dyn CommandRunner, flake_nix: &Path, flake_lock: &Path) 
             ),
         );
     }
-    let candidate_last_modified = match parse_metadata_last_modified(&out.stdout) {
+    let candidate_last_modified = match parse_metadata_last_modified(&out.stdout, &candidate_rev) {
         Ok(v) => v,
         Err(e) => return check_failed(Some(&input), current_rev, e),
     };
@@ -426,7 +542,7 @@ mod tests {
     const NEW: &str = "2222222222222222222222222222222222222222";
 
     fn gh(path: &str) -> String {
-        format!("{}{path}", "gith".to_string() + "ub:")
+        format!("{GITHUB_SCHEME}{path}")
     }
 
     fn template_flake(url: &str) -> String {
@@ -471,7 +587,7 @@ mod tests {
     fn the_repository_to_query_comes_out_of_the_operators_own_flake_nix() {
         let input = parse_input(&template_flake(&gh("syms-dev/ferrum")), "ferrum").unwrap();
         assert_eq!(input.url, gh("syms-dev/ferrum"));
-        assert_eq!(input.git_url, "https://gith".to_string() + "ub.com/syms-dev/ferrum.git");
+        assert_eq!(input.git_url, format!("https://{GITHUB_HOST}/syms-dev/ferrum.git"));
         assert_eq!(input.reference, "HEAD");
         assert!(!input.pinned);
         // And it is the FERRUM input, not whichever url happens to come
@@ -581,10 +697,16 @@ mod tests {
         ("ls-remote", ok(&format!("{rev}\tHEAD\n")))
     }
 
-    fn metadata_ok(last_modified: i64) -> (&'static str, crate::update_check::CommandOutput) {
+    /// A metadata answer that is about the revision it was asked about --
+    /// the honest case. `rev` is threaded through rather than hardcoded so
+    /// a test cannot accidentally pass by describing the wrong commit.
+    fn metadata_ok_for(
+        rev: &str,
+        last_modified: i64,
+    ) -> (&'static str, crate::update_check::CommandOutput) {
         (
             "flake metadata",
-            ok(&serde_json::json!({"lastModified": last_modified, "revision": NEW}).to_string()),
+            ok(&serde_json::json!({"lastModified": last_modified, "revision": rev}).to_string()),
         )
     }
 
@@ -594,7 +716,7 @@ mod tests {
     #[test]
     fn a_newer_candidate_is_an_update_carrying_its_exact_revision() {
         let h = host(&gh("syms-dev/ferrum"), OLD, 100);
-        let runner = FakeRunner::new(vec![ls_remote_ok(NEW), metadata_ok(200)]);
+        let runner = FakeRunner::new(vec![ls_remote_ok(NEW), metadata_ok_for(NEW, 200)]);
         let outcome = resolve(&runner, &h.flake_nix, &h.flake_lock);
         assert_eq!(outcome.report.state, CandidateState::UpdateAvailable);
         assert_eq!(outcome.report.rev.as_deref(), Some(NEW));
@@ -608,7 +730,7 @@ mod tests {
             argvs[0],
             vec![
                 "ls-remote".to_string(),
-                "https://gith".to_string() + "ub.com/syms-dev/ferrum.git",
+                format!("https://{GITHUB_HOST}/syms-dev/ferrum.git"),
                 "HEAD".to_string()
             ]
         );
@@ -634,13 +756,13 @@ mod tests {
     #[test]
     fn a_candidate_that_is_not_newer_is_not_an_update() {
         let h = host(&gh("syms-dev/ferrum"), NEW, 200);
-        let runner = FakeRunner::new(vec![ls_remote_ok(OLD), metadata_ok(100)]);
+        let runner = FakeRunner::new(vec![ls_remote_ok(OLD), metadata_ok_for(OLD, 100)]);
         let outcome = resolve(&runner, &h.flake_nix, &h.flake_lock);
         assert_eq!(outcome.report.state, CandidateState::NotNewer);
         assert_eq!(outcome.report.rev.as_deref(), Some(OLD));
 
         // Same commit time is not newer either.
-        let runner = FakeRunner::new(vec![ls_remote_ok(OLD), metadata_ok(200)]);
+        let runner = FakeRunner::new(vec![ls_remote_ok(OLD), metadata_ok_for(OLD, 200)]);
         assert_eq!(
             resolve(&runner, &h.flake_nix, &h.flake_lock).report.state,
             CandidateState::NotNewer
@@ -736,6 +858,62 @@ mod tests {
             "{:?}",
             outcome.warnings
         );
+    }
+
+    /// The other half of hand-pinning, and the one the warning gets wrong
+    /// if it fires on `pinned` alone: the operator has ALREADY edited
+    /// flake.nix forward and has not applied yet. There genuinely is
+    /// something newer waiting, so telling them nothing can ever be
+    /// discovered would be false at the exact moment it matters.
+    #[test]
+    fn a_pin_edited_ahead_of_the_lock_is_an_update_with_no_nothing_will_change_warning() {
+        let h = host(&gh(&format!("syms-dev/ferrum/{NEW}")), OLD, 100);
+        let runner = FakeRunner::new(vec![metadata_ok_for(NEW, 200)]);
+        let outcome = resolve(&runner, &h.flake_nix, &h.flake_lock);
+        assert_eq!(outcome.report.state, CandidateState::UpdateAvailable);
+        assert_eq!(outcome.report.rev.as_deref(), Some(NEW));
+        assert_eq!(outcome.report.current_rev.as_deref(), Some(OLD));
+        assert!(
+            !outcome.warnings.iter().any(|w| w.contains("exact commit")),
+            "there IS something newer here: {:?}",
+            outcome.warnings
+        );
+        // Still no ls-remote: a pinned ref needs no resolving either way.
+        assert_eq!(runner.programs(), vec!["nix"]);
+    }
+
+    /// The timestamp is the whole basis for calling a candidate newer, so
+    /// one belonging to a different revision would silently decide an
+    /// update. It fails closed instead.
+    #[test]
+    fn a_metadata_answer_about_a_different_revision_is_refused() {
+        let h = host(&gh("syms-dev/ferrum"), OLD, 100);
+        // ls-remote resolved NEW; the metadata answer describes some third
+        // commit and claims it is much newer.
+        let third = "3333333333333333333333333333333333333333";
+        let runner = FakeRunner::new(vec![ls_remote_ok(NEW), metadata_ok_for(third, 9_999)]);
+        let outcome = resolve(&runner, &h.flake_nix, &h.flake_lock);
+        assert_eq!(outcome.report.state, CandidateState::CheckFailed);
+        let error = outcome.report.error.as_deref().unwrap();
+        assert!(error.contains("3333333") && error.contains("2222222"), "{error}");
+
+        // The control: the SAME parse accepts an answer about the right
+        // revision, so "refused" above is about the mismatch and not about
+        // the parser refusing everything.
+        let runner = FakeRunner::new(vec![ls_remote_ok(NEW), metadata_ok_for(NEW, 200)]);
+        assert_eq!(
+            resolve(&runner, &h.flake_nix, &h.flake_lock).report.state,
+            CandidateState::UpdateAvailable
+        );
+    }
+
+    /// A flake with no VCS revision at all reports none, and that is not a
+    /// mismatch -- failing closed on an absence would turn a working check
+    /// into a permanent error.
+    #[test]
+    fn metadata_with_no_revision_field_is_not_treated_as_a_mismatch() {
+        let doc = serde_json::json!({"lastModified": 200}).to_string();
+        assert_eq!(parse_metadata_last_modified(&doc, NEW).unwrap(), 200);
     }
 
     #[test]

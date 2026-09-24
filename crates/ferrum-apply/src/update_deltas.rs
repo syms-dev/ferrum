@@ -21,7 +21,7 @@
 // renamed upstream its row carries the evaluator's own stderr and every
 // other row still reports normally, because R1 requires a loud, specific,
 // attributable failure rather than a dropped row or a collapsed report.
-use crate::update_check::{is_safe_app_id, AppReport, AppState, CommandRunner};
+use crate::update_check::{is_safe_app_id, AppReport, AppState, CandidateState, CommandRunner};
 
 /// The argv that evaluates one attribute of the resolved configuration
 /// against a candidate revision of one input.
@@ -129,47 +129,67 @@ pub fn apply_candidate_versions(
     }
 }
 
-/// Mark every enabled app when there is no candidate to compare against.
+/// Mark every enabled app when there is no delta to compute.
 ///
-/// The two cases are genuinely different and are not collapsed. When the
-/// candidate resolved to the revision this host already runs, the evaluation
-/// would be identical by construction, so the apps really are up to date and
-/// the row says so with the inference named. When the candidate could not be
-/// resolved, or resolved to something that is not an update, nothing is
-/// known about the apps and the row says that instead -- it must never read
-/// as "up to date".
+/// The three cases are genuinely different and are not collapsed.
+///
+/// `UpToDate`: the candidate resolved to the revision this host already
+/// runs, so the evaluation would be identical by construction and the apps
+/// really are up to date. The row says so with the inference named, rather
+/// than presenting it as a measurement.
+///
+/// `NotNewer`: a candidate WAS resolved, it simply is not newer. Saying
+/// "no candidate revision was resolved" here would be a plainly false
+/// sentence inside the one report whose entire premise is honesty.
+///
+/// `CheckFailed`: nothing was resolved and nothing is known.
+///
+/// Neither of the last two may read as "up to date".
 ///
 /// # Arguments
 /// * `rows` - the app rows, mutated in place.
-/// * `pin_unchanged` - true only when the candidate is the installed rev.
-pub fn mark_no_delta(rows: &mut [AppReport], pin_unchanged: bool) {
+/// * `candidate` - the resolved candidate state. `UpdateAvailable` never
+///   reaches here; it goes to `apply_candidate_versions` instead.
+///
+/// # Returns
+/// Nothing; `rows` is updated in place.
+pub fn mark_no_delta(rows: &mut [AppReport], candidate: CandidateState) {
+    let (state, reason) = match candidate {
+        CandidateState::UpToDate => (
+            AppState::UpToDate,
+            "this host already runs the revision its ferrum input tracks, so nothing about \
+             this app would change",
+        ),
+        CandidateState::NotNewer => (
+            AppState::NotChecked,
+            "the revision this host's ferrum input tracks is not newer than what it already \
+             runs, so no update was evaluated -- this is not a statement that this app is up \
+             to date",
+        ),
+        // UpdateAvailable cannot reach here, and treating it as "nothing
+        // known" is the safe way to be wrong if it ever did.
+        CandidateState::CheckFailed | CandidateState::UpdateAvailable => (
+            AppState::NotChecked,
+            "no candidate revision was resolved, so what this app would become is unknown -- \
+             this is not a statement that it is up to date",
+        ),
+    };
     for row in rows.iter_mut() {
         if !row.enabled || row.state == AppState::EvaluationFailed {
             continue;
         }
-        if pin_unchanged {
-            row.state = AppState::UpToDate;
+        row.state = state;
+        if state == AppState::UpToDate {
             row.candidate_version = row.current_version.clone();
-            row.reason = Some(
-                "this host already runs the revision its ferrum input tracks, so nothing \
-                 about this app would change"
-                    .to_string(),
-            );
-        } else {
-            row.state = AppState::NotChecked;
-            row.reason = Some(
-                "no candidate revision was resolved, so what this app would become is \
-                 unknown -- this is not a statement that it is up to date"
-                    .to_string(),
-            );
         }
+        row.reason = Some(reason.to_string());
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::update_check::testing::{fail, ok, FakeRunner};
+    use crate::update_check::testing::{fail, ok, read_only_defects, FakeRunner};
 
     const CANDIDATE: &str = "2222222222222222222222222222222222222222";
 
@@ -206,7 +226,10 @@ mod tests {
     }
 
     fn flakeref() -> String {
-        format!("{}syms-dev/ferrum/{CANDIDATE}", "gith".to_string() + "ub:")
+        format!(
+            "{}syms-dev/ferrum/{CANDIDATE}",
+            crate::update_candidate::GITHUB_SCHEME
+        )
     }
 
     fn run(runner: &FakeRunner, rows: &mut [AppReport]) {
@@ -246,20 +269,29 @@ mod tests {
             ]
         );
         for argv in &argvs {
-            assert!(!argv.iter().any(|a| a == "--impure"), "{argv:?}");
-            assert!(!argv.iter().any(|a| a == "build"), "{argv:?}");
             assert!(
-                argv.iter().any(|a| a == "--no-write-lock-file"),
-                "Spike B's flag is what makes this read-only: {argv:?}"
+                read_only_defects(argv).is_empty(),
+                "{argv:?} -> {:?}",
+                read_only_defects(argv)
             );
             assert!(
                 argv.iter().any(|a| a.ends_with(CANDIDATE)),
                 "the EXACT revision the operator was shown must be what is evaluated: {argv:?}"
             );
         }
-        // Anti-vacuity: the flag scan can really find a forbidden flag.
-        let planted = ["eval".to_string(), "--impure".to_string()];
-        assert!(planted.iter().any(|a| a == "--impure"));
+        // The control on the control: the same scan really fires, both on a
+        // forbidden flag and on the missing flag that is the whole guarantee.
+        let impure = [
+            "eval".to_string(),
+            "--impure".to_string(),
+            "--no-write-lock-file".to_string(),
+        ];
+        assert_eq!(read_only_defects(&impure), vec!["--impure is present".to_string()]);
+        let unlocked = ["eval".to_string(), "--json".to_string()];
+        assert_eq!(
+            read_only_defects(&unlocked),
+            vec!["--no-write-lock-file is missing".to_string()]
+        );
     }
 
     /// R1: current -> candidate, for every enabled app.
@@ -351,7 +383,7 @@ mod tests {
     #[test]
     fn an_unchanged_pin_makes_every_enabled_app_up_to_date_with_the_reason_named() {
         let mut r = rows();
-        mark_no_delta(&mut r, true);
+        mark_no_delta(&mut r, CandidateState::UpToDate);
         for app in r.iter().filter(|a| a.enabled) {
             assert_eq!(app.state, AppState::UpToDate, "{}", app.id);
             assert_eq!(app.candidate_version, app.current_version, "{}", app.id);
@@ -362,22 +394,44 @@ mod tests {
     }
 
     /// The case this whole design exists to keep honest: nothing known must
-    /// never read as "up to date".
+    /// never read as "up to date" -- and each not-known case must describe
+    /// itself truthfully rather than borrowing another case's sentence.
     #[test]
-    fn an_unresolved_candidate_leaves_every_app_explicitly_unknown() {
-        let mut r = rows();
-        mark_no_delta(&mut r, false);
-        for app in r.iter().filter(|a| a.enabled) {
-            assert_eq!(app.state, AppState::NotChecked, "{}", app.id);
-            assert!(app.candidate_version.is_none(), "{}", app.id);
-            let reason = app.reason.as_deref().unwrap();
-            assert!(reason.contains("is not a statement that it is up to date"), "{reason}");
+    fn every_unknown_case_is_explicitly_unknown_and_says_what_actually_happened() {
+        for (candidate, must_say, must_not_say) in [
+            (
+                CandidateState::CheckFailed,
+                "no candidate revision was resolved",
+                "not newer",
+            ),
+            (
+                CandidateState::NotNewer,
+                "is not newer than what it already runs",
+                "no candidate revision was resolved",
+            ),
+        ] {
+            let mut r = rows();
+            mark_no_delta(&mut r, candidate);
+            for app in r.iter().filter(|a| a.enabled) {
+                assert_eq!(app.state, AppState::NotChecked, "{candidate:?} {}", app.id);
+                assert!(app.candidate_version.is_none(), "{candidate:?} {}", app.id);
+                let reason = app.reason.as_deref().unwrap();
+                assert!(
+                    reason.contains("is not a statement that"),
+                    "{candidate:?}: {reason}"
+                );
+                assert!(reason.contains(must_say), "{candidate:?}: {reason}");
+                assert!(
+                    !reason.contains(must_not_say),
+                    "{candidate:?} must not borrow the other case's words: {reason}"
+                );
+            }
         }
-        // Anti-vacuity: the same helper really does produce up-to-date rows
-        // on the other branch, so "never up to date" is a property of this
-        // branch and not of the helper.
+        // The control: the same helper really does produce up-to-date rows
+        // on the one branch that earns them, so "never up to date" above is
+        // a property of those branches and not of the helper.
         let mut other = rows();
-        mark_no_delta(&mut other, true);
+        mark_no_delta(&mut other, CandidateState::UpToDate);
         assert_eq!(other[0].state, AppState::UpToDate);
     }
 }

@@ -7,8 +7,16 @@
 // /etc/ferrum/flake.nix and /etc/ferrum/flake.lock byte-identical: an
 // update check that advanced a pin would move the host without anyone
 // asking, and the operator's review step would be reviewing a decision
-// already taken. `ReadOnlyGuard` below proves that for real rather than
-// asserting it in a comment.
+// already taken.
+//
+// Two different mechanisms, and it is worth being precise about which does
+// what. PREVENTION is the argv -- `--no-write-lock-file` on every `nix
+// eval`, on the current side as much as the candidate side, because
+// evaluating a local-path flake is enough on its own to rewrite its lock.
+// `ReadOnlyGuard` is the TRIPWIRE: it re-reads both files afterwards and
+// fails the job if they moved. It cannot undo a write, so it is what
+// catches a prevention that was wrong, not the guarantee itself. The tests
+// use it as a proof; production uses it as an alarm.
 //
 // Everything that decides an argv or shapes the report is a pure function
 // over an injected `CommandRunner`, because there is no `nix`, no `git` and
@@ -38,8 +46,12 @@ pub const REPORT_SCHEMA_VERSION: u32 = 1;
 /// the evaluator's own text, never a generic "preview failed".
 #[derive(Debug, Clone)]
 pub struct CommandOutput {
+    /// True when the process exited zero.
     pub success: bool,
+    /// Captured standard output, normally the `--json` answer.
     pub stdout: String,
+    /// Captured standard error, kept byte-for-byte so it can reach the
+    /// report unmodified.
     pub stderr: String,
 }
 
@@ -239,6 +251,12 @@ impl ReadOnlyGuard {
     /// A path that does not exist is recorded as absent, and must still be
     /// absent afterwards -- creating `flake.lock` where there was none is
     /// as much a write as rewriting one.
+    ///
+    /// # Arguments
+    /// * `paths` - the files that must not move.
+    ///
+    /// # Returns
+    /// A guard holding their contents at this moment.
     pub fn capture(paths: &[&Path]) -> Self {
         Self {
             watched: paths
@@ -250,6 +268,10 @@ impl ReadOnlyGuard {
 
     /// Re-read every watched path and return one message per file that
     /// changed. An empty vector is the read-only guarantee holding.
+    ///
+    /// # Returns
+    /// One operator-facing message per file whose bytes, or whose
+    /// existence, differ from the capture.
     pub fn violations(&self) -> Vec<String> {
         self.watched
             .iter()
@@ -280,6 +302,9 @@ impl ReadOnlyGuard {
 /// header already gives: a second, independently-configured path can drift
 /// from the real deployment target, and this one cannot.
 ///
+/// # Arguments
+/// * `flake_ref` - `$FERRUM_FLAKE_REF`, or this crate's compiled-in default.
+///
 /// # Returns
 /// `(flake_dir, config_attr)`.
 pub fn split_flake_ref(flake_ref: &str) -> (String, String) {
@@ -307,6 +332,13 @@ pub fn split_flake_ref(flake_ref: &str) -> (String, String) {
 /// is a plain identifier" is cheap to check and expensive to be wrong
 /// about. Same reasoning as `job_uuid_from_unit`'s UUID re-parse in
 /// ferrumd.
+///
+/// # Arguments
+/// * `id` - a catalog app id, as the resolved configuration named it.
+///
+/// # Returns
+/// True for a lowercase identifier of letters, digits and hyphens starting
+/// with a letter; false for everything else.
 pub fn is_safe_app_id(id: &str) -> bool {
     !id.is_empty()
         && id.starts_with(|c: char| c.is_ascii_lowercase())
@@ -317,13 +349,32 @@ pub fn is_safe_app_id(id: &str) -> bool {
 
 /// The argv for evaluating one attribute of the resolved configuration.
 ///
-/// `--json` so the answer is parseable; no `--impure`, no `--no-link`, no
-/// `--write-lock-file`. Mirrors `run_preview_migration`'s single existing
-/// `nix eval` exactly.
+/// `--no-write-lock-file` is the flag that makes this read-only, and it is
+/// needed on THIS side even though the input is the host's own flake and
+/// nothing is being overridden. `nix eval` against a local-path flake locks
+/// it, and writes `flake.lock` whenever the lock on disk does not already
+/// satisfy `flake.nix`. That is reachable on exactly the path DA-1
+/// preserves: an operator hand-edits `ferrum.url` to a new revision and
+/// runs a check before applying. Without this flag the check would advance
+/// the on-disk pin, as root, with nobody having asked -- the harm this
+/// module's header exists to rule out. `ReadOnlyGuard` would report it
+/// afterwards; it cannot undo it, so prevention has to live here.
+///
+/// `--json` so the answer is parseable. No `--impure`: unlike
+/// `apply.rs`'s `nix build`, nothing here needs the purity sandbox
+/// disabled.
+///
+/// # Arguments
+/// * `flake_dir` - the host flake directory, e.g. `/etc/ferrum`.
+/// * `attr` - the attribute path to read, already fully qualified.
+///
+/// # Returns
+/// The arguments for `nix`, without the program name.
 pub fn eval_argv(flake_dir: &str, attr: &str) -> Vec<String> {
     vec![
         "eval".to_string(),
         "--json".to_string(),
+        "--no-write-lock-file".to_string(),
         format!("{flake_dir}#{attr}"),
     ]
 }
@@ -427,6 +478,16 @@ pub fn app_row(id: &str, enabled: bool, current: Result<String, String>) -> AppR
 ///
 /// Applies `preview-migration`'s existing monotonicity discipline: a target
 /// below the current version is a warning, never "would migrate".
+///
+/// # Arguments
+/// * `current` - `schemaVersion` from the host's own settings.json, or
+///   `None` when it could not be read.
+/// * `target` - the module tree's `config.ferrum.schemaVersion`, or the
+///   evaluator's own error text.
+///
+/// # Returns
+/// The migration block of the report. A failure becomes `error` inside it
+/// rather than an `Err`, because the rest of the report is still valid.
 pub fn schema_migration_report(
     current: Option<i64>,
     target: Result<i64, String>,
@@ -566,10 +627,7 @@ pub fn build_report(inputs: &CheckInputs, runner: &dyn CommandRunner) -> UpdateR
                 &crate::update_candidate::short_rev(rev),
             );
         }
-        _ => crate::update_deltas::mark_no_delta(
-            &mut rows,
-            candidate.state == CandidateState::UpToDate,
-        ),
+        _ => crate::update_deltas::mark_no_delta(&mut rows, candidate.state),
     }
 
     if let Some(e) = &apps_error {
@@ -599,6 +657,9 @@ pub fn build_report(inputs: &CheckInputs, runner: &dyn CommandRunner) -> UpdateR
 /// `FERRUM_UPDATE_REPORT_DIR` overrides it, following the same
 /// env-var-overridable convention every other path in this crate uses so
 /// the behaviour is testable.
+///
+/// # Returns
+/// The directory the report document is published in.
 pub fn report_dir() -> PathBuf {
     std::env::var("FERRUM_UPDATE_REPORT_DIR")
         .or_else(|_| std::env::var("FERRUM_JOBS_DIR"))
@@ -612,6 +673,12 @@ pub fn report_dir() -> PathBuf {
 /// it by the id it already holds and no second identifier has to be kept in
 /// sync. `latest.update-check.json` is the fallback for a run with no job
 /// id (a bare `ferrum-apply check-update` over SSH).
+///
+/// # Arguments
+/// * `job_id` - `$FERRUM_JOB_ID`, when this run was dispatched by ferrumd.
+///
+/// # Returns
+/// The filename, without a directory.
 pub fn report_file_name(job_id: Option<&str>) -> String {
     match job_id.filter(|id| !id.is_empty()) {
         Some(id) => format!("{id}.update-check.json"),
@@ -623,11 +690,28 @@ pub fn report_file_name(job_id: Option<&str>) -> String {
 ///
 /// Written to a temporary file and renamed, so a reader that arrives
 /// mid-write sees either the previous document or the complete new one,
-/// never a truncated one.
+/// never a truncated one. The temporary name carries this process's pid:
+/// a dispatched job's report is uuid-named and cannot collide, but two
+/// operators running `ferrum-apply check-update` over SSH at once would
+/// otherwise share one `latest.update-check.json.tmp` and one could publish
+/// the other's half-written bytes -- defeating the very discipline the
+/// rename exists for.
+///
+/// # Arguments
+/// * `dir` - the report directory, created if absent.
+/// * `file_name` - from `report_file_name`.
+/// * `report` - the document to publish.
+///
+/// # Returns
+/// The path the report was published at.
+///
+/// # Errors
+/// Any I/O failure creating the directory, writing, setting the mode, or
+/// renaming, and a serialization failure as `InvalidData`.
 pub fn write_report(dir: &Path, file_name: &str, report: &UpdateReport) -> std::io::Result<PathBuf> {
     std::fs::create_dir_all(dir)?;
     let final_path = dir.join(file_name);
-    let temp_path = dir.join(format!("{file_name}.tmp"));
+    let temp_path = dir.join(format!("{file_name}.{}.tmp", std::process::id()));
     let body = serde_json::to_string(report)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     std::fs::write(&temp_path, body)?;
@@ -645,6 +729,13 @@ pub fn write_report(dir: &Path, file_name: &str, report: &UpdateReport) -> std::
 
 /// One line of operator-facing summary, for the job's terminal progress
 /// event.
+///
+/// # Arguments
+/// * `report` - the finished report.
+///
+/// # Returns
+/// A single line naming the candidate outcome and the app counts. It never
+/// says "up to date" for a state that is not `UpToDate`.
 pub fn summary_line(report: &UpdateReport) -> String {
     let enabled = report.apps.iter().filter(|a| a.enabled).count();
     let excluded = report.apps.len() - enabled;
@@ -711,6 +802,40 @@ pub(crate) mod testing {
             }
             Err(format!("FakeRunner has no answer for: {program} {joined}"))
         }
+    }
+
+    /// Everything wrong one argv can be: a forbidden flag present, or the
+    /// flag that delivers the read-only guarantee absent.
+    ///
+    /// A free function rather than assertions inline, so the very same scan
+    /// can be pointed at a deliberately-broken argv below. That is what
+    /// makes the clean result a finding instead of a scan that never fires.
+    pub fn read_only_defects(argv: &[String]) -> Vec<String> {
+        let mut defects = Vec::new();
+        for forbidden in [
+            "--impure",
+            "--recreate-lock-file",
+            "--update-input",
+            "--commit-lock-file",
+        ] {
+            if argv.iter().any(|a| a == forbidden) {
+                defects.push(format!("{forbidden} is present"));
+            }
+        }
+        if argv.iter().any(|a| a == "build" || a == "lock" || a == "nix-env") {
+            defects.push("a mutating subcommand is present".to_string());
+        }
+        // The presence half, and the one an absence-only scan could never
+        // have caught: `nix eval` against a local-path flake writes
+        // flake.lock whenever the existing lock does not already satisfy
+        // flake.nix. Omitting this flag is not "no flag either way", it is
+        // an opt-in to a root-privileged write.
+        if argv.first().is_some_and(|a| a == "eval")
+            && !argv.iter().any(|a| a == "--no-write-lock-file")
+        {
+            defects.push("--no-write-lock-file is missing".to_string());
+        }
+        defects
     }
 
     pub fn ok(stdout: &str) -> CommandOutput {
@@ -841,7 +966,7 @@ mod tests {
             &flake_nix,
             format!(
                 "{{\n  inputs.ferrum.url = \"{}syms-dev/ferrum\";\n}}\n",
-                "gith".to_string() + "ub:"
+                crate::update_candidate::GITHUB_SCHEME
             ),
         )
         .unwrap();
@@ -931,8 +1056,8 @@ mod tests {
     }
 
     /// The argv itself is the control: a root-privileged `nix eval` must
-    /// never be handed `--impure`, and must never be asked to write a lock
-    /// file. Asserted on the vector actually built.
+    /// never be handed `--impure`, and must always be told not to write a
+    /// lock file. Asserted on the vector actually built.
     #[test]
     fn the_evaluator_is_invoked_read_only_with_no_impure_flag() {
         let f = fixture(1);
@@ -947,25 +1072,15 @@ mod tests {
                 "no other binary may be invoked by the check: {program} {argv:?}"
             );
             // The whole set of subcommands the check is allowed to reach.
-            // Anything that could write is absent by construction, not by
-            // a flag that could be forgotten.
             let sub = argv.join(" ");
             assert!(
                 argv[0] == "eval" || argv[0] == "ls-remote" || sub.starts_with("flake metadata"),
                 "an unexpected subcommand reached the check: {argv:?}"
             );
-            for forbidden in [
-                "--impure",
-                "--write-lock-file",
-                "--recreate-lock-file",
-                "--update-input",
-                "--commit-lock-file",
-            ] {
-                assert!(!argv.iter().any(|a| a == forbidden), "{forbidden} in {argv:?}");
-            }
             assert!(
-                !argv.iter().any(|a| a == "build" || a == "lock" || a == "nix-env"),
-                "{argv:?}"
+                read_only_defects(argv).is_empty(),
+                "{argv:?} -> {:?}",
+                read_only_defects(argv)
             );
         }
         assert!(
@@ -974,9 +1089,15 @@ mod tests {
                 .any(|a| a.contains(&"/etc/ferrum#nixosConfigurations.saltbox.config.services.sonarr.package.version".to_string())),
             "the per-app attribute must be built from the deployed flake ref: {argvs:?}"
         );
-        // Anti-vacuity: the forbidden-flag scan really can find one.
-        let planted = ["eval".to_string(), "--impure".to_string()];
-        assert!(planted.iter().any(|a| a == "--impure"));
+        // The control on the control: the SAME scan really does fire, on
+        // both a forbidden flag and a missing required one.
+        let impure = ["eval".to_string(), "--impure".to_string(), "--no-write-lock-file".to_string()];
+        assert_eq!(read_only_defects(&impure), vec!["--impure is present".to_string()]);
+        let unlocked = ["eval".to_string(), "--json".to_string()];
+        assert_eq!(
+            read_only_defects(&unlocked),
+            vec!["--no-write-lock-file is missing".to_string()]
+        );
     }
 
     /// R1: an app whose evaluation fails is a loud row carrying the
@@ -1068,10 +1189,6 @@ mod tests {
         assert!(r.error.as_deref().unwrap().contains("infinite recursion"));
     }
 
-    /// The whole reason `NotChecked` is a distinct value. A report that has
-    /// not looked at the candidate must not be readable as "up to date" by
-    /// anything -- including a consumer that only looks at the serialized
-    /// text.
     /// The whole reason the candidate states are distinct values. A check
     /// that could not reach the candidate must not be readable as "up to
     /// date" by anything -- including a consumer that only looks at the

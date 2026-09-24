@@ -1325,11 +1325,23 @@ mod tests {
                 "a read-only check must leave the interlock unclaimed"
             );
 
-            // Anti-vacuity: this probe really can observe a claimed
-            // interlock, so "unclaimed" above is a finding rather than a
-            // matcher that never fires.
-            *shared.job_running.lock().unwrap() = true;
-            assert!(*shared.job_running.lock().unwrap());
+            // The consequence rather than a re-read of the bool we just
+            // looked at: an apply dispatched afterwards must not find the
+            // interlock held. That is what "left it unclaimed" actually
+            // means, and it is what would break if the check claimed and
+            // never released.
+            let (status, body, _) = dispatch_with(
+                requests.path(),
+                Err(anyhow::anyhow!("unused")),
+                shared.clone(),
+                JobRequest::Apply,
+            )
+            .await;
+            assert_ne!(
+                status,
+                StatusCode::CONFLICT,
+                "a preceding read-only check must not have wedged the interlock: {body}"
+            );
         }
 
         /// The guard is scoped to rollback and must not cost the other
