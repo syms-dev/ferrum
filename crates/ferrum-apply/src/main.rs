@@ -10,6 +10,9 @@ mod request;
 mod restore_state;
 mod rollback;
 mod secrets;
+mod update_candidate;
+mod update_check;
+mod update_deltas;
 
 #[derive(Parser)]
 #[command(name = "ferrum-apply")]
@@ -80,6 +83,16 @@ enum Command {
     /// writing anything. Read-only: evaluates the real flake via `nix
     /// eval`, never runs `nix build` or touches settings.json on disk.
     PreviewMigration,
+    /// Report what this host runs today and what an update would change,
+    /// without changing anything.
+    ///
+    /// Strictly read-only: `nix eval` only, no `nix build`, no
+    /// `nix flake lock`, and provably no write to /etc/ferrum/flake.nix or
+    /// /etc/ferrum/flake.lock -- the two files the privilege boundary
+    /// exists to protect. Exists as a subcommand as well as a request kind
+    /// so `request::Request`'s own rule holds: every variant maps onto a
+    /// subcommand an operator can also run by hand over SSH.
+    CheckUpdate,
 }
 
 /// Writes the job's `started` line, then runs it.
@@ -424,6 +437,109 @@ fn run_preview_migration() -> i32 {
     0
 }
 
+/// Decides a check's job outcome from what the check itself produced.
+///
+/// Split out so the one case that must never be silent -- the read-only
+/// guarantee having been broken -- is testable without a real `nix`.
+///
+/// # Arguments
+/// * `violations` - one message per protected file the check modified.
+/// * `written` - where the report document landed, or why it could not be
+///   written.
+///
+/// # Returns
+/// `(result, detail, exit_code)` for the terminal progress line and the
+/// process exit.
+fn check_update_outcome(
+    violations: &[String],
+    written: Result<std::path::PathBuf, String>,
+    summary: &str,
+) -> (&'static str, String, i32) {
+    // Checked before the write outcome: a check that moved a pin is a
+    // failure whether or not it also managed to file a report about it.
+    if !violations.is_empty() {
+        return ("failed", violations.join("; "), 1);
+    }
+    match written {
+        Ok(path) => ("succeeded", format!("{summary} (report: {})", path.display()), 0),
+        Err(e) => (
+            "failed",
+            format!("the check ran but its report could not be written: {e}"),
+            1,
+        ),
+    }
+}
+
+/// Runs the read-only update check and leaves its report where ferrumd can
+/// read it.
+///
+/// Instrumented through `progress::Progress` -- unlike
+/// `run_preview_migration`, which is CLI-only -- because this one is
+/// dispatched as a job and `GET /api/jobs` renders its stream.
+///
+/// # Returns
+/// A process exit code: 0 when a report was produced and written, 1 when it
+/// could not be, or when the read-only guarantee was broken.
+fn run_check_update() -> i32 {
+    let mut progress = progress::Progress::open();
+    let flake_ref = std::env::var("FERRUM_FLAKE_REF").unwrap_or_else(|_| {
+        "/etc/ferrum#nixosConfigurations.default.config.system.build.toplevel".to_string()
+    });
+    let (flake_dir, config_attr) = update_check::split_flake_ref(&flake_ref);
+    let settings_path = std::env::var("FERRUM_SETTINGS_PATH")
+        .unwrap_or_else(|_| "/etc/ferrum/settings.json".to_string());
+    let flake_nix = std::path::Path::new(&flake_dir).join("flake.nix");
+    let flake_lock = std::path::Path::new(&flake_dir).join("flake.lock");
+
+    // Captured BEFORE the first subprocess, released after the last: the
+    // window this covers is the whole check.
+    let guard = update_check::ReadOnlyGuard::capture(&[&flake_nix, &flake_lock]);
+    progress.event(
+        "check-update",
+        "reading this host's resolved configuration -- nothing is written",
+    );
+
+    let inputs = update_check::CheckInputs {
+        flake_dir: &flake_dir,
+        config_attr: &config_attr,
+        settings_path: std::path::Path::new(&settings_path),
+        flake_nix: &flake_nix,
+        flake_lock: &flake_lock,
+        now: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+    };
+    let mut report = update_check::build_report(&inputs, &update_check::RealRunner);
+
+    let violations = guard.violations();
+    report.warnings.extend(violations.iter().cloned());
+
+    let job_id = std::env::var("FERRUM_JOB_ID").ok();
+    let written = update_check::write_report(
+        &update_check::report_dir(),
+        &update_check::report_file_name(job_id.as_deref()),
+        &report,
+    )
+    .map_err(|e| e.to_string());
+
+    // stdout carries the whole document, so a bare `ferrum-apply
+    // check-update` over SSH is useful on its own -- the same way
+    // `preview-migration` prints its summary.
+    match serde_json::to_string(&report) {
+        Ok(body) => println!("{body}"),
+        Err(e) => eprintln!("check-update: could not serialize the report: {e}"),
+    }
+
+    let summary = update_check::summary_line(&report);
+    let (result, detail, code) = check_update_outcome(&violations, written, &summary);
+    if code != 0 {
+        eprintln!("check-update failed: {detail}");
+    }
+    progress.complete(result, &detail);
+    code
+}
+
 /// A real GC pass: prunes state snapshots beyond `ferrum.storage.keepGenerations`.
 ///
 /// Was a stub returning exit 1 until 2026-09-15, while
@@ -612,6 +728,7 @@ fn main() -> anyhow::Result<()> {
         Command::RestoreState => run_restore_state(),
         Command::Gc => run_gc(),
         Command::PreviewMigration => run_preview_migration(),
+        Command::CheckUpdate => run_check_update(),
         Command::ReconcileDns { config } => run_reconcile_dns(&config),
         Command::PutSecret { name, replace } => run_put_secret(&name, replace),
         Command::RunRequest { path } => match request::read_request(&path) {
@@ -621,6 +738,7 @@ fn main() -> anyhow::Result<()> {
                 request::Request::Rollback { to } => run_rollback(to),
                 request::Request::RestoreState => run_restore_state(),
                 request::Request::Gc => run_gc(),
+                request::Request::CheckUpdate => run_check_update(),
             }),
             Err(e) => {
                 eprintln!("run-request: {e}");
@@ -779,6 +897,66 @@ mod tests {
         assert_eq!(second["event"], "pruning", "the subcommand's progress follows it");
     }
 
+    /// The read-only check is dispatched through the same mechanism as
+    /// every other capability (R3's second criterion), which means its
+    /// `started` line has to carry its own kind -- otherwise `GET
+    /// /api/jobs` reports a running check as a job of unknown kind, and the
+    /// UI has nothing to reattach to.
+    #[test]
+    fn a_dispatched_check_update_announces_its_own_kind_before_it_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("job.jsonl");
+        let mut progress = progress::Progress::to_path(&path);
+
+        let code = run_request(request::Request::CheckUpdate, &mut progress, |req| {
+            progress::Progress::to_path(&path).event("check-update", &format!("ran {}", req.kind()));
+            0
+        });
+        assert_eq!(code, 0);
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let first: serde_json::Value =
+            serde_json::from_str(content.lines().next().unwrap()).unwrap();
+        assert_eq!(first["event"], "started");
+        assert_eq!(first["detail"], "check_update");
+    }
+
+    /// The whole point of the guard: a check that moved a pin is a FAILED
+    /// job, loudly, even if everything else about it worked.
+    #[test]
+    fn a_check_that_broke_the_read_only_guarantee_fails_the_job() {
+        let (result, detail, code) = check_update_outcome(
+            &["the update check modified /etc/ferrum/flake.lock -- it must be strictly read-only"
+                .to_string()],
+            Ok(std::path::PathBuf::from("/var/lib/ferrum/jobs/x.update-check.json")),
+            "up to date; 4 enabled app(s), 3 excluded",
+        );
+        assert_eq!(result, "failed");
+        assert_eq!(code, 1);
+        assert!(detail.contains("flake.lock"), "{detail}");
+        // Anti-vacuity: the same call with no violation really does pass.
+        let (result, detail, code) = check_update_outcome(
+            &[],
+            Ok(std::path::PathBuf::from("/var/lib/ferrum/jobs/x.update-check.json")),
+            "up to date; 4 enabled app(s), 3 excluded",
+        );
+        assert_eq!(result, "succeeded");
+        assert_eq!(code, 0);
+        assert!(detail.contains("x.update-check.json"), "{detail}");
+    }
+
+    /// A report nobody can read is not a completed check: ferrumd serves
+    /// the document, not the progress stream, so a silent write failure
+    /// would leave the operator staring at a successful job with no answer.
+    #[test]
+    fn a_report_that_could_not_be_written_fails_the_job() {
+        let (result, detail, code) =
+            check_update_outcome(&[], Err("Permission denied (os error 13)".to_string()), "x");
+        assert_eq!(result, "failed");
+        assert_eq!(code, 1);
+        assert!(detail.contains("Permission denied"), "{detail}");
+    }
+
     /// The exit code is the runner's, not something `run_request` invents --
     /// a dispatched apply that degrades must still surface its own 3.
     #[test]
@@ -786,6 +964,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut progress = progress::Progress::to_path(&dir.path().join("j.jsonl"));
         assert_eq!(run_request(request::Request::Apply, &mut progress, |_| 3), 3);
+    }
+
+    #[test]
+    fn parses_check_update() {
+        let cli = Cli::parse_from(["ferrum-apply", "check-update"]);
+        assert!(matches!(cli.command, Command::CheckUpdate));
     }
 
     #[test]

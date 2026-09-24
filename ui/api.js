@@ -144,6 +144,40 @@ export const jobs = (limit) =>
   request("GET", `/api/jobs${limit ? `?limit=${encodeURIComponent(limit)}` : ""}`);
 export const job = (id) => request("GET", `/api/jobs/${encodeURIComponent(id)}`);
 
+/// The most recent check_update report this host holds.
+///
+/// The daemon always answers with the same three-key envelope, so the caller
+/// never has to tell "no report" apart from "a report that happens to be
+/// empty": `status` says which, explicitly.
+///
+/// `jobId` is null when the report came from a bare CLI run rather than a
+/// dispatched job. It is a provenance label only -- never feed it to
+/// `job()`, which would 400 on a non-uuid.
+///
+/// @returns {Promise<{status: string, jobId: string|null, report: object|null}>}
+///   `status: "report"` with the producer's document verbatim under `report`,
+///   or `status: "never-checked"` with `report: null` when no check has ever
+///   run on this host.
+export const updates = () => request("GET", "/api/updates");
+
+/// The report produced by one specific check_update job.
+///
+/// Deliberately the ONLY place the per-job query shape is spelled out.
+///
+/// A 404 here is NOT the never-checked state. It means that particular run
+/// wrote no report -- it is still running, or it failed before writing one --
+/// and the daemon's own message says so. Answering "this host has never
+/// checked" to a question about one run would be answering a different
+/// question.
+///
+/// @param {string} jobId - The uuid `POST /api/jobs` returned.
+/// @returns {Promise<{status: string, jobId: string, report: object}>} The
+///   same envelope, carrying that run's document.
+/// @throws {ApiError} 404 when that run produced no report, 400 when `jobId`
+///   is not a uuid.
+export const updatesForJob = (jobId) =>
+  request("GET", `/api/updates?job=${encodeURIComponent(jobId)}`);
+
 // --- writes --------------------------------------------------------------
 
 /// Writes settings. NEVER triggers an apply -- that is a separate, explicit
@@ -160,7 +194,11 @@ export const putSecret = (name, value) =>
   });
 
 /// Starts a privileged job. `kind` is one of the daemon's closed set:
-/// preflight, apply, rollback, restore_state, gc.
+/// preflight, apply, rollback, restore_state, gc, check_update.
+///
+/// Every kind but `check_update` can come back 409 from the daemon's
+/// single-job interlock. `check_update` deliberately does not claim it, so a
+/// read-only check can never stand between an operator and a rollback.
 export const startJob = (kind, extra = {}) =>
   request("POST", "/api/jobs", { body: { kind, ...extra } });
 

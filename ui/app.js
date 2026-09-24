@@ -1,4 +1,4 @@
-// The ferrum UI: four hash-routed views over the daemon's read-only APIs and
+// The ferrum UI: five hash-routed views over the daemon's read-only APIs and
 // its three mutating ones.
 //
 // No framework, no build step, no external request of any kind. The box this
@@ -458,6 +458,479 @@ async function generationsView() {
   );
 }
 
+// --- updates -------------------------------------------------------------
+
+/// The four values `candidate.state` can carry on the check_update report.
+///
+/// Kept on one line because the `updates-view-is-wired` flake check reads
+/// this file as text, cross-checks these names against CANDIDATE_STATE_TEXT's
+/// keys, AND cross-checks them against ferrum-apply's own `CandidateState`
+/// enum. A state the daemon can send with no branch here fails the build
+/// instead of rendering as an empty cell -- which is the failure this view
+/// exists to prevent, since "we could not check" and "you are up to date"
+/// look identical when a branch is missing.
+///
+/// There is no `not-checked` here, unlike APP_STATES below. Every code path
+/// that produces a candidate report has already resolved one of these four;
+/// "this host has never checked at all" is not a candidate state, it is the
+/// endpoint's own `never-checked` envelope status, rendered separately.
+const CANDIDATE_STATES = ["up-to-date", "not-newer", "update-available", "check-failed"];
+
+/// The five values an entry in `apps[]`'s `state` can carry. Same file, same
+/// flake check, same cross-check against `AppState`.
+///
+/// `not-checked` DOES exist on this side and is reachable: an enabled app
+/// whose current version is known while the candidate side never resolved.
+/// It is explicitly not a claim that the app is up to date.
+const APP_STATES = ["not-checked", "up-to-date", "update-available", "excluded", "evaluation-failed"];
+
+/// The three keys `GET /api/updates` always answers with, and the two values
+/// its `status` can take.
+///
+/// Both lines are cross-checked by `updates-view-is-wired` against what
+/// ferrumd's `report_body`/`never_checked_body` actually construct. This is
+/// the join the whole screen turns on: taking "never checked" from `status`
+/// instead of inferring it from an empty document only works for as long as
+/// that literal is what the daemon sends, and nothing but this check would
+/// notice it being renamed.
+const UPDATES_ENVELOPE_KEYS = ["status", "jobId", "report"];
+const UPDATES_ENVELOPE_STATUSES = ["report", "never-checked"];
+
+/// What is wrong with an `/api/updates` envelope, if anything.
+///
+/// The UI is a long-lived tab and the daemon can be rebuilt under it (1.5b's
+/// global constraint), so an envelope this page cannot read is an ordinary
+/// event, not an impossible one. Saying which key is missing beats rendering
+/// an empty screen and leaving the operator to guess.
+///
+/// @param {object|null} envelope - The parsed body of `GET /api/updates`.
+/// @returns {string|null} An operator-facing problem, or null when the
+///   envelope is one this page knows how to read.
+function envelopeProblem(envelope) {
+  if (envelope === null || typeof envelope !== "object") {
+    return "The daemon's reply to /api/updates was not an object. This page cannot read it.";
+  }
+  const missing = UPDATES_ENVELOPE_KEYS.filter((key) => !(key in envelope));
+  if (missing.length) {
+    return `The daemon's reply to /api/updates is missing ${missing.join(", ")}. This page is probably older than the daemon serving it — reload it.`;
+  }
+  if (!UPDATES_ENVELOPE_STATUSES.includes(envelope.status)) {
+    return `The daemon answered with status "${orUnknown(envelope.status)}", which this page does not understand. It knows: ${UPDATES_ENVELOPE_STATUSES.join(", ")}.`;
+  }
+  return null;
+}
+
+/// A state's short label and the sentence that explains it.
+///
+/// @param {string} label - The words shown in the status cell.
+/// @param {string} prose - One sentence saying what that state means for this host.
+/// @returns {{label: string, prose: string}} The pair both state tables hold.
+function stateText(label, prose) {
+  return { label, prose };
+}
+
+// One entry per line, one distinct sentence per state, on purpose. "Never
+// checked" and "up to date" are different facts about a host, and an
+// unreachable check that reads as a clean result is precisely the confusion
+// R1's edge cases name.
+const CANDIDATE_STATE_TEXT = {
+  "up-to-date": stateText("Up to date", "The tracked reference resolves to the revision this host is already running. There is nothing to apply."),
+  "not-newer": stateText("Candidate is not newer — not an update", "The tracked reference resolves to a revision that is not newer than the one this host runs. ferrum will not offer it, the same way preview-migration refuses to call a lower schema version a migration."),
+  "update-available": stateText("Update available", "A newer revision exists. Nothing has been fetched, built, or applied — a check only reads."),
+  "check-failed": stateText("Could not check for updates", "The check did not complete, so this host's update state is unknown. That is not the same as being up to date."),
+};
+
+// "Would change" rather than "Update available" for a single app, deliberately.
+// One nixpkgs pin supplies every app's package, so per-app wording that reads
+// like an actionable per-app update would claim an independence ferrum does
+// not have (R1's last criterion, R7).
+const APP_STATE_TEXT = {
+  "not-checked": stateText("Not checked", "No candidate has been resolved, so there is nothing to compare this app against."),
+  "up-to-date": stateText("Up to date", "The candidate package set carries the version this app already runs."),
+  "update-available": stateText("Would change", "The candidate package set carries a different version for this app. It moves with every other app, not on its own."),
+  "excluded": stateText("Not shown — disabled", "This app is disabled, so nothing is running to compare against. It picks up the candidate's version if you enable it after updating."),
+  "evaluation-failed": stateText("Could not evaluate", "Evaluating this app against the candidate failed. The row is kept, with the evaluator's own words, rather than dropped."),
+};
+
+/// A value the report may legitimately not know yet, rendered as words.
+///
+/// @param {string|number|null|undefined} value - A version, a revision, or nothing.
+/// @returns {string} The value, or "unknown" -- never an empty cell, which
+///   reads as "nothing changes" rather than "nobody looked".
+function orUnknown(value) {
+  return value === null || value === undefined || value === "" ? "unknown" : String(value);
+}
+
+/// How long ago an epoch-seconds instant was, in coarse operator words.
+///
+/// Every branch below is reached only with a count of two or more -- the
+/// thresholds are 90 seconds and 36 hours, not 60 and 24 -- so there is no
+/// singular form to write. That is deliberate rather than forgotten.
+///
+/// @param {number} epochSeconds - The report's `checkedAt`.
+/// @returns {string} A phrase to follow "Checked": "just now", "7 minutes
+///   ago", "3 days ago", or a plain statement that the timestamp is ahead of
+///   this host's own clock.
+function relativeAge(epochSeconds) {
+  const seconds = Math.round(Date.now() / 1000 - Number(epochSeconds));
+  if (!Number.isFinite(seconds)) return "at a time this page cannot read";
+  // A clock that stepped backwards is the exact condition that makes the
+  // daemon serve a stale report, so naming it beats clamping it to "just
+  // now" and hiding the one visible clue that it happened.
+  if (seconds < -60) return "at a time ahead of this host's own clock";
+  if (seconds < 90) return "just now";
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 90) return `${minutes} minutes ago`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 36) return `${hours} hours ago`;
+  return `${Math.round(hours / 24)} days ago`;
+}
+
+/// The status cell for one state, as words rather than a colour.
+///
+/// @param {{label: string, prose: string}|undefined} text - The state's entry
+///   in its table, or undefined for a state this page has never heard of.
+/// @param {string} raw - The wire value, shown when there is no entry for it.
+/// @param {string|null} detail - The daemon's own words (an evaluator error,
+///   or the reason an app is excluded), shown verbatim when present.
+/// @param {string[]} vocabulary - The states this page has wording for, named
+///   in the unknown branch so an operator can see the disagreement rather
+///   than just the symptom.
+/// @returns {HTMLElement} A cell body carrying the label, the explanation and
+///   any verbatim detail.
+function stateCell(text, raw, detail, vocabulary) {
+  const known = text !== undefined;
+  return el("div", { class: "state" }, [
+    el("strong", { text: known ? text.label : `Unrecognised state: ${orUnknown(raw)}` }),
+    el("p", {
+      class: known ? "hint" : "error",
+      text: known
+        ? text.prose
+        : `This page has no wording for that state and understands only: ${vocabulary.join(", ")}. It is probably older than the daemon serving it. Treat the state as unknown, not as up to date.`,
+    }),
+    detail ? el("pre", { class: "log detail", text: detail }) : null,
+  ]);
+}
+
+/// One row of the per-app table.
+///
+/// Deliberately renders no control of any kind. A per-app button would imply
+/// an app can be moved independently of the rest, which a single shared
+/// nixpkgs pin makes false (R1's last acceptance criterion). The
+/// `updates-view-is-wired` flake check reads this function's body and fails
+/// if a control ever appears inside it.
+///
+/// @param {object} app - One entry of the report's `apps` array.
+/// @param {object} catalogApps - `/api/catalog`'s apps map, for display names.
+/// @returns {HTMLElement} A `<tr>` for the per-app table.
+function appRow(app, catalogApps) {
+  const meta = catalogApps[app.id] || {};
+  return el("tr", {}, [
+    el("th", { scope: "row" }, [
+      el("span", { text: meta.displayName || app.id }),
+      el("p", { class: "hint", text: app.enabled ? "Enabled" : "Disabled" }),
+    ]),
+    el("td", { text: orUnknown(app.currentVersion) }),
+    el("td", { text: orUnknown(app.candidateVersion) }),
+    el("td", {}, [
+      stateCell(APP_STATE_TEXT[app.state], app.state, app.error || app.reason || null, APP_STATES),
+    ]),
+  ]);
+}
+
+/// Render the "no check has ever run here" answer.
+///
+/// A separate branch rather than a candidate state, because the daemon
+/// answers it separately: `status: "never-checked"` carries no report at all,
+/// and `CandidateState` has no `not-checked` value to borrow. Saying it in
+/// prose keeps it visibly distinct from "up to date", which is the one
+/// confusion R1's edge cases single out.
+///
+/// @param {HTMLElement} target - The element whose children are replaced.
+/// @returns {void}
+function renderNeverChecked(target) {
+  target.replaceChildren(
+    el("h3", { text: "This host has never checked for updates" }),
+    el("p", {
+      text:
+        "No check has run here, so there is nothing to report. This is not a claim that you are up to date — nobody has looked yet.",
+    }),
+    el("p", { class: "hint", text: "Use “Check for updates” above. It reads only." }),
+  );
+}
+
+/// Render a whole check_update report into the view's report region.
+///
+/// @param {HTMLElement} target - The element whose children are replaced.
+/// @param {object} report - The producer's document, taken from the
+///   endpoint's envelope. ferrumd models none of its fields and serves it
+///   verbatim, so this is the only place its shape is read.
+/// @param {object} catalogApps - `/api/catalog`'s apps map.
+/// @param {string|null} jobId - The run this report came from, or null when
+///   it came from a bare CLI run. Shown as provenance; never used as a job id.
+/// @returns {void}
+function renderUpdateReport(target, report, catalogApps, jobId) {
+  const candidate = report.candidate || {};
+  const ferrum = report.ferrum || {};
+  const migration = report.schemaMigration || {};
+  const apps = Array.isArray(report.apps) ? report.apps : [];
+  const warnings = Array.isArray(report.warnings) ? report.warnings : [];
+
+  const rows = el("tbody");
+  for (const app of apps) rows.appendChild(appRow(app, catalogApps));
+
+  // A report carrying no apps at all is a fact worth stating. An empty table
+  // body would read as "nothing changes", which is a different claim.
+  const appsBlock = apps.length
+    ? el("div", { class: "table-scroll" }, [
+        el("table", {}, [
+          el("caption", { class: "hint", text: "Every catalog app this report covers, including the ones nothing can be said about." }),
+          el("thead", {}, [
+            el("tr", {}, [
+              el("th", { scope: "col", text: "App" }),
+              el("th", { scope: "col", text: "Current" }),
+              el("th", { scope: "col", text: "Candidate" }),
+              el("th", { scope: "col", text: "What the check found" }),
+            ]),
+          ]),
+          rows,
+        ]),
+      ])
+    : el("p", { text: "This report lists no apps. That is not the same as no app changing — it means the check produced no per-app result at all." });
+
+  target.replaceChildren(
+    // Prominent, not a muted footnote, and carrying its own age.
+    //
+    // The daemon picks "the newest report" by file mtime, so a host clock
+    // that steps backwards between two checks -- NTP correcting a fast clock
+    // -- makes a freshly written report look older and the previous one gets
+    // served. ferrumd will not fix that by parsing the document, and should
+    // not: treating the report as opaque is what keeps it from becoming a
+    // second place the shape is written down. So the mitigation is here, and
+    // the age is the part that does the work: an absolute timestamp still
+    // leaves the operator doing arithmetic to notice that "the newest
+    // report" predates the check they just ran.
+    //
+    // No trailing full stop: localTime renders in the operator's own locale,
+    // and several of those (en-CA, en-GB 12-hour) end the string with "a.m."
+    // -- a sentence period after one reads as a typo.
+    el("p", {
+      class: "checked-at",
+      text: report.checkedAt
+        ? `Checked ${relativeAge(report.checkedAt)} — ${localTime(report.checkedAt)}`
+        : "This report carries no check time",
+    }),
+
+    el("p", {
+      class: "hint",
+      // Provenance, not a handle. A report written by a bare CLI run carries
+      // no job id at all, and the envelope says so with null rather than a
+      // placeholder -- so there is nothing here to feed back to /api/jobs.
+      text: jobId
+        ? `From check job ${jobId}`
+        : "From a check run on the host itself, not from a job started here",
+    }),
+
+    report.schemaVersion !== 1
+      ? el("p", {
+          class: "error",
+          text: `This report declares schema version ${orUnknown(report.schemaVersion)}, and this page understands only version 1. Some of it may be shown wrongly or not at all.`,
+        })
+      : null,
+
+    el("h3", { text: "The candidate" }),
+    stateCell(CANDIDATE_STATE_TEXT[candidate.state], candidate.state, candidate.error || null, CANDIDATE_STATES),
+
+    el("dl", { class: "facts" }, [
+      el("dt", { text: "Tracked input" }),
+      el("dd", { text: `${orUnknown(candidate.inputName)} — ${orUnknown(candidate.inputUrl)}` }),
+      el("dt", { text: "Tracked reference" }),
+      el("dd", { text: orUnknown(candidate.reference) }),
+      el("dt", { text: "Revision this host runs" }),
+      el("dd", {}, [el("code", { class: "rev", text: orUnknown(candidate.currentRev) })]),
+      el("dt", { text: "Candidate revision" }),
+      el("dd", {}, [el("code", { class: "rev", text: orUnknown(candidate.rev || ferrum.candidateRev) })]),
+    ]),
+
+    el("h3", { text: "ferrum itself" }),
+    el("p", {
+      text: `ferrum ${orUnknown(ferrum.currentVersion)} → ${orUnknown(ferrum.candidateVersion)}.`,
+    }),
+    el("p", {
+      class: "hint",
+      text: "ferrum's own release version moves with the same pin as the apps below. It is not a separate check and cannot be taken separately.",
+    }),
+
+    el("h3", { text: "Apps" }),
+    report.appsError
+      ? el("p", { class: "error", text: `The per-app evaluation failed as a whole: ${report.appsError}` })
+      : null,
+    appsBlock,
+
+    el("h3", { text: "Settings schema" }),
+    el("p", {
+      text: migration.pending
+        ? `A settings-schema migration is pending: version ${orUnknown(migration.currentVersion)} → ${orUnknown(migration.targetVersion)}.`
+        : `No settings-schema migration is pending. On-disk version ${orUnknown(migration.currentVersion)}, this ferrum's version ${orUnknown(migration.targetVersion)}.`,
+    }),
+    migration.note ? el("p", { class: "hint", text: migration.note }) : null,
+    migration.error ? el("pre", { class: "log detail", text: migration.error }) : null,
+    el("p", {
+      class: "hint",
+      text:
+        "ferrum cannot tell you whether you have seen this migration before: the step that would record having shown it is not built. A pending migration therefore reappears on every check, and seeing it twice is not evidence that anything went wrong.",
+    }),
+
+    warnings.length
+      ? el("section", {}, [
+          el("h3", { text: "Warnings" }),
+          el("ul", {}, warnings.map((w) => el("li", { text: String(w) }))),
+        ])
+      : null,
+  );
+}
+
+/// The Updates view: what a read-only check found, and nothing that acts on it.
+///
+/// @returns {Promise<void>} Resolves once the shell is painted and either a
+///   stored report has been rendered or an in-flight check reattached to.
+async function updatesView() {
+  closeStream();
+
+  const error = el("p", { class: "error" });
+  const pending = el("p", { class: "hint", role: "status", "aria-live": "polite" });
+  const report = el("div", {});
+  const log = el("pre", { class: "log", hidden: true });
+
+  function attach(id) {
+    log.hidden = false;
+    log.textContent = "";
+    // Written for slow, not for instant. The real cost of a candidate check
+    // is unmeasured -- it overrides an input the store has never seen and
+    // evaluates the whole module system against it -- and a screen that
+    // implied otherwise would be lying about the one thing nobody has timed.
+    pending.textContent = "Checking for updates. This can take a while: ferrum resolves the candidate and evaluates the whole configuration against it.";
+    state.stream = api.streamJob(id, {
+      onEvent: (e) => {
+        log.textContent += `${e.event}: ${e.detail}\n`;
+        log.scrollTop = log.scrollHeight;
+      },
+      onDone: async () => {
+        pending.textContent = "";
+        try {
+          const envelope = await api.updatesForJob(id);
+          const problem = envelopeProblem(envelope);
+          if (problem) {
+            error.textContent = problem;
+          } else {
+            renderUpdateReport(report, envelope.report, state.catalog?.apps || {}, envelope.jobId);
+            setStatus("Check finished.", "ok");
+          }
+        } catch (err) {
+          // A 404 here means THIS run wrote no report -- it failed before it
+          // could, or it is somehow still going. The daemon's own message
+          // says exactly that, and it is deliberately not the never-checked
+          // answer, so it stays in the error line rather than replacing the
+          // report region with "nobody has looked yet".
+          error.textContent = err.message;
+        }
+      },
+    });
+  }
+
+  const check = el("button", {
+    type: "button",
+    text: "Check for updates",
+    onclick: async () => {
+      error.textContent = "";
+      // No 409 branch, unlike the Apply view. A read-only check deliberately
+      // does not claim the daemon's single-job interlock: the one path that
+      // has to keep working on a host an update just broke is the rollback a
+      // shared interlock would block.
+      try {
+        const { id } = await api.startJob("check_update");
+        setStatus(`Update check started (${id}).`);
+        attach(id);
+      } catch (err) {
+        error.textContent = err.message;
+      }
+    },
+  });
+
+  // Painted before anything is awaited, so an operator arriving here never
+  // sees the previous view's DOM sitting under an "Updates" heading while a
+  // slow check runs.
+  view().replaceChildren(
+    el("section", { class: "updates" }, [
+      el("h2", { text: "Updates" }),
+      el("p", {
+        text:
+          "Checking reads only. It resolves what the tracked reference points at and works out what your configuration would become — it writes nothing, builds nothing and switches nothing. Nothing on this screen applies an update.",
+      }),
+      el("p", {
+        class: "hint",
+        text:
+          "ferrum cannot update one app without the others. A single nixpkgs pin supplies every app's package, so every version below moves together or not at all. There is no per-app update control here because there is no per-app update to offer.",
+      }),
+      el("div", { class: "row" }, [check]),
+      pending,
+      error,
+      log,
+      report,
+      el("section", {}, [
+        el("h3", { text: "What you are trusting" }),
+        el("p", {
+          text:
+            "A candidate is evaluated as root, with the build sandbox's purity disabled, exactly as an ordinary apply is. ferrum verifies no signature on it: pointing this host at a ferrum release is itself the trust decision.",
+        }),
+        el("p", {
+          text:
+            "Seeing the exact candidate revision above, before anything is applied, is the control that stands in place of that signature. Read it, and refuse it if it is not what you expect.",
+        }),
+        el("p", {
+          class: "hint",
+          text:
+            "An operator who wants no delegated trust can keep pinning an exact commit by hand in /etc/ferrum/flake.nix. This feature never takes that away.",
+        }),
+      ]),
+    ]),
+  );
+
+  pending.textContent = "Loading the most recent check…";
+  try {
+    const envelope = await api.updates();
+    const problem = envelopeProblem(envelope);
+    // Taken from `status`, never inferred from an absent or empty report:
+    // the daemon answers the question explicitly, and guessing it from the
+    // document's shape is how "never checked" starts reading as "up to date".
+    if (problem) {
+      error.textContent = problem;
+    } else if (envelope.status === "never-checked") {
+      renderNeverChecked(report);
+    } else {
+      renderUpdateReport(report, envelope.report, state.catalog?.apps || {}, envelope.jobId);
+    }
+  } catch (err) {
+    error.textContent = err.message;
+  }
+  pending.textContent = "";
+
+  // Reattach to a check still running from a previous page load. Filtered on
+  // kind as well as status, unlike the Apply view's finder above: an
+  // unfiltered one here would tail a rollback or a gc job into this screen's
+  // log and then ask /api/updates for a report that job never produced.
+  try {
+    const recent = await api.jobs(10);
+    const running = recent.jobs.find((j) => j.status === "running" && j.kind === "check_update");
+    if (running) {
+      setStatus("Reattached to an update check already running.");
+      attach(running.id);
+    }
+  } catch (err) {
+    error.textContent = err.message;
+  }
+}
+
 // --- routing -------------------------------------------------------------
 
 const routes = {
@@ -465,6 +938,7 @@ const routes = {
   "#/apply": applyView,
   "#/secrets": secretsView,
   "#/generations": generationsView,
+  "#/updates": updatesView,
 };
 
 async function route() {
