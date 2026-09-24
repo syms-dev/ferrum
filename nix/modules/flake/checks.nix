@@ -3305,6 +3305,145 @@
           echo ok > $out
         '';
 
+      # There is no JavaScript test runner anywhere in this repository, and
+      # adding one would be a new dependency for a UI whose entire design is
+      # "no build step, nothing between the source an operator reads and the
+      # bytes served" (nix/pkgs/ferrum-ui/default.nix). So the Updates view is
+      # guarded the only way this tree already guards UI source: by reading
+      # ui/app.js as text, exactly as uiRendersEverySchemaType reads
+      # ui/forms.js.
+      #
+      # This buys wiring and vocabulary, NOT rendering. It cannot prove a
+      # <td> holds the right words; it can prove that a state the daemon can
+      # send has SOME branch to land in, that the route exists, that no
+      # per-app control was added, and that nothing here reaches off-host.
+      # Everything else about this view is browser-only and is recorded as
+      # such rather than pretended away.
+      #
+      # Every structural lookup below throws rather than returning an empty
+      # result. A check that grepped for a declaration, found nothing, and
+      # passed would be worse than no check at all -- this tree has already
+      # shipped one of those (see the CATALOG_APPS comment above).
+      updatesViewIsWired =
+        let
+          appSrc = builtins.readFile ../../../ui/app.js;
+          lines = lib.splitString "\n" appSrc;
+          indexed = lib.imap0 (i: l: { inherit i l; }) lines;
+
+          indexOf = what: infix:
+            let hits = builtins.filter (e: lib.hasInfix infix e.l) indexed; in
+            if hits == [ ] then
+              throw ("ui/app.js no longer has a line containing '" + infix
+                + "', so updates-view-is-wired cannot verify " + what
+                + ". A check that cannot find what it guards must fail, not pass.")
+            else (builtins.head hits).i;
+
+          # Every line after the one opening `startInfix`, up to but not
+          # including the first line `isEnd` accepts.
+          blockAt = what: startInfix: isEnd:
+            let
+              after = lib.drop ((indexOf what startInfix) + 1) lines;
+              take = acc: rest:
+                if rest == [ ] then
+                  throw ("ui/app.js opens '" + startInfix
+                    + "' but updates-view-is-wired cannot find the line that closes it")
+                else if isEnd (builtins.head rest) then acc
+                else take (acc ++ [ (builtins.head rest) ]) (builtins.tail rest);
+              block = take [ ] after;
+            in
+            if block == [ ] then
+              throw ("ui/app.js's '" + startInfix + "' block is empty, so every assertion "
+                + "updates-view-is-wired makes about " + what + " would be vacuously true")
+            else block;
+
+          quotedIn = re: line:
+            map builtins.head (builtins.filter builtins.isList (builtins.split re line));
+
+          # The two wire vocabularies, read off their one-line declarations.
+          vocabOf = what: name:
+            let values = quotedIn "\"([a-z-]+)\"" (builtins.elemAt lines (indexOf what "const ${name} = [")); in
+            if values == [ ] then
+              throw ("ui/app.js declares " + name + " but updates-view-is-wired read no state "
+                + "names out of it -- it is no longer a single-line array literal, and an empty "
+                + "vocabulary would make the branch-coverage assertion vacuous")
+            else values;
+
+          # The keys of a one-entry-per-line state table: the branches that
+          # actually render.
+          branchesOf = what: name:
+            let
+              keys = lib.concatMap (quotedIn "\"([a-z-]+)\":")
+                (blockAt what "const ${name} = {" (l: l == "};"));
+            in
+            if keys == [ ] then
+              throw ("ui/app.js declares " + name + " but updates-view-is-wired found no "
+                + "\"state\": keys in it")
+            else keys;
+
+          candidateStates = vocabOf "the candidate-state vocabulary" "CANDIDATE_STATES";
+          appStates = vocabOf "the app-state vocabulary" "APP_STATES";
+          candidateBranches = branchesOf "candidate-state rendering" "CANDIDATE_STATE_TEXT";
+          appBranches = branchesOf "app-state rendering" "APP_STATE_TEXT";
+
+          unbranched = states: branches: builtins.filter (s: !(builtins.elem s branches)) states;
+          orphaned = states: branches: builtins.filter (b: !(builtins.elem b states)) branches;
+
+          # The view's own source, delimited by the banner comments this file
+          # already uses to separate its sections.
+          updatesBlock = blockAt "the Updates view's own source"
+            "// --- updates ---" (l: lib.hasInfix "// --- routing ---" l);
+
+          # The per-app row builder, to its closing brace at column zero.
+          appRowBlock = blockAt "the per-app row builder" "function appRow(" (l: l == "}");
+
+          # R1's last criterion: no affordance may imply an app moves alone.
+          perAppControls = builtins.filter
+            (l: lib.hasInfix "el(\"button\"" l || lib.hasInfix "onclick" l || lib.hasInfix "el(\"a\"" l)
+            appRowBlock;
+
+          # Nothing on this screen may start anything but the read-only check:
+          # no commit, no apply, no rollback.
+          startJobLines = builtins.filter (l: lib.hasInfix "api.startJob(" l) updatesBlock;
+          foreignJobKinds = builtins.filter (l: !(lib.hasInfix "\"check_update\"" l)) startJobLines;
+
+          # The Apply view's reattach finder is NOT kind-filtered, so an
+          # unfiltered copy here would tail a rollback or gc job into this
+          # screen and then ask for a report that job never wrote.
+          reattachIsKindFiltered = builtins.any
+            (l: lib.hasInfix "j.status === \"running\"" l && lib.hasInfix "j.kind === \"check_update\"" l)
+            updatesBlock;
+
+          routeWired = builtins.any (l: lib.hasInfix "\"#/updates\": updatesView" l) lines;
+
+          # The UI's standing "no external request of any kind" invariant. An
+          # absolute URL is the shape that breaks it; every real call in this
+          # file is a same-origin path.
+          absoluteUrls = builtins.filter
+            (l: lib.hasInfix "http://" l || lib.hasInfix "https://" l)
+            lines;
+        in
+        {
+          ok = routeWired
+            && reattachIsKindFiltered
+            && startJobLines != [ ]
+            && foreignJobKinds == [ ]
+            && perAppControls == [ ]
+            && absoluteUrls == [ ]
+            && unbranched candidateStates candidateBranches == [ ]
+            && orphaned candidateStates candidateBranches == [ ]
+            && unbranched appStates appBranches == [ ]
+            && orphaned appStates appBranches == [ ];
+
+          routeMissing = !routeWired;
+          reattachNotKindFiltered = !reattachIsKindFiltered;
+          startsNoCheckJob = startJobLines == [ ];
+          inherit foreignJobKinds perAppControls absoluteUrls;
+          candidateStatesWithNoBranch = unbranched candidateStates candidateBranches;
+          candidateBranchesWithNoState = orphaned candidateStates candidateBranches;
+          appStatesWithNoBranch = unbranched appStates appBranches;
+          appBranchesWithNoState = orphaned appStates appBranches;
+        };
+
       mkAssertionCheck = name: result:
         pkgs.runCommand "ferrum-check-${name}" { } (
           if result.ok then
@@ -3331,6 +3470,8 @@
         schema-uniformity = mkAssertionCheck "schema-uniformity" schemaUniformity;
         ui-renders-every-schema-type =
           mkAssertionCheck "ui-renders-every-schema-type" uiRendersEverySchemaType;
+        updates-view-is-wired =
+          mkAssertionCheck "updates-view-is-wired" updatesViewIsWired;
         pool-branches-are-all-seeded =
           mkAssertionCheck "pool-branches-are-all-seeded" poolBranchesAreAllSeeded;
         pool-assertions-can-fire =
