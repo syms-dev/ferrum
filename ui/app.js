@@ -471,10 +471,18 @@ async function generationsView() {
 /// look identical when a branch is missing.
 ///
 /// There is no `not-checked` here, unlike APP_STATES below. Every code path
-/// that produces a candidate report has already resolved one of these four;
+/// that produces a candidate report has already resolved one of these five;
 /// "this host has never checked at all" is not a candidate state, it is the
 /// endpoint's own `never-checked` envelope status, rendered separately.
-const CANDIDATE_STATES = ["up-to-date", "not-newer", "update-available", "check-failed"];
+///
+/// `order-unknown` is the newest of them and the one that carries the most
+/// weight. Ordering rests entirely on the `lastModified` each side reports
+/// for itself, and no ancestry is ever established, so there are real cases
+/// -- an unparseable probe, or a locked timestamp sitting in this host's
+/// future -- where ferrum knows the candidate DIFFERS and cannot honestly say
+/// which way. Collapsing that into `not-newer` is what turns one skewed clock
+/// into a permanent, silent "nothing to do".
+const CANDIDATE_STATES = ["up-to-date", "not-newer", "update-available", "check-failed", "order-unknown"];
 
 /// The five values an entry in `apps[]`'s `state` can carry. Same file, same
 /// flake check, same cross-check against `AppState`.
@@ -534,10 +542,11 @@ function stateText(label, prose) {
 // unreachable check that reads as a clean result is precisely the confusion
 // R1's edge cases name.
 const CANDIDATE_STATE_TEXT = {
-  "up-to-date": stateText("Up to date", "The tracked reference resolves to the revision this host is already running. There is nothing to apply."),
-  "not-newer": stateText("Candidate is not newer — not an update", "The tracked reference resolves to a revision that is not newer than the one this host runs. ferrum will not offer it, the same way preview-migration refuses to call a lower schema version a migration."),
-  "update-available": stateText("Update available", "A newer revision exists. Nothing has been fetched, built, or applied — a check only reads."),
+  "up-to-date": stateText("Up to date", "The tracked reference resolves to the revision this host already pins. There is nothing to apply."),
+  "not-newer": stateText("Candidate is not newer — not an update", "The tracked reference resolves to a revision that is older than the pinned one by the commit dates the two carry. ferrum will not offer it, the same way preview-migration refuses to call a lower schema version a migration."),
+  "update-available": stateText("Update available", "A revision later than the pinned one exists, by the commit dates the two carry. Nothing has been fetched, built, or applied — a check only reads."),
   "check-failed": stateText("Could not check for updates", "The check did not complete, so this host's update state is unknown. That is not the same as being up to date."),
+  "order-unknown": stateText("A different revision — ferrum cannot tell whether it is newer", "The tracked reference resolves to a revision this host does not pin, and ferrum could not establish which of the two came later. This is NOT a statement that you are up to date: there may well be an update here, and ferrum is declining to guess rather than answering. Both revisions are shown below; the judgement is yours."),
 };
 
 // "Would change" rather than "Update available" for a single app, deliberately.
@@ -679,6 +688,25 @@ function renderUpdateReport(target, report, catalogApps, jobId) {
   const rows = el("tbody");
   for (const app of apps) rows.appendChild(appRow(app, catalogApps));
 
+  // Warnings moved to the top of the report and given a callout of their own,
+  // rather than sitting last as a plain list. The case that forced it: one
+  // future-dated `lastModified` in the lock makes every genuinely later
+  // release compare as older, so the screen says "not newer" forever and
+  // nothing else on it ever looks wrong. The warning is the only thing on the
+  // page that names a cause an operator can act on, and a footnote below the
+  // apps table is not where it gets read.
+  //
+  // Deliberately NOT string-matched for the future-dated case: sniffing the
+  // producer's wording for one warning would silently demote every warning it
+  // failed to recognise, and the producer's text is not this file's to depend
+  // on. Every warning is treated as conspicuous instead.
+  const warningsBlock = warnings.length
+    ? el("section", { class: "callout warn" }, [
+        el("h3", { text: warnings.length === 1 ? "A warning about this check" : "Warnings about this check" }),
+        el("ul", {}, warnings.map((w) => el("li", { text: String(w) }))),
+      ])
+    : null;
+
   // A report carrying no apps at all is a fact worth stating. An empty table
   // body would read as "nothing changes", which is a different claim.
   const appsBlock = apps.length
@@ -738,19 +766,45 @@ function renderUpdateReport(target, report, catalogApps, jobId) {
         })
       : null,
 
+    warningsBlock,
+
     el("h3", { text: "The candidate" }),
     stateCell(CANDIDATE_STATE_TEXT[candidate.state], candidate.state, candidate.error || null, CANDIDATE_STATES),
+
+    // Said once, under every ordering verdict, rather than qualified into
+    // each state's own sentence. "Newer" here means nothing but: the commit
+    // date the candidate reports for itself is later than the one the lock
+    // records. Git commit dates are chosen by whoever makes the commit and
+    // ferrum establishes no ancestry between the two revisions, so this is
+    // self-reported metadata, not proof. It belongs in the same voice as the
+    // trust section at the foot of this screen.
+    el("p", {
+      class: "hint",
+      text: "Newer and older here mean only that one commit date is later than the other. Those dates are set by whoever made the commit, and ferrum does not establish that either revision descends from the other.",
+    }),
 
     el("dl", { class: "facts" }, [
       el("dt", { text: "Tracked input" }),
       el("dd", { text: `${orUnknown(candidate.inputName)} — ${orUnknown(candidate.inputUrl)}` }),
       el("dt", { text: "Tracked reference" }),
       el("dd", { text: orUnknown(candidate.reference) }),
-      el("dt", { text: "Revision this host runs" }),
+      // Named as the pin, not as the running revision. This value is read
+      // out of /etc/ferrum/flake.lock, which is the pin the NEXT build would
+      // start from; the pin the running generation was actually built from is
+      // recorded nowhere -- not in the journal, not anywhere else -- so the
+      // two can differ and ferrum has no way to tell. Declining to report the
+      // difference is honest; asserting the equality in a label was not, and
+      // it landed on the one field the operator is asked to read and refuse
+      // in place of a signature check.
+      el("dt", { text: "Revision pinned in /etc/ferrum/flake.lock" }),
       el("dd", {}, [el("code", { class: "rev", text: orUnknown(candidate.currentRev) })]),
       el("dt", { text: "Candidate revision" }),
       el("dd", {}, [el("code", { class: "rev", text: orUnknown(candidate.rev || ferrum.candidateRev) })]),
     ]),
+    el("p", {
+      class: "hint",
+      text: "That is the pin on disk. ferrum cannot confirm the generation now running was built from it — nothing records the pin a generation was built with.",
+    }),
 
     el("h3", { text: "ferrum itself" }),
     el("p", {
@@ -781,12 +835,6 @@ function renderUpdateReport(target, report, catalogApps, jobId) {
         "ferrum cannot tell you whether you have seen this migration before: the step that would record having shown it is not built. A pending migration therefore reappears on every check, and seeing it twice is not evidence that anything went wrong.",
     }),
 
-    warnings.length
-      ? el("section", {}, [
-          el("h3", { text: "Warnings" }),
-          el("ul", {}, warnings.map((w) => el("li", { text: String(w) }))),
-        ])
-      : null,
   );
 }
 
@@ -802,7 +850,46 @@ async function updatesView() {
   const report = el("div", {});
   const log = el("pre", { class: "log", hidden: true });
 
+  // Whether a check this view started or reattached to is still in flight.
+  //
+  // This flag is the ONLY bound on concurrent checks anywhere in the system,
+  // which is why it is a closure variable rather than a read of the button's
+  // own disabled state: the daemon exempts check_update from its single-job
+  // interlock on purpose (a rollback must never be blocked by a read-only
+  // check), POST /api/jobs is not rate limited, and the systemd template puts
+  // no limit on concurrent instances. Each check is roughly 2N+2 whole
+  // module-system nix evaluations as root on an N-app host, and nix eval is
+  // memory-heavy -- so an impatient double-click is a real self-DoS against
+  // the very apps this page is reporting on.
+  //
+  // A UI latch is not a substitute for a daemon-side bound. It is the part of
+  // the mitigation that belongs here.
+  let checking = false;
+
+  /// Moves the check control in or out of its in-flight state.
+  ///
+  /// @param {boolean} inFlight - Whether a check is running right now.
+  /// @returns {void}
+  function setChecking(inFlight) {
+    checking = inFlight;
+    check.disabled = inFlight;
+    check.setAttribute("aria-busy", String(inFlight));
+    // The label carries the state, so it survives without colour and is read
+    // out by anything that reaches the button. The dimming in style.css is
+    // the secondary cue, never the only one. The live `pending` region below
+    // announces the same fact to a screen reader that is not on the button.
+    check.textContent = inFlight ? "Checking for updates…" : "Check for updates";
+  }
+
   function attach(id) {
+    // A previous stream is closed rather than dropped. `attach` is reachable
+    // twice for one job -- this view paints before its two awaits, so a click
+    // can land first and the reattach finder below then finds that same job
+    // still running -- and overwriting state.stream without closing it left
+    // two EventSources tailing one job: every log line twice, and one
+    // connection leaked for as long as the tab lives.
+    closeStream();
+    setChecking(true);
     log.hidden = false;
     log.textContent = "";
     // Written for slow, not for instant. The real cost of a candidate check
@@ -833,7 +920,27 @@ async function updatesView() {
           // answer, so it stays in the error line rather than replacing the
           // report region with "nobody has looked yet".
           error.textContent = err.message;
+        } finally {
+          // Whatever the report fetch did, the job itself is over. Re-enabling
+          // only on the success branch would leave a host whose check failed
+          // with a control that never comes back -- a worse fault than the one
+          // this latch exists to prevent.
+          setChecking(false);
         }
+      },
+      onError: () => {
+        // EventSource reconnects by itself, so an error is not terminal and
+        // re-enabling on every one would hand out a second root job to an
+        // operator whose check is merely blinking. The exception is a stream
+        // the browser has closed for good -- a 404 or a non-event-stream
+        // reply -- where `complete` is never coming and the latch would
+        // otherwise be stuck for the life of the view.
+        if (state.stream?.readyState !== EventSource.CLOSED) return;
+        closeStream();
+        pending.textContent = "";
+        error.textContent =
+          "Lost the connection to this check's progress log. The check may still be running on the host — reload this page to pick it up again.";
+        setChecking(false);
       },
     });
   }
@@ -842,7 +949,19 @@ async function updatesView() {
     type: "button",
     text: "Check for updates",
     onclick: async () => {
+      // The guard, not the disabled attribute, is what makes a second click
+      // harmless: `disabled` is the affordance an operator sees, this is the
+      // thing that holds even if a click arrives some other way.
+      if (checking) return;
       error.textContent = "";
+      // Latched here, synchronously, BEFORE the await -- the handler stays
+      // live across it, so anything set afterwards would leave the window a
+      // double-click already fits through.
+      setChecking(true);
+      // Announced, not merely shown: disabling the button takes focus off it,
+      // so the live region above is what tells a screen-reader user that the
+      // click landed. `attach` replaces this with the longer wait message.
+      pending.textContent = "Starting an update check…";
       // No 409 branch, unlike the Apply view. A read-only check deliberately
       // does not claim the daemon's single-job interlock: the one path that
       // has to keep working on a host an update just broke is the rollback a
@@ -853,6 +972,10 @@ async function updatesView() {
         attach(id);
       } catch (err) {
         error.textContent = err.message;
+        pending.textContent = "";
+        // Deliberately not a `finally`: on the success path the latch is
+        // handed to `attach`, which holds it until the stream ends.
+        setChecking(false);
       }
     },
   });
@@ -914,6 +1037,11 @@ async function updatesView() {
     error.textContent = err.message;
   }
   pending.textContent = "";
+
+  // Nothing to reattach to when this view is already following a check: a
+  // click that landed while the two awaits above were outstanding has already
+  // attached to the very job this finder would go looking for.
+  if (checking) return;
 
   // Reattach to a check still running from a previous page load. Filtered on
   // kind as well as status, unlike the Apply view's finder above: an
