@@ -99,6 +99,10 @@ tr.current td { font-weight: 600; }
    keeps every column readable and labelled; stacking it into unlabelled
    fragments does not. */
 .table-scroll { overflow-x: auto; }
+/* Deliberately NOT .hint. The daemon serves the newest report by file mtime,
+   so a backwards clock step can hand the operator a stale one -- the age of
+   what they are reading is the mitigation, and a muted footnote is not read. */
+.checked-at { font-weight: 600; margin: .25rem 0 .75rem; }
 .updates table { min-width: 34rem; }
 .updates caption { text-align: left; padding: .25rem .5rem; }
 /* A 40-character hex revision has to be readable in full without pushing the

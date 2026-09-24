@@ -3327,6 +3327,24 @@
       # branch for it, and comparing the UI only against itself agreed
       # perfectly with its own mistake.
       #
+      # And it reads crates/ferrumd/src/updates.rs for the envelope those
+      # documents arrive in -- its three keys and its two `status` literals.
+      # The view takes "this host has never checked" from that literal instead
+      # of inferring it from an empty document, which is the right call and
+      # also a three-file handshake that nothing else holds together.
+      #
+      # It does NOT pin the report document's own field names, deliberately.
+      # Set equality would be the wrong assertion there: the document is
+      # read defensively (`orUnknown`, `|| {}`) precisely so a field added to
+      # it is backward-compatible, and a check that failed on an additive
+      # change would punish the design. The one-directional alternative --
+      # "every field the UI reads must exist" -- needs the UI's reads
+      # extracted from source, and the only ways to do that are a hand-written
+      # list (which pins a comment, not the rendering) or a scan keyed on the
+      # local variable names inside two functions (which silently checks
+      # nothing the day someone renames `migration` to `m`). A small honest
+      # check beats a large one that can quietly stop looking.
+      #
       # Every structural lookup below throws rather than returning an empty
       # result. A check that grepped for a declaration, found nothing, and
       # passed would be worse than no check at all -- this tree has already
@@ -3345,9 +3363,17 @@
           rustPath = "crates/ferrum-apply/src/update_check.rs";
           rustLines = lib.splitString "\n" (builtins.readFile ../../../crates/ferrum-apply/src/update_check.rs);
 
-          # Both helpers take their source explicitly. This check now reads
-          # two files, and a helper closed over one of them is a trap for
-          # whoever adds the third.
+          # ferrumd owns the envelope the document arrives in, and the UI
+          # takes "this host has never checked" from its `status` literal
+          # rather than inferring it from an empty document. That is the right
+          # design, and it is also a three-file handshake with nothing holding
+          # it together -- so the constructors are read here too.
+          daemonPath = "crates/ferrumd/src/updates.rs";
+          daemonLines = lib.splitString "\n" (builtins.readFile ../../../crates/ferrumd/src/updates.rs);
+
+          # The helpers take their source explicitly. This check reads three
+          # files, and one closed over a single source is a trap for whoever
+          # adds the fourth.
           indexIn = src: file: what: infix:
             let
               hits = builtins.filter (e: lib.hasInfix infix e.l) (lib.imap0 (i: l: { inherit i l; }) src);
@@ -3382,9 +3408,14 @@
           quotedIn = re: line:
             map builtins.head (builtins.filter builtins.isList (builtins.split re line));
 
-          # The two wire vocabularies, read off their one-line declarations.
+          # A one-line `const NAME = ["a", "b"];` declaration in ui/app.js.
+          #
+          # The character class admits camelCase as well as kebab-case: the
+          # state vocabularies are kebab, but the envelope keys are `jobId`,
+          # and a kebab-only class would silently skip it and leave that
+          # assertion comparing two short lists that happen to agree.
           vocabOf = what: name:
-            let values = quotedIn "\"([a-z-]+)\"" (builtins.elemAt lines (indexOf what "const ${name} = [")); in
+            let values = quotedIn "\"([a-zA-Z][a-zA-Z0-9-]*)\"" (builtins.elemAt lines (indexOf what "const ${name} = [")); in
             if values == [ ] then
               throw ("ui/app.js declares " + name + " but updates-view-is-wired read no state "
                 + "names out of it -- it is no longer a single-line array literal, and an empty "
@@ -3468,6 +3499,74 @@
           daemonOnly = daemon: ui: builtins.filter (v: !(builtins.elem v ui)) daemon;
           uiOnly = daemon: ui: builtins.filter (v: !(builtins.elem v daemon)) ui;
 
+          # One envelope constructor in ferrumd's updates.rs: the keys it
+          # builds, and the `status` literal it builds them with.
+          #
+          # Same `unparsed` discipline as the enums above. A key line this
+          # check cannot read would be dropped from the daemon's key set and
+          # then reported as the UI expecting a key the daemon "never sends"
+          # -- the misdirection that guard exists to stop.
+          envelopeOf = fnName:
+            let
+              body = blockIn daemonLines daemonPath ("ferrumd's " + fnName + " envelope")
+                "fn ${fnName}(" (l: l == "}");
+              keyOf = l: builtins.match ".*\"([a-zA-Z][a-zA-Z0-9]*)\"[[:space:]]*:.*" l;
+              ignorable = l:
+                builtins.match "[[:space:]]*" l != null
+                || builtins.match "[[:space:]]*//.*" l != null
+                # The json! wrapper's own opening and closing lines. Bracket
+                # literals rather than backslash escapes: Nix's regex engine
+                # rejects `\}`, which is how this check first failed to build.
+                || builtins.match "[[:space:]]*serde_json::json![(][{][[:space:]]*" l != null
+                || builtins.match "[[:space:]]*[}][)][[:space:]]*" l != null;
+              keyLines = builtins.filter (l: keyOf l != null) body;
+              # Every `"key":` on every key-bearing line, not just the first:
+              # never_checked_body builds the whole envelope on one line.
+              keys = lib.concatMap
+                (l: map builtins.head
+                  (builtins.filter builtins.isList
+                    (builtins.split "\"([a-zA-Z][a-zA-Z0-9]*)\"[[:space:]]*:" l)))
+                keyLines;
+              statusHits = lib.concatMap
+                (l: let m = builtins.match ".*\"status\"[[:space:]]*:[[:space:]]*\"([a-z-]+)\".*" l; in
+                    if m == null then [ ] else m)
+                body;
+              unparsed = builtins.filter (l: keyOf l == null && !(ignorable l)) body;
+            in
+            if !(builtins.any (l: lib.hasInfix "serde_json::json!(" l) body) then
+              throw (daemonPath + "'s " + fnName + " no longer builds its body with "
+                + "serde_json::json!, so updates-view-is-wired cannot read the envelope it "
+                + "constructs. A check that cannot find what it guards must fail, not pass.")
+            else if unparsed != [ ] then
+              throw (daemonPath + "'s " + fnName + " has lines updates-view-is-wired cannot read "
+                + "as envelope keys: " + builtins.toJSON unparsed + ". Silently dropping them "
+                + "would understate the envelope and blame the UI for the difference.")
+            else if keys == [ ] then
+              throw (daemonPath + " defines " + fnName + " but updates-view-is-wired parsed no "
+                + "keys out of it -- an empty key set would make the UI's expectations agree "
+                + "with it vacuously")
+            else if builtins.length statusHits != 1 then
+              throw (daemonPath + "'s " + fnName + " does not build exactly one literal \"status\" "
+                + "value this check can read (found " + builtins.toJSON statusHits + "), so the "
+                + "literal the UI branches on cannot be confirmed")
+            else { inherit keys; status = builtins.head statusHits; };
+
+          reportEnvelope = envelopeOf "report_body";
+          neverCheckedEnvelope = envelopeOf "never_checked_body";
+
+          # Both constructors must build the SAME keys: the UI reads one
+          # envelope shape, and a status-dependent shape would make
+          # `envelopeProblem`'s missing-key report wrong for one of them.
+          envelopeKeysDisagree =
+            daemonOnly reportEnvelope.keys neverCheckedEnvelope.keys
+            ++ uiOnly reportEnvelope.keys neverCheckedEnvelope.keys;
+
+          daemonEnvelopeKeys = lib.unique reportEnvelope.keys;
+          daemonEnvelopeStatuses = [ reportEnvelope.status neverCheckedEnvelope.status ];
+
+          uiEnvelopeKeys = vocabOf "the envelope keys the view expects" "UPDATES_ENVELOPE_KEYS";
+          uiEnvelopeStatuses = vocabOf "the envelope statuses the view knows" "UPDATES_ENVELOPE_STATUSES";
+
           # The view's own source, delimited by the banner comments this file
           # already uses to separate its sections.
           updatesBlock = blockAt "the Updates view's own source"
@@ -3516,7 +3615,12 @@
             && daemonOnly daemonCandidateStates candidateStates == [ ]
             && uiOnly daemonCandidateStates candidateStates == [ ]
             && daemonOnly daemonAppStates appStates == [ ]
-            && uiOnly daemonAppStates appStates == [ ];
+            && uiOnly daemonAppStates appStates == [ ]
+            && envelopeKeysDisagree == [ ]
+            && daemonOnly daemonEnvelopeKeys uiEnvelopeKeys == [ ]
+            && uiOnly daemonEnvelopeKeys uiEnvelopeKeys == [ ]
+            && daemonOnly daemonEnvelopeStatuses uiEnvelopeStatuses == [ ]
+            && uiOnly daemonEnvelopeStatuses uiEnvelopeStatuses == [ ];
 
           routeMissing = !routeWired;
           reattachNotKindFiltered = !reattachIsKindFiltered;
@@ -3536,6 +3640,13 @@
           candidateStatesTheUiExpectsAndTheDaemonNeverSends = uiOnly daemonCandidateStates candidateStates;
           appStatesTheDaemonSendsAndTheUiLacks = daemonOnly daemonAppStates appStates;
           appStatesTheUiExpectsAndTheDaemonNeverSends = uiOnly daemonAppStates appStates;
+
+          inherit daemonEnvelopeKeys daemonEnvelopeStatuses uiEnvelopeKeys uiEnvelopeStatuses;
+          theTwoEnvelopeConstructorsBuildDifferentKeys = envelopeKeysDisagree;
+          envelopeKeysTheDaemonSendsAndTheUiLacks = daemonOnly daemonEnvelopeKeys uiEnvelopeKeys;
+          envelopeKeysTheUiExpectsAndTheDaemonNeverSends = uiOnly daemonEnvelopeKeys uiEnvelopeKeys;
+          envelopeStatusesTheDaemonSendsAndTheUiLacks = daemonOnly daemonEnvelopeStatuses uiEnvelopeStatuses;
+          envelopeStatusesTheUiExpectsAndTheDaemonNeverSends = uiOnly daemonEnvelopeStatuses uiEnvelopeStatuses;
         };
 
       mkAssertionCheck = name: result:

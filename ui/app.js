@@ -484,6 +484,42 @@ const CANDIDATE_STATES = ["up-to-date", "not-newer", "update-available", "check-
 /// It is explicitly not a claim that the app is up to date.
 const APP_STATES = ["not-checked", "up-to-date", "update-available", "excluded", "evaluation-failed"];
 
+/// The three keys `GET /api/updates` always answers with, and the two values
+/// its `status` can take.
+///
+/// Both lines are cross-checked by `updates-view-is-wired` against what
+/// ferrumd's `report_body`/`never_checked_body` actually construct. This is
+/// the join the whole screen turns on: taking "never checked" from `status`
+/// instead of inferring it from an empty document only works for as long as
+/// that literal is what the daemon sends, and nothing but this check would
+/// notice it being renamed.
+const UPDATES_ENVELOPE_KEYS = ["status", "jobId", "report"];
+const UPDATES_ENVELOPE_STATUSES = ["report", "never-checked"];
+
+/// What is wrong with an `/api/updates` envelope, if anything.
+///
+/// The UI is a long-lived tab and the daemon can be rebuilt under it (1.5b's
+/// global constraint), so an envelope this page cannot read is an ordinary
+/// event, not an impossible one. Saying which key is missing beats rendering
+/// an empty screen and leaving the operator to guess.
+///
+/// @param {object|null} envelope - The parsed body of `GET /api/updates`.
+/// @returns {string|null} An operator-facing problem, or null when the
+///   envelope is one this page knows how to read.
+function envelopeProblem(envelope) {
+  if (envelope === null || typeof envelope !== "object") {
+    return "The daemon's reply to /api/updates was not an object. This page cannot read it.";
+  }
+  const missing = UPDATES_ENVELOPE_KEYS.filter((key) => !(key in envelope));
+  if (missing.length) {
+    return `The daemon's reply to /api/updates is missing ${missing.join(", ")}. This page is probably older than the daemon serving it — reload it.`;
+  }
+  if (!UPDATES_ENVELOPE_STATUSES.includes(envelope.status)) {
+    return `The daemon answered with status "${orUnknown(envelope.status)}", which this page does not understand. It knows: ${UPDATES_ENVELOPE_STATUSES.join(", ")}.`;
+  }
+  return null;
+}
+
 /// A state's short label and the sentence that explains it.
 ///
 /// @param {string} label - The words shown in the status cell.
@@ -523,6 +559,31 @@ const APP_STATE_TEXT = {
 ///   reads as "nothing changes" rather than "nobody looked".
 function orUnknown(value) {
   return value === null || value === undefined || value === "" ? "unknown" : String(value);
+}
+
+/// How long ago an epoch-seconds instant was, in coarse operator words.
+///
+/// Every branch below is reached only with a count of two or more -- the
+/// thresholds are 90 seconds and 36 hours, not 60 and 24 -- so there is no
+/// singular form to write. That is deliberate rather than forgotten.
+///
+/// @param {number} epochSeconds - The report's `checkedAt`.
+/// @returns {string} A phrase to follow "Checked": "just now", "7 minutes
+///   ago", "3 days ago", or a plain statement that the timestamp is ahead of
+///   this host's own clock.
+function relativeAge(epochSeconds) {
+  const seconds = Math.round(Date.now() / 1000 - Number(epochSeconds));
+  if (!Number.isFinite(seconds)) return "at a time this page cannot read";
+  // A clock that stepped backwards is the exact condition that makes the
+  // daemon serve a stale report, so naming it beats clamping it to "just
+  // now" and hiding the one visible clue that it happened.
+  if (seconds < -60) return "at a time ahead of this host's own clock";
+  if (seconds < 90) return "just now";
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 90) return `${minutes} minutes ago`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 36) return `${hours} hours ago`;
+  return `${Math.round(hours / 24)} days ago`;
 }
 
 /// The status cell for one state, as words rather than a colour.
@@ -638,12 +699,26 @@ function renderUpdateReport(target, report, catalogApps, jobId) {
     : el("p", { text: "This report lists no apps. That is not the same as no app changing — it means the check produced no per-app result at all." });
 
   target.replaceChildren(
+    // Prominent, not a muted footnote, and carrying its own age.
+    //
+    // The daemon picks "the newest report" by file mtime, so a host clock
+    // that steps backwards between two checks -- NTP correcting a fast clock
+    // -- makes a freshly written report look older and the previous one gets
+    // served. ferrumd will not fix that by parsing the document, and should
+    // not: treating the report as opaque is what keeps it from becoming a
+    // second place the shape is written down. So the mitigation is here, and
+    // the age is the part that does the work: an absolute timestamp still
+    // leaves the operator doing arithmetic to notice that "the newest
+    // report" predates the check they just ran.
+    //
+    // No trailing full stop: localTime renders in the operator's own locale,
+    // and several of those (en-CA, en-GB 12-hour) end the string with "a.m."
+    // -- a sentence period after one reads as a typo.
     el("p", {
-      class: "hint",
-      // No trailing full stop: localTime renders in the operator's own locale,
-      // and several of those (en-CA, en-GB 12-hour) end the string with "a.m."
-      // -- a sentence period after one reads as a typo.
-      text: `Last checked: ${report.checkedAt ? localTime(report.checkedAt) : "never"}`,
+      class: "checked-at",
+      text: report.checkedAt
+        ? `Checked ${relativeAge(report.checkedAt)} — ${localTime(report.checkedAt)}`
+        : "This report carries no check time",
     }),
 
     el("p", {
@@ -744,8 +819,13 @@ async function updatesView() {
         pending.textContent = "";
         try {
           const envelope = await api.updatesForJob(id);
-          renderUpdateReport(report, envelope.report, state.catalog?.apps || {}, envelope.jobId);
-          setStatus("Check finished.", "ok");
+          const problem = envelopeProblem(envelope);
+          if (problem) {
+            error.textContent = problem;
+          } else {
+            renderUpdateReport(report, envelope.report, state.catalog?.apps || {}, envelope.jobId);
+            setStatus("Check finished.", "ok");
+          }
         } catch (err) {
           // A 404 here means THIS run wrote no report -- it failed before it
           // could, or it is somehow still going. The daemon's own message
@@ -819,10 +899,13 @@ async function updatesView() {
   pending.textContent = "Loading the most recent check…";
   try {
     const envelope = await api.updates();
+    const problem = envelopeProblem(envelope);
     // Taken from `status`, never inferred from an absent or empty report:
     // the daemon answers the question explicitly, and guessing it from the
     // document's shape is how "never checked" starts reading as "up to date".
-    if (envelope.status === "never-checked") {
+    if (problem) {
+      error.textContent = problem;
+    } else if (envelope.status === "never-checked") {
       renderNeverChecked(report);
     } else {
       renderUpdateReport(report, envelope.report, state.catalog?.apps || {}, envelope.jobId);
