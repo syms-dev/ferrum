@@ -46,7 +46,7 @@ fn jobs_dir() -> std::path::PathBuf {
         .into()
 }
 
-fn requests_dir() -> std::path::PathBuf {
+pub fn requests_dir() -> std::path::PathBuf {
     std::env::var("FERRUM_REQUESTS_DIR")
         .unwrap_or_else(|_| "/run/ferrum/requests".to_string())
         .into()
@@ -86,15 +86,12 @@ pub fn job_uuid_from_unit(unit: &str) -> Option<String> {
 /// is defence in depth underneath it: it shrinks the window in which a
 /// replay would find anything to replay, rather than closing the hole on
 /// its own.
-pub fn remove_request_file(uuid: &str) {
-    remove_request_file_in(&requests_dir(), uuid)
-}
-
-/// The body of `remove_request_file`, with the directory passed in so the
-/// tests below exercise the real deletion against a real temp directory
-/// without mutating process-wide environment state that the other tests in
-/// this module read concurrently.
-fn remove_request_file_in(dir: &std::path::Path, uuid: &str) {
+///
+/// The directory is passed in rather than read from the environment so the
+/// tests exercise the real deletion against a real temp directory without
+/// mutating process-wide environment state that the other tests in this
+/// module read concurrently. Production callers hand it `requests_dir()`.
+pub fn remove_request_file_in(dir: &std::path::Path, uuid: &str) {
     let path = dir.join(format!("{uuid}.json"));
     match std::fs::remove_file(&path) {
         Ok(()) => {}
@@ -108,6 +105,143 @@ fn remove_request_file_in(dir: &std::path::Path, uuid: &str) {
             path.display()
         ),
     }
+}
+
+/// The one definition of which request kinds claim ferrumd's single-job
+/// interlock, expressed over the `kind` string that actually crosses the
+/// privilege boundary.
+///
+/// DA-7 exempts exactly one kind, the read-only `check_update`. Two
+/// separate places need that answer -- `create_job_in`, deciding whether an
+/// incoming POST claims it, and `interlock_holder_in`, deciding whether a
+/// unit systemd reports running is holding it -- and the two disagreeing is
+/// the whole shape of this defect class. They ask the same function about
+/// the same string, and that string is the one written into the request
+/// file by `request_body`.
+///
+/// An unrecognized kind claims the interlock. That is the fail-closed
+/// direction: the cost of wrongly holding it is a 409 that clears when the
+/// unit stops, and the cost of wrongly releasing it is two concurrent
+/// `nix-env --set` plus `switch-to-configuration` runs as root.
+///
+/// # Arguments
+/// * `kind` - the `kind` field of a request, e.g. `"apply"`.
+pub fn kind_takes_interlock(kind: &str) -> bool {
+    kind != "check_update"
+}
+
+/// Reads back the `kind` a dispatched job was requested with, from the
+/// request file ferrumd itself wrote before starting the unit.
+///
+/// `None` when the file is gone, unreadable, not JSON, or has no string
+/// `kind` -- every one of which is "we cannot say", and every one of which
+/// callers must treat as interlock-taking rather than as a check.
+///
+/// This is the only durable record of a running job's kind that survives a
+/// ferrumd restart: the file lives in `/run/ferrum/requests` (tmpfs), so it
+/// outlives the process but not a reboot -- which is exactly the lifetime
+/// wanted, because after a reboot systemd has no running units to ask about
+/// either.
+///
+/// # Arguments
+/// * `dir` - the requests directory.
+/// * `uuid` - the job id, which is also the file's stem.
+pub fn request_kind_in(dir: &std::path::Path, uuid: &str) -> Option<String> {
+    let text = std::fs::read_to_string(dir.join(format!("{uuid}.json"))).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    value.get("kind")?.as_str().map(str::to_string)
+}
+
+/// What one systemd `JobRemoved` signal means for ferrumd's state.
+#[derive(Debug, PartialEq)]
+pub struct JobRemovedEffects {
+    /// Whether this signal releases the interlock. True only when the unit
+    /// that finished is the one currently holding it.
+    pub release_interlock: bool,
+    /// The job whose request file is now spent, if this is one of our
+    /// units at all. Independent of the interlock: every kind's file is
+    /// spent when its unit's job is gone.
+    pub spent_request: Option<String>,
+}
+
+/// Decides what a `JobRemoved` signal does, given who holds the interlock.
+///
+/// Pure, and separated from the stream loop in `main.rs` on purpose: this
+/// decision used to be four inline lines inside `attach_and_watch`, which
+/// no test could reach, and it went on being wrong in exactly the way an
+/// untested decision does.
+///
+/// The rule is identity, not unit-name shape. `ferrum-apply@<uuid>.service`
+/// names both an apply and a read-only check since DA-7, so "the unit is
+/// one of ours" no longer implies "this is the job that claimed the
+/// interlock". A check finishing -- which a DNS failure does in seconds --
+/// must not clear the interlock of an apply that is still building and
+/// switching, because the next `apply` or `rollback` would then be admitted
+/// alongside a root-privileged system switch already in flight. It also
+/// must not clear it because `create_job_in` never gave it one to clear;
+/// this is the same invariant that function's conditional release states,
+/// and this was the out-of-band path that undid it.
+///
+/// The narrowing is deliberate and has a cost worth naming: an unrelated
+/// unit finishing used to be an accidental release valve for an interlock
+/// whose own holder's signal went missing. That valve was the defect. The
+/// remaining recovery is `reconcile_interlock`, which re-derives the truth
+/// from systemd on every attach and re-attach.
+///
+/// # Arguments
+/// * `unit` - the systemd unit name from the signal.
+/// * `held` - the job currently holding the interlock, if any.
+pub fn job_removed_effects(unit: &str, held: Option<&str>) -> JobRemovedEffects {
+    let finished = job_uuid_from_unit(unit);
+    JobRemovedEffects {
+        release_interlock: held.is_some() && finished.as_deref() == held,
+        spent_request: finished,
+    }
+}
+
+/// Decides which job, if any, should hold the interlock, given the
+/// `ferrum-apply@` units systemd reports as running right now.
+///
+/// This is the second half of the DA-7 regression. The seeding used to be a
+/// bare bool from `dbus::ferrum_apply_job_is_running`, whose glob
+/// `ferrum-apply@*.service` matches a read-only check exactly as well as an
+/// apply -- so a check running when ferrumd started, or when the JobRemoved
+/// stream dropped and re-attached, held the interlock that no job had
+/// claimed and the next rollback was refused with 409.
+///
+/// Each running unit's kind is read back from its own request file rather
+/// than remembered in the daemon. That is the deliberate trade-off: an
+/// in-memory register of claimants is destroyed by the one event this whole
+/// path exists for, a ferrumd that its own apply restarted mid-run, whereas
+/// `/run/ferrum/requests` is tmpfs and survives the process. It does not
+/// survive a reboot -- and it does not need to, because after a reboot
+/// systemd has no running units to classify either, so both sources agree
+/// on "nothing".
+///
+/// Only units systemd says are running are consulted, which is what makes a
+/// stale request file harmless: cleanup is best-effort, so one can outlive
+/// its job, but a file whose unit is not running is never looked at.
+///
+/// More than one claimant should be impossible, and would mean the
+/// interlock had already been defeated. The lowest id wins, so the answer
+/// is at least stable across re-attaches rather than alternating.
+///
+/// # Arguments
+/// * `dir` - the requests directory, where each running job's kind is
+///   recorded.
+/// * `running_units` - systemd's current running `ferrum-apply@` unit names.
+pub fn interlock_holder_in(dir: &std::path::Path, running_units: &[String]) -> Option<String> {
+    let mut claimants: Vec<String> = running_units
+        .iter()
+        .filter_map(|unit| job_uuid_from_unit(unit))
+        .filter(|uuid| {
+            request_kind_in(dir, uuid)
+                .map(|kind| kind_takes_interlock(&kind))
+                .unwrap_or(true)
+        })
+        .collect();
+    claimants.sort();
+    claimants.into_iter().next()
 }
 
 /// The exact JSON `ferrum-apply run-request` parses back out of the request
@@ -248,27 +382,37 @@ async fn create_job_in(
     // This is a change INSIDE the critical section, not a bypass bolted
     // beside it: for every kind that does take the interlock, the check and
     // the set are still one lock acquisition, because two concurrent POSTs
-    // that both read `false` before either wrote `true` would otherwise
+    // that both found it unclaimed before either claimed it would otherwise
     // both be admitted.
-    let takes_interlock = !matches!(req, JobRequest::CheckUpdate);
+    //
+    // The id is minted BEFORE the claim because the claim now records it:
+    // an interlock that does not know who holds it cannot be released by
+    // that holder alone, and `main.rs`'s JobRemoved handler was releasing
+    // it for whichever of our units finished first.
+    let uuid = Uuid::new_v4().to_string();
+    let takes_interlock = kind_takes_interlock(&kind);
     if takes_interlock {
-        let mut running = state.job_running.lock().unwrap();
-        if *running {
+        let mut held = state.interlock.lock().unwrap();
+        if held.is_some() {
             audit_job("denied", &format!("kind={kind} a job is already running"));
             return (StatusCode::CONFLICT, "a job is already running").into_response();
         }
-        *running = true;
+        *held = Some(uuid.clone());
     }
 
-    let uuid = Uuid::new_v4().to_string();
     let body = request_body(&req);
 
     // Releasing is conditional for the same reason claiming is: a failed
     // check must not clear an interlock it never claimed, which would let a
-    // second apply in alongside the one still running.
+    // second apply in alongside the one still running. It is also gated on
+    // still being OUR claim, so this cannot become the same out-of-band
+    // clear it is guarding against.
     let release = || {
         if takes_interlock {
-            *state.job_running.lock().unwrap() = false;
+            let mut held = state.interlock.lock().unwrap();
+            if held.as_deref() == Some(uuid.as_str()) {
+                *held = None;
+            }
         }
     };
 
@@ -1089,10 +1233,15 @@ mod tests {
             dir
         }
 
+        /// A stand-in for the id of an apply that is already in flight. A
+        /// real UUID, because the interlock now holds a job id and every
+        /// other consumer of one re-parses it.
+        const RUNNING_APPLY: &str = "9e4a1f2c-7d61-4a3e-9b02-5c8f3a1d6e77";
+
         fn state() -> Arc<AppState> {
             let dir = tempfile::tempdir().unwrap();
             let db = crate::db::Db::open(&dir.path().join("test.db")).unwrap();
-            Arc::new(AppState { db, job_running: std::sync::Mutex::new(false) })
+            Arc::new(AppState { db, interlock: std::sync::Mutex::new(None) })
         }
 
         /// Drives the real handler and hands back its status, its body, and
@@ -1254,7 +1403,7 @@ mod tests {
         /// DA-7, asserted rather than commented.
         ///
         /// The invariant: *a rollback must never be blocked by a read-only
-        /// check.* `job_running` has no timeout and no cancel, and a
+        /// check.* The interlock has no timeout and no cancel, and a
         /// candidate check can take minutes -- so if the check claimed it,
         /// the one path that has to work on a host an update just broke is
         /// exactly the path a shared interlock would block.
@@ -1266,7 +1415,7 @@ mod tests {
         async fn a_read_only_check_is_not_blocked_by_a_running_job_but_an_apply_still_is() {
             let requests = tempfile::tempdir().unwrap();
             let shared = state();
-            *shared.job_running.lock().unwrap() = true;
+            *shared.interlock.lock().unwrap() = Some(RUNNING_APPLY.to_string());
 
             let (status, body, _) = dispatch_with(
                 requests.path(),
@@ -1299,9 +1448,11 @@ mod tests {
             );
 
             // And the check neither claimed nor released someone else's
-            // claim: the flag is exactly as it was found.
-            assert!(
-                *shared.job_running.lock().unwrap(),
+            // claim: the interlock is exactly as it was found, still naming
+            // the apply -- not merely still held by somebody.
+            assert_eq!(
+                shared.interlock.lock().unwrap().as_deref(),
+                Some(RUNNING_APPLY),
                 "the check must leave the running job's own interlock alone"
             );
         }
@@ -1320,12 +1471,13 @@ mod tests {
                 JobRequest::CheckUpdate,
             )
             .await;
-            assert!(
-                !*shared.job_running.lock().unwrap(),
+            assert_eq!(
+                shared.interlock.lock().unwrap().as_deref(),
+                None,
                 "a read-only check must leave the interlock unclaimed"
             );
 
-            // The consequence rather than a re-read of the bool we just
+            // The consequence rather than a re-read of the state we just
             // looked at: an apply dispatched afterwards must not find the
             // interlock held. That is what "left it unclaimed" actually
             // means, and it is what would break if the check claimed and
@@ -1362,6 +1514,282 @@ mod tests {
                 !body.contains("FERRUM_PROFILES_DIR"),
                 "a preflight must not be refused for a profile directory it never reads: {body}"
             );
+        }
+
+        /// Defect 2, driven to the outcome DA-7 exists to prevent.
+        ///
+        /// `dbus::ferrum_apply_job_is_running` globs
+        /// `ferrum-apply@*.service`, which since DA-7 matches a read-only
+        /// check as readily as an apply. So a check that happened to be
+        /// running when ferrumd started -- or when the JobRemoved stream
+        /// dropped and re-attached, which `supervise_job_watch` makes an
+        /// ordinary event -- seeded the interlock with no job having
+        /// claimed it, and the next rollback was refused with 409. On a
+        /// host an update has just broken, that rollback is the one
+        /// operation that has to work.
+        ///
+        /// Both halves are asserted together because either alone is
+        /// vacuous: seeding that never held anything would pass a test that
+        /// only looked at the check.
+        #[tokio::test]
+        async fn a_check_running_at_startup_still_admits_a_rollback_but_a_running_apply_refuses_it() {
+            let requests = tempfile::tempdir().unwrap();
+            let profiles = profiles(7);
+            let check = "b0f4c211-59ad-4f0e-8c37-2e6d5a9f1b84";
+            let apply = "c7a1e3d8-46b2-4ff1-9d05-8a2c7b6e4f10";
+            std::fs::write(
+                requests.path().join(format!("{check}.json")),
+                r#"{"kind":"check_update"}"#,
+            )
+            .unwrap();
+            std::fs::write(
+                requests.path().join(format!("{apply}.json")),
+                r#"{"kind":"apply"}"#,
+            )
+            .unwrap();
+
+            // What `attach_and_watch` resolves from systemd's answer, and
+            // then what `reconcile_interlock` does with it.
+            let holder = interlock_holder_in(
+                requests.path(),
+                &[format!("ferrum-apply@{check}.service")],
+            );
+            assert_eq!(
+                holder, None,
+                "a read-only check is not a claimant, so reconciliation must not seed the \
+                 interlock from one"
+            );
+            let shared = state();
+            *shared.interlock.lock().unwrap() = holder;
+
+            let (status, body, _) = dispatch_with(
+                requests.path(),
+                Ok(profiles.path().to_path_buf()),
+                shared.clone(),
+                JobRequest::Rollback { to: 6 },
+            )
+            .await;
+            assert_ne!(
+                status,
+                StatusCode::CONFLICT,
+                "a rollback must never be refused because a read-only check happens to be \
+                 running -- that is verbatim the outcome DA-7 exists to prevent: {body}"
+            );
+            // There is no system bus here, so it fails at the dispatch. That
+            // is the proof it got as far as trying, which a 409 never does.
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+
+            // The positive control: an APPLY running at startup must still
+            // seed the interlock, and the same rollback must then be
+            // refused. Without this the assertion above would also pass a
+            // reconciliation that had simply stopped seeding anything.
+            let holder = interlock_holder_in(
+                requests.path(),
+                &[format!("ferrum-apply@{apply}.service")],
+            );
+            assert_eq!(
+                holder.as_deref(),
+                Some(apply),
+                "an apply systemd reports running must seed the interlock, and the interlock \
+                 must name it"
+            );
+            let restarted = state();
+            *restarted.interlock.lock().unwrap() = holder;
+
+            let (status, body, _) = dispatch_with(
+                requests.path(),
+                Ok(profiles.path().to_path_buf()),
+                restarted.clone(),
+                JobRequest::Rollback { to: 6 },
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::CONFLICT,
+                "a rollback alongside an apply that is still switching the system is the \
+                 concurrency the interlock exists to refuse: {body}"
+            );
+        }
+    }
+
+    /// The two decisions `main.rs` used to make inline, where no test could
+    /// reach them. Both defects lived in exactly those lines.
+    mod interlock {
+        use super::*;
+
+        const APPLY: &str = "3c8d5a72-1e94-4b60-8f21-7d4e0a9c6b35";
+        const CHECK: &str = "f1927b04-8ca6-4d3f-91e7-0b52d8a37c6e";
+
+        fn unit(uuid: &str) -> String {
+            format!("ferrum-apply@{uuid}.service")
+        }
+
+        /// A requests directory holding exactly the `(uuid, kind)` pairs
+        /// given, written in the same shape `request_body` writes.
+        fn requests_holding(entries: &[(&str, &str)]) -> tempfile::TempDir {
+            let dir = tempfile::tempdir().unwrap();
+            for (uuid, kind) in entries {
+                std::fs::write(
+                    dir.path().join(format!("{uuid}.json")),
+                    serde_json::json!({ "kind": kind }).to_string(),
+                )
+                .unwrap();
+            }
+            dir
+        }
+
+        /// `kind_takes_interlock` is asked about the string `request_body`
+        /// actually writes, so this walks every variant and derives the
+        /// string the same way the handler does rather than restating it.
+        /// A seventh kind added without a decision here would fail this.
+        #[test]
+        fn every_kind_but_the_read_only_check_claims_the_interlock() {
+            let cases = [
+                (JobRequest::Preflight, true),
+                (JobRequest::Apply, true),
+                (JobRequest::Rollback { to: 3 }, true),
+                (JobRequest::RestoreState, true),
+                (JobRequest::Gc, true),
+                (JobRequest::CheckUpdate, false),
+            ];
+            for (req, claims) in cases {
+                let kind = request_body(&req)
+                    .get("kind")
+                    .and_then(|k| k.as_str())
+                    .expect("every request kind must serialize a kind string")
+                    .to_string();
+                assert_eq!(
+                    kind_takes_interlock(&kind),
+                    claims,
+                    "kind={kind} must {} the interlock",
+                    if claims { "claim" } else { "be exempt from" }
+                );
+            }
+        }
+
+        #[test]
+        fn a_recorded_kind_is_read_back_and_anything_unreadable_is_no_answer() {
+            let dir = requests_holding(&[(APPLY, "apply"), (CHECK, "check_update")]);
+            assert_eq!(request_kind_in(dir.path(), APPLY).as_deref(), Some("apply"));
+            assert_eq!(
+                request_kind_in(dir.path(), CHECK).as_deref(),
+                Some("check_update")
+            );
+
+            // Absent, not JSON, and JSON without a string kind are all "we
+            // cannot say" rather than a kind.
+            assert_eq!(
+                request_kind_in(dir.path(), "00000000-0000-4000-8000-000000000000"),
+                None
+            );
+            std::fs::write(dir.path().join("broken.json"), "not json at all").unwrap();
+            assert_eq!(request_kind_in(dir.path(), "broken"), None);
+            std::fs::write(dir.path().join("kindless.json"), r#"{"to":7}"#).unwrap();
+            assert_eq!(request_kind_in(dir.path(), "kindless"), None);
+        }
+
+        /// Defect 1. The unit name carries only a UUID, so nothing in it
+        /// says whether the job that just ended was a check or an apply --
+        /// and a check that fails on DNS ends in seconds while an apply is
+        /// still building and switching. Releasing on unit-name shape
+        /// rather than on identity handed the next `apply` or `rollback` a
+        /// free pass alongside a root-privileged system switch already in
+        /// flight.
+        ///
+        /// The holder's own completion is asserted in the same test as the
+        /// positive control: a rule that never released anything would
+        /// satisfy the first half and wedge the daemon permanently.
+        #[test]
+        fn only_the_interlock_holders_own_completion_releases_it() {
+            let held = Some(APPLY);
+
+            let other = job_removed_effects(&unit(CHECK), held);
+            assert!(
+                !other.release_interlock,
+                "a read-only check finishing must not release the interlock of an apply that \
+                 is still running -- it would admit a second root system switch alongside it"
+            );
+
+            let own = job_removed_effects(&unit(APPLY), held);
+            assert!(
+                own.release_interlock,
+                "the holder's own completion is the one thing that must release it; without \
+                 this the interlock has no timeout and no cancel and would wedge the daemon"
+            );
+
+            // An unclaimed interlock stays unclaimed rather than being
+            // "released" into some other state.
+            assert!(!job_removed_effects(&unit(APPLY), None).release_interlock);
+            assert!(!job_removed_effects("sshd.service", held).release_interlock);
+        }
+
+        /// The request file is spent for every kind, and that is decided
+        /// separately from the interlock. A check's file is just as
+        /// replayable a privileged trigger as an apply's.
+        #[test]
+        fn every_kinds_completion_marks_its_own_request_file_spent() {
+            assert_eq!(
+                job_removed_effects(&unit(CHECK), Some(APPLY)).spent_request.as_deref(),
+                Some(CHECK),
+                "a check's file is spent even though its completion releases nothing"
+            );
+            assert_eq!(
+                job_removed_effects(&unit(APPLY), Some(APPLY)).spent_request.as_deref(),
+                Some(APPLY)
+            );
+            // Still gated on a real UUID, and still nothing for a unit that
+            // is not ours: the value names a file to delete.
+            assert_eq!(job_removed_effects("sshd.service", None).spent_request, None);
+            assert_eq!(
+                job_removed_effects("ferrum-apply@../../etc/passwd.service", None).spent_request,
+                None
+            );
+        }
+
+        #[test]
+        fn a_running_check_is_not_a_claimant_but_a_running_apply_is() {
+            let dir = requests_holding(&[(APPLY, "apply"), (CHECK, "check_update")]);
+
+            assert_eq!(
+                interlock_holder_in(dir.path(), &[unit(CHECK)]),
+                None,
+                "a read-only check running is not a job holding the interlock"
+            );
+            assert_eq!(
+                interlock_holder_in(dir.path(), &[unit(APPLY)]).as_deref(),
+                Some(APPLY),
+                "an apply running is"
+            );
+            // A check running beside an apply must not hide the apply.
+            assert_eq!(
+                interlock_holder_in(dir.path(), &[unit(CHECK), unit(APPLY)]).as_deref(),
+                Some(APPLY)
+            );
+            assert_eq!(interlock_holder_in(dir.path(), &[]), None);
+        }
+
+        /// Fail-closed. A running unit whose kind cannot be established --
+        /// its request file already deleted, unreadable, or written by an
+        /// older ferrumd -- is treated as claiming the interlock.
+        ///
+        /// The cost of guessing "check" wrongly is two concurrent
+        /// `nix-env --set` and `switch-to-configuration` runs as root. The
+        /// cost of guessing "apply" wrongly is a 409 that lasts only as
+        /// long as the unit does, because the next reconciliation re-derives
+        /// the answer from systemd rather than from this state.
+        #[test]
+        fn a_running_unit_of_unknown_kind_claims_the_interlock() {
+            let dir = requests_holding(&[(CHECK, "check_update")]);
+            let unknown = "8b3c1d59-2f74-4e08-a916-6d0e5b7c3a21";
+
+            assert_eq!(
+                interlock_holder_in(dir.path(), &[unit(unknown)]).as_deref(),
+                Some(unknown),
+                "a running unit we cannot classify must be treated as interlock-taking"
+            );
+            // The control that keeps that from being "everything claims it":
+            // a unit we CAN classify as a check still does not.
+            assert_eq!(interlock_holder_in(dir.path(), &[unit(CHECK)]), None);
         }
     }
 
