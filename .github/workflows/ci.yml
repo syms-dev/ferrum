@@ -42,6 +42,7 @@ jobs:
             .#checks.x86_64-linux.schema-uniformity \
             .#checks.x86_64-linux.sopsfile-are-paths \
             .#checks.x86_64-linux.ui-renders-every-schema-type \
+            .#checks.x86_64-linux.updates-view-is-wired \
             .#checks.x86_64-linux.installer-offers-every-catalog-app \
             .#checks.x86_64-linux.settings-schema-covers-every-option \
             .#checks.x86_64-linux.auth-model-enforced \

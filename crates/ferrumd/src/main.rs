@@ -9,6 +9,7 @@ mod jobs;
 mod secrets_api;
 mod settings;
 mod static_files;
+mod updates;
 
 use axum::{
     extract::State,
@@ -25,15 +26,30 @@ use tower_cookies::{Cookie, CookieManagerLayer, Cookies};
 pub struct AppState {
     pub db: db::Db,
     /// ferrumd's own single-job interlock -- see jobs::create_job.
-    /// Reconciled against systemd's real view of whether a
-    /// `ferrum-apply@*.service` is running (see `reconcile_interlock` and
-    /// dbus::ferrum_apply_job_is_running) from inside the JobRemoved
-    /// subscription, so a ferrumd restarted mid-apply by its own generation
-    /// switch does not admit a second job -- and so a completion missed
-    /// while the listener was detached does not leave it held forever.
-    /// Cleared both by ferrum-apply finishing (via systemd's JobRemoved
-    /// signal, below) and, on the failure paths, by create_job itself.
-    pub job_running: Mutex<bool>,
+    ///
+    /// `None` is free; `Some(uuid)` is claimed, and names the job that
+    /// claimed it. The identity is the load-bearing part, not decoration.
+    /// It used to be a bare `Mutex<bool>`, which was sound only while every
+    /// `ferrum-apply@` unit took the interlock. DA-7 ended that: the
+    /// read-only `check_update` kind is exempt, so "a ferrum-apply unit
+    /// finished" and "the job holding the interlock finished" became
+    /// different statements -- and a bool cannot tell them apart. A check
+    /// finishing (a DNS failure returns in seconds) then cleared the
+    /// interlock of an apply that was still building and switching, which
+    /// silently defeated the only serialization protecting a root-privileged
+    /// system switch. Holding the claimant's UUID is what lets
+    /// `jobs::job_removed_effects` release it for that job and no other.
+    ///
+    /// Reconciled against systemd's real view of which
+    /// `ferrum-apply@*.service` units are running (see
+    /// `reconcile_interlock` and `attach_and_watch`) from inside the
+    /// JobRemoved subscription, so a ferrumd restarted mid-apply by its own
+    /// generation switch does not admit a second job -- and so a completion
+    /// missed while the listener was detached does not leave it held
+    /// forever. Cleared both by ferrum-apply finishing (via systemd's
+    /// JobRemoved signal, below) and, on the failure paths, by create_job
+    /// itself.
+    pub interlock: Mutex<Option<String>>,
 }
 
 #[derive(Deserialize)]
@@ -544,6 +560,7 @@ fn build_router(state: Arc<AppState>) -> Router {
     let protected = Router::new()
         .route("/api/catalog", axum::routing::get(catalog::get_catalog))
         .route("/api/generations", axum::routing::get(generations::get_generations))
+        .route("/api/updates", axum::routing::get(updates::get_updates))
         .route("/api/settings", axum::routing::get(settings::get_settings).put(settings::put_settings))
         .route("/api/secrets/:name", axum::routing::post(secrets_api::write_secret))
         .route("/api/session", axum::routing::get(session_handler))
@@ -731,45 +748,108 @@ fn reconnect_delay(consecutive_failures: u32) -> Duration {
     Duration::from_secs(secs.min(CEILING_SECS))
 }
 
+/// The unit-name glob `attach_and_watch` asks systemd to list.
+///
+/// A deliberate copy of `dbus::FERRUM_APPLY_PATTERN`, which is private to
+/// that module, kept honest by
+/// `the_unit_pattern_matches_the_one_dbus_queries_with` below rather than
+/// by hope. It is the same `ferrum-apply@<uuid>.service` template the
+/// polkit rule in modules/core/daemon.nix authorizes and the same one
+/// `jobs::job_uuid_from_unit` parses back.
+const FERRUM_APPLY_PATTERN: &str = "ferrum-apply@*.service";
+
 /// Sets the interlock from systemd's own answer about what is running.
 ///
-/// The in-process flag is authoritative for admission but systemd is
+/// The in-process state is authoritative for admission but systemd is
 /// authoritative for reality, and they can disagree in both directions: an
 /// apply that switched to a generation carrying a new ferrumd restarts this
-/// process mid-run (flag says no, systemd says yes), and a `JobRemoved`
-/// that arrived while the listener was detached is gone forever (flag says
-/// yes, systemd says no). Both are corrected here.
+/// process mid-run (state says nothing, systemd says yes), and a
+/// `JobRemoved` that arrived while the listener was detached is gone
+/// forever (state says held, systemd says nothing). Both are corrected here.
+///
+/// It takes the claimant's UUID rather than a bare "something is running"
+/// bool, and that is the fix for the second half of the DA-7 regression.
+/// The bool came from `dbus::ferrum_apply_job_is_running`, whose glob
+/// matches `ferrum-apply@*.service` -- which since DA-7 includes check
+/// units. A read-only check that happened to be running when ferrumd
+/// started, or when the JobRemoved stream dropped and re-attached, seeded
+/// the interlock with no job having claimed it, and the next
+/// `POST /api/jobs {"kind":"rollback"}` got a 409: verbatim the outcome
+/// DA-7 exists to prevent. Resolving the UUID first, and its kind from the
+/// request file, is what makes "running" mean "running something that
+/// serializes".
 ///
 /// The correction is only sound because the caller is already subscribed
 /// when it asks -- see `attach_and_watch`.
 ///
 /// There is one narrow window this can get wrong: a re-attach whose query
-/// lands in the few milliseconds between `create_job` claiming the flag and
-/// systemd having a unit to report would clear a flag that is legitimately
-/// held, admitting a second job. That is a rare race with a bounded,
-/// self-correcting cost, and it replaces a wedge that was permanent.
+/// lands in the few milliseconds between `create_job` claiming the
+/// interlock and systemd having a unit to report would release a claim that
+/// is legitimately held, admitting a second job. That is a rare race with a
+/// bounded, self-correcting cost, and it replaces a wedge that was
+/// permanent.
 ///
 /// # Arguments
 /// * `state` - the daemon state holding the interlock.
-/// * `systemd_says_running` - whether systemd currently reports a running
-///   `ferrum-apply@*.service`.
-fn reconcile_interlock(state: &AppState, systemd_says_running: bool) {
-    let mut running = state.job_running.lock().unwrap();
-    if *running == systemd_says_running {
+/// * `holder` - the job systemd's answer says should hold the interlock
+///   right now, or `None` if no interlock-taking job is running. Produced
+///   by `jobs::interlock_holder_in` from the units systemd reports.
+fn reconcile_interlock(state: &AppState, holder: Option<String>) {
+    let mut held = state.interlock.lock().unwrap();
+    if *held == holder {
         return;
     }
-    if systemd_says_running {
-        eprintln!(
-            "ferrumd: a ferrum-apply job is still running -- holding the single-job \
-             interlock; new jobs will be refused until it finishes"
-        );
-    } else {
-        eprintln!(
-            "ferrumd: systemd reports no ferrum-apply job running -- releasing the \
-             single-job interlock"
-        );
+    match &holder {
+        Some(uuid) => eprintln!(
+            "ferrumd: job {uuid} is still running -- holding the single-job interlock; \
+             new jobs will be refused until it finishes"
+        ),
+        None => eprintln!(
+            "ferrumd: systemd reports no interlock-taking ferrum-apply job running -- \
+             releasing the single-job interlock"
+        ),
     }
-    *running = systemd_says_running;
+    *held = holder;
+}
+
+/// Applies one `JobRemoved` signal to the daemon's state.
+///
+/// The decision is `jobs::job_removed_effects`, which is pure and tested;
+/// this is the thin part that owns the lock and touches the filesystem.
+/// Splitting them is not tidiness -- the release rule lived inline in
+/// `attach_and_watch`'s stream loop, where no test could reach it, and that
+/// is exactly why it went on clearing any job's interlock for two releases
+/// after DA-7 made that wrong.
+///
+/// The interlock is read and written under a SINGLE lock acquisition, for
+/// the same reason `create_job_in` claims it under one: deciding from a
+/// released snapshot would let a claim land in between and be discarded.
+///
+/// # Arguments
+/// * `state` - the daemon state holding the interlock.
+/// * `requests_dir` - where the spent request file lives.
+/// * `unit` - the systemd unit name carried by the signal.
+fn handle_job_removed_in(state: &AppState, requests_dir: &std::path::Path, unit: &str) {
+    let effects = {
+        let mut held = state.interlock.lock().unwrap();
+        let effects = jobs::job_removed_effects(unit, held.as_deref());
+        if effects.release_interlock {
+            *held = None;
+        }
+        effects
+    };
+    // The request file is spent the moment the unit's job is gone:
+    // `ferrum-apply run-request` has already read it (JobRemoved for a
+    // Type=oneshot start job fires after ExecStart returns), so nothing
+    // legitimate still needs it, while leaving it in place keeps a
+    // replayable privileged trigger sitting in /run/ferrum/requests. This
+    // happens for every kind, check included, and is deliberately
+    // independent of the interlock decision above: a check's file is just
+    // as spent as an apply's, and the interlock was never what made it
+    // safe to delete.
+    if let Some(uuid) = effects.spent_request {
+        jobs::remove_request_file_in(requests_dir, &uuid);
+    }
 }
 
 /// One attachment to systemd's `JobRemoved` signal, held until it breaks.
@@ -809,26 +889,35 @@ async fn attach_and_watch(
     let mut stream = proxy.receive_job_removed().await?;
 
     // Safe to ask only now: any completion from here on has a listener.
-    reconcile_interlock(state, dbus::ferrum_apply_job_is_running(&proxy).await?);
+    //
+    // Two queries, and the first is not redundant. `ferrum_apply_job_is_running`
+    // answers the question that is true almost every time this runs -- "is
+    // anything of ours in flight at all?" -- in one round trip and with no
+    // filesystem work. Only when the answer is yes is it worth asking WHICH
+    // units, and reading each one's recorded kind off /run to find out
+    // whether any of them is the sort that claims the interlock. The second
+    // query is also the fresher of the two, so a unit that starts or ends
+    // between them is seen correctly rather than raced.
+    let holder = if dbus::ferrum_apply_job_is_running(&proxy).await? {
+        let units = proxy
+            .list_units_by_patterns(&[], &[FERRUM_APPLY_PATTERN])
+            .await?;
+        let running: Vec<String> = units
+            .iter()
+            .filter(|u| dbus::any_unit_is_running(std::slice::from_ref(u)))
+            .map(|u| u.name.clone())
+            .collect();
+        jobs::interlock_holder_in(&jobs::requests_dir(), &running)
+    } else {
+        None
+    };
+    reconcile_interlock(state, holder);
     ready.fire();
 
     use futures::StreamExt;
     while let Some(signal) = stream.next().await {
         let Ok(args) = signal.args() else { continue };
-        if args.unit().starts_with("ferrum-apply@") {
-            *state.job_running.lock().unwrap() = false;
-            // The request file is spent the moment the unit's job is gone:
-            // `ferrum-apply run-request` has already read it (JobRemoved for
-            // a Type=oneshot start job fires after ExecStart returns), so
-            // nothing legitimate still needs it, while leaving it in place
-            // keeps a replayable privileged trigger sitting in
-            // /run/ferrum/requests. Deliberately gated on the UUID parsing
-            // cleanly -- the interlock above clears for ANY ferrum-apply@
-            // unit, but only a real UUID may name a file to delete.
-            if let Some(uuid) = jobs::job_uuid_from_unit(args.unit()) {
-                jobs::remove_request_file(&uuid);
-            }
-        }
+        handle_job_removed_in(state, &jobs::requests_dir(), args.unit());
     }
     anyhow::bail!("the systemd JobRemoved signal stream ended unexpectedly")
 }
@@ -909,13 +998,15 @@ async fn main() -> anyhow::Result<()> {
     // M3: that question is no longer asked here. It belongs inside
     // `attach_and_watch`, after the JobRemoved subscription exists, because
     // asking it first loses any completion that lands before the listener
-    // is up and wedges the interlock closed for good. `false` is the
-    // starting value; `reconcile_interlock` corrects it, in both
-    // directions, from within the subscription.
-    let state = Arc::new(AppState { db, job_running: Mutex::new(false) });
+    // is up and wedges the interlock closed for good. `None` -- unclaimed
+    // -- is the starting value; `reconcile_interlock` corrects it, in both
+    // directions, from within the subscription, and it recovers the
+    // claimant's identity from /run/ferrum/requests rather than from
+    // memory, because memory is precisely what this restart destroyed.
+    let state = Arc::new(AppState { db, interlock: Mutex::new(None) });
 
     // Independently confirms job completion via systemd's own JobRemoved
-    // D-Bus signal, so `job_running` is cleared even if ferrum-apply
+    // D-Bus signal, so the interlock is cleared even if ferrum-apply
     // crashed before ever writing a "complete" line to its own progress
     // file -- see this plan's spec Known Risk #2 for why a job can
     // otherwise be left "running" forever.
@@ -1031,7 +1122,7 @@ mod tests {
         auth::ensure_first_user(&db, dir.path()).unwrap();
         let password = std::fs::read_to_string(dir.path().join("ferrumd-setup-password")).unwrap();
         let result = auth::login(&db, "admin", password.trim(), &test_client()).unwrap().session().unwrap();
-        let state = Arc::new(AppState { db, job_running: Mutex::new(false) });
+        let state = Arc::new(AppState { db, interlock: Mutex::new(None) });
         (dir, state, result.session_token, result.csrf_token)
     }
 
@@ -2122,6 +2213,7 @@ mod tests {
         ("secrets_api.rs", include_str!("secrets_api.rs")),
         ("settings.rs", include_str!("settings.rs")),
         ("static_files.rs", include_str!("static_files.rs")),
+        ("updates.rs", include_str!("updates.rs")),
     ];
 
     /// The behavioural tests above prove the routes they drive ignore a
@@ -2292,6 +2384,186 @@ mod tests {
             declared, scanned,
             "CRATE_SOURCES must list every module main.rs declares, in order"
         );
+    }
+
+    /// R3's second criterion, held as data rather than as a promise:
+    /// ferrumd never shells out to `nix` and never opens the flake.
+    ///
+    /// The update check is dispatched to privileged `ferrum-apply` as an
+    /// ordinary job precisely so the daemon needs neither -- a subprocess
+    /// would put the whole Nix closure on the unprivileged daemon's PATH
+    /// (modules/core/daemon.nix gives ferrumd exactly `pkgs.sops` and
+    /// `pkgs.ssh-to-age`), and reading `/etc/ferrum/flake.nix` or
+    /// `flake.lock` would make ferrumd a second reader of the privileged
+    /// side's inputs. `updates.rs` serves a document somebody else
+    /// produced, and this is what keeps it that way after the next edit.
+    #[test]
+    fn no_source_file_invokes_nix_or_opens_the_flake() {
+        let mut found = Vec::new();
+        for (name, source) in CRATE_SOURCES {
+            for (number, line) in source.lines().enumerate() {
+                if let Some(needle) = nix_reach_named_on(line) {
+                    found.push(format!("{name}:{}: {needle}: {}", number + 1, line.trim()));
+                }
+            }
+        }
+        assert!(
+            found.is_empty(),
+            "ferrumd must never run a subprocess or read the flake (R3); found:\n{}",
+            found.join("\n")
+        );
+    }
+
+    /// The spellings a careless addition would use to reach the privileged
+    /// side's tooling.
+    ///
+    /// Four literal substrings, and deliberately described as what they are:
+    /// this is a TRIPWIRE, not a proof of absence. An aliased import
+    /// (`use std::process::Command as Cmd;` then `Cmd::new(...)`), a direct
+    /// `libc::execve`, or a flake path assembled at runtime rather than
+    /// written as a literal all walk past it clean. It catches the way the
+    /// code would most plausibly be written on a hurried afternoon, which is
+    /// worth having; it does not catch an author who is working around it.
+    /// The real guarantee is structural -- ferrumd is given exactly
+    /// `pkgs.sops` and `pkgs.ssh-to-age` on its PATH by
+    /// modules/core/daemon.nix -- and this only makes a regression noisy.
+    ///
+    /// `Command::new(` rather than the word "nix": the daemon runs NO
+    /// subprocess at all today, which is both the stronger claim and the
+    /// one with no false positives -- `/nix/var/nix/profiles` is a path
+    /// generations.rs reads on purpose, and a scan keyed on the word would
+    /// have to exempt it, then be one careless exemption away from missing
+    /// the real thing.
+    const NIX_REACH: &[&str] = &[
+        "Command::new(",
+        "process::Command",
+        "flake.nix",
+        "flake.lock",
+    ];
+
+    /// The reach a line makes, if it makes one.
+    ///
+    /// Split out so the recogniser can be exercised directly, for the same
+    /// reason `forward_auth_header_named_on` was: the scan it feeds asserts
+    /// an ABSENCE, and a broken matcher reports exactly what a clean crate
+    /// reports.
+    ///
+    /// # Arguments
+    /// * `line` - one source line, exactly as written.
+    ///
+    /// # Returns
+    /// The matched entry of `NIX_REACH`, or `None` -- including for this
+    /// crate's own prose about why it does none of these things, and for
+    /// the fixture tables below, which are exempted by their leading quote
+    /// exactly as the forward-auth scan's are.
+    fn nix_reach_named_on(line: &str) -> Option<&'static str> {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("//") || trimmed.starts_with('"') {
+            return None;
+        }
+        NIX_REACH.iter().copied().find(|needle| line.contains(needle))
+    }
+
+    /// Lines the recogniser must match. Each begins with a quote so the
+    /// scan above skips this table while reading main.rs -- the same
+    /// exemption `READS_A_HEADER` relies on, and for the same reason: a
+    /// positive control must not be reported as a violation.
+    const REACHES_FOR_NIX: &[&str] = &[
+        "    let out = std::process::Command::new(\"nix\").arg(\"eval\").output();",
+        "        Command::new(\"nix-env\").arg(\"--set\").status()",
+        "    let raw = std::fs::read_to_string(\"/etc/ferrum/flake.nix\")?;",
+        "    let pins = std::fs::read(dir.join(\"flake.lock\"))?;",
+    ];
+
+    /// The crate's own prose about the rule, and ordinary code.
+    const REACHES_FOR_NOTHING: &[&str] = &[
+        "// ferrumd must never shell out to nix; see updates.rs",
+        "    let dir = std::path::PathBuf::from(\"/nix/var/nix/profiles\");",
+        "    let doc = crate::updates::get_updates(query).await;",
+    ];
+
+    /// `GET /api/updates` really is inside the session-gated router, and
+    /// really serves the report that is on disk.
+    ///
+    /// The module's own tests drive `updates_response_in` directly, which
+    /// says nothing about whether the handler was ever wired up or whether
+    /// an anonymous caller can reach it. This drives the REAL router, so
+    /// both are observed rather than assumed.
+    #[tokio::test]
+    async fn updates_is_session_gated_and_serves_the_report_on_disk() {
+        let (dir, state, session, _csrf) = logged_in();
+        let reports = dir.path().join("reports");
+        std::fs::create_dir(&reports).unwrap();
+        let job = "11111111-2222-3333-4444-555555555555";
+        std::fs::write(
+            reports.join(format!("{job}.update-check.json")),
+            serde_json::json!({
+                "schemaVersion": 1,
+                "checkedAt": 1758700000u64,
+                "candidate": { "state": "update-available" }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        // This is the only test that asserts anything about this
+        // variable, but it is NOT the only code that reads it: the
+        // API_ROUTES matrix drives `GET /api/updates` through the real
+        // router, so `report_dir()` reads it on other threads of this same
+        // binary while this line runs. That is safe for the specific reason
+        // that those probes assert on CORS headers and on not-404, neither
+        // of which depends on which directory the handler reads -- not
+        // because nothing else looks. The distinction matters: a `set_var`
+        // defended by "nobody else reads it" invites the next person to add
+        // a test that does. (`FERRUM_JOBS_DIR` is the cautionary case, in
+        // jobs.rs's
+        // `handlers_skip_non_uuid_files_clamp_limit_and_reject_traversal_ids`.)
+        std::env::set_var("FERRUM_UPDATE_REPORT_DIR", &reports);
+
+        let anonymous = build_router(state.clone())
+            .oneshot(Request::builder().uri("/api/updates").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            anonymous.status(),
+            StatusCode::UNAUTHORIZED,
+            "an unauthenticated read of the update report must be refused"
+        );
+
+        // No CSRF header, on purpose: require_session checks the token on
+        // mutating methods only, and this read must not need one.
+        let response = build_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/updates")
+                    .header("Cookie", format!("{SESSION_COOKIE}={session}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["status"], "report");
+        assert_eq!(body["jobId"], job);
+        assert_eq!(body["report"]["candidate"]["state"], "update-available");
+
+        std::env::remove_var("FERRUM_UPDATE_REPORT_DIR");
+    }
+
+    /// The positive control the scan above has none of on its own.
+    #[test]
+    fn a_reach_for_nix_is_recognised_however_it_is_spelled() {
+        for line in REACHES_FOR_NIX {
+            assert!(nix_reach_named_on(line).is_some(), "the scan's matcher misses: {line}");
+        }
+        for line in REACHES_FOR_NOTHING {
+            assert_eq!(
+                nix_reach_named_on(line),
+                None,
+                "the scan's matcher over-matches: {line}"
+            );
+        }
     }
 
     /// The shapes `module_declared_on` has to recognise, and the ones it
@@ -2478,6 +2750,11 @@ mod tests {
             ("POST", "/api/logout", "/api/logout"),
             ("GET", "/api/catalog", "/api/catalog"),
             ("GET", "/api/generations", "/api/generations"),
+            // No `?job=`: the probe asks for the most recent report, the
+            // shape the Updates view uses on first paint, and the one that
+            // answers 200 on a host that has never been checked rather
+            // than the 400 a non-UUID `job` would earn.
+            ("GET", "/api/updates", "/api/updates"),
             ("GET", "/api/settings", "/api/settings"),
             ("PUT", "/api/settings", "/api/settings"),
             ("POST", "/api/secrets/:name", "/api/secrets/cors-probe"),
@@ -2823,7 +3100,7 @@ mod tests {
             let db = db::Db::open(&dir.path().join("test.db")).unwrap();
             // The TempDir is dropped here on purpose: SQLite keeps the open
             // handle, and nothing in these tests touches the file again.
-            AppState { db, job_running: Mutex::new(false) }
+            AppState { db, interlock: Mutex::new(None) }
         }
 
         /// The half of M3 that needs no race at all.
@@ -2892,26 +3169,136 @@ mod tests {
             }
         }
 
-        /// Reconciliation corrects the flag in both directions. The
+        /// Reconciliation corrects the interlock in both directions. The
         /// "systemd says nothing is running" direction is the one that
         /// undoes a missed `JobRemoved`; without it a re-attachment would
         /// restore the listener but not the state it was supposed to be
         /// keeping.
+        ///
+        /// This only exercises the applying half. What makes the value it
+        /// is handed correct is `jobs::interlock_holder_in`, which is where
+        /// the check-versus-apply distinction lives and where
+        /// `a_check_running_at_startup_does_not_seed_the_interlock` drives
+        /// it.
         #[test]
         fn reconciling_sets_the_interlock_from_systemds_answer_in_both_directions() {
             let state = state();
+            let apply = "5f0c9b1e-3a47-4c6d-8e12-9b7a4d2f6c03";
 
-            reconcile_interlock(&state, true);
-            assert!(*state.job_running.lock().unwrap(), "a running apply must hold the interlock");
+            reconcile_interlock(&state, Some(apply.to_string()));
+            assert_eq!(
+                state.interlock.lock().unwrap().as_deref(),
+                Some(apply),
+                "a running apply must hold the interlock, and the interlock must name it"
+            );
 
-            reconcile_interlock(&state, true);
-            assert!(*state.job_running.lock().unwrap(), "reconciling twice must not flip it");
+            reconcile_interlock(&state, Some(apply.to_string()));
+            assert_eq!(
+                state.interlock.lock().unwrap().as_deref(),
+                Some(apply),
+                "reconciling twice must not flip it"
+            );
 
-            reconcile_interlock(&state, false);
-            assert!(
-                !*state.job_running.lock().unwrap(),
+            reconcile_interlock(&state, None);
+            assert_eq!(
+                state.interlock.lock().unwrap().as_deref(),
+                None,
                 "a completion missed while detached is gone forever, so systemd's own answer \
                  has to be able to release the interlock"
+            );
+        }
+
+        /// Defect 1, driven through the real handler rather than the pure
+        /// rule underneath it.
+        ///
+        /// `jobs::only_the_interlock_holders_own_completion_releases_it`
+        /// pins the decision; this pins that `attach_and_watch`'s loop
+        /// actually applies it to the shared state. The bug was never in
+        /// the rule -- there was no rule, just four lines inline in a
+        /// stream loop no test could reach.
+        #[test]
+        fn a_finished_check_leaves_a_running_applys_interlock_alone_but_its_own_completion_clears_it() {
+            let state = state();
+            let requests = tempfile::tempdir().unwrap();
+            let apply = "2a7f6c31-9b04-4e85-8d12-3f6a0c9e5b47";
+            let check = "6d10b8f4-52ce-4a97-b305-8e71c4d2a9f0";
+            *state.interlock.lock().unwrap() = Some(apply.to_string());
+
+            handle_job_removed_in(&state, requests.path(), &format!("ferrum-apply@{check}.service"));
+            assert_eq!(
+                state.interlock.lock().unwrap().as_deref(),
+                Some(apply),
+                "a read-only check finishing -- which a DNS failure does in seconds -- must \
+                 leave the interlock of an apply that is still building and switching exactly \
+                 as it found it"
+            );
+
+            handle_job_removed_in(&state, requests.path(), &format!("ferrum-apply@{apply}.service"));
+            assert_eq!(
+                state.interlock.lock().unwrap().as_deref(),
+                None,
+                "the holder's own completion must release it -- there is no timeout and no \
+                 cancel, so an interlock nothing releases wedges the daemon permanently"
+            );
+        }
+
+        /// The other half of the same handler, which the interlock change
+        /// must not have disturbed: every kind's request file is spent when
+        /// its unit's job is gone, check included. It is the input a
+        /// `ferrum-apply@<uuid>.service` start consumes, so one left behind
+        /// is a replayable privileged trigger.
+        #[test]
+        fn a_completion_deletes_that_jobs_request_file_whichever_kind_it_was() {
+            let state = state();
+            let requests = tempfile::tempdir().unwrap();
+            let check = "0f5e2a86-73b1-4c49-9d20-5a8c1e6b7f34";
+            let apply = "e91d4b07-6a52-4f8c-b713-2d09f5a8c64e";
+            let bystander = "47c8e2a1-0d63-4b95-8f24-1e7a3c5d90b6";
+            for uuid in [check, apply, bystander] {
+                std::fs::write(requests.path().join(format!("{uuid}.json")), "{}").unwrap();
+            }
+
+            handle_job_removed_in(&state, requests.path(), &format!("ferrum-apply@{check}.service"));
+            assert!(
+                !requests.path().join(format!("{check}.json")).exists(),
+                "a check's request file is as spent as an apply's, and as replayable"
+            );
+
+            handle_job_removed_in(&state, requests.path(), &format!("ferrum-apply@{apply}.service"));
+            assert!(!requests.path().join(format!("{apply}.json")).exists());
+
+            // The control: it deletes that job's file and nothing else, and
+            // a unit that is not ours names no file at all.
+            handle_job_removed_in(&state, requests.path(), "sshd.service");
+            assert!(
+                requests.path().join(format!("{bystander}.json")).exists(),
+                "a completion must not touch another job's pending request file"
+            );
+        }
+
+        /// `FERRUM_APPLY_PATTERN` is duplicated from `dbus.rs`, which keeps
+        /// it private. A copy that drifted would make `attach_and_watch`
+        /// list nothing and silently stop reconciling, so the copy is
+        /// checked against the original rather than trusted.
+        #[test]
+        fn the_unit_pattern_matches_the_one_dbus_queries_with() {
+            let declared = include_str!("dbus.rs")
+                .lines()
+                .find(|line| line.contains("FERRUM_APPLY_PATTERN:") && line.contains('='))
+                .and_then(|line| line.split('"').nth(1).map(str::to_string))
+                .expect("dbus.rs must still declare FERRUM_APPLY_PATTERN as a string literal");
+            assert_eq!(
+                declared, FERRUM_APPLY_PATTERN,
+                "main.rs asks systemd for one glob and dbus.rs asks for another"
+            );
+
+            // And the glob really names units the rest of the daemon parses
+            // -- a pattern both files agreed on but nothing matched would
+            // pass the comparison above and reconcile nothing.
+            let uuid = "d2b7f490-1c85-4a36-9e07-6f3b8a2d5c19";
+            assert_eq!(
+                jobs::job_uuid_from_unit(&FERRUM_APPLY_PATTERN.replace('*', uuid)).as_deref(),
+                Some(uuid)
             );
         }
 
@@ -2947,7 +3334,16 @@ mod tests {
             let query = body
                 .find("ferrum_apply_job_is_running(")
                 .expect("it must still ask systemd what is running");
+            let identify = body
+                .find("list_units_by_patterns(")
+                .expect("it must still ask systemd WHICH units are running");
 
+            assert!(
+                subscribe < identify && stream < identify,
+                "the follow-up query that identifies the running units must be established \
+                 after the subscription too (subscribe at {subscribe}, stream at {stream}, \
+                 identifying query at {identify})"
+            );
             assert!(
                 subscribe < query && stream < query,
                 "the JobRemoved subscription and its stream must be established BEFORE \

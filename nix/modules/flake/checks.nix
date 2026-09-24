@@ -3305,6 +3305,350 @@
           echo ok > $out
         '';
 
+      # There is no JavaScript test runner anywhere in this repository, and
+      # adding one would be a new dependency for a UI whose entire design is
+      # "no build step, nothing between the source an operator reads and the
+      # bytes served" (nix/pkgs/ferrum-ui/default.nix). So the Updates view is
+      # guarded the only way this tree already guards UI source: by reading
+      # ui/app.js as text, exactly as uiRendersEverySchemaType reads
+      # ui/forms.js.
+      #
+      # This buys wiring and vocabulary, NOT rendering. It cannot prove a
+      # <td> holds the right words; it can prove that a state the daemon can
+      # send has SOME branch to land in, that the route exists, that no
+      # per-app control was added, and that nothing here reaches off-host.
+      # Everything else about this view is browser-only and is recorded as
+      # such rather than pretended away.
+      #
+      # It also reads crates/ferrum-apply/src/update_check.rs and asserts set
+      # equality between the UI's two vocabularies and the real serde variant
+      # names. That half is the one with a proven failure behind it: the
+      # candidate enum dropped NotChecked while ui/app.js still rendered a
+      # branch for it, and comparing the UI only against itself agreed
+      # perfectly with its own mistake.
+      #
+      # And it reads crates/ferrumd/src/updates.rs for the envelope those
+      # documents arrive in -- its three keys and its two `status` literals.
+      # The view takes "this host has never checked" from that literal instead
+      # of inferring it from an empty document, which is the right call and
+      # also a three-file handshake that nothing else holds together.
+      #
+      # It does NOT pin the report document's own field names, deliberately.
+      # Set equality would be the wrong assertion there: the document is
+      # read defensively (`orUnknown`, `|| {}`) precisely so a field added to
+      # it is backward-compatible, and a check that failed on an additive
+      # change would punish the design. The one-directional alternative --
+      # "every field the UI reads must exist" -- needs the UI's reads
+      # extracted from source, and the only ways to do that are a hand-written
+      # list (which pins a comment, not the rendering) or a scan keyed on the
+      # local variable names inside two functions (which silently checks
+      # nothing the day someone renames `migration` to `m`). A small honest
+      # check beats a large one that can quietly stop looking.
+      #
+      # Every structural lookup below throws rather than returning an empty
+      # result. A check that grepped for a declaration, found nothing, and
+      # passed would be worse than no check at all -- this tree has already
+      # shipped one of those (see the CATALOG_APPS comment above).
+      updatesViewIsWired =
+        let
+          appSrc = builtins.readFile ../../../ui/app.js;
+          lines = lib.splitString "\n" appSrc;
+
+          # ferrum-apply OWNS the wire vocabulary; ui/app.js only transcribes
+          # it. Reading the real enums here is what turns that transcription
+          # from a comment into an invariant, and it is not hypothetical: the
+          # candidate side lost its NotChecked variant on the first day the
+          # two files existed apart, and nothing but this would have caught
+          # the UI still rendering a branch for it.
+          rustPath = "crates/ferrum-apply/src/update_check.rs";
+          rustLines = lib.splitString "\n" (builtins.readFile ../../../crates/ferrum-apply/src/update_check.rs);
+
+          # ferrumd owns the envelope the document arrives in, and the UI
+          # takes "this host has never checked" from its `status` literal
+          # rather than inferring it from an empty document. That is the right
+          # design, and it is also a three-file handshake with nothing holding
+          # it together -- so the constructors are read here too.
+          daemonPath = "crates/ferrumd/src/updates.rs";
+          daemonLines = lib.splitString "\n" (builtins.readFile ../../../crates/ferrumd/src/updates.rs);
+
+          # The helpers take their source explicitly. This check reads three
+          # files, and one closed over a single source is a trap for whoever
+          # adds the fourth.
+          indexIn = src: file: what: infix:
+            let
+              hits = builtins.filter (e: lib.hasInfix infix e.l) (lib.imap0 (i: l: { inherit i l; }) src);
+            in
+            if hits == [ ] then
+              throw (file + " no longer has a line containing '" + infix
+                + "', so updates-view-is-wired cannot verify " + what
+                + ". A check that cannot find what it guards must fail, not pass.")
+            else (builtins.head hits).i;
+
+          # Every line after the one opening `startInfix`, up to but not
+          # including the first line `isEnd` accepts.
+          blockIn = src: file: what: startInfix: isEnd:
+            let
+              after = lib.drop ((indexIn src file what startInfix) + 1) src;
+              take = acc: rest:
+                if rest == [ ] then
+                  throw (file + " opens '" + startInfix
+                    + "' but updates-view-is-wired cannot find the line that closes it")
+                else if isEnd (builtins.head rest) then acc
+                else take (acc ++ [ (builtins.head rest) ]) (builtins.tail rest);
+              block = take [ ] after;
+            in
+            if block == [ ] then
+              throw (file + "'s '" + startInfix + "' block is empty, so every assertion "
+                + "updates-view-is-wired makes about " + what + " would be vacuously true")
+            else block;
+
+          indexOf = indexIn lines "ui/app.js";
+          blockAt = blockIn lines "ui/app.js";
+
+          quotedIn = re: line:
+            map builtins.head (builtins.filter builtins.isList (builtins.split re line));
+
+          # A one-line `const NAME = ["a", "b"];` declaration in ui/app.js.
+          #
+          # The character class admits camelCase as well as kebab-case: the
+          # state vocabularies are kebab, but the envelope keys are `jobId`,
+          # and a kebab-only class would silently skip it and leave that
+          # assertion comparing two short lists that happen to agree.
+          vocabOf = what: name:
+            let values = quotedIn "\"([a-zA-Z][a-zA-Z0-9-]*)\"" (builtins.elemAt lines (indexOf what "const ${name} = [")); in
+            if values == [ ] then
+              throw ("ui/app.js declares " + name + " but updates-view-is-wired read no state "
+                + "names out of it -- it is no longer a single-line array literal, and an empty "
+                + "vocabulary would make the branch-coverage assertion vacuous")
+            else values;
+
+          # The keys of a one-entry-per-line state table: the branches that
+          # actually render.
+          branchesOf = what: name:
+            let
+              keys = lib.concatMap (quotedIn "\"([a-z-]+)\":")
+                (blockAt what "const ${name} = {" (l: l == "};"));
+            in
+            if keys == [ ] then
+              throw ("ui/app.js declares " + name + " but updates-view-is-wired found no "
+                + "\"state\": keys in it")
+            else keys;
+
+          candidateStates = vocabOf "the candidate-state vocabulary" "CANDIDATE_STATES";
+          appStates = vocabOf "the app-state vocabulary" "APP_STATES";
+          candidateBranches = branchesOf "candidate-state rendering" "CANDIDATE_STATE_TEXT";
+          appBranches = branchesOf "app-state rendering" "APP_STATE_TEXT";
+
+          unbranched = states: branches: builtins.filter (s: !(builtins.elem s branches)) states;
+          orphaned = states: branches: builtins.filter (b: !(builtins.elem b states)) branches;
+
+          # serde's kebab-case rule, DERIVED rather than hand-listed: a
+          # variant `UpdateAvailable` is the wire value `update-available`.
+          #
+          # serde lowercases each character and inserts a separator before
+          # every uppercase after the first, so splitting on `[A-Z][a-z0-9]*`
+          # and joining with "-" is the same rule, including the cases that
+          # look like they would differ: `DNSUnreachable` gives
+          # `d-n-s-unreachable` both ways, and `V2Format` gives `v2-format`
+          # both ways. Checked against serde's RenameRule, not assumed.
+          #
+          # There is no "refuse to guess" branch here because nothing can
+          # reach it: `variantOf` below only ever admits `[A-Z][A-Za-z0-9]*`,
+          # and every such name round-trips through this split. The guard
+          # that CAN fire is `unparsed`, below.
+          kebabOf = variant:
+            lib.toLower (builtins.concatStringsSep "-"
+              (map builtins.head
+                (builtins.filter builtins.isList (builtins.split "([A-Z][a-z0-9]*)" variant))));
+
+          # The unit variants of one enum in update_check.rs, as wire values.
+          daemonStatesOf = enumName:
+            let
+              block = blockIn rustLines rustPath ("ferrum-apply's " + enumName + " variants")
+                "pub enum ${enumName} {" (l: l == "}");
+              variantOf = l: builtins.match "[[:space:]]*([A-Z][A-Za-z0-9]*),[[:space:]]*" l;
+              ignorable = l:
+                builtins.match "[[:space:]]*" l != null
+                || builtins.match "[[:space:]]*(//|#\\[).*" l != null;
+              names = lib.concatMap (l: let m = variantOf l; in if m == null then [ ] else m) block;
+
+              # A body line that is neither blank, nor a comment or attribute,
+              # nor a variant this check can read. Without this it would be
+              # dropped from the daemon's set, and the resulting diff would
+              # accuse the UI of inventing a state the daemon "never sends" --
+              # sending the reader to fix the wrong file. Measured: writing
+              # `Not_Newer,` into CandidateState produced exactly that
+              # misdirection before this guard existed.
+              unparsed = builtins.filter (l: variantOf l == null && !(ignorable l)) block;
+            in
+            if unparsed != [ ] then
+              throw (rustPath + "'s " + enumName + " has lines updates-view-is-wired cannot read "
+                + "as unit variants: " + builtins.toJSON unparsed + ". Silently dropping them "
+                + "would understate the daemon's vocabulary and blame the UI for the difference.")
+            else if names == [ ] then
+              throw (rustPath + " declares " + enumName + " but updates-view-is-wired parsed no "
+                + "variants out of it -- an empty variant set would make the UI's vocabulary "
+                + "agree with it vacuously")
+            else map kebabOf names;
+
+          daemonCandidateStates = daemonStatesOf "CandidateState";
+          daemonAppStates = daemonStatesOf "AppState";
+
+          # Set equality, reported as two separate lists so a failure says
+          # which side is ahead rather than just that they differ.
+          daemonOnly = daemon: ui: builtins.filter (v: !(builtins.elem v ui)) daemon;
+          uiOnly = daemon: ui: builtins.filter (v: !(builtins.elem v daemon)) ui;
+
+          # One envelope constructor in ferrumd's updates.rs: the keys it
+          # builds, and the `status` literal it builds them with.
+          #
+          # Same `unparsed` discipline as the enums above. A key line this
+          # check cannot read would be dropped from the daemon's key set and
+          # then reported as the UI expecting a key the daemon "never sends"
+          # -- the misdirection that guard exists to stop.
+          envelopeOf = fnName:
+            let
+              body = blockIn daemonLines daemonPath ("ferrumd's " + fnName + " envelope")
+                "fn ${fnName}(" (l: l == "}");
+              keyOf = l: builtins.match ".*\"([a-zA-Z][a-zA-Z0-9]*)\"[[:space:]]*:.*" l;
+              ignorable = l:
+                builtins.match "[[:space:]]*" l != null
+                || builtins.match "[[:space:]]*//.*" l != null
+                # The json! wrapper's own opening and closing lines. Bracket
+                # literals rather than backslash escapes: Nix's regex engine
+                # rejects `\}`, which is how this check first failed to build.
+                || builtins.match "[[:space:]]*serde_json::json![(][{][[:space:]]*" l != null
+                || builtins.match "[[:space:]]*[}][)][[:space:]]*" l != null;
+              keyLines = builtins.filter (l: keyOf l != null) body;
+              # Every `"key":` on every key-bearing line, not just the first:
+              # never_checked_body builds the whole envelope on one line.
+              keys = lib.concatMap
+                (l: map builtins.head
+                  (builtins.filter builtins.isList
+                    (builtins.split "\"([a-zA-Z][a-zA-Z0-9]*)\"[[:space:]]*:" l)))
+                keyLines;
+              statusHits = lib.concatMap
+                (l: let m = builtins.match ".*\"status\"[[:space:]]*:[[:space:]]*\"([a-z-]+)\".*" l; in
+                    if m == null then [ ] else m)
+                body;
+              unparsed = builtins.filter (l: keyOf l == null && !(ignorable l)) body;
+            in
+            if !(builtins.any (l: lib.hasInfix "serde_json::json!(" l) body) then
+              throw (daemonPath + "'s " + fnName + " no longer builds its body with "
+                + "serde_json::json!, so updates-view-is-wired cannot read the envelope it "
+                + "constructs. A check that cannot find what it guards must fail, not pass.")
+            else if unparsed != [ ] then
+              throw (daemonPath + "'s " + fnName + " has lines updates-view-is-wired cannot read "
+                + "as envelope keys: " + builtins.toJSON unparsed + ". Silently dropping them "
+                + "would understate the envelope and blame the UI for the difference.")
+            else if keys == [ ] then
+              throw (daemonPath + " defines " + fnName + " but updates-view-is-wired parsed no "
+                + "keys out of it -- an empty key set would make the UI's expectations agree "
+                + "with it vacuously")
+            else if builtins.length statusHits != 1 then
+              throw (daemonPath + "'s " + fnName + " does not build exactly one literal \"status\" "
+                + "value this check can read (found " + builtins.toJSON statusHits + "), so the "
+                + "literal the UI branches on cannot be confirmed")
+            else { inherit keys; status = builtins.head statusHits; };
+
+          reportEnvelope = envelopeOf "report_body";
+          neverCheckedEnvelope = envelopeOf "never_checked_body";
+
+          # Both constructors must build the SAME keys: the UI reads one
+          # envelope shape, and a status-dependent shape would make
+          # `envelopeProblem`'s missing-key report wrong for one of them.
+          envelopeKeysDisagree =
+            daemonOnly reportEnvelope.keys neverCheckedEnvelope.keys
+            ++ uiOnly reportEnvelope.keys neverCheckedEnvelope.keys;
+
+          daemonEnvelopeKeys = lib.unique reportEnvelope.keys;
+          daemonEnvelopeStatuses = [ reportEnvelope.status neverCheckedEnvelope.status ];
+
+          uiEnvelopeKeys = vocabOf "the envelope keys the view expects" "UPDATES_ENVELOPE_KEYS";
+          uiEnvelopeStatuses = vocabOf "the envelope statuses the view knows" "UPDATES_ENVELOPE_STATUSES";
+
+          # The view's own source, delimited by the banner comments this file
+          # already uses to separate its sections.
+          updatesBlock = blockAt "the Updates view's own source"
+            "// --- updates ---" (l: lib.hasInfix "// --- routing ---" l);
+
+          # The per-app row builder, to its closing brace at column zero.
+          appRowBlock = blockAt "the per-app row builder" "function appRow(" (l: l == "}");
+
+          # R1's last criterion: no affordance may imply an app moves alone.
+          perAppControls = builtins.filter
+            (l: lib.hasInfix "el(\"button\"" l || lib.hasInfix "onclick" l || lib.hasInfix "el(\"a\"" l)
+            appRowBlock;
+
+          # Nothing on this screen may start anything but the read-only check:
+          # no commit, no apply, no rollback.
+          startJobLines = builtins.filter (l: lib.hasInfix "api.startJob(" l) updatesBlock;
+          foreignJobKinds = builtins.filter (l: !(lib.hasInfix "\"check_update\"" l)) startJobLines;
+
+          # The Apply view's reattach finder is NOT kind-filtered, so an
+          # unfiltered copy here would tail a rollback or gc job into this
+          # screen and then ask for a report that job never wrote.
+          reattachIsKindFiltered = builtins.any
+            (l: lib.hasInfix "j.status === \"running\"" l && lib.hasInfix "j.kind === \"check_update\"" l)
+            updatesBlock;
+
+          routeWired = builtins.any (l: lib.hasInfix "\"#/updates\": updatesView" l) lines;
+
+          # The UI's standing "no external request of any kind" invariant. An
+          # absolute URL is the shape that breaks it; every real call in this
+          # file is a same-origin path.
+          absoluteUrls = builtins.filter
+            (l: lib.hasInfix "http://" l || lib.hasInfix "https://" l)
+            lines;
+        in
+        {
+          ok = routeWired
+            && reattachIsKindFiltered
+            && startJobLines != [ ]
+            && foreignJobKinds == [ ]
+            && perAppControls == [ ]
+            && absoluteUrls == [ ]
+            && unbranched candidateStates candidateBranches == [ ]
+            && orphaned candidateStates candidateBranches == [ ]
+            && unbranched appStates appBranches == [ ]
+            && orphaned appStates appBranches == [ ]
+            && daemonOnly daemonCandidateStates candidateStates == [ ]
+            && uiOnly daemonCandidateStates candidateStates == [ ]
+            && daemonOnly daemonAppStates appStates == [ ]
+            && uiOnly daemonAppStates appStates == [ ]
+            && envelopeKeysDisagree == [ ]
+            && daemonOnly daemonEnvelopeKeys uiEnvelopeKeys == [ ]
+            && uiOnly daemonEnvelopeKeys uiEnvelopeKeys == [ ]
+            && daemonOnly daemonEnvelopeStatuses uiEnvelopeStatuses == [ ]
+            && uiOnly daemonEnvelopeStatuses uiEnvelopeStatuses == [ ];
+
+          routeMissing = !routeWired;
+          reattachNotKindFiltered = !reattachIsKindFiltered;
+          startsNoCheckJob = startJobLines == [ ];
+          inherit foreignJobKinds perAppControls absoluteUrls;
+          candidateStatesWithNoBranch = unbranched candidateStates candidateBranches;
+          candidateBranchesWithNoState = orphaned candidateStates candidateBranches;
+          appStatesWithNoBranch = unbranched appStates appBranches;
+          appBranchesWithNoState = orphaned appStates appBranches;
+
+          # Both sides named on every failure, so the message says what the
+          # daemon actually sends as well as what the UI believes.
+          inherit daemonCandidateStates daemonAppStates;
+          uiCandidateStates = candidateStates;
+          uiAppStates = appStates;
+          candidateStatesTheDaemonSendsAndTheUiLacks = daemonOnly daemonCandidateStates candidateStates;
+          candidateStatesTheUiExpectsAndTheDaemonNeverSends = uiOnly daemonCandidateStates candidateStates;
+          appStatesTheDaemonSendsAndTheUiLacks = daemonOnly daemonAppStates appStates;
+          appStatesTheUiExpectsAndTheDaemonNeverSends = uiOnly daemonAppStates appStates;
+
+          inherit daemonEnvelopeKeys daemonEnvelopeStatuses uiEnvelopeKeys uiEnvelopeStatuses;
+          theTwoEnvelopeConstructorsBuildDifferentKeys = envelopeKeysDisagree;
+          envelopeKeysTheDaemonSendsAndTheUiLacks = daemonOnly daemonEnvelopeKeys uiEnvelopeKeys;
+          envelopeKeysTheUiExpectsAndTheDaemonNeverSends = uiOnly daemonEnvelopeKeys uiEnvelopeKeys;
+          envelopeStatusesTheDaemonSendsAndTheUiLacks = daemonOnly daemonEnvelopeStatuses uiEnvelopeStatuses;
+          envelopeStatusesTheUiExpectsAndTheDaemonNeverSends = uiOnly daemonEnvelopeStatuses uiEnvelopeStatuses;
+        };
+
       mkAssertionCheck = name: result:
         pkgs.runCommand "ferrum-check-${name}" { } (
           if result.ok then
@@ -3331,6 +3675,8 @@
         schema-uniformity = mkAssertionCheck "schema-uniformity" schemaUniformity;
         ui-renders-every-schema-type =
           mkAssertionCheck "ui-renders-every-schema-type" uiRendersEverySchemaType;
+        updates-view-is-wired =
+          mkAssertionCheck "updates-view-is-wired" updatesViewIsWired;
         pool-branches-are-all-seeded =
           mkAssertionCheck "pool-branches-are-all-seeded" poolBranchesAreAllSeeded;
         pool-assertions-can-fire =

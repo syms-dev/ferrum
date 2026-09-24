@@ -152,6 +152,37 @@ Two things, and only these two, stand between a compromised sibling app and this
 
 ferrumd also requires its own valid session on every request regardless of what Authelia concluded; it trusts no `Remote-User` header. Nothing on this host runs in a network namespace that would stop a local process from talking straight to `127.0.0.1:7788`, so a header set by nginx would be a header any compromised app could forge.
 
+## Dashboard API
+
+Everything the UI does, it does through these. The authority is `build_router`
+(`crates/ferrumd/src/main.rs`); this table is a hand-kept mirror of it, and nothing mechanical
+checks that the two agree — so where they disagree, the router is right.
+
+| Method | Path | What it does | Auth |
+|--------|------|--------------|------|
+| POST | `/api/login` | Exchanges a username and password for a session cookie and a CSRF token | none |
+| POST | `/api/logout` | Clears the session | none (see `logout_is_still_unguarded_and_the_ui_still_depends_on_that`) |
+| GET | `/api/session` | The current session's user and CSRF token | session |
+| POST | `/api/password` | Changes the signed-in user's password | session + CSRF |
+| GET | `/api/catalog` | The app catalog and the settings JSON Schema the UI renders its form from | session |
+| GET | `/api/settings` | The host's current `settings.json` | session |
+| PUT | `/api/settings` | Replaces `settings.json` after schema validation | session + CSRF |
+| POST | `/api/secrets/:name` | Writes one sops-encrypted secret | session + CSRF |
+| GET | `/api/generations` | The system generations and their snapshots, for rollback | session |
+| GET | `/api/updates` | The most recent update-check report, or `?job=<uuid>` for one run's own | session |
+| POST | `/api/jobs` | Starts a privileged `ferrum-apply` job | session + CSRF |
+| GET | `/api/jobs` | Recent jobs (`?limit=`) | session |
+| GET | `/api/jobs/:id` | One job's summary and its progress events | session |
+| GET | `/api/jobs/:id/stream` | That job's progress as server-sent events | session |
+
+`GET /api/updates` serves a document ferrum-apply's `check_update` job wrote; ferrumd only reads
+it, and runs no `nix` of its own. It answers `200` with
+`{"status":"report","jobId":...,"report":{...}}`, or `200` with
+`{"status":"never-checked","jobId":null,"report":null}` on a host where no check has ever run —
+an explicit state rather than an empty body, so the UI can tell "never checked" from "checked,
+and up to date". Reports are read from `FERRUM_UPDATE_REPORT_DIR`, falling back to
+`FERRUM_JOBS_DIR` and then to `/var/lib/ferrum/jobs`, which is where the job writes them today.
+
 ## Development
 
 See the design doc's "Dev loop" section for the intended setup (an aarch64 dev VM plus a real x86_64 test target provisioned via `nixos-anywhere`).
