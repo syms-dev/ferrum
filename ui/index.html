@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<!--
+  The ferrum web UI.
+
+  Hand-written HTML, CSS and ES modules. No build step, no bundler, no npm,
+  and no external request of ANY kind -- no CDN, no web font, no analytics.
+  The box this serves from may have no internet at all, which is a real state
+  during provisioning and exactly when an operator most needs this page.
+  Anything added here that fetches from another origin breaks that.
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ferrum</title>
+  <link rel="stylesheet" href="./style.css">
+  <link rel="icon" href="data:,">
+</head>
+<body>
+  <header>
+    <strong>ferrum</strong>
+    <nav id="nav" hidden>
+      <a href="#/apps">Apps</a>
+      <a href="#/secrets">Secrets</a>
+      <a href="#/apply">Apply</a>
+      <a href="#/generations">Generations</a>
+      <!-- This nav is hand-written, NOT generated from app.js's `routes` map.
+           A new view needs an entry in both places; the `updates-view-is-wired`
+           flake check guards the app.js half. -->
+      <a href="#/updates">Updates</a>
+      <span class="spacer"></span>
+      <span id="who" class="hint"></span>
+      <button id="logout" type="button" class="ghost">Log out</button>
+    </nav>
+  </header>
+  <p id="status" role="status" aria-live="polite"></p>
+  <main id="view"></main>
+  <script type="module" src="./app.js"></script>
+</body>
+</html>

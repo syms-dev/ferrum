@@ -1,0 +1,510 @@
+//! Stage 2: everything that cannot exist until the host does.
+//!
+//! App secrets, Authelia's two secrets, the Cloudflare token and correct
+//! file ownership are one idea, not four. Each is a fact about a machine
+//! that does not exist while the first build is being evaluated, and every
+//! place the spec failed to model that produced a defect.
+//!
+//! The constraint underneath all of them: sops-nix requires each
+//! `sops.secrets.<name>.sopsFile` to be a Nix path pointing at a file that
+//! **physically exists at evaluation time**. On a machine being installed
+//! from nothing, `/etc/ferrum/secrets/` does not exist and neither do those
+//! files -- they are generated on the host, encrypted to the host's own
+//! key, which cannot happen before the host exists.
+//!
+//! So stage 1 installs with no apps and no auth, and stage 2 turns both on.
+
+use crate::answers::Answers;
+
+/// The `--set-default` variables in `modules/core/overlays.nix` that are
+/// derived from `ferrum.apps.*` or `ferrum.auth.*`, and therefore differ
+/// between the two stages.
+///
+/// This is the whole list, walked rather than sampled. Of the fourteen
+/// variables baked into the `ferrum-apply` wrapper, nine come from storage
+/// or host configuration that is identical in both stages and one
+/// (`FERRUM_AUTHELIA_STATE_DIR`) is a hardcoded literal. These five are the
+/// remainder, and every one of them silently breaks stage 2 if left at its
+/// stage-1 value:
+///
+/// | variable | left alone |
+/// |---|---|
+/// | `FERRUM_SERVARR_APPS` | baked empty; `main.rs`'s `unwrap_or_else` fires only when **unset**, so an empty string survives to `.filter(!is_empty)` and collects to an empty list. `ensure_all` generates nothing and sonarr/radarr/prowlarr's `sopsFile` is missing at eval. |
+/// | `FERRUM_AUTH_ENABLED` | `ensure_authelia_secrets` skipped; both Authelia `sopsFile`s missing. |
+/// | `FERRUM_ADMIN_EMAIL` | the generated Authelia user has no address. |
+/// | `FERRUM_SABNZBD_STATE_DIR` | baked `""`, mapped to `None`, `ensure_sabnzbd_apikey` skipped, while the app declares its `sopsFile` unconditionally. |
+/// | `FERRUM_SABNZBD_PORT` | falls back to 8080 and writes the wrong port into sabnzbd's ini. |
+///
+/// This works at all only because `overlays.nix` uses `--set-default`
+/// rather than `--set`: the caller's environment wins over the value baked
+/// in at build time.
+///
+/// **If a future phase adds any `--set-default` derived from `apps.*` or
+/// `auth.*`, it belongs in this list.**
+pub const STAGE2_OVERRIDDEN: &[&str] = &[
+    "FERRUM_SERVARR_APPS",
+    "FERRUM_AUTH_ENABLED",
+    "FERRUM_ADMIN_EMAIL",
+    "FERRUM_SABNZBD_STATE_DIR",
+    "FERRUM_SABNZBD_PORT",
+];
+
+/// The three servarr apps `ferrum-apply`'s `secrets.rs` generates keys for.
+/// qBittorrent, Plex, Jellyfin and SABnzbd have their own mechanisms and
+/// are deliberately excluded, matching `overlays.nix`'s own list.
+const SERVARR: &[&str] = &["sonarr", "radarr", "prowlarr"];
+
+/// sabnzbd's default state directory and port, matching the module tree.
+const SABNZBD_STATE_DIR: &str = "/var/lib/ferrum/state/sabnzbd";
+const SABNZBD_PORT: &str = "8080";
+
+/// Builds the environment the stage-2 apply must carry.
+///
+/// Driven FROM `STAGE2_OVERRIDDEN` rather than alongside it, so the list is
+/// the single source of truth. Adding a name there without giving it a
+/// value here fails to compile the match's exhaustiveness in spirit and
+/// fails `every_documented_variable_is_emitted` in fact -- which is the
+/// point, because the failure mode of a forgotten variable is a stage-2
+/// build dying on a `.sops` path the operator has never heard of.
+pub fn env(answers: &Answers) -> Vec<(String, String)> {
+    let servarr: Vec<&str> = SERVARR
+        .iter()
+        .copied()
+        .filter(|a| answers.apps.iter().any(|x| x == a))
+        .collect();
+    let sabnzbd_on = answers.apps.iter().any(|a| a == "sabnzbd");
+
+    STAGE2_OVERRIDDEN
+        .iter()
+        .map(|&name| {
+            let value = match name {
+                "FERRUM_SERVARR_APPS" => servarr.join(","),
+                "FERRUM_AUTH_ENABLED" => if answers.sso.enabled { "1" } else { "0" }.to_string(),
+                "FERRUM_ADMIN_EMAIL" => answers.sso.admin_email.clone().unwrap_or_default(),
+                "FERRUM_SABNZBD_STATE_DIR" => {
+                    if sabnzbd_on {
+                        SABNZBD_STATE_DIR.to_string()
+                    } else {
+                        String::new()
+                    }
+                }
+                "FERRUM_SABNZBD_PORT" => SABNZBD_PORT.to_string(),
+                other => {
+                    unreachable!("{other} is listed in STAGE2_OVERRIDDEN but has no value here")
+                }
+            };
+            (name.to_string(), value)
+        })
+        .collect()
+}
+
+/// Renders the environment as a shell prefix, quoted.
+pub fn env_prefix(answers: &Answers) -> String {
+    env(answers)
+        .into_iter()
+        // The shared quoter, not a second copy of the same logic -- a
+        // duplicate defeats the single-source-of-truth this exists for.
+        .map(|(k, v)| format!("{k}={}", crate::collect::sh_quote(&v)))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Repairs `/etc/ferrum/settings.json`'s ownership after first boot.
+///
+/// `nixos-anywhere --extra-files` copies everything **root-owned**, and it
+/// cannot do better by name because the `ferrum` group does not exist at
+/// copy time. The tmpfiles rule will not repair it either:
+/// `modules/core/bootstrap.nix` uses `C`, which copies **only if the path
+/// does not already exist**, so after a transfer it is a permanent no-op.
+/// The only other code that looks at this merely warns.
+///
+/// Left unfixed, `ferrumd` cannot write settings.json and the dashboard
+/// renders correctly while silently saving nothing.
+pub fn ownership_repair() -> &'static str {
+    "chown root:ferrum /etc/ferrum/settings.json && chmod 0664 /etc/ferrum/settings.json"
+}
+
+/// The commands stage 2 runs on the host, in order.
+pub fn commands(answers: &Answers) -> Vec<String> {
+    let mut cmds = vec![ownership_repair().to_string()];
+
+    if answers.cloudflare_token.is_some() {
+        // The payload is the systemd EnvironmentFile line, not a bare
+        // token: modules/proxy/acme.nix hands the decrypted file to systemd
+        // as an EnvironmentFile=, so a bare token produces a file ACME
+        // cannot use. The value arrives on stdin, never in argv.
+        cmds.push("ferrum-apply put-secret acme-dns".into());
+    }
+
+    // Neither the copy nor the commit happens on the target any more.
+    //
+    // A ferrum host has no git -- a real install failed here with "bash:
+    // line 1: git: command not found", the SECOND site with that bug after
+    // the hardware-config transfer. Fixing one and not sweeping for the
+    // other cost an extra round trip on real hardware, which is the lesson
+    // worth keeping: fix the class, not the instance.
+    //
+    // So the operator's copy is updated first (which is where R4 A5 wanted
+    // it anyway), committed there, and the objects plus the new
+    // settings.json arrive as a tar. The ownership repair after it matters:
+    // tar restores the file as root:root, and ferrumd must be able to write
+    // its own settings.
+    cmds.push(crate::install::extract_into_etc_ferrum());
+    cmds.push(ownership_repair().to_string());
+    cmds.push(format!("{} ferrum-apply apply", env_prefix(answers)));
+    cmds
+}
+
+/// The stdin payload for `put-secret acme-dns`.
+pub fn acme_payload(token: &str) -> String {
+    format!("CLOUDFLARE_DNS_API_TOKEN={token}")
+}
+
+/// What `ferrum-apply apply` reported, as the installer needs to act on it.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ApplyOutcome {
+    /// Exit 0. The switch completed and everything it manages is healthy.
+    Clean,
+    /// Exit 3. The system closure switched, but something `ferrum-apply`
+    /// manages is not healthy -- most often a DNS reconcile that could not
+    /// reach Cloudflare. The host is running the new generation.
+    Degraded,
+}
+
+/// Exit code `ferrum-apply` uses for "switched, but degraded".
+///
+/// Defined at `crates/ferrum-apply/src/main.rs:116-119`, and given its own
+/// code deliberately so a caller can tell it apart from a clean success
+/// without parsing stderr.
+const APPLY_DEGRADED: i32 = 3;
+
+/// Interprets `ferrum-apply apply`'s exit code.
+///
+/// A degraded apply is NOT an install failure. The distinction matters off
+/// the test bench: `ferrum.proxy.dns.enable` is on for any host the installer
+/// gave a domain, so the apply reconciles DNS against Cloudflare on its way
+/// through. If Cloudflare is rate-limiting, having an outage, or the token
+/// has since expired, the reconcile comes back degraded -- and the machine is
+/// otherwise perfectly installed. Failing the whole install there reports a
+/// working host as a broken one, and tells the operator to do nothing useful,
+/// because the thing that went wrong belongs to a third party and will very
+/// likely be fine in an hour.
+///
+/// What the operator needs instead is the truth: the install finished, one
+/// named thing did not, and re-running the apply is how to pick it up.
+///
+/// # Arguments
+/// * `code` - the exit code from `ferrum-apply apply`.
+///
+/// # Returns
+/// [`ApplyOutcome::Clean`] for 0, [`ApplyOutcome::Degraded`] for 3.
+///
+/// # Errors
+/// Any other code. `ferrum-apply` has already printed the reason to stderr,
+/// which the installer streams, so this names the code rather than inventing
+/// an explanation it does not have.
+pub fn interpret_apply_exit(code: i32) -> anyhow::Result<ApplyOutcome> {
+    match code {
+        0 => Ok(ApplyOutcome::Clean),
+        APPLY_DEGRADED => Ok(ApplyOutcome::Degraded),
+        other => anyhow::bail!(
+            "ferrum-apply exited {other} on the target. The output above is \
+             its own; it names what failed."
+        ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A degraded apply must not fail the install.
+    ///
+    /// `ferrum.proxy.dns.enable` is on for every host the installer gives a
+    /// domain, so the apply reconciles DNS against Cloudflare. A rate limit,
+    /// an outage or an expired token makes that reconcile degrade -- on a
+    /// machine that is otherwise installed and running the new generation.
+    /// Reporting that as a failed install is a working host described as a
+    /// broken one, over something belonging to a third party.
+    #[test]
+    fn a_degraded_apply_is_not_an_install_failure() {
+        assert_eq!(
+            interpret_apply_exit(3).expect("a degraded apply must not fail the install"),
+            ApplyOutcome::Degraded
+        );
+    }
+
+    /// And a clean apply is still clean -- so the case above cannot be
+    /// satisfied by accepting everything.
+    #[test]
+    fn a_clean_apply_is_clean() {
+        assert_eq!(interpret_apply_exit(0).unwrap(), ApplyOutcome::Clean);
+    }
+
+    /// Every other code is still fatal. Without this the fix above would be
+    /// indistinguishable from deleting the error handling.
+    #[test]
+    fn any_other_exit_code_still_fails_the_install() {
+        for code in [1, 2, 4, 101, 255] {
+            let err = interpret_apply_exit(code)
+                .expect_err("only 0 and 3 are survivable")
+                .to_string();
+            assert!(err.contains(&code.to_string()), "the code must be named: {err}");
+        }
+    }
+    use crate::sso::SsoDecision;
+
+    fn answers(apps: &[&str], sso: bool) -> Answers {
+        Answers {
+            hostname: "saltbox".into(),
+            base_domain: Some("thesyms.ca".into()),
+            acme_email: Some("me@thesyms.ca".into()),
+            sso: SsoDecision {
+                enabled: sso,
+                unauthenticated_accepted_for: Vec::new(),
+                admin_email: sso.then(|| "admin@thesyms.ca".to_string()),
+            },
+            apps: apps.iter().map(|s| s.to_string()).collect(),
+            cloudflare_token: Some(crate::answers::Secret::new("tok".into())),
+            // Nothing in this module reads the DNS decision; it reaches the
+            // host through settings.json, which render.rs owns and tests.
+            dns: None,
+        }
+    }
+
+    fn get(answers: &Answers, key: &str) -> String {
+        env(answers)
+            .into_iter()
+            .find(|(k, _)| k == key)
+            .unwrap_or_else(|| panic!("{key} not in the stage-2 environment"))
+            .1
+    }
+
+    /// Every variable in the documented list must actually be emitted.
+    /// Missing one is silent: the stage-2 build fails much later on a
+    /// missing .sops path the operator has never heard of.
+    #[test]
+    fn every_documented_variable_is_emitted() {
+        let e = env(&answers(&["sonarr"], true));
+        let emitted: Vec<&str> = e.iter().map(|(k, _)| k.as_str()).collect();
+        for expected in STAGE2_OVERRIDDEN {
+            assert!(
+                emitted.contains(expected),
+                "{expected} is missing from {emitted:?}"
+            );
+        }
+        assert_eq!(e.len(), STAGE2_OVERRIDDEN.len(), "no extras either");
+    }
+
+    /// The nastiest of the five: an EMPTY string is not the same as unset.
+    /// main.rs's unwrap_or_else fires only when unset, so the baked empty
+    /// value survives the filter and collects to an empty list.
+    #[test]
+    fn servarr_apps_lists_only_the_selected_servarr_apps() {
+        assert_eq!(
+            get(&answers(&["sonarr", "plex"], true), "FERRUM_SERVARR_APPS"),
+            "sonarr"
+        );
+        assert_eq!(
+            get(
+                &answers(&["prowlarr", "radarr", "sonarr"], true),
+                "FERRUM_SERVARR_APPS"
+            ),
+            "sonarr,radarr,prowlarr",
+            "order follows overlays.nix's own list"
+        );
+        assert_eq!(
+            get(&answers(&["plex", "jellyfin"], true), "FERRUM_SERVARR_APPS"),
+            ""
+        );
+    }
+
+    /// qbittorrent and sabnzbd have their own mechanisms and must not be
+    /// treated as servarr apps, matching overlays.nix.
+    #[test]
+    fn non_servarr_apps_never_appear_in_the_servarr_list() {
+        let v = get(
+            &answers(&["qbittorrent", "sabnzbd", "jellyfin", "plex"], true),
+            "FERRUM_SERVARR_APPS",
+        );
+        assert_eq!(v, "");
+    }
+
+    #[test]
+    fn auth_variables_track_the_sso_decision() {
+        let on = answers(&["sonarr"], true);
+        assert_eq!(get(&on, "FERRUM_AUTH_ENABLED"), "1");
+        assert_eq!(get(&on, "FERRUM_ADMIN_EMAIL"), "admin@thesyms.ca");
+
+        let off = answers(&["sonarr"], false);
+        assert_eq!(get(&off, "FERRUM_AUTH_ENABLED"), "0");
+        assert_eq!(get(&off, "FERRUM_ADMIN_EMAIL"), "");
+    }
+
+    /// sabnzbd declares its sopsFile unconditionally, so a stage-1 empty
+    /// state dir means ensure_sabnzbd_apikey is skipped and the build
+    /// fails on the missing file.
+    #[test]
+    fn sabnzbd_gets_a_state_dir_only_when_selected() {
+        assert_eq!(
+            get(&answers(&["sabnzbd"], true), "FERRUM_SABNZBD_STATE_DIR"),
+            "/var/lib/ferrum/state/sabnzbd"
+        );
+        assert_eq!(
+            get(&answers(&["sonarr"], true), "FERRUM_SABNZBD_STATE_DIR"),
+            ""
+        );
+        assert_eq!(
+            get(&answers(&["sabnzbd"], true), "FERRUM_SABNZBD_PORT"),
+            "8080"
+        );
+    }
+
+    #[test]
+    fn the_prefix_quotes_every_value() {
+        let p = env_prefix(&answers(&["sonarr"], true));
+        assert!(p.contains("FERRUM_SERVARR_APPS='sonarr'"), "{p}");
+        assert!(p.contains("FERRUM_AUTH_ENABLED='1'"), "{p}");
+        assert!(
+            p.contains("FERRUM_SABNZBD_STATE_DIR=''"),
+            "empty must still be set: {p}"
+        );
+    }
+
+    /// An empty value must be EXPORTED as empty, not omitted -- omitting it
+    /// would let the stage-1 baked value stand, which is the entire defect.
+    #[test]
+    fn empty_values_are_still_exported() {
+        let p = env_prefix(&answers(&["plex"], false));
+        for k in STAGE2_OVERRIDDEN {
+            assert!(p.contains(&format!("{k}=")), "{k} was omitted from: {p}");
+        }
+    }
+
+    #[test]
+    fn a_quote_in_a_value_cannot_break_out_of_the_shell_word() {
+        let mut a = answers(&["sonarr"], true);
+        a.sso.admin_email = Some("wei'rd@example.com".into());
+        let p = env_prefix(&a);
+        assert!(p.contains(r"'\''"), "single quote must be escaped: {p}");
+    }
+
+    #[test]
+    fn the_ownership_repair_is_what_bootstrap_nix_tells_you_to_run() {
+        let c = ownership_repair();
+        assert!(c.contains("chown root:ferrum /etc/ferrum/settings.json"));
+        assert!(c.contains("chmod 0664"));
+    }
+
+    /// Ownership is repaired BEFORE and AFTER the settings swap: whether it
+    /// survives depends on the copy mechanism, and `cp` over an existing
+    /// file preserves ownership only if it truncates in place.
+    #[test]
+    fn ownership_is_repaired_on_both_sides_of_the_swap() {
+        // The swap itself moved to the operator's side, so the marker here
+        // is the delivery of the result rather than a remote `cp`.
+        let c = commands(&answers(&["sonarr"], true));
+        let swap = c
+            .iter()
+            .position(|x| *x == crate::install::extract_into_etc_ferrum())
+            .unwrap();
+        assert!(c[..swap].iter().any(|x| x.contains("chown root:ferrum")));
+        assert!(c[swap..].iter().any(|x| x.contains("chown root:ferrum")));
+    }
+
+    #[test]
+    fn the_token_is_delivered_before_the_apply() {
+        let c = commands(&answers(&["sonarr"], true));
+        let put = c
+            .iter()
+            .position(|x| x.contains("put-secret acme-dns"))
+            .unwrap();
+        let apply = c
+            .iter()
+            .position(|x| x.contains("ferrum-apply apply"))
+            .unwrap();
+        assert!(
+            put < apply,
+            "the .sops file must exist before the build evaluates"
+        );
+    }
+
+    #[test]
+    fn no_token_means_no_put_secret() {
+        let mut a = answers(&["sonarr"], true);
+        a.cloudflare_token = None;
+        assert!(!commands(&a).iter().any(|c| c.contains("put-secret")));
+    }
+
+    /// acme.nix hands the decrypted file to systemd as an EnvironmentFile,
+    /// so a bare token produces a file ACME cannot use.
+    #[test]
+    fn the_acme_payload_is_an_environment_file_line() {
+        assert_eq!(acme_payload("abc123"), "CLOUDFLARE_DNS_API_TOKEN=abc123");
+    }
+
+    #[test]
+    fn the_apply_carries_the_whole_environment() {
+        let c = commands(&answers(&["sonarr", "sabnzbd"], true));
+        let apply = c.iter().find(|x| x.contains("ferrum-apply apply")).unwrap();
+        for k in STAGE2_OVERRIDDEN {
+            assert!(apply.contains(k), "{k} missing from: {apply}");
+        }
+    }
+
+    /// Nix ignores untracked files inside a git tree, so the swapped
+    /// settings must reach the host TRACKED before the apply re-evaluates
+    /// /etc/ferrum -- which is what the tar of .git delivers.
+    #[test]
+    fn the_swapped_settings_arrive_tracked_before_the_apply() {
+        let c = commands(&answers(&["sonarr"], true));
+        let extract = c
+            .iter()
+            .position(|x| *x == crate::install::extract_into_etc_ferrum())
+            .expect("settings.json and .git must be delivered to the host");
+        let apply = c
+            .iter()
+            .position(|x| x.contains("ferrum-apply apply"))
+            .unwrap();
+        assert!(extract < apply, "{c:?}");
+    }
+
+    /// Nothing stage 2 runs on the host may need git.
+    ///
+    /// A real install failed here with "git: command not found" -- the
+    /// second site of that bug, found only because the first fix did not
+    /// sweep for others.
+    ///
+    /// Mutation check: put any git command back into `commands` and this
+    /// fails.
+    #[test]
+    fn no_command_stage_2_runs_on_the_host_needs_git() {
+        for c in commands(&answers(&["sonarr"], true)) {
+            assert!(
+                !c.contains("git "),
+                "a ferrum host has no git, and this would fail on it: {c}"
+            );
+        }
+    }
+
+    /// Ownership is repaired AFTER the tar, because tar restores
+    /// settings.json as root:root and ferrumd must be able to write it.
+    #[test]
+    fn ownership_is_repaired_after_the_settings_arrive() {
+        let c = commands(&answers(&["sonarr"], true));
+        let extract = c
+            .iter()
+            .position(|x| *x == crate::install::extract_into_etc_ferrum())
+            .unwrap();
+        let repair_after = c
+            .iter()
+            .skip(extract)
+            .position(|x| x == ownership_repair())
+            .expect("settings.json arrives root:root and must be fixed");
+        let apply = c
+            .iter()
+            .position(|x| x.contains("ferrum-apply apply"))
+            .unwrap();
+        assert!(extract + repair_after < apply, "{c:?}");
+    }
+}

@@ -1,0 +1,10 @@
+.fk-badge {
+  display: inline-block; font-size: .7rem; text-transform: uppercase;
+  letter-spacing: .06em; font-weight: 700; padding: .15rem .45rem;
+  border-radius: .25rem; border: 1px solid var(--ferrum-line);
+  color: var(--ferrum-muted);
+}
+.fk-badge[data-tone="ok"] { color: var(--ferrum-ok); border-color: var(--ferrum-ok); }
+.fk-badge[data-tone="accent"] { color: var(--ferrum-accent); border-color: var(--ferrum-accent); }
+.fk-badge[data-tone="danger"] { color: var(--ferrum-danger); border-color: var(--ferrum-danger); }
+.fk-badge[data-tone="warn"] { color: var(--ferrum-warn); border-color: var(--ferrum-warn); }

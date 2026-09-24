@@ -1,0 +1,9 @@
+.fk-apply { display: grid; gap: .7rem; }
+.fk-apply-steps { list-style: none; margin: 0; padding: 0; display: grid; gap: .35rem; }
+.fk-apply-steps li { display: flex; align-items: baseline; gap: .55rem; font-size: .9rem; }
+.fk-apply-mark { width: .55rem; height: .55rem; border-radius: 50%; flex: none; background: var(--ferrum-line); }
+.fk-apply-steps li[data-state="running"] .fk-apply-mark { background: var(--ferrum-accent); }
+.fk-apply-steps li[data-state="done"] .fk-apply-mark { background: var(--ferrum-ok); }
+.fk-apply-steps li[data-state="failed"] .fk-apply-mark { background: var(--ferrum-danger); }
+.fk-apply-steps li[data-state="pending"] .fk-apply-label { color: var(--ferrum-muted); }
+.fk-apply-detail { font-family: var(--ferrum-mono); font-size: .8rem; color: var(--ferrum-danger); }

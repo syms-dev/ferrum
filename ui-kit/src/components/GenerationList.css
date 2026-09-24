@@ -1,0 +1,21 @@
+.fk-gens { list-style: none; margin: 0; padding: 0; }
+.fk-gen {
+  border: 1px solid var(--ferrum-line); border-radius: var(--ferrum-radius);
+  padding: .7rem .9rem; margin-bottom: .6rem; background: var(--ferrum-panel);
+}
+.fk-gen[data-current="true"] { border-color: var(--ferrum-accent); }
+.fk-gen-main { display: flex; align-items: baseline; gap: .6rem; flex-wrap: wrap; }
+.fk-gen-num { font-family: var(--ferrum-mono); font-weight: 700; }
+.fk-gen-now {
+  font-size: .7rem; text-transform: uppercase; letter-spacing: .06em;
+  font-weight: 700; color: var(--ferrum-accent);
+}
+.fk-gen-when { margin-left: auto; font-size: .82rem; color: var(--ferrum-muted); }
+.fk-gen-summary { margin: .35rem 0 0; font-size: .88rem; color: var(--ferrum-muted); }
+.fk-gen button {
+  font: inherit; font-size: .85rem; cursor: pointer; margin-top: .5rem;
+  background: transparent; color: var(--ferrum-text);
+  border: 1px solid var(--ferrum-line); border-radius: var(--ferrum-radius-sm);
+  padding: .3rem .7rem;
+}
+.fk-gen button:hover { border-color: var(--ferrum-accent); color: var(--ferrum-accent); }

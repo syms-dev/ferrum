@@ -49,6 +49,19 @@ jobs:
       - uses: DeterminateSystems/nix-installer-action@main
 
       - uses: DeterminateSystems/magic-nix-cache-action@main
+      # Every job in this workflow now carries this, including the cheap
+      # one. Fixing only the jobs that happened to be red is what left
+      # vm-tests exposed to the identical failure one push later.
+      - name: A throttled cache must slow this job, not fail it
+        run: |
+          sudo tee -a /etc/nix/nix.conf >/dev/null <<'CONF'
+          fallback = true
+          connect-timeout = 5
+          stalled-download-timeout = 20
+          CONF
+          nix config show 2>/dev/null \
+            | grep -E '^(fallback|connect-timeout|stalled-download-timeout)' \
+            || echo "note: could not read the settings back; they are appended regardless"
 
       - name: /dev/kvm is available and accessible
         run: |
@@ -66,6 +79,143 @@ jobs:
   #
   # x86_64 only, deliberately: the aarch64 hosted runners have no /dev/kvm
   # (see the matrix comment above), so there is nowhere to run these today.
+  # Phase 1.6a story S13: the half of the installer that a sandboxed
+  # runNixOSTest cannot reach. tests/install-from-nothing.nix covers the
+  # PRE-DESTRUCTIVE refusals and the blank-disk invariant only -- NOT the
+  # install itself, because Tier 1 evaluates a flake whose ferrum input is
+  # a remote `github:` reference and the sandbox has no network. Everything
+  # from the install onward is proven here or nowhere. Stage 2 additionally
+  # exists so each app's sopsFile is
+  # created at RUNTIME on the guest, which rules out the pre-built-closure
+  # trick the other VM tests rely on and needs a network to build in place.
+  #
+  # Two jobs rather than one: they need separate blank targets (the first
+  # leaves its machine installed), and a failure in one should not hide the
+  # other. Both are slow -- a real QEMU guest builds its own closure.
+  stage2:
+    runs-on: ubuntu-latest
+    # 90 was too small and killed real, healthy runs. Measured on run
+    # 35347617925: `stage2` was still building past 85 minutes and would
+    # have hit the cap, and `stage2-resume` failed at exactly 60 minutes on
+    # its own inner `timeout` with the guest already booted -- both budget
+    # exhaustion, neither a defect. A from-scratch NixOS install plus a
+    # stage-2 rebuild with sonarr and sabnzbd, against a routinely
+    # throttled CI cache, is simply an hour-plus of work; the resume does
+    # all of it again after the kill.
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+      # A throttled cache must make this job SLOWER, never red.
+      #
+      # stage2 and stage2-resume failed on every run from at least
+      # 2026-09-21 to 2026-09-23 without once failing on ferrum's code.
+      # Both died fetching from the GitHub Actions cache, which rate-limits
+      # them: `substituter ... is disabled` on the 21st, `HTTP error 418`
+      # (ResourceExhausted / rate limit exceeded) on the 23rd. The changing
+      # symptom is part of why it read as noise rather than as a standing
+      # outage.
+      #
+      # The cost is not a red cross. stage2 is "install a real host end to
+      # end", so the most load-bearing test this project has spent days
+      # returning no signal at all -- and returning it in a shape
+      # indistinguishable from a code failure. This repository has already
+      # paid for that lesson once: the aarch64 smoke leg needed a
+      # twenty-line comment to stop its expected failure being misread.
+      #
+      # `fallback` is the setting that matches the failure: when a
+      # substituter claims a path and then cannot deliver it, build the path
+      # locally instead of failing the command. A cache outage becomes
+      # minutes, which the 180-minute budget above already absorbs.
+      # The timeouts stop a rate-limited endpoint from spending that budget
+      # hanging rather than building.
+      #
+      # NOT YET CONFIRMED against a throttled run -- the condition cannot be
+      # reproduced locally, since it needs GitHub's own cache to refuse us.
+      # If these jobs still fail this way, the next step is dropping the
+      # cache action from them entirely rather than tuning it further.
+      - name: A throttled cache must slow this job, not fail it
+        run: |
+          sudo tee -a /etc/nix/nix.conf >/dev/null <<'CONF'
+          fallback = true
+          connect-timeout = 5
+          stalled-download-timeout = 20
+          CONF
+          # Read back, but never fail on the read-back itself: GitHub runs
+          # these steps under `bash -e`, so an unsupported `nix config show`
+          # spelling would turn this job red for a different reason than the
+          # one it exists to fix -- swapping one false failure for another.
+          nix config show 2>/dev/null \
+            | grep -E '^(fallback|connect-timeout|stalled-download-timeout)' \
+            || echo "note: could not read the settings back; they are appended regardless"
+      - name: /dev/kvm is available
+        run: test -r /dev/kvm && test -w /dev/kvm
+      - name: install a real host end to end, with sonarr and sabnzbd
+        run: ./tests/stage2/run.sh
+
+  stage2-resume:
+    runs-on: ubuntu-latest
+    # 90 was too small and killed real, healthy runs. Measured on run
+    # 35347617925: `stage2` was still building past 85 minutes and would
+    # have hit the cap, and `stage2-resume` failed at exactly 60 minutes on
+    # its own inner `timeout` with the guest already booted -- both budget
+    # exhaustion, neither a defect. A from-scratch NixOS install plus a
+    # stage-2 rebuild with sonarr and sabnzbd, against a routinely
+    # throttled CI cache, is simply an hour-plus of work; the resume does
+    # all of it again after the kill.
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+      # A throttled cache must make this job SLOWER, never red.
+      #
+      # stage2 and stage2-resume failed on every run from at least
+      # 2026-09-21 to 2026-09-23 without once failing on ferrum's code.
+      # Both died fetching from the GitHub Actions cache, which rate-limits
+      # them: `substituter ... is disabled` on the 21st, `HTTP error 418`
+      # (ResourceExhausted / rate limit exceeded) on the 23rd. The changing
+      # symptom is part of why it read as noise rather than as a standing
+      # outage.
+      #
+      # The cost is not a red cross. stage2 is "install a real host end to
+      # end", so the most load-bearing test this project has spent days
+      # returning no signal at all -- and returning it in a shape
+      # indistinguishable from a code failure. This repository has already
+      # paid for that lesson once: the aarch64 smoke leg needed a
+      # twenty-line comment to stop its expected failure being misread.
+      #
+      # `fallback` is the setting that matches the failure: when a
+      # substituter claims a path and then cannot deliver it, build the path
+      # locally instead of failing the command. A cache outage becomes
+      # minutes, which the 180-minute budget above already absorbs.
+      # The timeouts stop a rate-limited endpoint from spending that budget
+      # hanging rather than building.
+      #
+      # NOT YET CONFIRMED against a throttled run -- the condition cannot be
+      # reproduced locally, since it needs GitHub's own cache to refuse us.
+      # If these jobs still fail this way, the next step is dropping the
+      # cache action from them entirely rather than tuning it further.
+      - name: A throttled cache must slow this job, not fail it
+        run: |
+          sudo tee -a /etc/nix/nix.conf >/dev/null <<'CONF'
+          fallback = true
+          connect-timeout = 5
+          stalled-download-timeout = 20
+          CONF
+          # Read back, but never fail on the read-back itself: GitHub runs
+          # these steps under `bash -e`, so an unsupported `nix config show`
+          # spelling would turn this job red for a different reason than the
+          # one it exists to fix -- swapping one false failure for another.
+          nix config show 2>/dev/null \
+            | grep -E '^(fallback|connect-timeout|stalled-download-timeout)' \
+            || echo "note: could not read the settings back; they are appended regardless"
+      - name: /dev/kvm is available
+        run: test -r /dev/kvm && test -w /dev/kvm
+      - name: kill nixos-anywhere mid-install, then resume
+        run: ./tests/stage2/resume.sh
+
   vm-tests:
     runs-on: ubuntu-latest
     steps:
@@ -74,6 +224,26 @@ jobs:
       - uses: DeterminateSystems/nix-installer-action@main
 
       - uses: DeterminateSystems/magic-nix-cache-action@main
+      # Same reason as stage2 above, arrived at one push later. This job was
+      # passing until the bug-hunt work added eight checks and forty-two
+      # tests; the extra build volume was enough to pull it over the same
+      # GitHub Actions cache rate limit, and it failed with the identical
+      # HTTP 418 / ResourceExhausted / "throttled Magic Nix Cache" trio.
+      #
+      # Fixing only the jobs that were red at the time was the narrower and
+      # more careful choice, and it was wrong: the throttle is a property of
+      # how much this workflow builds, not of which job builds it, so any
+      # job here is one busy run away from the same failure.
+      - name: A throttled cache must slow this job, not fail it
+        run: |
+          sudo tee -a /etc/nix/nix.conf >/dev/null <<'CONF'
+          fallback = true
+          connect-timeout = 5
+          stalled-download-timeout = 20
+          CONF
+          nix config show 2>/dev/null \
+            | grep -E '^(fallback|connect-timeout|stalled-download-timeout)' \
+            || echo "note: could not read the settings back; they are appended regardless"
 
       - name: /dev/kvm is available and accessible
         run: |
@@ -94,4 +264,5 @@ jobs:
             .#checks.x86_64-linux.state-restore-interlock \
             .#checks.x86_64-linux.privilege-boundary \
             .#checks.x86_64-linux.daemon-end-to-end \
-            .#checks.x86_64-linux.daemon-apply-end-to-end
+            .#checks.x86_64-linux.daemon-apply-end-to-end \
+            .#checks.x86_64-linux.install-from-nothing

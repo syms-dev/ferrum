@@ -1,0 +1,15 @@
+.fk-copy { display: inline-flex; align-items: center; gap: .4rem; min-width: 0; }
+.fk-copy[data-variant="block"] { display: flex; width: 100%; }
+.fk-copy-value {
+  font-family: var(--ferrum-mono); font-size: .8rem; color: var(--ferrum-text);
+  overflow-x: auto; white-space: nowrap; min-width: 0;
+}
+.fk-copy-btn {
+  font: inherit; font-size: .7rem; text-transform: uppercase; letter-spacing: .06em;
+  font-weight: 700; cursor: pointer; flex: none; padding: .1rem .4rem;
+  border-radius: var(--ferrum-radius-sm); border: 1px solid var(--ferrum-line);
+  background: transparent; color: var(--ferrum-muted);
+}
+.fk-copy-btn:hover { color: var(--ferrum-accent); border-color: var(--ferrum-accent); }
+.fk-copy-btn[data-state="copied"] { color: var(--ferrum-ok); border-color: var(--ferrum-ok); }
+.fk-copy-btn[data-state="failed"] { color: var(--ferrum-danger); border-color: var(--ferrum-danger); }

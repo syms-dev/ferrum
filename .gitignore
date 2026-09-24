@@ -16,6 +16,22 @@ Thumbs.db
 
 # Local agent/tooling config -- not part of the ferrum project
 .claude/
+
+# Agent/SDLC tooling is how ferrum is BUILT, not part of what ferrum IS.
+# ferrum is a NixOS media-server appliance; a reader cloning it wants the
+# modules, the crates and the installer, not a development pipeline's
+# scaffolding. Keeping it out also stops two specific embarrassments:
+# .ckit/config/stack-catalog.snapshot.yaml records python/fastapi/postgres
+# for a repo with zero .py files, and the agent-memory store is a running
+# commentary on the project's own mistakes. Both are useful locally and
+# neither belongs in front of a stranger.
+#
+# All of it still works -- these files live on disk and the hooks read
+# them. They are simply not distributed.
+.ckit/
+AGENTS.md
+README.claude-sdlc.md
+.design-sync/NOTES.md
 .serena/
 .superpowers/
 CLAUDE.md
@@ -23,3 +39,36 @@ CLAUDE.md
 # Secrets should never land unencrypted
 *.env
 *.env.local
+
+# ckit shared runtime state and recoverable sidecars
+# CONTINUITY.md is the live working-memory scratchpad: high-churn by design,
+# rewritten every turn, and meaningful only on the machine that wrote it.
+# claude-kit's own rule (.claude/rules/continuity.md) says never commit it --
+# it was tracked here by accident and touched 12 commits on this branch alone.
+# The committed counterpart is .ckit/agent-memory/, which is durable and low-churn.
+.ckit/CONTINUITY.md
+.ckit/state/*
+!.ckit/state/.gitkeep
+.ckit/tmp/*
+!.ckit/tmp/.gitkeep
+.ckit/config/upgrade-in-progress.json
+.ckit.bak-*/
+.claude.bak-*/
+.codex.bak-*/
+.agents.bak-*/
+.claude-kit-txn-*/
+.claude-kit-managed-execution.lock
+*.claude-kit
+*.codex-kit
+
+# ui-kit build products and deps
+ui-kit/node_modules/
+ui-kit/dist/
+# design-sync: the durable inputs (config.json, NOTES.md, conventions.md,
+# previews/, overrides/) ARE committed so a re-sync on another machine
+# reuses them. Only machine state and staged scripts are ignored.
+.design-sync/.cache/
+.design-sync/learnings/
+.design-sync/node_modules/
+ds-bundle/
+.ds-sync/

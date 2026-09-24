@@ -14,6 +14,16 @@ serde_json = "1"
 anyhow = "1"
 rustix = { version = "0.38", features = ["fs"] }
 ferrum-secrets = { path = "../ferrum-secrets" }
+ferrum-state = { path = "../ferrum-state" }
+# The one seam that talks to Cloudflare (OQ1/D-01). A path dependency on the
+# workspace member, never a second `ureq` here: both on-host call sites and
+# ferrum-install share one HTTP client through one library crate, which is
+# what keeps the ownership guards unbypassable.
+ferrum-dns = { path = "../ferrum-dns" }
 
 [dev-dependencies]
 tempfile = "3"
+# The fake Cloudflare server, reached across the crate boundary. No test in
+# this workspace may call the real API: the Nix sandbox that runs
+# workspace-tests has no network at all.
+ferrum-dns = { path = "../ferrum-dns", features = ["testing"] }

@@ -1,0 +1,144 @@
+import { Badge } from "./Badge";
+import { CapacityBar } from "./CapacityBar";
+import { Copyable } from "./Copyable";
+import "./DiskCard.css";
+
+export interface DiskPartition {
+  name: string;
+  fstype?: string;
+  size?: string;
+  mountpoint?: string;
+}
+
+export interface Disk {
+  /** Kernel name, e.g. `sda`. */
+  name: string;
+  /** Total capacity in bytes. */
+  size: number;
+  /** Bytes in use, when known. Absent for an unpartitioned disk. */
+  used?: number;
+  model?: string;
+  /**
+   * The serial. Absent means the disk is UNSELECTABLE: there is nothing
+   * the operator could type to name it, so the confirmation gate cannot
+   * cover it. Its absence does not disqualify the machine — a floppy or
+   * an empty card reader has no serial and refusing the whole host over
+   * one was a real defect.
+   */
+  serial?: string;
+  /** Stable `/dev/disk/by-id/` path. */
+  byId?: string;
+  partitions?: DiskPartition[];
+  /** This is the disk the system is currently running from. */
+  isOsDisk?: boolean;
+  /** This disk already holds a ferrum installation. */
+  hasFerrum?: boolean;
+}
+
+/**
+ * Disk size as the label on the drive reads it.
+ *
+ * Decimal units, because that is what manufacturers print and what lsblk
+ * reports -- and a unit switch below 1 TB, because a 240 GB boot SSD
+ * rendered as "0.3 TB" tells the operator nothing they can match against
+ * the hardware in front of them.
+ */
+function formatSize(bytes: number): string {
+  return bytes >= 1e12
+    ? `${(bytes / 1e12).toFixed(1)} TB`
+    : `${Math.round(bytes / 1e9)} GB`;
+}
+
+export interface DiskCardProps {
+  disk: Disk;
+  selected?: boolean;
+  onSelect?: (name: string) => void;
+}
+
+/**
+ * One disk, as something to choose between — not a row in a table.
+ *
+ * Stacked cards rather than a grid, deliberately: a grid invites
+ * comparison by position, but the operator must compare by the label
+ * they are about to TYPE. Everything here is arranged so the
+ * identification line (name, size, model) is largest and the serial is
+ * findable, with the rest as corroboration.
+ *
+ * A disk with no serial renders locked and cannot be chosen.
+ */
+export function DiskCard({ disk, selected = false, onSelect }: DiskCardProps) {
+  const selectable = Boolean(disk.serial);
+  return (
+    <button
+      type="button"
+      className="fk-disk"
+      data-selected={selected}
+      data-locked={!selectable}
+      aria-pressed={selectable ? selected : undefined}
+      disabled={!selectable}
+      onClick={selectable ? () => onSelect?.(disk.name) : undefined}
+    >
+      <span className="fk-disk-head">
+        <span className="fk-disk-name">{disk.name}</span>
+        <span className="fk-disk-size">{formatSize(disk.size)}</span>
+        <span className="fk-disk-model">{disk.model ?? "(no model reported)"}</span>
+        <span className="fk-disk-pick">
+          {!selectable ? "Not selectable" : selected ? "Will be erased" : "Select"}
+        </span>
+      </span>
+
+      {!selectable && (
+        <p className="fk-disk-note">
+          This disk reports no serial, so there&apos;s nothing you could type to name it. You
+          can&apos;t pick it. It doesn&apos;t stop you installing on the others.
+        </p>
+      )}
+
+      {selectable && (
+        <>
+          {disk.used !== undefined && (
+            <CapacityBar used={disk.used} total={disk.size} tone={selected ? "danger" : "neutral"} />
+          )}
+
+          <span className="fk-disk-badges">
+            {disk.isOsDisk && <Badge tone="accent">Running the OS</Badge>}
+            {disk.hasFerrum && <Badge>Has a ferrum install</Badge>}
+            {!disk.isOsDisk && disk.used !== undefined && disk.used > 0 && (
+              <Badge tone="ok">Holds data</Badge>
+            )}
+          </span>
+
+          <span className="fk-disk-kv">
+            <span className="fk-disk-k">serial</span>
+            <Copyable
+              value={disk.serial ?? ""}
+              describe={`Copy ${disk.name}'s serial`}
+              variant="inline"
+            />
+            {disk.byId && (
+              <>
+                <span className="fk-disk-k">by-id</span>
+                <Copyable
+                  value={disk.byId}
+                  describe={`Copy ${disk.name}'s by-id path`}
+                  variant="inline"
+                />
+              </>
+            )}
+          </span>
+
+          {disk.partitions && disk.partitions.length > 0 && (
+            <span className="fk-disk-parts">
+              {disk.partitions.map((p) => (
+                <span key={p.name}>
+                  {p.name} {p.fstype ?? "—"} {p.size ?? ""}
+                  {p.mountpoint ? ` mounted at ${p.mountpoint}` : ""}
+                </span>
+              ))}
+            </span>
+          )}
+        </>
+      )}
+    </button>
+  );
+}

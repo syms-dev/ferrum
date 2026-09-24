@@ -1,5 +1,5 @@
-use crate::generations::{is_rollbackable, snapshot_ts, GenerationInfo};
-use crate::journal;
+use ferrum_state::generations::{is_rollbackable, snapshot_ts, GenerationInfo};
+use ferrum_state::journal;
 use crate::restore_state::RollbackIntent;
 use std::path::Path;
 use std::process::Command;
@@ -134,17 +134,65 @@ fn run_inner(
     }
 
     progress.event("reboot", "scheduling the reboot into the target generation");
-    Command::new("reboot").status()?;
+    request_reboot("reboot")
+}
+
+/// Asks the machine to reboot, and refuses to call a non-zero exit a
+/// reboot.
+///
+/// `Command::status()?` propagates only a failure to SPAWN; a process that
+/// ran and exited non-zero comes back as `Ok(status)`. Discarding that
+/// status made a failed `reboot` indistinguishable from a successful one,
+/// and `run` then wrote "succeeded -- rebooting into generation N" about a
+/// machine that had not moved. The two steps above already check
+/// `status.success()` for exactly this reason; this one did not.
+///
+/// The intent file is deliberately KEPT on failure, which is the opposite
+/// of what the two steps above do. They remove it because they failed
+/// before the boot configuration was committed, so a surviving intent would
+/// "trigger a surprise state restore on some later, unrelated boot". Here
+/// `switch-to-configuration boot` has already succeeded -- generation N is
+/// armed and the next boot goes there whatever this process does -- so
+/// removing the intent would leave the machine booting the target
+/// generation with the CURRENT state, which is the mismatch the intent file
+/// exists to prevent. Keeping it is correct; saying nothing was not.
+///
+/// # Arguments
+/// * `program` - the reboot binary to run. Parameterised only so the
+///   failure path can be exercised against a real process with a real exit
+///   code.
+///
+/// # Errors
+/// When the reboot cannot be spawned, or exits non-zero. The message says
+/// the machine is still up and that the target generation is nonetheless
+/// armed, because the operator's next action differs completely from the
+/// other two failure paths: there, nothing happened; here, the rollback
+/// will complete on the next boot by any cause.
+fn request_reboot(program: &str) -> anyhow::Result<()> {
+    let status = Command::new(program).status()?;
+    if !status.success() {
+        anyhow::bail!(
+            "the machine did not reboot: {program} exited with {}. The \
+             target generation is already armed and the rollback intent is \
+             still in place, so the rollback WILL complete on the next \
+             boot -- reboot deliberately rather than leaving it to happen \
+             unannounced.",
+            status
+                .code()
+                .map(|c| format!("status {c}"))
+                .unwrap_or_else(|| "a signal".to_string())
+        );
+    }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::journal::JournalEntry;
+    use ferrum_state::journal::JournalEntry;
 
     fn write_journal_entry(dir: &std::path::Path, snapshot: &str, generation: u32) {
-        crate::journal::write(
+        ferrum_state::journal::write(
             dir,
             &JournalEntry {
                 snapshot: snapshot.to_string(),
@@ -155,6 +203,64 @@ mod tests {
             },
         )
         .unwrap();
+    }
+
+    /// A `reboot` that exits non-zero is not a reboot.
+    ///
+    /// `Command::status()?` propagates only a failure to SPAWN. A non-zero
+    /// exit came back as `Ok(status)` and was discarded, so `run_inner`
+    /// returned `Ok(())` and `run` wrote "succeeded -- rebooting into
+    /// generation N" about a machine that had not moved.
+    /// Writes an executable `/bin/sh` script that exits with `code`, and
+    /// returns its path.
+    ///
+    /// NOT `/bin/false` and `/bin/true`, which is what these tests used
+    /// first. Those exist on a developer's machine and on CI's runner, and
+    /// do NOT exist inside a Nix build sandbox -- so `cargo test` was green
+    /// everywhere a human looked while the `cargo-test-ferrum-apply` and
+    /// `workspace-tests` flake checks failed with ENOENT. A test fixture
+    /// that depends on the ambient filesystem is a test that passes for a
+    /// reason unrelated to the code. `/bin/sh` is one of the few paths Nix
+    /// guarantees inside the sandbox, so the script is portable where the
+    /// coreutils binaries are not.
+    fn script_exiting(dir: &std::path::Path, name: &str, code: u8) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(name);
+        std::fs::write(&path, format!("#!/bin/sh\nexit {code}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn a_reboot_that_fails_is_not_reported_as_a_reboot() {
+        let dir = tempfile::tempdir().unwrap();
+        let failing = script_exiting(dir.path(), "reboot-fails", 1);
+        let err = request_reboot(&failing).unwrap_err().to_string();
+        assert!(
+            err.contains("did not reboot"),
+            "the operator has to be told the machine is still up: {err}"
+        );
+        assert!(
+            err.contains("armed"),
+            "and that the target generation is already committed for the \
+             next boot: {err}"
+        );
+    }
+
+    /// The success path still succeeds, so the check above cannot be
+    /// satisfied by refusing everything.
+    #[test]
+    fn a_reboot_that_is_accepted_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let accepting = script_exiting(dir.path(), "reboot-ok", 0);
+        request_reboot(&accepting).unwrap();
+    }
+
+    /// A `reboot` binary that is not there at all is a spawn failure, and
+    /// must not be mistaken for a clean reboot either.
+    #[test]
+    fn a_reboot_that_cannot_be_spawned_is_an_error() {
+        assert!(request_reboot("/nonexistent/reboot").is_err());
     }
 
     #[test]

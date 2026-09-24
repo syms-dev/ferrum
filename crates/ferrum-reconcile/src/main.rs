@@ -31,6 +31,84 @@ struct Pair {
 struct ReconcileConfig {
     apps: HashMap<String, AppConnInfo>,
     pairs: Vec<Pair>,
+    /// Root folders each *arr must know about before it can accept a
+    /// single show or film.
+    ///
+    /// Registering apps to each other is not enough to make the stack
+    /// usable: Sonarr with no root folder refuses to add a series at all,
+    /// and the operator has to go and type a path that ferrum already
+    /// knows. That is precisely the "log in and everything is pre-setup"
+    /// gap this product exists to close.
+    #[serde(default)]
+    root_folders: Vec<RootFolder>,
+    /// Where each download client writes.
+    ///
+    /// This is where hardlinking is won or lost. The *arrs import by
+    /// hardlinking out of the download directory into the library, and a
+    /// hardlink cannot cross a filesystem -- so a download client left on
+    /// its own default (somewhere under its state directory on the OS
+    /// disk) makes every import a COPY, silently.
+    #[serde(default)]
+    download_paths: Vec<DownloadPath>,
+    /// Plex, which is shaped differently from everything else here.
+    ///
+    /// It has no API key: it is claimed to a plex.tv account, and until it
+    /// is, it answers "You do not have access to this server" to anything
+    /// that is not localhost. On a ferrum host the usual escape hatch --
+    /// claim it from the LAN at :32400 -- does not exist either, because
+    /// apps are published through nginx and the port is not open.
+    #[serde(default)]
+    plex: Option<PlexConfig>,
+}
+
+/// What Plex needs to become a usable server rather than a running one.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PlexConfig {
+    /// `host:port` of the local Plex.
+    base_url: String,
+    /// sops path holding a plex.tv claim token, when one was supplied.
+    /// Claim tokens expire four minutes after they are issued, so this is
+    /// frequently a token that no longer works -- which is not an error,
+    /// it just means the operator has to supply a fresh one.
+    #[serde(default)]
+    claim_token_path: Option<String>,
+    /// Plex's own Preferences.xml, which holds the account token once the
+    /// server is claimed. That token is what library calls authenticate
+    /// with.
+    preferences_path: String,
+    /// Libraries to create if absent: (type, name, path).
+    #[serde(default)]
+    libraries: Vec<PlexLibrary>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PlexLibrary {
+    /// Plex's own vocabulary: "movie" or "show".
+    kind: String,
+    name: String,
+    path: String,
+}
+
+/// Where one download client should write.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DownloadPath {
+    app: String,
+    /// Finished downloads. Must be under the same root as the library.
+    path: String,
+    /// In-progress downloads, where the client supports a separate one.
+    #[serde(default)]
+    incomplete_path: Option<String>,
+}
+
+/// One `app -> path` root folder registration.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RootFolder {
+    app: String,
+    path: String,
 }
 
 /// Reads a sops-nix decrypted secret's bare content, trimmed of the
@@ -83,6 +161,54 @@ fn main() -> anyhow::Result<()> {
             }
         }
     }
+    // Root folders after the pairs, and independently: a failed pair must
+    // not stop the *arrs learning where their media lives, and a failed
+    // root folder must not undo a registration that worked.
+    for rf in &config.root_folders {
+        match ensure_root_folder(&config, rf) {
+            Ok(changed) => println!(
+                "ferrum-reconcile: {} root folder {} {}",
+                rf.app,
+                rf.path,
+                if changed { "ADDED" } else { "already present" }
+            ),
+            Err(e) => {
+                eprintln!(
+                    "ferrum-reconcile: {} root folder {} FAILED: {e}",
+                    rf.app, rf.path
+                );
+                had_error = true;
+            }
+        }
+    }
+
+    for dp in &config.download_paths {
+        match set_download_path(&config, dp) {
+            Ok(()) => println!(
+                "ferrum-reconcile: {} downloads -> {} OK",
+                dp.app, dp.path
+            ),
+            Err(e) => {
+                eprintln!("ferrum-reconcile: {} downloads -> {} FAILED: {e}", dp.app, dp.path);
+                had_error = true;
+            }
+        }
+    }
+
+    if let Some(plex) = &config.plex {
+        match reconcile_plex(plex) {
+            Ok(msgs) => {
+                for m in msgs {
+                    println!("ferrum-reconcile: plex {m}");
+                }
+            }
+            Err(e) => {
+                eprintln!("ferrum-reconcile: plex FAILED: {e}");
+                had_error = true;
+            }
+        }
+    }
+
     if had_error {
         anyhow::bail!("one or more pairs failed to reconcile -- see errors above");
     }
@@ -120,6 +246,294 @@ fn reconcile_pair(config: &ReconcileConfig, pair: &Pair) -> anyhow::Result<()> {
             pair.provider
         ),
     }
+}
+
+/// Ensures an *arr knows about a root folder, adding it if absent.
+///
+/// Idempotent by PATH rather than by name, because that is the identity
+/// the *arr APIs use for a root folder -- `GET /api/v3/rootfolder` returns
+/// objects whose `path` is the natural key, and adding a duplicate path is
+/// rejected by the app rather than silently merged.
+///
+/// # Arguments
+/// * `config` - the whole config, for the app's connection details.
+/// * `rf` - the app and the path it should hold.
+///
+/// # Returns
+/// `true` when a folder was added, `false` when it was already there.
+///
+/// # Errors
+/// When the app is unknown, has no API key, or its API refuses the call.
+fn ensure_root_folder(config: &ReconcileConfig, rf: &RootFolder) -> anyhow::Result<bool> {
+    let app = config
+        .apps
+        .get(&rf.app)
+        .ok_or_else(|| anyhow::anyhow!("unknown app '{}' in rootFolders", rf.app))?;
+    let key = read_api_key(&app.api_key_secret_path)?.ok_or_else(|| {
+        anyhow::anyhow!("no API key for '{}' -- required to set its root folder", rf.app)
+    })?;
+
+    let existing: Vec<serde_json::Value> = ureq::get(&format!("{}/api/v3/rootfolder", base_url(app)))
+        .set("X-Api-Key", &key)
+        .call()
+        .map_err(|e| anyhow::anyhow!("GET rootfolder failed: {e}"))?
+        .into_json()
+        .map_err(|e| anyhow::anyhow!("GET rootfolder returned invalid JSON: {e}"))?;
+    if existing
+        .iter()
+        .any(|f| f.get("path").and_then(|p| p.as_str()) == Some(rf.path.as_str()))
+    {
+        return Ok(false);
+    }
+
+    // The directory must exist before the app will accept it; the *arrs
+    // validate the path and reject one they cannot see. storage.nix
+    // creates the whole tree, so this is a guard against a mismatch
+    // between what ferrum thinks the layout is and what is on disk --
+    // exactly the disconnect that left the apps pointed at an empty
+    // /srv/media while the media sat unmounted elsewhere.
+    if !std::path::Path::new(&rf.path).is_dir() {
+        anyhow::bail!(
+            "{} does not exist on this host, so {} would reject it. The \
+             media tree is created by modules/core/storage.nix from \
+             ferrum.storage.mediaDir -- if that path is wrong, the apps and \
+             the disks disagree about where media lives.",
+            rf.path,
+            rf.app
+        );
+    }
+
+    ureq::post(&format!("{}/api/v3/rootfolder", base_url(app)))
+        .set("X-Api-Key", &key)
+        .send_json(serde_json::json!({ "path": rf.path }))
+        .map_err(|e| anyhow::anyhow!("POST rootfolder {} failed: {e}", rf.path))?;
+    Ok(true)
+}
+
+/// Points a download client at the shared media root.
+///
+/// Both clients are driven through their own APIs rather than by writing
+/// their config files. SABnzbd owns `sabnzbd.ini` and rewrites it on
+/// exit, so seeding it is fragile; qBittorrent's config is worse still.
+/// Setting it through the API is also what makes the value visible in the
+/// app's own UI, which matters when an operator goes looking.
+///
+/// Idempotent because both APIs take a desired value rather than an
+/// append -- setting the same path twice is a no-op.
+///
+/// # Arguments
+/// * `config` - the whole config, for connection details.
+/// * `dp` - the app and the paths it should write to.
+///
+/// # Errors
+/// When the app is unknown, the directory is missing, or its API refuses.
+fn set_download_path(config: &ReconcileConfig, dp: &DownloadPath) -> anyhow::Result<()> {
+    let app = config
+        .apps
+        .get(&dp.app)
+        .ok_or_else(|| anyhow::anyhow!("unknown app '{}' in downloadPaths", dp.app))?;
+    let base = base_url(app);
+
+    for path in std::iter::once(&dp.path).chain(dp.incomplete_path.iter()) {
+        if !std::path::Path::new(path).is_dir() {
+            anyhow::bail!(
+                "{path} does not exist, so {} would reject it. The download \
+                 tree is created by modules/core/storage.nix from \
+                 ferrum.storage.mediaDir.",
+                dp.app
+            );
+        }
+    }
+
+    match dp.app.as_str() {
+        // qBittorrent: LocalHostAuth is off, so no credential is needed
+        // from localhost. setPreferences takes a JSON blob as a form
+        // field, which is its own peculiar shape rather than a JSON body.
+        "qbittorrent" => {
+            let mut prefs = serde_json::json!({ "save_path": dp.path });
+            if let Some(inc) = &dp.incomplete_path {
+                prefs["temp_path"] = serde_json::json!(inc);
+                prefs["temp_path_enabled"] = serde_json::json!(true);
+            }
+            ureq::post(&format!("{base}/api/v2/app/setPreferences"))
+                .send_form(&[("json", &prefs.to_string())])
+                .map_err(|e| anyhow::anyhow!("qBittorrent setPreferences failed: {e}"))?;
+            Ok(())
+        }
+        // SABnzbd: one key per call, and the api key goes in the query.
+        "sabnzbd" => {
+            let key = read_api_key(&app.api_key_secret_path)?.ok_or_else(|| {
+                anyhow::anyhow!("no API key for sabnzbd -- required to set its directories")
+            })?;
+            let mut settings = vec![("complete_dir", dp.path.as_str())];
+            if let Some(inc) = &dp.incomplete_path {
+                settings.push(("download_dir", inc.as_str()));
+            }
+            for (keyword, value) in settings {
+                ureq::get(&format!("{base}/api"))
+                    .query("mode", "set_config")
+                    .query("section", "misc")
+                    .query("keyword", keyword)
+                    .query("value", value)
+                    .query("apikey", &key)
+                    .query("output", "json")
+                    .call()
+                    .map_err(|e| anyhow::anyhow!("SABnzbd set_config {keyword} failed: {e}"))?;
+            }
+            // set_config alone updates the running config; saving persists
+            // it to sabnzbd.ini so it survives a restart.
+            ureq::get(&format!("{base}/api"))
+                .query("mode", "config")
+                .query("name", "save")
+                .query("apikey", &key)
+                .query("output", "json")
+                .call()
+                .map_err(|e| anyhow::anyhow!("SABnzbd config save failed: {e}"))?;
+            Ok(())
+        }
+        other => anyhow::bail!("no download-path support for '{other}'"),
+    }
+}
+
+/// Claims Plex if it is unclaimed, then creates any missing libraries.
+///
+/// Both steps are skipped when already done, because this runs after
+/// every apply and must be a no-op on a host that is already set up.
+///
+/// # Arguments
+/// * `plex` - connection details, the claim token path, and the wanted
+///   libraries.
+///
+/// # Returns
+/// One line per thing it did or deliberately did not do, so the operator
+/// can see why nothing happened as easily as why something did.
+///
+/// # Errors
+/// Only for failures that are not the operator's to fix by supplying a
+/// fresh token -- an expired or rejected claim is reported, not fatal,
+/// because failing the whole unit over it would also block the libraries
+/// and every other app's reconciliation.
+fn reconcile_plex(plex: &PlexConfig) -> anyhow::Result<Vec<String>> {
+    let mut out = Vec::new();
+
+    let mut token = plex_account_token(&plex.preferences_path);
+
+    if token.is_none() {
+        match &plex.claim_token_path {
+            None => {
+                out.push(
+                    "is NOT claimed and no claim token was supplied -- it will answer \
+                     \"You do not have access to this server\" to anything but localhost. \
+                     Get one from https://plex.tv/claim (valid 4 minutes) and put it in \
+                     the plex-claim secret."
+                        .to_string(),
+                );
+            }
+            Some(path) => match claim_plex(&plex.base_url, path) {
+                Ok(()) => {
+                    out.push("claimed".to_string());
+                    token = plex_account_token(&plex.preferences_path);
+                }
+                Err(e) => out.push(format!(
+                    "could not be claimed: {e}. Claim tokens expire four minutes after \
+                     they are issued, so this is usually a stale one -- get a fresh \
+                     token from https://plex.tv/claim and replace the plex-claim secret."
+                )),
+            },
+        }
+    }
+
+    let Some(token) = token else {
+        out.push("libraries skipped: the server must be claimed first".to_string());
+        return Ok(out);
+    };
+
+    let existing = plex_existing_library_paths(&plex.base_url, &token)?;
+    for lib in &plex.libraries {
+        if existing.iter().any(|p| p == &lib.path) {
+            continue;
+        }
+        if !std::path::Path::new(&lib.path).is_dir() {
+            out.push(format!("library {:?} skipped: {} does not exist", lib.name, lib.path));
+            continue;
+        }
+        create_plex_library(&plex.base_url, &token, lib)?;
+        out.push(format!("library {:?} created at {}", lib.name, lib.path));
+    }
+    Ok(out)
+}
+
+/// Reads the account token Plex writes into Preferences.xml once claimed.
+///
+/// Its absence IS the definition of unclaimed, which is why this is the
+/// check rather than asking the server: a running unclaimed Plex answers
+/// perfectly well on localhost, so reachability proves nothing.
+fn plex_account_token(preferences_path: &str) -> Option<String> {
+    let xml = fs::read_to_string(preferences_path).ok()?;
+    let needle = "PlexOnlineToken=\"";
+    let start = xml.find(needle)? + needle.len();
+    let rest = &xml[start..];
+    let end = rest.find('"')?;
+    let token = &rest[..end];
+    if token.is_empty() {
+        None
+    } else {
+        Some(token.to_string())
+    }
+}
+
+fn claim_plex(base_url: &str, claim_token_path: &str) -> anyhow::Result<()> {
+    let claim = fs::read_to_string(claim_token_path)
+        .map_err(|e| anyhow::anyhow!("could not read the claim token at {claim_token_path}: {e}"))?
+        .trim()
+        .to_string();
+    if claim.is_empty() {
+        anyhow::bail!("the claim token is empty");
+    }
+    ureq::post(&format!("{base_url}/myplex/claim"))
+        .query("token", &claim)
+        .call()
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(())
+}
+
+fn plex_existing_library_paths(base_url: &str, token: &str) -> anyhow::Result<Vec<String>> {
+    let xml = ureq::get(&format!("{base_url}/library/sections"))
+        .set("X-Plex-Token", token)
+        .call()
+        .map_err(|e| anyhow::anyhow!("listing Plex libraries failed: {e}"))?
+        .into_string()
+        .map_err(|e| anyhow::anyhow!("Plex returned unreadable library XML: {e}"))?;
+    // Deliberately a substring scan rather than an XML parse: the only
+    // thing needed is whether a path is already used, and pulling in an
+    // XML dependency for one attribute is not worth it.
+    Ok(xml
+        .split("path=\"")
+        .skip(1)
+        .filter_map(|rest| rest.split('"').next().map(str::to_string))
+        .collect())
+}
+
+fn create_plex_library(base_url: &str, token: &str, lib: &PlexLibrary) -> anyhow::Result<()> {
+    // The agent/scanner pair is Plex's own default for each type; naming
+    // them explicitly avoids depending on whatever the server's current
+    // default happens to be.
+    let (agent, scanner) = match lib.kind.as_str() {
+        "movie" => ("tv.plex.agents.movie", "Plex Movie"),
+        "show" => ("tv.plex.agents.series", "Plex TV Series"),
+        other => anyhow::bail!("unsupported Plex library type {other:?}"),
+    };
+    ureq::post(&format!("{base_url}/library/sections"))
+        .set("X-Plex-Token", token)
+        .query("name", &lib.name)
+        .query("type", &lib.kind)
+        .query("agent", agent)
+        .query("scanner", scanner)
+        .query("language", "en-US")
+        .query("location", &lib.path)
+        .call()
+        .map_err(|e| anyhow::anyhow!("creating Plex library {:?} failed: {e}", lib.name))?;
+    Ok(())
 }
 
 /// Looks up an existing entry by `name` at `GET {base}{path}` -- both
@@ -193,6 +607,33 @@ fn provider_implementation(
     }
 }
 
+/// Builds the `mode=set_config` request that creates or updates one
+/// SABnzbd category.
+///
+/// # Arguments
+/// * `base` - the provider's base URL.
+/// * `provider_key` - SABnzbd's own API key.
+/// * `category` - the category name to create or update.
+///
+/// # Returns
+/// The prepared request, uncalled, so its query can be inspected.
+fn sabnzbd_category_request(base: &str, provider_key: &str, category: &str) -> ureq::Request {
+    // `.query()` rather than a formatted query string. Concatenation made
+    // every value here one `&` away from becoming a PARAMETER instead of
+    // staying a value, and the two parameters it could become are the ones
+    // that matter: `mode` is the whole SABnzbd API surface, and `apikey` is
+    // the credential. It is also simply the correct way to build a query --
+    // concatenation percent-encoded nothing, so a key containing `&` or `+`
+    // went out mangled.
+    ureq::get(&format!("{base}/api"))
+        .query("mode", "set_config")
+        .query("section", "categories")
+        .query("name", category)
+        .query("dir", category)
+        .query("apikey", provider_key)
+        .query("output", "json")
+}
+
 /// SABnzbd requires a category to already exist before any downloadclient
 /// registration can reference it -- confirmed for real: a registration
 /// attempt otherwise returns a real 400 "Category does not exist", unlike
@@ -206,11 +647,7 @@ fn ensure_sabnzbd_category(
     provider_key: &str,
     category: &str,
 ) -> anyhow::Result<()> {
-    let url = format!(
-        "{}/api?mode=set_config&section=categories&name={category}&dir={category}&apikey={provider_key}&output=json",
-        base_url(provider)
-    );
-    ureq::get(&url)
+    sabnzbd_category_request(&base_url(provider), provider_key, category)
         .call()
         .map_err(|e| anyhow::anyhow!("failed to ensure SABnzbd category '{category}': {e}"))?;
     Ok(())
@@ -350,6 +787,58 @@ fn register_application(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// R4/SEC3. The SABnzbd category request built its query by string
+    /// concatenation, so every value in it was one `&` away from becoming a
+    /// PARAMETER rather than staying a value. `mode` is the whole API --
+    /// `mode=shutdown`, `mode=set_config&section=misc` -- and `apikey` is
+    /// the credential, so a second copy of either decides what the call
+    /// actually does.
+    ///
+    /// Constrained in practice today (`category` is a catalog app id and
+    /// `provider_key` a generated hex string), which is why this is
+    /// hardening rather than a live hole. The concatenation is also just
+    /// wrong for a value that legitimately needs escaping: nothing here
+    /// percent-encoded anything, so a key containing `&` or `+` was
+    /// silently mangled on the wire.
+    ///
+    /// Asserted against the parsed query of the real prepared request, not
+    /// against a format string, so it is the request that is pinned.
+    #[test]
+    fn the_sabnzbd_category_request_cannot_have_parameters_smuggled_into_it() {
+        let request = sabnzbd_category_request(
+            "http://127.0.0.1:8080",
+            "realkey&mode=shutdown",
+            "tv&mode=shutdown&apikey=stolen",
+        );
+        let url = request.request_url().expect("the request url parses");
+        let pairs: Vec<(String, String)> = url
+            .as_url()
+            .query_pairs()
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect();
+
+        let values = |key: &str| -> Vec<String> {
+            pairs.iter().filter(|(k, _)| k == key).map(|(_, v)| v.clone()).collect()
+        };
+        assert_eq!(
+            values("mode"),
+            vec!["set_config".to_string()],
+            "a second `mode` decides what this call does: {pairs:?}"
+        );
+        assert_eq!(
+            values("apikey"),
+            vec!["realkey&mode=shutdown".to_string()],
+            "the credential must appear exactly once, intact: {pairs:?}"
+        );
+        assert_eq!(
+            values("name"),
+            vec!["tv&mode=shutdown&apikey=stolen".to_string()],
+            "the category must stay ONE value rather than becoming parameters: {pairs:?}"
+        );
+        assert_eq!(values("section"), vec!["categories".to_string()]);
+        assert_eq!(values("output"), vec!["json".to_string()]);
+    }
 
     #[test]
     fn category_field_name_matches_each_apps_real_schema() {

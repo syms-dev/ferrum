@@ -1,0 +1,9 @@
+.fk-safe {
+  border: 1px solid var(--ferrum-ok); background: var(--ferrum-wash-ok);
+  border-radius: var(--ferrum-radius); padding: .8rem 1rem;
+}
+.fk-safe h3 { margin: 0 0 .4rem; font-size: .9rem; color: var(--ferrum-ok); }
+.fk-safe ul { margin: 0; padding-left: 1.1rem; }
+.fk-safe li { font-family: var(--ferrum-mono); font-size: .86rem; }
+.fk-safe p { margin: .5rem 0 0; font-size: .84rem; color: var(--ferrum-muted); }
+.fk-safe code { font-family: var(--ferrum-mono); }

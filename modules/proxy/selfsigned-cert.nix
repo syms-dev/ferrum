@@ -26,12 +26,46 @@ lib.mkIf ferrum.proxy.enable {
     description = "Generate a self-signed TLS certificate for LAN-only ferrum vhosts";
     wantedBy = [ "nginx.service" ];
     before = [ "nginx.service" ];
-    unitConfig.ConditionPathExists = "!${certDir}/cert.pem";
     serviceConfig.Type = "oneshot";
     path = [ pkgs.openssl ];
+    # The gate is the certificate's DOMAIN, not its mere existence.
+    #
+    # This unit used to carry `ConditionPathExists = "!${certDir}/cert.pem"`,
+    # which asks "is there a certificate" and never "is it the right one".
+    # Since the CN and both SANs are built from ferrum.proxy.baseDomain,
+    # changing that option -- one field in the settings UI -- left every
+    # lan-exposure vhost and, on a host with no public app, the auth vhost
+    # itself serving a certificate for the OLD name. The browser refuses it,
+    # and because the auth vhost is where Authelia's forward-auth redirect
+    # lands, the failure is "SSO is broken on a host that just applied
+    # cleanly" rather than anything that points at the certificate.
+    #
+    # The domain is recorded beside the certificate and compared on every
+    # start. Recorded rather than read back out of the certificate with
+    # `openssl x509 -noout -subject`: parsing a subject line to recover a
+    # wildcard CN is a second grammar to get wrong, and the file we wrote
+    # ourselves is the fact we actually want.
+    #
+    # ConditionPathExists is dropped rather than widened, because a
+    # condition can only test paths and this is a comparison. The unit now
+    # runs on every nginx start and exits immediately when nothing changed
+    # -- a string compare against a small file, ordered before a service
+    # that is already reading the certificate from the same directory.
+    #
+    # The old certificate is replaced in place. It is self-signed and
+    # trusted by nobody, so there is nothing to preserve and no rollback
+    # value in keeping it; the pair is written together, so nginx never sees
+    # a new key beside an old certificate.
     script = ''
       set -euo pipefail
       mkdir -p -m 0755 ${certDir}
+
+      if [ -f ${certDir}/cert.pem ] \
+         && [ -f ${certDir}/key.pem ] \
+         && [ "$(cat ${certDir}/domain 2>/dev/null || true)" = "${ferrum.proxy.baseDomain}" ]; then
+        exit 0
+      fi
+
       openssl req -x509 -nodes -newkey rsa:2048 \
         -keyout ${certDir}/key.pem -out ${certDir}/cert.pem \
         -days 3650 -subj "/CN=*.${ferrum.proxy.baseDomain}" \
@@ -45,6 +79,13 @@ lib.mkIf ferrum.proxy.enable {
       chown root:${config.services.nginx.group} ${certDir}/key.pem
       chmod 640 ${certDir}/key.pem
       chmod 644 ${certDir}/cert.pem
+
+      # Written LAST, and only after both halves of the pair are in place:
+      # a marker recorded before a failed openssl run would claim a
+      # certificate for this domain exists when it does not, and the next
+      # start would take the early exit above and never retry.
+      printf '%s' "${ferrum.proxy.baseDomain}" > ${certDir}/domain
+      chmod 644 ${certDir}/domain
     '';
   };
 }

@@ -10,8 +10,95 @@
 { config, lib, pkgs, ... }:
 let
   ferrum = config.ferrum;
+
+  listenAddress = ferrum.daemon.listenAddress;
+  # 127.0.0.0/8 by its first octet, plus the two other spellings of the
+  # same thing. Split rather than prefix-matched so that "127.0.0.1.example"
+  # -- a string that starts with "127." and is not an address at all -- is
+  # not quietly admitted.
+  octets = lib.splitString "." listenAddress;
+  # Each part must be a NUMBER, and that is not a detail. Until this
+  # function existed the guard checked only how many parts there were and
+  # what the first one said, which made it a shape heuristic rather than an
+  # address parse -- and the difference was exploitable. Split
+  # `127.0.0.1 ; return 200 "pwned" ; #` on "." and you get four parts whose
+  # head is "127", so the old predicate accepted it; modules/proxy/nginx.nix
+  # then interpolated the whole string into proxy_pass, real nginx parsed
+  # the result with EXIT 0, and the control plane's own vhost answered
+  # `HTTP/1.1 200` with the attacker's body. Proved end to end, with a real
+  # nginx, before this line was written.
+  #
+  # builtins.match anchors implicitly -- it matches the WHOLE string or
+  # returns null -- which is the property doing the work here: no suffix
+  # after a valid number can survive, whether it starts with a space, a
+  # semicolon or a newline.
+  #
+  # Leading zeros are refused rather than tolerated because "127.010.0.1" is
+  # read as decimal by some resolvers and octal by others, and an address
+  # whose meaning depends on who parses it has no place in a guard whose
+  # entire job is that two programs agree on one.
+  isOctet = part:
+    builtins.match "0|[1-9][0-9]{0,2}" part != null && lib.toInt part <= 255;
+  # "localhost" is deliberately NOT here, and it is the one spelling that
+  # looks safest. It is a NAME, so the two consumers of this option resolve
+  # it differently and neither is wrong: nginx resolves it once at config
+  # load and load-balances across every address /etc/hosts offers -- on a
+  # stock host that is ::1 AND 127.0.0.1 -- while ferrumd's
+  # TcpListener::bind (crates/ferrumd/src/main.rs:585) takes the FIRST
+  # address its resolver returns and binds only that one. Measured:
+  # "localhost:7788".to_socket_addrs() yields [[::1]:7788, 127.0.0.1:7788],
+  # so nginx sends roughly half the dashboard's requests at a port nothing
+  # is listening on. That is an intermittent 502 whose cause is in neither
+  # program's logs -- strictly worse than the clean refusal an operator gets
+  # from any other name, and the reason this accepts literals only.
+  listenIsLoopback =
+    (builtins.length octets == 4
+      && builtins.head octets == "127"
+      && builtins.all isOctet octets)
+    || listenAddress == "::1";
 in
 lib.mkIf ferrum.daemon.enable {
+  assertions = [
+    {
+      # A5, enforced rather than merely described.
+      #
+      # modules/lib/settings-schema.json types daemon.listenAddress as a
+      # bare { "type": "string" }, and ferrumd's own PUT /api/settings
+      # validates against that schema -- so the web UI could write
+      # "0.0.0.0" into /etc/ferrum/settings.json, the next apply would
+      # build cleanly, and the daemon would come up on every interface
+      # with Authelia and nginx bypassed entirely. Nothing in either
+      # language said otherwise: changing the default in
+      # crates/ferrumd/src/main.rs left all 103 of that crate's tests
+      # green, and no Nix check varied the option at all.
+      #
+      # Caught here, at evaluation, because that is the last moment it is
+      # cheap. ferrumd itself cannot refuse the value it is handed: by the
+      # time the process reads FERRUMD_LISTEN_ADDRESS the host is built and
+      # the generation is being activated, so the only thing it could do is
+      # fail to start -- which takes the UI away instead of protecting it.
+      assertion = listenIsLoopback;
+      message = ''
+        ferrum.daemon.listenAddress = "${listenAddress}" is not a loopback address.
+        ferrumd holds this host's settings, its secrets API and its system
+        generations, and the only login in front of it is Authelia, in nginx
+        (modules/proxy/nginx.nix). Binding anything else puts the control
+        plane on the network with that gate bypassed.
+
+        Publishing the dashboard is what ferrum.daemon.subdomain and
+        ferrum.proxy are for: nginx reaches ferrumd over loopback and gates
+        it there. Set ferrum.daemon.listenAddress to 127.0.0.1 (or another
+        127.0.0.0/8 address, or ::1), and reach the UI from elsewhere either
+        through the proxy or over an SSH tunnel to that port.
+
+        This wants a literal, so "localhost" is refused too even though it
+        resolves to one. nginx load-balances across every address the name
+        resolves to and ferrumd binds only the first, so that spelling costs
+        you intermittent 502s instead of a clean failure.
+      '';
+    }
+  ];
+
   users.users.ferrum = {
     isSystemUser = true;
     group = "ferrum";
@@ -165,6 +252,13 @@ lib.mkIf ferrum.daemon.enable {
       FERRUM_JOBS_DIR = "/var/lib/ferrum/jobs";
       FERRUM_REQUESTS_DIR = "/run/ferrum/requests";
       FERRUM_SETTINGS_SCHEMA = "${pkgs.ferrum-settings-schema}/share/ferrum/settings-schema.json";
+      # The per-app metadata GET /api/catalog serves. Built since Phase 1.1
+      # and, until now, consumed by nothing -- nix/modules/flake/packages.nix
+      # said so in its own header comment.
+      FERRUM_CATALOG = "${pkgs.ferrum-catalog}/share/ferrum/catalog.json";
+      FERRUM_PROFILES_DIR = "/nix/var/nix/profiles";
+      FERRUM_JOURNAL_DIR = ferrum.storage.journalDir;
+      FERRUM_UI_DIR = "${pkgs.ferrum-ui}/share/ferrum/ui";
     };
     serviceConfig = {
       Type = "simple";

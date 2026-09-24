@@ -1,10 +1,11 @@
-# Builds the catalog artifact the (future) ferrumd daemon reads at runtime
+# Builds the catalog artifact the ferrumd daemon reads at runtime
 # to render the UI from -- see the plan's "How the UI discovers the
-# catalog" section. Nothing consumes this yet (ferrumd is Phase 1.5), but
-# publishing it now keeps the catalog schema honest as apps are added.
+# catalog" section. Consumed by ferrumd's GET /api/catalog (Phase 1.5b)
+# via $FERRUM_CATALOG, wired in modules/core/daemon.nix;
+# publishing it also keeps the catalog schema honest as apps are added.
 { inputs, ... }:
 {
-  perSystem = { pkgs, lib, ... }:
+  perSystem = { config, pkgs, lib, ... }:
     let
       catalog = import ../../../modules/lib/catalog.nix { inherit lib; };
     in
@@ -23,6 +24,48 @@
         ferrum-apply = pkgs.callPackage ../../../nix/pkgs/ferrum-apply { };
         ferrum-reconcile = pkgs.callPackage ../../../nix/pkgs/ferrum-reconcile { };
         ferrumd = pkgs.callPackage ../../../nix/pkgs/ferrumd { };
+        # Deliberately NOT in nix/overlays/default.nix, unlike every
+        # package above it. The overlay exists so `pkgs.<name>` resolves
+        # from inside the NixOS module tree; nothing in modules/ references
+        # the installer and nothing can, because by the time a host is
+        # being evaluated this binary's work is finished. See the package's
+        # own header.
+        ferrum-install = pkgs.callPackage ../../../nix/pkgs/ferrum-install {
+          nixos-anywhere = inputs.nixos-anywhere.packages.${pkgs.stdenv.hostPlatform.system}.default;
+          # Same source as ferrum-catalog's ferrumVersion above. A generated
+          # host pins this exact revision, so the installed machine and the
+          # tool that installed it provably agree.
+          ferrumRev = inputs.self.rev or inputs.self.dirtyRev or "dev";
+        };
+        # The SAME installer, compiled with `test-cloudflare-endpoint`, and
+        # built by nothing an operator ever runs -- `tests/stage2/run.sh`
+        # and the `production-installer-has-no-api-override` check are its
+        # only consumers, and the Docker image above is deliberately built
+        # from `ferrum-install` rather than from this.
+        #
+        # It exists because A5 verifies the operator's Cloudflare token
+        # against the live API and stage 2 installs to `s13.invalid`, a
+        # domain in nobody's account: no token, real or invented, can pass
+        # there. The alternative -- a skip flag -- was rejected, because an
+        # offline ferrum install produces a media server nobody can reach,
+        # so the valve would ship to every operator as a way to get a
+        # silently broken host. A separate artifact keeps the escape hatch
+        # out of the one people run.
+        ferrum-install-testing = pkgs.callPackage ../../../nix/pkgs/ferrum-install {
+          nixos-anywhere = inputs.nixos-anywhere.packages.${pkgs.stdenv.hostPlatform.system}.default;
+          ferrumRev = inputs.self.rev or inputs.self.dirtyRev or "dev";
+          cargoFeatures = [ "test-cloudflare-endpoint" ];
+        };
+        ferrum-install-image = pkgs.callPackage ../../../nix/pkgs/ferrum-install/image.nix {
+          ferrum-install = config.packages.ferrum-install;
+        };
+        # Also present in nix/overlays/default.nix -- modules/core/daemon.nix
+        # reads pkgs.ferrum-ui, and a package defined ONLY here builds fine
+        # and then fails at host eval with "attribute missing". That has now
+        # happened three times in this repo; see the package's own comment.
+        ferrum-ui = pkgs.callPackage ../../../nix/pkgs/ferrum-ui {
+          uiSrc = ../../../ui;
+        };
         ferrum-settings-schema = pkgs.writeTextFile {
           name = "ferrum-settings-schema.json";
           destination = "/share/ferrum/settings-schema.json";

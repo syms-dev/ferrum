@@ -1,0 +1,24 @@
+.fk-gate {
+  border: 1px solid var(--ferrum-danger); border-radius: var(--ferrum-radius);
+  padding: 1rem; background: var(--ferrum-wash-danger);
+}
+.fk-gate h3 { margin: 0 0 .3rem; color: var(--ferrum-danger); font-size: 1rem; }
+.fk-gate p { margin: .35rem 0; font-size: .88rem; }
+.fk-gate-mono { font-family: var(--ferrum-mono); }
+.fk-gate-label { display: block; font-size: .84rem; color: var(--ferrum-muted); margin-top: .6rem; }
+.fk-gate-input {
+  font: inherit; font-family: var(--ferrum-mono);
+  padding: .55rem .65rem; border-radius: var(--ferrum-radius-sm);
+  border: 1px solid var(--ferrum-line); background: var(--ferrum-panel);
+  color: var(--ferrum-text); width: 100%; max-width: 22rem; margin-top: .4rem;
+}
+.fk-gate-input:focus-visible { outline: 3px solid var(--ferrum-accent); outline-offset: 1px; }
+.fk-gate-warn { color: var(--ferrum-danger); font-weight: 650; font-size: .86rem; margin-top: .45rem; }
+.fk-gate-go {
+  font: inherit; font-weight: 700; border: 0; border-radius: var(--ferrum-radius-sm);
+  padding: .6rem .9rem; cursor: pointer; background: var(--ferrum-danger);
+  color: #fff; margin-top: .7rem; display: block;
+}
+.fk-gate-go[disabled] { opacity: .45; cursor: not-allowed; }
+.fk-gate-go:focus-visible { outline: 3px solid var(--ferrum-accent); outline-offset: 2px; }
+.fk-gate-hint { font-size: .84rem; color: var(--ferrum-muted); }

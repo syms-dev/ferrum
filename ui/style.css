@@ -1,0 +1,162 @@
+/* Plain, legible, and usable on a phone on the same LAN.
+   System fonts only -- a web font is an external request, and this page must
+   work on a box with no internet. */
+:root {
+  --bg: #14161a;
+  --panel: #1c1f26;
+  --line: #2c313b;
+  --text: #e6e8ec;
+  --muted: #9aa3b2;
+  --accent: #5aa9e6;
+  /* #e2574c measured 4.48:1 on --panel, a hair under AA. Nudged up
+   * while fixing the light-mode block rather than left as a near-miss,
+   * since danger is the colour the installer uses to say a disk is
+   * about to be erased. 4.96 on --panel, 5.45 on --bg. */
+  --danger: #e86257;
+  --ok: #56b96b;
+}
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #f6f7f9; --panel: #fff; --line: #dfe3e8;
+    --text: #1b1f27; --muted: #5c6673;
+
+    /* The semantic colours MUST be overridden here too.
+     *
+     * This block used to redefine only the surface and text tokens, so
+     * --accent, --ok and --danger kept the values chosen for the dark
+     * panel (#1c1f26, where they measure 6.5 / 6.7 / 4.5) and landed on
+     * white instead. Measured there: accent 2.54:1, ok 2.46:1, danger
+     * 3.68:1 -- all three fail WCAG AA for text, and two fail even the
+     * 3:1 floor for UI components and graphical objects.
+     *
+     * That is already wrong on the dashboard. It becomes dangerous in the
+     * installer, which uses red and green to say which disk is about to
+     * be erased and which are safe -- a 2.46:1 green is not a signal, and
+     * the operator reading it is about to destroy something.
+     *
+     * Values below are darkened until they clear 4.5:1 against BOTH
+     * surfaces in this block (--panel #fff and --bg #f6f7f9), since these
+     * tokens are used on both. Worst case is ok at 4.74:1 on --bg. */
+    --accent: #15639f;  /* 6.33 on #fff, 5.91 on #f6f7f9 */
+    --ok: #1a7f37;      /* 5.08 on #fff, 4.74 on #f6f7f9 */
+    --danger: #b3261e;  /* 6.54 on #fff, 6.10 on #f6f7f9 */
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  font: 16px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+}
+header {
+  display: flex; align-items: center; gap: 1rem;
+  padding: .75rem 1rem; border-bottom: 1px solid var(--line); background: var(--panel);
+  flex-wrap: wrap;
+}
+nav { display: flex; align-items: center; gap: .75rem; flex: 1; flex-wrap: wrap; }
+nav .spacer { flex: 1; }
+a { color: var(--accent); text-decoration: none; }
+a:hover, a:focus-visible { text-decoration: underline; }
+main { padding: 1rem; max-width: 60rem; margin: 0 auto; }
+h1, h2, h3, h4 { line-height: 1.25; }
+.hint { color: var(--muted); font-size: .9rem; margin: .25rem 0; }
+.error { color: var(--danger); }
+#status { margin: 0; padding: 0 1rem; min-height: 1.5rem; max-width: 60rem; }
+#status.ok { color: var(--ok); }
+#status.error { color: var(--danger); }
+
+.field { margin: .75rem 0; }
+label { display: block; font-weight: 600; margin-bottom: .25rem; }
+input, select, button {
+  font: inherit; padding: .5rem .6rem; border-radius: .4rem;
+  border: 1px solid var(--line); background: var(--panel); color: var(--text);
+}
+input[type=checkbox] { width: 1.1rem; height: 1.1rem; padding: 0; }
+input:disabled { opacity: .6; cursor: not-allowed; }
+input[type=text], input[type=password], input[type=number], select { width: 100%; max-width: 32rem; }
+button { cursor: pointer; background: var(--accent); color: #06121c; border: 0; font-weight: 600; }
+button.ghost { background: transparent; color: var(--accent); border: 1px solid var(--line); }
+button.danger { background: var(--danger); color: #fff; }
+/* There was no button:disabled rule, so a disabled button rendered exactly
+   like a live one -- a control that looks clickable and is not reads as a
+   broken page. Matches input:disabled above rather than inventing a second
+   disabled treatment. The dimming is the secondary cue only: the button that
+   uses this also changes its own label, so the state is never carried by
+   appearance alone. */
+button:disabled { opacity: .6; cursor: not-allowed; }
+.row { display: flex; gap: .5rem; align-items: center; flex-wrap: wrap; margin: .25rem 0; }
+.rows { margin: .5rem 0; }
+fieldset { border: 1px solid var(--line); border-radius: .5rem; margin: 1rem 0; padding: .75rem 1rem; }
+legend { font-weight: 700; padding: 0 .35rem; }
+.unsupported { color: var(--danger); }
+
+.cards { display: grid; gap: 1rem; grid-template-columns: repeat(auto-fill, minmax(15rem, 1fr)); }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: .6rem; padding: 1rem; }
+.card h3 { margin: 0 0 .25rem; }
+.pill { display: inline-block; font-size: .8rem; padding: .15rem .5rem; border-radius: 1rem;
+        border: 1px solid var(--line); color: var(--muted); }
+.pill.on { color: var(--ok); border-color: var(--ok); }
+
+table { width: 100%; border-collapse: collapse; }
+th, td { text-align: left; padding: .5rem; border-bottom: 1px solid var(--line); vertical-align: top; }
+tr.current td { font-weight: 600; }
+
+/* Four columns of prose do not fit a phone. Scrolling the table sideways
+   keeps every column readable and labelled; stacking it into unlabelled
+   fragments does not. */
+.table-scroll { overflow-x: auto; }
+/* Deliberately NOT .hint. The daemon serves the newest report by file mtime,
+   so a backwards clock step can hand the operator a stale one -- the age of
+   what they are reading is the mitigation, and a muted footnote is not read. */
+.checked-at { font-weight: 600; margin: .25rem 0 .75rem; }
+/* A warning that reads like body text does not get read, and the one this
+   exists for -- a future-dated lock timestamp, which makes every genuine
+   later release report "not newer" forever -- is the only thing on the page
+   naming a cause the operator can act on. The border and the heading are what
+   make it conspicuous; colour is the third cue and never the only one, so it
+   still reads in monochrome. --danger on the edge rather than the text: a
+   warning about the check is not a failure of it. */
+.callout { border: 1px solid var(--line); border-left: .25rem solid var(--accent);
+           border-radius: .4rem; padding: .5rem .75rem; margin: .75rem 0; background: var(--panel); }
+.callout h3 { margin: 0 0 .35rem; font-size: 1rem; }
+.callout ul { margin: 0; padding-left: 1.25rem; }
+.callout.warn { border-left-color: var(--danger); }
+.updates table { min-width: 34rem; }
+.updates caption { text-align: left; padding: .25rem .5rem; }
+/* A 40-character hex revision has to be readable in full without pushing the
+   layout wider than the viewport: it is the control that stands in place of
+   signature verification, so truncating it would remove the control. */
+code.rev {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: .85rem; word-break: break-all;
+}
+dl.facts { display: grid; grid-template-columns: max-content 1fr; gap: .25rem .75rem; margin: .5rem 0; }
+dl.facts dt { color: var(--muted); font-size: .9rem; }
+dl.facts dd { margin: 0; }
+@media (max-width: 30rem) {
+  dl.facts { grid-template-columns: 1fr; }
+  dl.facts dd { margin-bottom: .5rem; }
+}
+/* A state is carried by its label and its sentence. Colour is never the only
+   indicator here -- there is no colour on an app state at all. */
+.state strong { display: block; }
+.state .hint, .state .error { margin: .15rem 0 0; }
+pre.log.detail { max-height: 10rem; margin: .35rem 0 0; }
+
+pre.diff, pre.log {
+  background: var(--panel); border: 1px solid var(--line); border-radius: .5rem;
+  padding: .75rem; overflow: auto; max-height: 22rem; font-size: .85rem;
+  white-space: pre-wrap; word-break: break-word;
+}
+dialog.confirm {
+  max-width: 34rem; border: 1px solid var(--line); border-radius: .6rem;
+  background: var(--panel); color: var(--text); padding: 1.25rem;
+}
+dialog.confirm h3 { margin-top: 0; }
+dialog::backdrop { background: rgba(0,0,0,.6); }
+.login { max-width: 22rem; margin: 3rem auto; }
+
+details.advanced { margin: 1rem 0; border: 1px solid var(--line); border-radius: .5rem; padding: .5rem .75rem; }
+details.advanced summary { cursor: pointer; font-weight: 600; }
+details.advanced[open] summary { margin-bottom: .5rem; }

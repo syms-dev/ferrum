@@ -1,0 +1,62 @@
+[package]
+name = "ferrum-install"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "ferrum-install"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
+
+# The one seam every Cloudflare call in this workspace goes through. A path
+# dependency on a workspace member rather than a direct `ureq` dependency:
+# this binary and `ferrum-apply` reach Cloudflare through one library, so
+# the zone, ownership and error-envelope logic cannot drift between them.
+# No new package enters `Cargo.lock` -- `ureq` is already resolved there
+# via `ferrum-reconcile`.
+ferrum-dns = { path = "../ferrum-dns" }
+
+[dev-dependencies]
+tempfile = "3"
+# The same crate with its fake Cloudflare server switched on. A5's
+# verification is only testable if the tests can point the client at
+# something other than the real API, and the Nix sandbox that runs
+# `workspace-tests` has no network at all -- a test reaching
+# api.cloudflare.com would fail CI by construction. Enabling the existing
+# `testing` feature here keeps that fake single rather than growing a
+# second one on this side of the boundary.
+ferrum-dns = { path = "../ferrum-dns", features = ["testing"] }
+
+[features]
+# OFF by default, and the production build never turns it on.
+#
+# `tests/stage2/run.sh` drives the real installer end to end against a real
+# QEMU target, and A5's token check refuses to be faked: the credential is
+# verified against Cloudflare's live API, and no string the test can invent
+# passes it. `placeholder-cf-token` is rejected on shape alone (Cloudflare
+# error 6003 / chain 6111, "Invalid format for Authorization header"), a
+# well-formed 40-character fake is rejected as error 9109 "Invalid access
+# token", and even a REAL token would fail, because the test installs to
+# `s13.invalid`, a domain in nobody's Cloudflare account. The check is
+# working exactly as designed; the test simply has no live zone.
+#
+# The fix therefore points the test at a stand-in API rather than teaching
+# the installer to accept less. There is deliberately NO skip flag: an
+# offline ferrum install produces a media server nobody can reach, so a
+# release valve added for a test would ship to every operator as a way to
+# get a silently broken host.
+#
+# What makes that safe is that this is a COMPILE-TIME feature, not a
+# runtime branch. `answers::cloudflare_client` has two whole bodies, one
+# per `cfg`, and the environment variable's name exists only inside the
+# gated one -- so the production binary contains no code that consults it
+# and no string to consult. `nix/modules/flake/checks.nix`'s
+# `production-installer-has-no-api-override` proves that against the built
+# binaries rather than trusting this comment.
+test-cloudflare-endpoint = ["ferrum-dns/testing"]

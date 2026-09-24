@@ -16,7 +16,7 @@
 // usage grows faster than 'snapshots are free' intuition suggests"), and
 // it is the failure an operator hits months in, with a full disk and no
 // obvious cause.
-use crate::journal::{self, JournalEntry};
+use ferrum_state::journal::{self, JournalEntry};
 use std::collections::HashSet;
 use std::path::Path;
 use std::process::Command;
@@ -58,7 +58,7 @@ pub struct GcPlan {
 pub fn plan(entries: Vec<JournalEntry>, keep_generations: usize, current_generation: u32) -> GcPlan {
     let mut sorted = entries;
     // Newest first. `snapshot_ts` is the shared parser -- see rule 1.
-    sorted.sort_by_key(|e| std::cmp::Reverse(crate::generations::snapshot_ts(&e.snapshot)));
+    sorted.sort_by_key(|e| std::cmp::Reverse(ferrum_state::generations::snapshot_ts(&e.snapshot)));
 
     // A retention count of 0 would mean "keep nothing", which combined with
     // rule 2 still keeps the current generation's snapshot. Treated as the

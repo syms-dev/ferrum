@@ -1,0 +1,15 @@
+.fk-risky {
+  border: 1px solid var(--ferrum-danger); border-radius: var(--ferrum-radius);
+  padding: 1rem 1.1rem; display: grid; gap: .7rem; align-content: start;
+  background: var(--ferrum-panel);
+}
+.fk-risky-head { display: flex; flex-wrap: wrap; gap: .5rem; align-items: center; }
+.fk-risky-now { font-family: var(--ferrum-mono); font-size: .8rem; color: var(--ferrum-muted); }
+.fk-risky-effect {
+  display: grid; gap: .4rem;
+  border-top: 1px solid var(--ferrum-danger);
+  background: var(--ferrum-wash-danger);
+  margin: 0 -1.1rem -1rem; padding: .7rem 1.1rem 1rem;
+}
+.fk-risky-what { font-size: .85rem; line-height: 1.45; font-weight: 700; color: var(--ferrum-danger); }
+.fk-risky-how { font-size: .82rem; line-height: 1.45; color: var(--ferrum-text); }

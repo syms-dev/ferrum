@@ -40,7 +40,100 @@ jobs:
           nix build --print-build-logs \
             .#checks.x86_64-linux.catalog-consistency \
             .#checks.x86_64-linux.schema-uniformity \
-            .#checks.x86_64-linux.sopsfile-are-paths
+            .#checks.x86_64-linux.sopsfile-are-paths \
+            .#checks.x86_64-linux.ui-renders-every-schema-type \
+            .#checks.x86_64-linux.updates-view-is-wired \
+            .#checks.x86_64-linux.installer-offers-every-catalog-app \
+            .#checks.x86_64-linux.settings-schema-covers-every-option \
+            .#checks.x86_64-linux.auth-model-enforced \
+            .#checks.x86_64-linux.daemon-vhost-enforced \
+            .#checks.x86_64-linux.daemon-unpublished-but-running \
+            .#checks.x86_64-linux.nginx-config-parses \
+            .#checks.x86_64-linux.nginx-emits-no-cors-headers \
+            .#checks.x86_64-linux.reserved-subdomain-collision \
+            .#checks.x86_64-linux.duplicate-subdomain-collision \
+            .#checks.x86_64-linux.dns-record-set \
+            .#checks.x86_64-linux.root-folders-reach-the-apps \
+            .#checks.x86_64-linux.migration-mechanism \
+            .#checks.x86_64-linux.mkhost-applies-migration \
+            .#checks.x86_64-linux.journaldir-collision \
+            .#checks.x86_64-linux.storage-path-nesting \
+            .#checks.x86_64-linux.schema-refuses-every-separator-payload \
+            .#checks.x86_64-linux.directive-separators-never-reach-a-generated-file \
+            .#checks.x86_64-linux.pool-branches-are-all-seeded \
+            .#checks.x86_64-linux.pool-assertions-can-fire \
+            .#checks.x86_64-linux.media-tree-waits-for-its-mounts \
+            .#checks.x86_64-linux.fixed-ports-are-enforced \
+            .#checks.x86_64-linux.selfsigned-cert-tracks-its-domain \
+            .#checks.x86_64-linux.recyclarr-needs-an-arr \
+            .#checks.x86_64-linux.extra-unfree-packages-compose
+
+      # A check nobody runs protects nothing, and this repo has now written
+      # one and left it unwired twice. Sixteen of the thirty-one defined
+      # checks were executed by no workflow at all, among them the five
+      # clippy-* derivations and settings-schema-covers-every-option --
+      # which exists BECAUSE modules/lib/settings-schema.json drifted from
+      # modules/core/options.nix and shipped, breaking `PUT /api/settings`
+      # on every host with a domain. Its first real run found twelve
+      # uncovered options. That drift, and the storage.pool.* drift before
+      # it, both went green through CI precisely because nothing looked.
+      #
+      # The lists in this file stay explicit rather than becoming a glob,
+      # for two reasons a glob would destroy: they are greppable (you can
+      # ask "where does this check run?" and get an answer), and expensive
+      # checks must stay OUT of the cheap job by default -- a glob would
+      # silently pull the VM tests and eval-example-hosts in and blow the
+      # runner's disk, which is the very thing the comment above explains.
+      # What an explicit list cannot do on its own is notice its own
+      # omissions, so this step supplies that half: enumerate every defined
+      # check and fail if any is wired into no job anywhere. Explicit where
+      # it aids reading, mechanical where humans forget.
+      #
+      # Runs after the builds above, not before: a genuinely failing check
+      # is the more urgent signal, and this one reports on the next run.
+      - name: every check is wired into a job
+        run: |
+          set -euo pipefail
+
+          # The one deliberate exception. Realizing this needs
+          # sops-install-secrets and the host's full app closures, measured
+          # at well beyond a hosted runner's disk -- see the comment above
+          # and the longer one on eval-example-hosts in
+          # nix/modules/flake/checks.nix. Run by hand on a real machine.
+          excluded="eval-example-hosts"
+
+          # Assigned to a variable rather than inlined into the `for` list
+          # below, and then asserted non-empty. Both matter: `set -e` does
+          # NOT abort on a failed command substitution inside a `for` list,
+          # so `for name in $(nix eval ...)` would iterate zero times on an
+          # eval failure and this step would report green having checked
+          # nothing -- the precise class of silent pass it exists to end.
+          names="$(nix eval --raw .#checks.x86_64-linux \
+                     --apply 'cs: builtins.concatStringsSep "\n" (builtins.attrNames cs)')"
+          if [ -z "$names" ]; then
+            echo "::error::enumerating .#checks.x86_64-linux produced nothing -- refusing to pass"
+            exit 1
+          fi
+
+          missing=()
+          for name in $names; do
+            case " $excluded " in *" $name "*) continue ;; esac
+            # Matches the qualified `.#checks.<system>.<name>` build form
+            # only, so a check merely NAMED in a prose comment does not
+            # count as wired. `<system>` is a wildcard because vm-tests.yml
+            # builds its matrix leg as `.#checks.${{ matrix.system }}.smoke-vm`.
+            grep -qE "\.#checks\..*\.${name}( |\\\\|$)" .github/workflows/*.yml \
+              || missing+=("$name")
+          done
+
+          if [ ${#missing[@]} -ne 0 ]; then
+            echo "::error::defined but run by no workflow: ${missing[*]}"
+            echo "Wire each one into a job -- cheap eval checks into 'cheap checks' above,"
+            echo "Rust ones into the 'rust' job, VM tests into vm-tests.yml -- or add it to"
+            echo "this step's \$excluded with a comment saying why it cannot run in CI."
+            exit 1
+          fi
+          echo "every flake check is wired into a job"
 
   # The Rust workspace: ~5,200 lines across four crates and 118 unit tests
   # which, until 2026-09-15, CI never ran even once. The eval checks above
@@ -66,6 +159,31 @@ jobs:
 
       - uses: DeterminateSystems/magic-nix-cache-action@main
 
+      # The clippy-* derivations belong here rather than in "cheap checks":
+      # they are full Rust builds sharing this job's vendored Cargo.lock
+      # closure, so a lint failure and a test failure stay in one place and
+      # the cache is warm for both. Every one of them was defined and never
+      # executed by CI -- including clippy-ferrum-install, added after two
+      # real clippy errors had accumulated unnoticed in the crate holding
+      # the installer's Criticals, and clippy-ferrum-dns, which lints the
+      # only crate that makes Cloudflare calls.
+      #
+      # The cargo-test-* entries are aliases of the packages above (see
+      # checks.nix), so they cost no extra build time; they are named
+      # explicitly so the wiring check in flake-check can see them covered
+      # rather than needing an exception.
+      #
+      # production-installer-has-no-api-override is here rather than in
+      # "cheap checks" for the same reason: it realizes BOTH installers --
+      # the operator's `.#ferrum-install` and the
+      # `test-cloudflare-endpoint` build tests/stage2/run.sh drives -- and
+      # shares this job's vendored Cargo.lock closure, so the second costs
+      # little after the first. What it asserts is that only the second can
+      # be pointed away from Cloudflare, proved by grepping the built
+      # binaries rather than by reading the source. Without it, collapsing
+      # the two cfg-gated bodies of answers::cloudflare_client into one
+      # runtime branch would pass every test while shipping operators a way
+      # to finish an install that can publish nothing.
       - name: build and test the Rust workspace
         run: |
           nix build --print-build-logs \
@@ -73,4 +191,124 @@ jobs:
             .#ferrumd \
             .#ferrum-reconcile \
             .#ferrum-testapp \
-            .#checks.x86_64-linux.workspace-tests
+            .#ferrum-install \
+            .#checks.x86_64-linux.workspace-tests \
+            .#checks.x86_64-linux.cargo-test-ferrum-apply \
+            .#checks.x86_64-linux.cargo-test-ferrum-reconcile \
+            .#checks.x86_64-linux.cargo-test-ferrumd \
+            .#checks.x86_64-linux.clippy-ferrum-apply \
+            .#checks.x86_64-linux.clippy-ferrum-dns \
+            .#checks.x86_64-linux.clippy-ferrum-install \
+            .#checks.x86_64-linux.clippy-ferrum-reconcile \
+            .#checks.x86_64-linux.clippy-ferrumd \
+            .#checks.x86_64-linux.production-installer-has-no-api-override
+
+  # A mechanical CVE scan of the Rust dependency tree. Cheap, and the
+  # alternative is a knowledge-based review whose freshness silently decays
+  # -- which is what the Phase 1.6a security review had to fall back on.
+  cargo-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+      - name: audit the Rust dependency tree
+        run: nix run nixpkgs#cargo-audit -- audit --file crates/Cargo.lock
+
+  # The installer's delivery vehicle (Phase 1.6a, DEC-02: Docker is the only
+  # thing the operator's own machine must have). Built here because the
+  # image is the artifact a new user actually pulls, and a broken one is
+  # otherwise discovered by them rather than by us -- the same reasoning
+  # that put the Rust workspace in CI after five thousand lines had never
+  # been compiled by it.
+  #
+  # Its own job, not a step in `rust` above: a layered image build is the
+  # slowest thing in this file, and folding it in would mean a failed image
+  # and a failed unit test are the same red X.
+  installer-image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: DeterminateSystems/nix-installer-action@main
+
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+
+      - name: build the ferrum-install Docker image
+        run: |
+          nix build --print-build-logs .#ferrum-install-image
+
+          # Prove the artifact is a loadable image, not merely a tarball
+          # that built. `nix build` succeeding says nothing about whether
+          # Docker can read the result.
+          docker load < result
+          docker image inspect ferrum-install:latest > /dev/null
+
+          # R1 A3: no target argument means usage and a non-zero exit,
+          # without contacting anything. Asserted against the real image
+          # because this is the operator's very first interaction with it.
+          if docker run --rm ferrum-install:latest; then
+            echo "::error::running with no target should have failed"
+            exit 1
+          fi
+
+      # The step above exits before the installer opens a single SSH
+      # connection, which is why it did not catch the defect that made this
+      # step necessary: the image shipped with no /etc/passwd, OpenSSH
+      # refuses to start when it cannot resolve its own uid, and EVERY
+      # target interaction failed with "No user exists for uid 0". The
+      # image could not collect an inventory, let alone install. 394 unit
+      # tests and six security review cycles all passed with it broken,
+      # because every one of them runs the binary OUTSIDE the image.
+      #
+      # So this drives the real image against a real SSH server and
+      # asserts it gets far enough to have actually talked to it.
+      - name: the image can reach a target over SSH
+        run: |
+          set -euo pipefail
+          work="$(mktemp -d)"
+          mkdir -p "$work/ssh" "$work/host"
+          ssh-keygen -t ed25519 -N "" -f "$work/ssh/id_ed25519" -q
+
+          # A stand-in target: sshd with our key. It is NOT installable --
+          # it has no real disks -- and it does not need to be. What is
+          # being proved is that the image can authenticate, run a command
+          # and parse what comes back.
+          cat > "$work/Dockerfile" <<'DOCKERFILE'
+          FROM debian:bookworm-slim
+          RUN apt-get update -qq && apt-get install -y -qq openssh-server util-linux >/dev/null            && mkdir -p /run/sshd /root/.ssh
+          COPY id_ed25519.pub /root/.ssh/authorized_keys
+          RUN chmod 700 /root/.ssh && chmod 600 /root/.ssh/authorized_keys            && sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config            && ssh-keygen -A
+          CMD ["/usr/sbin/sshd","-D","-e"]
+          DOCKERFILE
+          cp "$work/ssh/id_ed25519.pub" "$work/"
+          docker build -q -t ferrum-fake-target "$work" > /dev/null
+          docker network create ferrum-ci-net > /dev/null
+          docker run -d --name ferrum-ci-target --network ferrum-ci-net ferrum-fake-target > /dev/null
+          sleep 5
+
+          set +e
+          out="$(printf 'ci-host\n\n\n' | docker run --rm -i --network ferrum-ci-net \
+                   -v "$work/host:/host" -v "$work/ssh:/ssh:ro" \
+                   ferrum-install:latest root@ferrum-ci-target 2>&1)"
+          set -e
+          echo "$out"
+
+          # The assertion that matters. "No user exists for uid 0" is the
+          # exact symptom of the shipped defect; anything mentioning a
+          # failure to RUN ssh means the image is broken regardless of the
+          # target.
+          if echo "$out" | grep -q "No user exists for uid"; then
+            echo "::error::the image cannot run ssh -- /etc/passwd is missing from it"
+            exit 1
+          fi
+
+          # Positive proof it really reached the target and read it, rather
+          # than failing early for some unrelated reason.
+          echo "$out" | grep -q "collecting inventory" || {
+            echo "::error::the image never got as far as collecting an inventory"; exit 1; }
+          echo "$out" | grep -q "architecture: x86_64" || {
+            echo "::error::the image did not read the target's architecture over SSH"; exit 1; }
+
+          docker rm -f ferrum-ci-target > /dev/null
+          docker network rm ferrum-ci-net > /dev/null

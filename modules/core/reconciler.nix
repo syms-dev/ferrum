@@ -77,15 +77,72 @@ let
         (builtins.filter (p: enabledApps ? ${p}) (catalog.${id}.integrations.consumes or [ ])))
     enabledApps);
 
-  reconcileConfigFile = pkgs.writeText "ferrum-reconcile-config.json" (builtins.toJSON {
+  # One root folder per enabled app that manages a library, derived from
+  # the catalog rather than listed here -- same reasoning as `pairs`.
+  #
+  # The path is built from ferrum.storage.mediaDir, so the apps are told
+  # about exactly the tree modules/core/storage.nix created. Those two
+  # disagreeing is what left every app pointed at an empty /srv/media
+  # while the media sat on unmounted disks.
+  rootFolders = lib.flatten (lib.mapAttrsToList
+    (id: _:
+      let cat = catalog.${id}.mediaCategory or null; in
+      lib.optional (cat != null) {
+        app = id;
+        path = "${config.ferrum.storage.mediaDir}/media/${cat}";
+      })
+    enabledApps);
+
+  # Same shape as rootFolders: derived from the catalog, built from
+  # mediaDir, so the download tree and the library tree are the same tree.
+  downloadPaths = lib.flatten (lib.mapAttrsToList
+    (id: _:
+      let
+        sub = catalog.${id}.downloadSubdir or null;
+        inc = catalog.${id}.downloadIncompleteSubdir or null;
+      in
+      lib.optional (sub != null) ({
+        app = id;
+        path = "${config.ferrum.storage.mediaDir}/${sub}";
+      } // lib.optionalAttrs (inc != null) {
+        incompletePath = "${config.ferrum.storage.mediaDir}/${inc}";
+      }))
+    enabledApps);
+
+  # Plex, which does not fit the app/pair model: no API key, claimed to a
+  # plex.tv account rather than configured, and unusable until it is.
+  #
+  # The claim token is a ferrum SECRET rather than a settings value. It
+  # grants association of a server with an account, and settings.json is
+  # world-readable by design (the UI renders it); plex/meta.nix's
+  # settingsSchema.claimToken is the wrong home for it for that reason.
+  plexApp = config.ferrum.apps.plex or { enable = false; };
+  plexClaimDeclared = config.ferrum.secrets ? "plex-claim";
+  plexConfig = lib.optionalAttrs (plexApp.enable or false) {
+    plex = {
+      baseUrl = "http://127.0.0.1:${toString plexApp.port}";
+      preferencesPath =
+        "${plexApp.stateDir}/Plex Media Server/Preferences.xml";
+      claimTokenPath = if plexClaimDeclared then "/run/secrets/plex-claim" else null;
+      libraries = [
+        { kind = "movie"; name = "Movies"; path = "${config.ferrum.storage.mediaDir}/media/movies"; }
+        { kind = "show"; name = "TV Shows"; path = "${config.ferrum.storage.mediaDir}/media/tv"; }
+      ];
+    };
+  };
+
+  reconcileConfigFile = pkgs.writeText "ferrum-reconcile-config.json" (builtins.toJSON ({
     apps = lib.mapAttrs appConnInfo enabledApps;
-    inherit pairs;
-  });
+    inherit pairs rootFolders downloadPaths;
+  } // plexConfig));
 in
 {
   assertions = map (msg: { assertion = false; message = msg; }) realSymmetryErrors;
 
-  systemd.services.ferrum-reconcile = lib.mkIf (pairs != [ ]) {
+  # Runs when there is EITHER a registration or a root folder to set. A
+  # single *arr with no peers still needs its root folder, and gating only
+  # on pairs meant it silently got nothing.
+  systemd.services.ferrum-reconcile = lib.mkIf (pairs != [ ] || rootFolders != [ ] || downloadPaths != [ ] || plexConfig != { }) {
     description = "Register download clients and indexer applications across the catalog";
     after = [ "ferrum-apps.target" ];
     wantedBy = [ "ferrum-apps.target" ];

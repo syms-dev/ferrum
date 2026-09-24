@@ -1,16 +1,73 @@
 # Installing ferrum
 
-> **This procedure destroys the target machine's operating system disk.**
-> It has never been run to completion on real hardware. Read all of it before
-> starting, and read [Before you start](#before-you-start) twice if the
-> machine currently holds data.
+There are two ways to install a ferrum host. **Use the first one.**
 
-ferrum is installed with [nixos-anywhere](https://github.com/nix-community/nixos-anywhere),
-which kexecs a NixOS installer over SSH, repartitions the disk you name with
-[disko](https://github.com/nix-community/disko), and installs your host
-configuration. The target does not need to be running NixOS — any kexec-capable
-Linux with root SSH works, which is what makes it possible to point this at an
-existing Ubuntu or Debian server.
+## The installer
+
+```bash
+docker run --rm -it \
+  -v ~/.ssh:/ssh:ro \
+  -v ~/ferrum-host:/host \
+  ghcr.io/syms-dev/ferrum-install root@YOUR-TARGET
+```
+
+Docker is the only thing your own machine needs. The installer inventories
+the target, asks which disk to erase and which apps you want, generates the
+whole host repository into `~/ferrum-host`, installs, enables the apps, and
+prints the URLs and both first-run passwords.
+
+It refuses before touching anything if the target is not reachable as root,
+if the `/host` mount is missing, or if it cannot find an SSH key. It will
+not erase a disk you have not named by typing its serial, and it records
+its progress so that a failure after the disk is gone is resumable rather
+than a reinstall.
+
+Read **Before you start** below anyway. Two of those prerequisites are
+things no tool can supply for you, and the backup is not optional.
+
+---
+
+# The manual path
+
+Everything below installs a host by hand. It exists for people modifying
+ferrum itself, and as the documentation of what the installer actually
+does. It is longer, and it is easier to get wrong -- the four corrections
+marked **FIXED** below are defects that survived in this document until the
+installer was written and forced each of them to be stated precisely.
+
+> **FIXED (2026-09-17): Step 6 never transferred the host repository to the
+> target.** Step 8 tells you to edit "the host flake repo" on the target and
+> run `ferrum-apply apply` there -- but nothing before it puts that
+> repository on the machine. `nixos-anywhere` installs a *closure*, not a
+> source tree, and no module creates `/etc/ferrum`'s flake either:
+> `modules/core/bootstrap.nix` creates only the directory, a seeded
+> `settings.json`, `secrets/` and `custom/`. Without the transfer,
+> `ferrum-apply` cannot resolve `FERRUM_FLAKE_REF`
+> (`/etc/ferrum#nixosConfigurations.<hostname>`) and Step 8 fails. Step 6
+> below now passes `--extra-files`.
+
+> **FIXED: `/etc/ferrum/settings.json` lands root-owned and nothing repairs
+> it.** `--extra-files` copies files owned by root, and cannot name the
+> `ferrum` group because that group does not exist yet at copy time. The
+> tmpfiles rule will not fix it either -- `bootstrap.nix` uses `C`, which
+> copies *only if the path does not already exist*, so after a transfer it
+> is a permanent no-op. The activation script only prints a warning.
+> Unrepaired, `ferrumd` cannot write settings.json and the web UI renders
+> correctly while silently saving nothing. Step 7 now chowns it.
+
+> **FIXED: nothing here enabled single sign-on.** With a base domain
+> configured, apps default to `exposure = "public"` while
+> `ferrum.auth.enable` defaults to false -- so following this document
+> published Sonarr, Radarr, Prowlarr, SABnzbd and qBittorrent admin
+> interfaces on real certificates with **no login at all**. qBittorrent and
+> SABnzbd accept arbitrary download paths. Step 8 now enables Authelia.
+
+> **FIXED: the Cloudflare DNS-01 token was never mentioned.** Because
+> `exposure` defaults to `public`, `modules/proxy/acme.nix`'s assertion
+> `publicApps == {} || credentialProvided` fires on the default path, so a
+> host with any app enabled cannot even evaluate until
+> `/etc/ferrum/secrets/acme-dns.sops` exists AND `"acme-dns"` is declared in
+> `ferrum.secrets`. Both are now in Step 8.
 
 ## Before you start
 
@@ -29,8 +86,15 @@ You need all of these before you begin. Each one is something that is
 painful or impossible to obtain after the OS is gone:
 
 - [ ] **Out-of-band access** — IPMI, a KVM, or physical access with a monitor
-      and keyboard. If the install fails partway the machine may not boot, and
-      SSH will not be there to help you.
+      **and** keyboard. If the install fails partway the machine may not boot,
+      and SSH will not be there to help you.
+
+      A keyboard without a monitor is not out-of-band access. You cannot read
+      a GRUB error, see which device failed to mount, or tell whether the
+      machine got past POST — you would be typing blind into a box that
+      cannot answer. Any HDMI television counts as a monitor. If you truly
+      cannot attach a display, treat Step 5b's VM test as mandatory rather
+      than recommended.
 - [ ] **A backup of anything on the OS disk you care about.** Application
       configuration, databases, `docker-compose` files, `.env` files, cron
       jobs, anything under `/opt` or `/home`. ferrum's catalog is seven apps;
@@ -79,10 +143,17 @@ ships a UEFI layout (a vfat ESP plus systemd-boot); a BIOS target needs an
 `EF02` BIOS boot partition and GRUB instead. Both files say so at the point
 of change.
 
-The partition table is a second, independent tell: a UEFI system cannot boot
-without a FAT32 ESP, so `lsblk -o NAME,FSTYPE` showing no `vfat` partition
-anywhere means the machine is booting BIOS regardless of what its firmware
-supports.
+The partition table is a second, independent tell, **but only on a machine
+that is already installed**: a running UEFI system cannot have booted without
+a FAT32 ESP, so on such a machine `lsblk -o NAME,FSTYPE` showing no `vfat`
+partition anywhere means it is booting BIOS whatever its firmware supports.
+
+**Do not apply that rule to a blank or live-booted target.** A genuinely UEFI
+machine with a wiped disk, or one booted from rescue media, has EFI firmware
+and no vfat anywhere — and reading that as "therefore BIOS" generates an
+unbootable host. `/sys/firmware/efi` is authoritative; the vfat signal only
+corroborates it. If the two disagree, stop and find out which is true rather
+than picking one.
 
 If the data disks are pooled (mergerfs, LVM, RAID, ZFS), record the pool's
 layout too. **ferrum has no mergerfs or rclone support** — the design doc puts
@@ -181,15 +252,56 @@ itself: **if the pure build fails, something other than secrets is wrong.**
 It must succeed before you continue. A failure here is free; the same failure
 after Step 6 has begun is a machine with no operating system.
 
+## Step 5b — boot the configuration in a VM first
+
+`nixos-anywhere` can build the system and boot the disk layout in a VM
+without touching the target at all:
+
+```bash
+nix run github:nix-community/nixos-anywhere -- --flake .#<hostname> --vm-test
+```
+
+This is the single highest-value step in this document, and it is the one
+that settles the question a dry run cannot: **does this disk layout actually
+produce a machine that boots?** Partitioning, bootloader installation, the
+subvolume layout and the mount ordering are all exercised for real. It is
+also the only place a BIOS-versus-UEFI mistake shows up *before* it has cost
+you an operating system.
+
+**Run it on the target itself.** The VM test needs KVM and must match the
+target's architecture, so a laptop of a different architecture cannot run it
+— but the machine you are about to install onto is, by definition, the right
+architecture, and it is about to be wiped anyway. Installing Nix on it for
+this one check costs nothing:
+
+```bash
+# on the target, which is about to be replaced regardless
+curl --proto '=https' --tlsv1.2 -sSf -L https://install.determinate.systems/nix | sh -s -- install
+```
+
+Do this especially if you do not have a monitor on the target. It does not
+replace console access — a VM cannot reproduce the real firmware's boot
+order, a USB disk that enumerates slowly, or a kexec that hangs — but it
+converts the largest single unknown from a gamble into a tested fact.
+
 ## Step 6 — install
 
 **This is the destructive step.**
 
 ```bash
+# --extra-files is NOT optional: it is what puts this repository on the
+# target at /etc/ferrum, which every later `ferrum-apply apply` evaluates.
+mkdir -p /tmp/extra/etc && cp -a . /tmp/extra/etc/ferrum
+
 nix run github:nix-community/nixos-anywhere -- \
   --flake .#ferrum-host \
+  --extra-files /tmp/extra \
   root@TARGET
 ```
+
+Copy the `.git` directory with it. Nix silently ignores untracked files
+inside a git tree, so a repository whose history did not travel produces
+confusing "file does not exist" errors on the host.
 
 On a machine whose CPU differs from your laptop's, add `--build-on remote` so
 the target builds its own closure rather than having a foreign-architecture one
@@ -204,6 +316,11 @@ ssh root@TARGET
 
 # ferrumd's own first-user password, generated once, root-readable only.
 cat /var/lib/ferrum/daemon/ferrumd-setup-password
+
+# --extra-files copied settings.json root-owned, and the tmpfiles `C` rule
+# will NOT repair an existing file. Without this, ferrumd cannot save
+# anything and the web UI fails silently.
+chown root:ferrum /etc/ferrum/settings.json && chmod 0664 /etc/ferrum/settings.json
 
 # Confirm /etc/ferrum was provisioned with the ownership ferrumd requires.
 ls -la /etc/ferrum
@@ -234,9 +351,58 @@ set to) and log in as `admin` with the password above. Change it immediately.
 On the target, swap the full settings in and apply. This run is what generates
 every app's sops secret for the first time:
 
+First, the Cloudflare DNS-01 token. Apps default to `public`, so
+`modules/proxy/acme.nix` refuses to build without it:
+
 ```bash
-cp settings.stage2.json settings.json   # in the host flake repo
-ferrum-apply apply
+# On the target. The payload is the systemd EnvironmentFile LINE, not a
+# bare token -- acme.nix hands the decrypted file to systemd as one.
+echo -n "CLOUDFLARE_DNS_API_TOKEN=<your token>" | ferrum-apply put-secret acme-dns
+```
+
+Then edit `/etc/ferrum/settings.stage2.json` so it declares the secret and
+enables single sign-on, alongside your apps:
+
+```json
+{
+  "auth": { "enable": true, "adminEmail": "you@example.com" },
+  "secrets": { "acme-dns": { "description": "Cloudflare DNS-01 API token" } }
+}
+```
+
+Declaring the name matters on its own: `acme.nix` checks
+`ferrum.secrets ? acme-dns` as well as the file's existence.
+
+Then swap it in and apply. **The environment prefix is required**, not
+decorative: `modules/core/overlays.nix` bakes these five values into the
+installed `ferrum-apply` wrapper from the *stage-1* configuration, which
+had no apps and no auth. Without overriding them, `ferrum-apply` skips
+generating the very secrets the build then fails on. It works because the
+wrapper uses `--set-default` rather than `--set`.
+
+```bash
+cd /etc/ferrum
+cp settings.stage2.json settings.json
+chown root:ferrum settings.json && chmod 0664 settings.json
+git add -A && git commit -m "enable apps"
+
+FERRUM_SERVARR_APPS=sonarr,radarr,prowlarr \
+FERRUM_AUTH_ENABLED=1 \
+FERRUM_ADMIN_EMAIL=you@example.com \
+FERRUM_SABNZBD_STATE_DIR=/var/lib/ferrum/state/sabnzbd \
+FERRUM_SABNZBD_PORT=8080 \
+  ferrum-apply apply
+```
+
+Adjust `FERRUM_SERVARR_APPS` to the servarr apps you actually enabled, and
+set `FERRUM_SABNZBD_STATE_DIR` to an empty string if you did not enable
+SABnzbd.
+
+Enabling SSO generates a **second** one-time password, separate from
+ferrumd's:
+
+```bash
+cat /var/lib/authelia-main/authelia-setup-password
 ```
 
 `ferrum-apply` passes `--impure` itself, so this needs no flag from you. Watch

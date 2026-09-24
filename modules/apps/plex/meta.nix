@@ -12,9 +12,50 @@
   summary = "Media server for streaming movies, TV, and music.";
 
   defaultPort = 32400;
+
+  # Plex binds 32400 and nothing ferrum does can move it.
+  #
+  # nixpkgs' services.plex exposes no port option at all (confirmed by
+  # reading the module: `options.services.plex ? port` evaluates to false),
+  # because Plex itself has no configuration file setting for it. So
+  # modules/apps/plex/service.nix has nothing to wire the uniform
+  # ferrum.apps.plex.port through to, and the option is decorative here in a
+  # way it is not for the servarr apps.
+  #
+  # Decorative is not harmless. modules/proxy/nginx.nix generates
+  # `proxy_pass http://127.0.0.1:${port}` from the same option, so an
+  # operator who changes it gets a vhost pointed at a port nothing is
+  # listening on: a 502 in the browser, a failing reconciler health check,
+  # and not one word at evaluation time. Measured before this field existed
+  # -- plex.port = 9999 produced `proxy_pass http://127.0.0.1:9999` with
+  # zero failed assertions while Plex carried on serving 32400.
+  #
+  # Declared here rather than as a special case in a module, for the same
+  # reason mediaCategory, downloadSubdir, unfreePackages and authBypassPaths
+  # are: the catalog is where a per-app capability belongs, and "add an app
+  # by adding a directory" only stays true if adding one cannot require
+  # editing a list somewhere else.
+  portIsFixed = true;
+
   defaultSubdomain = "plex";
   defaultMediaAccess = "read";
-  defaultAuthPolicy = "one_factor";
+  # "bypass", not one_factor, and this is a correctness matter rather than
+  # a convenience one. Plex's native clients (Roku, Apple TV, game consoles, mobile)
+  # authenticate with Plex's own token and have no browser to
+  # complete an Authelia redirect with -- forward-auth in front of them does
+  # not prompt for a login, it makes every native client fail to connect,
+  # while a desktop browser still works. That asymmetry is what makes it
+  # easy to misdiagnose.
+  #
+  # This app is NOT thereby unauthenticated: it ships its own login, which
+  # is why crates/ferrum-install/src/sso.rs lists it in APPS_WITH_OWN_LOGIN
+  # and does not count it among the apps left open when Authelia is off.
+  # Keep those two facts in step.
+  #
+  # authBypassPaths below stays as documentation of the endpoints clients
+  # hit before authenticating; with a bypass policy the whole vhost is
+  # already unguarded, so it has no additional effect here.
+  defaultAuthPolicy = "bypass";
 
   # nixpkgs' plexmediaserver package is licensed unfree; without allowing
   # it, the whole host config fails to evaluate the moment this app is

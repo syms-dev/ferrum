@@ -1,0 +1,7 @@
+.fk-log {
+  font-family: var(--ferrum-mono); font-size: .78rem; line-height: 1.5;
+  background: var(--ferrum-bg); border: 1px solid var(--ferrum-line);
+  border-radius: .5rem; padding: .6rem .7rem; margin: 0;
+  overflow-x: auto; overflow-y: auto; white-space: pre; max-height: 18rem;
+}
+.fk-log:focus-visible { outline: 3px solid var(--ferrum-accent); outline-offset: 2px; }

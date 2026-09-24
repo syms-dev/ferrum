@@ -1,0 +1,19 @@
+.fk-shell { min-height: 100%; background: var(--ferrum-bg); color: var(--ferrum-text); font-family: var(--ferrum-sans); }
+.fk-shell-head {
+  display: flex; align-items: baseline; gap: .75rem; flex-wrap: wrap;
+  padding: .7rem 1rem; border-bottom: 1px solid var(--ferrum-line); background: var(--ferrum-panel);
+}
+.fk-shell-brand { font-weight: 700; letter-spacing: .02em; }
+.fk-shell-host { font-family: var(--ferrum-mono); font-size: .85rem; color: var(--ferrum-muted); }
+.fk-shell-nav { margin-left: auto; display: flex; gap: .25rem; flex-wrap: wrap; }
+.fk-shell-nav a {
+  color: var(--ferrum-muted); text-decoration: none; font-size: .9rem;
+  padding: .3rem .7rem; border-radius: var(--ferrum-radius-sm);
+}
+.fk-shell-nav a:hover { color: var(--ferrum-text); }
+.fk-shell-nav a[aria-current="page"] { color: var(--ferrum-text); background: var(--ferrum-bg); }
+.fk-shell-status { padding: .5rem 1rem; border-bottom: 1px solid var(--ferrum-line); }
+.fk-shell-main { padding: 1rem; display: grid; gap: var(--ferrum-gap); }
+@media (max-width: 40rem) {
+  .fk-shell-nav { margin-left: 0; width: 100%; }
+}

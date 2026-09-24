@@ -312,7 +312,7 @@ Run `cd nix/pkgs/testapp && cargo generate-lockfile` to produce `Cargo.lock` bef
 
 - [ ] **Step 7: Wire it into the flake's packages**
 
-Read `nix/modules/flake/packages.nix` first (`get_symbols_overview` per this project's CLAUDE.md) to see the existing `perSystem` shape, then add:
+Read `nix/modules/flake/packages.nix` first (read the symbol overview first, per this project's agent instructions) to see the existing `perSystem` shape, then add:
 
 ```nix
 # inside the existing `packages = { ... };` attrset in nix/modules/flake/packages.nix

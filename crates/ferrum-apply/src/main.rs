@@ -1,15 +1,18 @@
 use clap::{Parser, Subcommand};
 
 mod apply;
+mod dns_reconcile;
 mod gc;
-mod generations;
-mod journal;
 mod preflight;
 mod progress;
+mod put_secret;
 mod request;
 mod restore_state;
 mod rollback;
 mod secrets;
+mod update_candidate;
+mod update_check;
+mod update_deltas;
 
 #[derive(Parser)]
 #[command(name = "ferrum-apply")]
@@ -40,10 +43,80 @@ enum Command {
     RunRequest {
         path: std::path::PathBuf,
     },
+    /// Encrypt an OPERATOR-SUPPLIED secret value, read from stdin, to this
+    /// host's own age recipient and write <secretsDir>/<name>.sops.
+    ///
+    /// Every other secret this binary handles is one it generates itself.
+    /// This is the path for a value only a human has -- today, the
+    /// Cloudflare DNS-01 token, without which a host with any `public` app
+    /// cannot even evaluate (modules/proxy/acme.nix asserts the .sops file
+    /// exists at Nix eval time).
+    ///
+    /// The value comes from stdin, never argv, so it stays out of `ps` and
+    /// shell history. Existing files are left alone unless --replace is
+    /// given, which keeps a resumed install idempotent.
+    PutSecret {
+        /// Secret name, e.g. `acme-dns`. Must match the name declared in
+        /// settings.json's `secrets` map.
+        name: String,
+        /// Overwrite an existing value (use when rotating a credential).
+        #[arg(long)]
+        replace: bool,
+    },
+    /// Reconcile the DNS records this host publishes against Cloudflare.
+    ///
+    /// Invoked on a schedule by `ferrum-dns-updater.service`
+    /// (`modules/proxy/dns.nix`) to correct the A records ferrum owns when
+    /// this host's public address moves. `ferrum-apply apply` does the same
+    /// work in-process after every switch; this is that reconciliation
+    /// *between* applies, and it is safe to run by hand at any time.
+    ///
+    /// Takes a path, never a credential: the token is read from the file the
+    /// document names, so it never appears in argv and never reaches `ps`.
+    ReconcileDns {
+        /// The desired-record document, normally
+        /// `/etc/ferrum-dns-config.json`.
+        #[arg(long)]
+        config: std::path::PathBuf,
+    },
     /// Show what a settings.json schema migration would do, without
     /// writing anything. Read-only: evaluates the real flake via `nix
     /// eval`, never runs `nix build` or touches settings.json on disk.
     PreviewMigration,
+    /// Report what this host runs today and what an update would change,
+    /// without changing anything.
+    ///
+    /// Strictly read-only: `nix eval` only, no `nix build`, no
+    /// `nix flake lock`, and provably no write to /etc/ferrum/flake.nix or
+    /// /etc/ferrum/flake.lock -- the two files the privilege boundary
+    /// exists to protect. Exists as a subcommand as well as a request kind
+    /// so `request::Request`'s own rule holds: every variant maps onto a
+    /// subcommand an operator can also run by hand over SSH.
+    CheckUpdate,
+}
+
+/// Writes the job's `started` line, then runs it.
+///
+/// Extracted from the `RunRequest` arm -- the way this file already extracts
+/// `handle_apply_result` and `restore_state_outcome` -- so that the ORDERING
+/// is testable: the `started` line must be the first line of a dispatched
+/// job's file, before any subcommand writes progress of its own. `GET
+/// /api/jobs` reads that first line to answer "what was this job?", and by
+/// then ferrumd has already deleted the request file that would otherwise
+/// have said.
+///
+/// The kind comes from the parsed `Request`, never re-derived from the raw
+/// file text. `Progress` is passed in rather than opened here so the test
+/// below needs no process-wide environment; in production it is
+/// `Progress::open()`, which is a total no-op when `FERRUM_JOB_ID` is unset,
+/// so a bare `ferrum-apply run-request` over SSH still writes nothing.
+fn run_request(
+    req: request::Request,
+    progress: &mut progress::Progress,
+    run: impl FnOnce(request::Request) -> i32,
+) -> i32 {
+    progress.event("started", req.kind());
+    run(req)
 }
 
 /// Maps an `apply::run` outcome to a process exit code, printing context to
@@ -364,6 +437,173 @@ fn run_preview_migration() -> i32 {
     0
 }
 
+/// Decides a check's job outcome from what the check itself produced.
+///
+/// Split out so the one case that must never be silent -- the read-only
+/// guarantee having been broken -- is testable without a real `nix`.
+///
+/// # Arguments
+/// * `violations` - one message per protected file the check modified.
+/// * `written` - where the report document landed, or why it could not be
+///   written.
+///
+/// # Returns
+/// `(result, detail, exit_code)` for the terminal progress line and the
+/// process exit.
+fn check_update_outcome(
+    violations: &[String],
+    written: Result<std::path::PathBuf, String>,
+    summary: &str,
+) -> (&'static str, String, i32) {
+    // Checked before the write outcome: a check that moved a pin is a
+    // failure whether or not it also managed to file a report about it.
+    if !violations.is_empty() {
+        return ("failed", violations.join("; "), 1);
+    }
+    match written {
+        Ok(path) => ("succeeded", format!("{summary} (report: {})", path.display()), 0),
+        Err(e) => (
+            "failed",
+            format!("the check ran but its report could not be written: {e}"),
+            1,
+        ),
+    }
+}
+
+/// Everything the update check reads out of the environment, resolved once.
+///
+/// Split from the run below so that the run is a function of its inputs and
+/// nothing else. The composition it performs -- capture the tripwire, build
+/// the report, hand the tripwire's real output to the outcome, publish,
+/// exit -- is the part with no second chance if it is wrong, and it was not
+/// reachable from a test while it read the environment and constructed a
+/// `RealRunner` inline.
+struct CheckUpdateJob {
+    /// The flake directory, e.g. `/etc/ferrum`.
+    flake_dir: String,
+    /// The configuration attribute path up to and including `.config`.
+    config_attr: String,
+    /// The host's `settings.json`.
+    settings_path: std::path::PathBuf,
+    /// The two files the read-only guarantee is measured against.
+    flake_nix: std::path::PathBuf,
+    flake_lock: std::path::PathBuf,
+    /// Where the report document is published.
+    report_dir: std::path::PathBuf,
+    /// The report's file name, from `$FERRUM_JOB_ID`.
+    report_file: String,
+    /// The host clock, as seconds since the epoch.
+    now: u64,
+}
+
+impl CheckUpdateJob {
+    /// Resolve the job from the environment ferrumd sets.
+    ///
+    /// # Returns
+    /// The paths and identifiers the run below needs.
+    fn from_env() -> Self {
+        let flake_ref = std::env::var("FERRUM_FLAKE_REF").unwrap_or_else(|_| {
+            "/etc/ferrum#nixosConfigurations.default.config.system.build.toplevel".to_string()
+        });
+        let (flake_dir, config_attr) = update_check::split_flake_ref(&flake_ref);
+        let settings_path = std::env::var("FERRUM_SETTINGS_PATH")
+            .unwrap_or_else(|_| "/etc/ferrum/settings.json".to_string());
+        let job_id = std::env::var("FERRUM_JOB_ID").ok();
+        Self {
+            flake_nix: std::path::Path::new(&flake_dir).join("flake.nix"),
+            flake_lock: std::path::Path::new(&flake_dir).join("flake.lock"),
+            settings_path: settings_path.into(),
+            report_dir: update_check::report_dir(),
+            report_file: update_check::report_file_name(job_id.as_deref()),
+            now: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            flake_dir,
+            config_attr,
+        }
+    }
+}
+
+/// Runs the read-only update check and leaves its report where ferrumd can
+/// read it.
+///
+/// Instrumented through `progress::Progress` -- unlike
+/// `run_preview_migration`, which is CLI-only -- because this one is
+/// dispatched as a job and `GET /api/jobs` renders its stream.
+///
+/// # Arguments
+/// * `job` - the resolved paths and clock.
+/// * `runner` - the subprocess seam, so a test can drive the whole
+///   composition without a real `nix` or `git`.
+/// * `progress` - the job's event stream.
+///
+/// # Returns
+/// A process exit code: 0 when a report was produced and written, 1 when it
+/// could not be, or when the read-only guarantee was broken.
+fn run_check_update_job(
+    job: &CheckUpdateJob,
+    runner: &dyn update_check::CommandRunner,
+    progress: &mut progress::Progress,
+) -> i32 {
+    // Captured BEFORE the first subprocess, released after the last: the
+    // window this covers is the whole check.
+    let guard = update_check::ReadOnlyGuard::capture(&[&job.flake_nix, &job.flake_lock]);
+    progress.event(
+        "check-update",
+        "reading this host's resolved configuration -- neither flake.nix nor flake.lock is \
+         written",
+    );
+
+    let inputs = update_check::CheckInputs {
+        flake_dir: &job.flake_dir,
+        config_attr: &job.config_attr,
+        settings_path: &job.settings_path,
+        flake_nix: &job.flake_nix,
+        flake_lock: &job.flake_lock,
+        now: job.now,
+    };
+    let mut report = update_check::build_report(&inputs, runner);
+
+    let violations = guard.violations();
+    report.warnings.extend(violations.iter().cloned());
+
+    let written = update_check::write_report(&job.report_dir, &job.report_file, &report)
+        .map_err(|e| e.to_string());
+
+    // stdout carries the whole document, so a bare `ferrum-apply
+    // check-update` over SSH is useful on its own -- the same way
+    // `preview-migration` prints its summary. Nothing in it is a secret:
+    // `update_candidate` strips userinfo at the parse precisely because
+    // this line, and the journal behind it, are below the trust level of
+    // the root-only file the URL came from.
+    match serde_json::to_string(&report) {
+        Ok(body) => println!("{body}"),
+        Err(e) => eprintln!("check-update: could not serialize the report: {e}"),
+    }
+
+    let summary = update_check::summary_line(&report);
+    let (result, detail, code) = check_update_outcome(&violations, written, &summary);
+    if code != 0 {
+        eprintln!("check-update failed: {detail}");
+    }
+    progress.complete(result, &detail);
+    code
+}
+
+/// The environment-reading wrapper the CLI and the dispatcher both call.
+///
+/// # Returns
+/// The process exit code from `run_check_update_job`.
+fn run_check_update() -> i32 {
+    let mut progress = progress::Progress::open();
+    run_check_update_job(
+        &CheckUpdateJob::from_env(),
+        &update_check::RealRunner,
+        &mut progress,
+    )
+}
+
 /// A real GC pass: prunes state snapshots beyond `ferrum.storage.keepGenerations`.
 ///
 /// Was a stub returning exit 1 until 2026-09-15, while
@@ -372,6 +612,129 @@ fn run_preview_migration() -> i32 {
 /// set a retention policy that nothing enforced, and snapshots accumulated
 /// for the life of the host. See gc.rs's own header for why that matters
 /// more than it sounds.
+/// Encrypts an operator-supplied secret read from stdin.
+///
+/// Deliberately does NOT go through `progress::Progress`: that file is the
+/// job stream ferrumd renders, and this subcommand is invoked directly over
+/// SSH by the installer, never dispatched as a ferrumd job (it is absent
+/// from `request::Request` for the same reason). Writing a job file here
+/// would fabricate an entry for work the daemon never asked for.
+///
+/// Returns 0 on success -- including the idempotent "already exists" path,
+/// so a resumed install does not fail at this step.
+fn run_put_secret(name: &str, replace: bool) -> i32 {
+    let secrets_dir: std::path::PathBuf = std::env::var("FERRUM_SECRETS_DIR")
+        .unwrap_or_else(|_| "/etc/ferrum/secrets".to_string())
+        .into();
+    let host_key_pub: std::path::PathBuf = std::env::var("FERRUM_HOST_KEY_PUB")
+        .unwrap_or_else(|_| ferrum_secrets::DEFAULT_HOST_KEY_PUB.to_string())
+        .into();
+
+    match put_secret::run(&secrets_dir, &host_key_pub, name, replace) {
+        Ok(put_secret::Outcome::Wrote) => {
+            println!("put-secret: wrote {}", secrets_dir.join(format!("{name}.sops")).display());
+            0
+        }
+        Ok(put_secret::Outcome::Replaced) => {
+            println!("put-secret: replaced {}", secrets_dir.join(format!("{name}.sops")).display());
+            0
+        }
+        Ok(put_secret::Outcome::Unchanged) => {
+            println!(
+                "put-secret: {} already exists, left unchanged (pass --replace to overwrite)",
+                secrets_dir.join(format!("{name}.sops")).display()
+            );
+            0
+        }
+        Err(e) => {
+            eprintln!("put-secret: {e}");
+            1
+        }
+    }
+}
+
+/// Reconciles this host's DNS records against Cloudflare, then records that
+/// it did (A8).
+///
+/// Reads only the state directory from the environment, the same way every
+/// other subcommand here does. The credential is never read here: it comes
+/// from the path the document names, inside `dns_reconcile`, so nothing
+/// about it passes through argv or this function.
+fn run_reconcile_dns(config: &std::path::Path) -> i32 {
+    let marker = std::path::PathBuf::from(
+        std::env::var("FERRUM_STATE_DIR").unwrap_or_else(|_| "/var/lib/ferrum/state".to_string()),
+    )
+    .join("dns-updater-last-success");
+    let outcome = dns_reconcile::run(
+        config,
+        &dns_reconcile::cloudflare_client,
+        &dns_reconcile::authoritative_verifier,
+    );
+    reconcile_dns_exit(outcome, &marker, std::time::SystemTime::now())
+}
+
+/// Turns a reconcile outcome into output and an exit code.
+///
+/// Exit codes follow `handle_apply_result`'s convention so a unit or future
+/// automation can tell the cases apart without parsing text: **0** clean,
+/// **3** reconciled but something is wrong, **1** could not reconcile at
+/// all.
+///
+/// The last-success marker is written only on a clean cycle, and a cycle
+/// with nothing to do counts as clean. Its *age* is the signal A8 asks for:
+/// a timer that has been erroring for six weeks is, from outside,
+/// indistinguishable from one that has never had anything to do -- unless
+/// something records the difference. `ferrum-apply apply`'s in-process
+/// reconcile deliberately does not write it, so the file keeps meaning "the
+/// scheduled updater ran and was happy" rather than "something, at some
+/// point, looked".
+///
+/// # Arguments
+/// * `outcome` - what `dns_reconcile::run` returned.
+/// * `marker` - where the last-success timestamp lives.
+/// * `now` - the timestamp to record.
+fn reconcile_dns_exit(
+    outcome: Result<Option<dns_reconcile::ReconcileReport>, dns_reconcile::ReconcileError>,
+    marker: &std::path::Path,
+    now: std::time::SystemTime,
+) -> i32 {
+    let report = match outcome {
+        Ok(Some(report)) => report,
+        Ok(None) => {
+            println!("reconcile-dns: DNS record management is disabled on this host");
+            return 0;
+        }
+        Err(e) => {
+            eprintln!("reconcile-dns: {e}");
+            return 1;
+        }
+    };
+
+    println!("{}", report.full_summary());
+    if let Some(failures) = report.failure_summary() {
+        eprintln!("reconcile-dns: {failures}");
+        return 3;
+    }
+    // Reconciliation itself succeeded, so this is not a failed cycle -- but
+    // an unwritten marker means the next observer cannot tell a working
+    // updater from a silent one, which is the entire point of the file. Say
+    // so rather than exiting 0 in silence.
+    if let Err(e) = dns_reconcile::record_last_success(marker, now) {
+        eprintln!(
+            "reconcile-dns: records are correct, but the last-success marker at {} could not be written: {e}",
+            marker.display()
+        );
+        return 3;
+    }
+    if !report.scheduled {
+        println!(
+            "reconcile-dns: scheduled re-checks are off -- these records will not be corrected \
+             automatically if this host's public address changes"
+        );
+    }
+    0
+}
+
 fn run_gc() -> i32 {
     let mut progress = progress::Progress::open();
     match run_gc_inner(&mut progress) {
@@ -429,12 +792,18 @@ fn main() -> anyhow::Result<()> {
         Command::RestoreState => run_restore_state(),
         Command::Gc => run_gc(),
         Command::PreviewMigration => run_preview_migration(),
+        Command::CheckUpdate => run_check_update(),
+        Command::ReconcileDns { config } => run_reconcile_dns(&config),
+        Command::PutSecret { name, replace } => run_put_secret(&name, replace),
         Command::RunRequest { path } => match request::read_request(&path) {
-            Ok(request::Request::Preflight) => run_preflight(),
-            Ok(request::Request::Apply) => run_apply(),
-            Ok(request::Request::Rollback { to }) => run_rollback(to),
-            Ok(request::Request::RestoreState) => run_restore_state(),
-            Ok(request::Request::Gc) => run_gc(),
+            Ok(req) => run_request(req, &mut progress::Progress::open(), |req| match req {
+                request::Request::Preflight => run_preflight(),
+                request::Request::Apply => run_apply(),
+                request::Request::Rollback { to } => run_rollback(to),
+                request::Request::RestoreState => run_restore_state(),
+                request::Request::Gc => run_gc(),
+                request::Request::CheckUpdate => run_check_update(),
+            }),
             Err(e) => {
                 eprintln!("run-request: {e}");
                 progress::Progress::open().complete("failed", &e.to_string());
@@ -448,7 +817,224 @@ fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod reconcile_dns {
+        use super::*;
+        use crate::dns_reconcile::{Operation, ReconcileError, ReconcileReport, RecordReport};
+
+        fn report(records: Vec<RecordReport>, scheduled: bool) -> ReconcileReport {
+            ReconcileReport { records, scheduled }
+        }
+
+        fn clean_record() -> RecordReport {
+            RecordReport {
+                name: "auth.example.com".to_string(),
+                operation: Operation::Create,
+                failure: None,
+                note: None,
+            }
+        }
+
+        fn failed_record() -> RecordReport {
+            RecordReport {
+                name: "plex.example.com".to_string(),
+                operation: Operation::Create,
+                failure: Some("Cloudflare refused the request".to_string()),
+                note: None,
+            }
+        }
+
+        #[test]
+        fn a_clean_cycle_exits_zero_and_leaves_a_timestamp_behind() {
+            let dir = tempfile::tempdir().unwrap();
+            let marker = dir.path().join("state").join("dns-updater-last-success");
+            let code = reconcile_dns_exit(
+                Ok(Some(report(vec![clean_record()], true))),
+                &marker,
+                std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_770_000_000),
+            );
+            assert_eq!(code, 0);
+            assert_eq!(std::fs::read_to_string(&marker).unwrap(), "1770000000\n");
+        }
+
+        /// A cycle with nothing to do is still a cycle that proved the
+        /// records are right, so it must refresh the marker -- otherwise the
+        /// file ages out on a host where nothing is wrong.
+        #[test]
+        fn a_no_op_cycle_still_refreshes_the_marker() {
+            let dir = tempfile::tempdir().unwrap();
+            let marker = dir.path().join("dns-updater-last-success");
+            assert_eq!(
+                reconcile_dns_exit(
+                    Ok(Some(report(Vec::new(), true))),
+                    &marker,
+                    std::time::SystemTime::now()
+                ),
+                0
+            );
+            assert!(marker.exists());
+        }
+
+        /// The marker must not claim a healthy cycle that did not happen: a
+        /// failed record is exactly when a stale timestamp would be read as
+        /// "the updater is fine".
+        ///
+        /// Mutation check: write the marker before checking
+        /// `failure_summary()` and this fails.
+        #[test]
+        fn a_failed_record_exits_three_and_writes_no_timestamp() {
+            let dir = tempfile::tempdir().unwrap();
+            let marker = dir.path().join("dns-updater-last-success");
+            let code = reconcile_dns_exit(
+                Ok(Some(report(vec![clean_record(), failed_record()], true))),
+                &marker,
+                std::time::SystemTime::now(),
+            );
+            assert_eq!(code, 3, "a partial result is a reported failure");
+            assert!(
+                !marker.exists(),
+                "a failed cycle must not leave a marker claiming success"
+            );
+        }
+
+        /// A run that could not start at all is distinct from one that ran
+        /// and found problems, so the exit code distinguishes them.
+        #[test]
+        fn a_run_that_could_not_start_exits_one_and_writes_no_timestamp() {
+            let dir = tempfile::tempdir().unwrap();
+            let marker = dir.path().join("dns-updater-last-success");
+            let code = reconcile_dns_exit(
+                Err(ReconcileError::NoCredentialConfigured),
+                &marker,
+                std::time::SystemTime::now(),
+            );
+            assert_eq!(code, 1);
+            assert!(!marker.exists());
+        }
+
+        #[test]
+        fn a_host_that_does_not_manage_dns_exits_zero_without_a_timestamp() {
+            let dir = tempfile::tempdir().unwrap();
+            let marker = dir.path().join("dns-updater-last-success");
+            assert_eq!(
+                reconcile_dns_exit(Ok(None), &marker, std::time::SystemTime::now()),
+                0
+            );
+            assert!(
+                !marker.exists(),
+                "a host that reconciles nothing has not proved anything about its records"
+            );
+        }
+    }
     use clap::Parser;
+
+    /// The `started` line must be the FIRST line of a dispatched job's file.
+    /// `GET /api/jobs` reads only the first line to recover a job's kind, so
+    /// if a subcommand's own progress landed ahead of it the kind would be
+    /// reported as null for every job.
+    ///
+    /// Uses `Progress::to_path` rather than `FERRUM_JOB_ID`/`FERRUM_JOBS_DIR`:
+    /// those are process-wide, and progress.rs's own env test runs in this
+    /// same test binary, so racing it would make this flaky.
+    #[test]
+    fn a_dispatched_jobs_started_line_comes_before_the_subcommands_own_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("job.jsonl");
+        let mut progress = progress::Progress::to_path(&path);
+
+        let code = run_request(request::Request::Gc, &mut progress, |req| {
+            // Stand-in for a real subcommand writing its own progress.
+            progress::Progress::to_path(&path).event("pruning", &format!("ran {}", req.kind()));
+            0
+        });
+        assert_eq!(code, 0, "the runner's exit code must pass through unchanged");
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(lines.len(), 2, "expected exactly the started line then the subcommand's: {content}");
+
+        let first: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(first["event"], "started", "the FIRST line must be the started event");
+        assert_eq!(first["detail"], "gc", "and it must name the request's own kind");
+
+        let second: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(second["event"], "pruning", "the subcommand's progress follows it");
+    }
+
+    /// The read-only check is dispatched through the same mechanism as
+    /// every other capability (R3's second criterion), which means its
+    /// `started` line has to carry its own kind -- otherwise `GET
+    /// /api/jobs` reports a running check as a job of unknown kind, and the
+    /// UI has nothing to reattach to.
+    #[test]
+    fn a_dispatched_check_update_announces_its_own_kind_before_it_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("job.jsonl");
+        let mut progress = progress::Progress::to_path(&path);
+
+        let code = run_request(request::Request::CheckUpdate, &mut progress, |req| {
+            progress::Progress::to_path(&path).event("check-update", &format!("ran {}", req.kind()));
+            0
+        });
+        assert_eq!(code, 0);
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let first: serde_json::Value =
+            serde_json::from_str(content.lines().next().unwrap()).unwrap();
+        assert_eq!(first["event"], "started");
+        assert_eq!(first["detail"], "check_update");
+    }
+
+    /// The whole point of the guard: a check that moved a pin is a FAILED
+    /// job, loudly, even if everything else about it worked.
+    #[test]
+    fn a_check_that_broke_the_read_only_guarantee_fails_the_job() {
+        let (result, detail, code) = check_update_outcome(
+            &["the update check modified /etc/ferrum/flake.lock -- it must be strictly read-only"
+                .to_string()],
+            Ok(std::path::PathBuf::from("/var/lib/ferrum/jobs/x.update-check.json")),
+            "up to date; 4 enabled app(s), 3 excluded",
+        );
+        assert_eq!(result, "failed");
+        assert_eq!(code, 1);
+        assert!(detail.contains("flake.lock"), "{detail}");
+        // Anti-vacuity: the same call with no violation really does pass.
+        let (result, detail, code) = check_update_outcome(
+            &[],
+            Ok(std::path::PathBuf::from("/var/lib/ferrum/jobs/x.update-check.json")),
+            "up to date; 4 enabled app(s), 3 excluded",
+        );
+        assert_eq!(result, "succeeded");
+        assert_eq!(code, 0);
+        assert!(detail.contains("x.update-check.json"), "{detail}");
+    }
+
+    /// A report nobody can read is not a completed check: ferrumd serves
+    /// the document, not the progress stream, so a silent write failure
+    /// would leave the operator staring at a successful job with no answer.
+    #[test]
+    fn a_report_that_could_not_be_written_fails_the_job() {
+        let (result, detail, code) =
+            check_update_outcome(&[], Err("Permission denied (os error 13)".to_string()), "x");
+        assert_eq!(result, "failed");
+        assert_eq!(code, 1);
+        assert!(detail.contains("Permission denied"), "{detail}");
+    }
+
+    /// The exit code is the runner's, not something `run_request` invents --
+    /// a dispatched apply that degrades must still surface its own 3.
+    #[test]
+    fn run_request_returns_the_runners_exit_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut progress = progress::Progress::to_path(&dir.path().join("j.jsonl"));
+        assert_eq!(run_request(request::Request::Apply, &mut progress, |_| 3), 3);
+    }
+
+    #[test]
+    fn parses_check_update() {
+        let cli = Cli::parse_from(["ferrum-apply", "check-update"]);
+        assert!(matches!(cli.command, Command::CheckUpdate));
+    }
 
     #[test]
     fn parses_preflight() {
@@ -482,6 +1068,26 @@ mod tests {
     fn parses_preview_migration_subcommand() {
         let cli = Cli::parse_from(["ferrum-apply", "preview-migration"]);
         assert!(matches!(cli.command, Command::PreviewMigration));
+    }
+
+    /// The secret VALUE must never be an argument -- it would land in `ps`
+    /// and in shell history. Only the name and the flag are.
+    #[test]
+    fn put_secret_takes_a_name_and_an_optional_replace_flag() {
+        let cli = Cli::parse_from(["ferrum-apply", "put-secret", "acme-dns"]);
+        match cli.command {
+            Command::PutSecret { ref name, replace } => {
+                assert_eq!(name, "acme-dns");
+                assert!(!replace);
+            }
+            _ => panic!("expected PutSecret, got {:?}", cli.command),
+        }
+
+        let cli = Cli::parse_from(["ferrum-apply", "put-secret", "acme-dns", "--replace"]);
+        match cli.command {
+            Command::PutSecret { replace, .. } => assert!(replace),
+            _ => panic!("expected PutSecret"),
+        }
     }
 
     #[test]
@@ -606,5 +1212,157 @@ mod tests {
             1
         );
         assert_eq!(handle_apply_result(Err(anyhow::anyhow!("boom"))), 1);
+    }
+
+    /// The one function that composes the whole check -- tripwire, report,
+    /// publication, exit code -- and the only place the tripwire's output
+    /// is connected to the job's outcome.
+    ///
+    /// It had no test at all: a mutation that replaced `guard.violations()`
+    /// with an empty vector, disconnecting the read-only tripwire from the
+    /// job outcome entirely, left the whole suite green. These two tests
+    /// are what makes that mutation fail.
+    mod check_update_composition {
+        use super::*;
+        use crate::update_check::{CommandOutput, CommandRunner};
+        use std::cell::RefCell;
+
+        const INSTALLED: &str = "1111111111111111111111111111111111111111";
+        const CANDIDATE: &str = "2222222222222222222222222222222222222222";
+
+        /// A runner that answers the check's questions, and -- when asked
+        /// to -- writes to `flake.nix` while doing it, which is exactly the
+        /// event the tripwire exists to catch.
+        struct Saboteur {
+            writes_to: Option<std::path::PathBuf>,
+            calls: RefCell<usize>,
+        }
+
+        impl CommandRunner for Saboteur {
+            fn run(&self, _program: &str, args: &[String]) -> Result<CommandOutput, String> {
+                *self.calls.borrow_mut() += 1;
+                if let Some(path) = &self.writes_to {
+                    // A pin advanced behind the operator's back: the whole
+                    // reason this job is defined by what it must not do.
+                    std::fs::write(path, "{ inputs.ferrum.url = \"github:someone/else\"; }\n")
+                        .unwrap();
+                }
+                let joined = args.join(" ");
+                let body = if joined.contains("ferrum.apps") {
+                    r#"{"sonarr":{"enable":true}}"#.to_string()
+                } else if joined.contains("ferrum.schemaVersion") {
+                    "2".to_string()
+                } else if joined.contains("package.version") {
+                    "\"4.0.1\"".to_string()
+                } else if joined.contains("ls-remote") {
+                    format!("{CANDIDATE}\tHEAD\n")
+                } else {
+                    serde_json::json!({"lastModified": 200, "revision": CANDIDATE}).to_string()
+                };
+                Ok(CommandOutput { success: true, stdout: body, stderr: String::new() })
+            }
+        }
+
+        struct Host {
+            _dir: tempfile::TempDir,
+            job: CheckUpdateJob,
+            progress_path: std::path::PathBuf,
+        }
+
+        fn host() -> Host {
+            let dir = tempfile::tempdir().unwrap();
+            let flake_dir = dir.path().join("etc");
+            std::fs::create_dir_all(&flake_dir).unwrap();
+            let flake_nix = flake_dir.join("flake.nix");
+            std::fs::write(&flake_nix, "{ inputs.ferrum.url = \"github:syms-dev/ferrum\"; }\n")
+                .unwrap();
+            let flake_lock = flake_dir.join("flake.lock");
+            std::fs::write(
+                &flake_lock,
+                serde_json::json!({
+                    "nodes": {
+                        "root": {"inputs": {"ferrum": "ferrum"}},
+                        "ferrum": {"locked": {"rev": INSTALLED, "lastModified": 100}}
+                    },
+                    "version": 7
+                })
+                .to_string(),
+            )
+            .unwrap();
+            let settings_path = dir.path().join("settings.json");
+            std::fs::write(&settings_path, r#"{"schemaVersion":2,"apps":{}}"#).unwrap();
+            let report_dir = dir.path().join("jobs");
+            Host {
+                progress_path: dir.path().join("job.jsonl"),
+                job: CheckUpdateJob {
+                    flake_dir: flake_dir.to_string_lossy().into_owned(),
+                    config_attr: "nixosConfigurations.saltbox.config".to_string(),
+                    settings_path,
+                    flake_nix,
+                    flake_lock,
+                    report_dir,
+                    report_file: "job-1.update-check.json".to_string(),
+                    now: 1_758_700_000,
+                },
+                _dir: dir,
+            }
+        }
+
+        /// The clean path: a report is published and the job succeeds.
+        /// Without this, the failing case below could pass simply because
+        /// the composition never succeeds at anything.
+        #[test]
+        fn a_check_that_touches_nothing_publishes_its_report_and_exits_zero() {
+            let h = host();
+            let runner = Saboteur { writes_to: None, calls: RefCell::new(0) };
+            let mut progress = progress::Progress::to_path(&h.progress_path);
+
+            let code = run_check_update_job(&h.job, &runner, &mut progress);
+
+            assert_eq!(code, 0, "a clean check must exit zero");
+            assert!(*runner.calls.borrow() > 0, "the check ran no subprocess at all");
+            let published = h.job.report_dir.join(&h.job.report_file);
+            let body = std::fs::read_to_string(&published).expect("no report was published");
+            let doc: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(doc["candidate"]["state"], "update-available");
+            let stream = std::fs::read_to_string(&h.progress_path).unwrap();
+            assert!(stream.contains("succeeded"), "{stream}");
+        }
+
+        /// The case with no second chance: the check moved a protected
+        /// file. The tripwire's real output must reach the job outcome --
+        /// a non-zero exit, a `failed` progress line, and the violation
+        /// recorded in the report's own warnings.
+        #[test]
+        fn a_check_that_moved_a_protected_file_fails_the_job_with_the_tripwires_own_words() {
+            let h = host();
+            let before = std::fs::read_to_string(&h.job.flake_nix).unwrap();
+            let runner = Saboteur {
+                writes_to: Some(h.job.flake_nix.clone()),
+                calls: RefCell::new(0),
+            };
+            let mut progress = progress::Progress::to_path(&h.progress_path);
+
+            let code = run_check_update_job(&h.job, &runner, &mut progress);
+
+            // Positive control on the fixture: the file really did move,
+            // so a passing tripwire below would be a finding and not an
+            // artefact of nothing having happened.
+            let after = std::fs::read_to_string(&h.job.flake_nix).unwrap();
+            assert_ne!(before, after, "the saboteur did not actually write the file");
+
+            assert_eq!(code, 1, "a broken read-only guarantee must fail the job");
+            let stream = std::fs::read_to_string(&h.progress_path).unwrap();
+            assert!(stream.contains("failed"), "the job did not report failure: {stream}");
+            assert!(
+                stream.contains("flake.nix"),
+                "the terminal line must name the file that moved: {stream}"
+            );
+            let body = std::fs::read_to_string(h.job.report_dir.join(&h.job.report_file)).unwrap();
+            assert!(
+                body.contains("flake.nix"),
+                "the published report must carry the violation: {body}"
+            );
+        }
     }
 }

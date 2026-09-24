@@ -23,7 +23,7 @@
 # BEFORE the base overlay, so the base's plain `ferrum-apply =
 # final.callPackage ...` silently clobbered the wrapper). A single list
 # literal has no such ambiguity -- Nix list order is exactly written order.
-{ config, lib, ... }:
+{ config, lib, pkgs, revision, ... }:
 let
   ferrum = config.ferrum;
 
@@ -43,8 +43,26 @@ let
   # referenced (a disabled app) is never built regardless of whether its
   # name appears in this allowlist.
   catalog = import ../lib/catalog.nix { inherit lib; };
+  #
+  # ferrum.extraUnfreePackages joins the SAME union rather than being
+  # allowed a predicate of its own, and the predicate below stays without
+  # lib.mkDefault. Both of those are deliberate.
+  #
+  # nixpkgs.config is types.attrs, so definitions of it merge with `//` and
+  # a later one WINS -- silently, with no conflict error. Measured at
+  # 03d569f: a /etc/ferrum/custom/ module setting its own
+  # allowUnfreePredicate produced a host where the predicate answered
+  # plexmediaserver = false and unrar = false. The operator added one
+  # package and took Plex and SABnzbd out, and the only symptom is a build
+  # failure naming a package they never touched.
+  #
+  # lib.mkDefault does not fix that; it blesses it. It would let the custom
+  # definition win CLEANLY, which is the same silent loss with a tidier
+  # mechanism. The composable thing is the LIST, so the list is what this
+  # option extends.
   unfreePackageNames = lib.unique (
     lib.concatMap (app: app.unfreePackages or [ ]) (lib.attrValues catalog)
+    ++ ferrum.extraUnfreePackages
   );
 
   # Only the three servarr apps ferrum-apply's secrets.rs module actually
@@ -90,6 +108,23 @@ let
   hostKeyPubPath =
     let paths = config.sops.age.sshKeyPaths or [ ];
     in lib.optionalString (paths != [ ]) "${builtins.toString (lib.head paths)}.pub";
+  # ferrum-apply's own compiled-in fallback is
+  # "/etc/ferrum#nixosConfigurations.default...", which quietly assumes every
+  # host flake names its configuration `default`. Real host flakes name it
+  # after the machine -- examples/hosts/template and docs/INSTALL.md both say
+  # to -- so on the first real ferrum host a bare `ferrum-apply apply` failed
+  # outright. Deriving it from this host's own hostName makes it always
+  # correct, and the operator never has to learn the variable exists.
+  #
+  # NOTE FOR ANYONE EDITING THE makeWrapper BLOCK BELOW: it is one shell
+  # command held together by trailing backslashes, so a `#` comment must
+  # never be placed between two of its lines. The backslash joins the
+  # comment into the command, everything after `#` is discarded, and every
+  # following `--set-default` becomes a standalone command -- which fails
+  # the build with the genuinely baffling "--set-default: command not
+  # found". That really happened here; hence this binding.
+  defaultFlakeRef =
+    "/etc/ferrum#nixosConfigurations.${config.networking.hostName}.config.system.build.toplevel";
 in
 {
   nixpkgs.config.allowUnfreePredicate = pkg:
@@ -98,6 +133,42 @@ in
   nixpkgs.overlays = [
     (import ../../nix/overlays)
     (final: prev: {
+      # modules/core/daemon.nix's FERRUM_CATALOG consumes pkgs.ferrum-catalog.
+      # It lived only in nix/modules/flake/packages.nix, which builds the
+      # package but does NOT populate pkgs.* inside this module tree -- so
+      # `nix flake check` passed while every real host eval failed with
+      # "attribute 'ferrum-catalog' missing". That is the third instance of
+      # the gap nix/overlays/default.nix's own ferrumd comment warns about.
+      #
+      # Defined in THIS config-wiring overlay rather than the base one
+      # because it needs the `revision` specialArg, and the base overlay is a
+      # plain `final: prev:` with no access to the module arguments.
+      #
+      # `revision` is mkHost's own parameter (modules/lib/default.nix:25),
+      # threaded through specialArgs and, until now, consumed by NOTHING --
+      # it was wired up waiting for exactly this consumer. Real host flakes
+      # already pass their own `self.shortRev` (examples/hosts/template's
+      # flake.nix:41 and saltbox's do), and checks.nix passes "ci", so using
+      # it here makes ferrumVersion true on every existing host with no
+      # host-flake change at all. Its default is "unknown".
+      ferrum-catalog = prev.writeTextFile {
+        name = "ferrum-catalog.json";
+        destination = "/share/ferrum/catalog.json";
+        # schemaVersion is the literal 1, mirroring the flake package byte for
+        # byte rather than reading ferrum.schemaVersion. Both resolve to 1
+        # today (modules/lib/migrations.nix has an empty migration list), but
+        # the option is computed as `length migrations + 1` while the flake
+        # package hardcodes it -- so reading the option here would make the two
+        # producers disagree the first time a migration is added. Consistently
+        # stale is better than newly divergent; that the flake package
+        # hardcodes it at all is a separate pre-existing bug.
+        text = builtins.toJSON {
+          schemaVersion = 1;
+          ferrumVersion = revision;
+          apps = catalog;
+        };
+      };
+
       # `--set-default` (not `--set`): a caller's own explicit environment=
       # still wins, matching how ferrum-state-restore.service sets
       # FERRUM_ROOT_DEVICE itself today. Only a host that changes these
@@ -116,6 +187,7 @@ in
             --set-default FERRUM_SNAPSHOT_DIR ${lib.escapeShellArg ferrum.storage.snapshotDir} \
             --set-default FERRUM_JOURNAL_DIR ${lib.escapeShellArg ferrum.storage.journalDir} \
             --set-default FERRUM_MIN_FREE_GIB ${toString ferrum.storage.minFreeGiB} \
+            --set-default FERRUM_FLAKE_REF ${lib.escapeShellArg defaultFlakeRef} \
             --set-default FERRUM_KEEP_GENERATIONS ${toString ferrum.storage.keepGenerations} \
             --set-default FERRUM_HEALTH_CHECK_TIMEOUT_SEC ${toString ferrum.apply.healthCheckTimeoutSec} \
             --set-default FERRUM_SECRETS_DIR ${lib.escapeShellArg ferrum.secretsDir} \
@@ -131,5 +203,48 @@ in
         meta = (prev.ferrum-apply.meta or { }) // { mainProgram = "ferrum-apply"; };
       };
     })
+  ];
+
+  # Put the operator's own CLI on PATH.
+  #
+  # FOUND ON THE FIRST REAL INSTALL, 2026-09-15: nothing in this module tree
+  # had ever set environment.systemPackages, so `ferrum-apply` existed only
+  # as a store path referenced by the ferrum-apply@ template unit's
+  # ExecStart. On a real booted ferrum host the operator typed
+  # `ferrum-apply apply` and got "command not found" -- which is the entire
+  # documented workflow (docs/INSTALL.md's own first-boot and rollback
+  # steps, and every "then re-apply" instruction in README.md) rendered
+  # impossible.
+  #
+  # Every VM test missed it for the same structural reason: they invoke the
+  # binary through the systemd unit or by explicit store path, never as a
+  # bare command the way a human does.
+  #
+  # This is `pkgs.ferrum-apply`, so it resolves to the OVERLAID, wrapped
+  # derivation defined above -- the one carrying every FERRUM_* default for
+  # this host. An operator running it by hand gets exactly the same
+  # environment a ferrumd-dispatched run gets, which is what makes the two
+  # paths genuinely equivalent rather than superficially similar.
+  environment.systemPackages = [
+    pkgs.ferrum-apply
+
+    # git is NOT optional on a ferrum host, and its absence is not a
+    # convenience gap.
+    #
+    # /etc/ferrum is a git repository by design, because Nix SILENTLY
+    # IGNORES untracked files inside a git tree -- an untracked
+    # custom/whatever.nix is not "added but broken", it simply does not
+    # exist as far as evaluation is concerned. So every documented
+    # operator action there ends in `git add`, and ferrum-apply evaluates
+    # that repo on every run.
+    #
+    # Without git the host cannot perform the actions its own design
+    # requires. Found on the first real install: the installer's own R6 A2
+    # commit of the generated hardware-configuration.nix failed with
+    # "bash: line 1: git: command not found", leaving the real hardware
+    # configuration present in the working tree but UNTRACKED -- i.e.
+    # invisible to Nix, on the one file the host cannot boot correctly
+    # without.
+    pkgs.git
   ];
 }
