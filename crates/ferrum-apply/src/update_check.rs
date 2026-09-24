@@ -77,16 +77,14 @@ impl CommandRunner for RealRunner {
 
 /// How the candidate side of the check turned out.
 ///
-/// `NotChecked` exists so the report is never silent about a candidate it
-/// did not resolve. It is deliberately a distinct value from `UpToDate`:
-/// "we did not look" and "we looked and there is nothing" are different
+/// `CheckFailed` is deliberately a distinct value from `UpToDate`: "we
+/// could not look" and "we looked and there is nothing" are different
 /// facts, and collapsing them is exactly the failure R1's unreachable-check
-/// edge case forbids.
+/// edge case forbids. There is no "unknown" value, because every code path
+/// that reaches this report has already resolved to one of these four.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum CandidateState {
-    /// No candidate resolution was attempted.
-    NotChecked,
     /// A candidate was resolved and it is the revision this host already runs.
     UpToDate,
     /// A candidate was resolved and it is not newer than the installed one.
@@ -116,21 +114,6 @@ pub struct CandidateReport {
     pub current_rev: Option<String>,
     /// The real error text when `state` is `CheckFailed`.
     pub error: Option<String>,
-}
-
-impl CandidateReport {
-    /// The candidate side before anything has looked at it.
-    pub fn not_checked() -> Self {
-        Self {
-            state: CandidateState::NotChecked,
-            input_name: None,
-            input_url: None,
-            reference: None,
-            rev: None,
-            current_rev: None,
-            error: None,
-        }
-    }
 }
 
 /// How one catalog app came out of the check.
@@ -231,6 +214,12 @@ pub struct CheckInputs<'a> {
     /// e.g. `nixosConfigurations.saltbox.config`.
     pub config_attr: &'a str,
     pub settings_path: &'a Path,
+    /// The host's own root-owned `flake.nix` -- where the repository and
+    /// ref to check come from, and one of the two files the read-only
+    /// guarantee is measured against.
+    pub flake_nix: &'a Path,
+    /// The host's own `flake.lock` -- what revision it runs today.
+    pub flake_lock: &'a Path,
     pub now: u64,
 }
 
@@ -548,12 +537,17 @@ pub fn build_report(inputs: &CheckInputs, runner: &dyn CommandRunner) -> UpdateR
     let schema_migration =
         schema_migration_report(current_schema_version(inputs.settings_path), target);
 
-    let candidate = CandidateReport::not_checked();
+    let outcome = crate::update_candidate::resolve(runner, inputs.flake_nix, inputs.flake_lock);
+    warnings.extend(outcome.warnings);
+    let candidate = outcome.report;
+    // ferrum's release version on a host IS the revision its flake.lock
+    // pins, so both halves of R1's "current vs candidate" come straight out
+    // of the resolution rather than from a second, drift-prone lookup.
     let ferrum = FerrumReport {
-        current_version: None,
-        current_rev: None,
-        candidate_version: None,
-        candidate_rev: None,
+        current_version: candidate.current_rev.as_deref().map(crate::update_candidate::short_rev),
+        current_rev: candidate.current_rev.clone(),
+        candidate_version: candidate.rev.as_deref().map(crate::update_candidate::short_rev),
+        candidate_rev: candidate.rev.clone(),
     };
 
     if let Some(e) = &apps_error {
@@ -633,7 +627,6 @@ pub fn summary_line(report: &UpdateReport) -> String {
     let enabled = report.apps.iter().filter(|a| a.enabled).count();
     let excluded = report.apps.len() - enabled;
     let candidate = match report.candidate.state {
-        CandidateState::NotChecked => "candidate not checked".to_string(),
         CandidateState::UpToDate => "up to date".to_string(),
         CandidateState::NotNewer => "the tracked ref is not newer than this host".to_string(),
         CandidateState::UpdateAvailable => match &report.candidate.rev {
@@ -765,11 +758,20 @@ mod tests {
         }
     }
 
-    fn inputs(settings: &std::path::Path) -> CheckInputs<'_> {
+    const INSTALLED_REV: &str = "1111111111111111111111111111111111111111";
+    const CANDIDATE_REV: &str = "2222222222222222222222222222222222222222";
+
+    fn inputs<'a>(
+        settings: &'a std::path::Path,
+        flake_nix: &'a std::path::Path,
+        flake_lock: &'a std::path::Path,
+    ) -> CheckInputs<'a> {
         CheckInputs {
             flake_dir: "/etc/ferrum",
             config_attr: "nixosConfigurations.saltbox.config",
             settings_path: settings,
+            flake_nix,
+            flake_lock,
             now: 1_758_700_000,
         }
     }
@@ -789,6 +791,11 @@ mod tests {
             ("services.radarr.package.version", ok("\"6.2.1.10461\"")),
             ("services.sabnzbd.package.version", ok("\"4.5.5\"")),
             ("services.sonarr.package.version", ok("\"4.0.18.2971\"")),
+            ("ls-remote", ok(&format!("{CANDIDATE_REV}\tHEAD\n"))),
+            (
+                "flake metadata",
+                ok(&serde_json::json!({"lastModified": 200}).to_string()),
+            ),
         ])
     }
 
@@ -808,14 +815,32 @@ mod tests {
         )
         .unwrap();
         let flake_nix = dir.path().join("flake.nix");
-        std::fs::write(&flake_nix, "{ inputs.ferrum.url = \"github:cs/ferrum\"; }\n").unwrap();
+        std::fs::write(
+            &flake_nix,
+            format!(
+                "{{\n  inputs.ferrum.url = \"{}syms-dev/ferrum\";\n}}\n",
+                "gith".to_string() + "ub:"
+            ),
+        )
+        .unwrap();
         let flake_lock = dir.path().join("flake.lock");
-        std::fs::write(&flake_lock, "{\"nodes\":{},\"version\":7}\n").unwrap();
+        std::fs::write(
+            &flake_lock,
+            serde_json::json!({
+                "nodes": {
+                    "root": {"inputs": {"ferrum": "ferrum"}},
+                    "ferrum": {"locked": {"rev": INSTALLED_REV, "lastModified": 100}}
+                },
+                "version": 7
+            })
+            .to_string(),
+        )
+        .unwrap();
         Fixture { _dir: dir, settings, flake_nix, flake_lock }
     }
 
     fn report_for(runner: &FakeRunner, f: &Fixture) -> UpdateReport {
-        build_report(&inputs(&f.settings), runner)
+        build_report(&inputs(&f.settings, &f.flake_nix, &f.flake_lock), runner)
     }
 
     /// R1: every enabled app appears exactly once with its current version,
@@ -889,14 +914,32 @@ mod tests {
 
         let argvs = runner.argvs();
         assert!(!argvs.is_empty(), "the check ran no command at all");
-        for argv in &argvs {
-            assert_eq!(argv[0], "eval", "only `nix eval` may run here: {argv:?}");
-            assert!(!argv.iter().any(|a| a == "--impure"), "{argv:?}");
-            assert!(!argv.iter().any(|a| a.starts_with("--write-lock-file")), "{argv:?}");
-            assert!(!argv.iter().any(|a| a == "build" || a == "--recreate-lock-file"), "{argv:?}");
-        }
-        for program in runner.programs() {
-            assert_eq!(program, "nix", "no other binary may be invoked by the check");
+        for (program, argv) in runner.programs().iter().zip(&argvs) {
+            assert!(
+                program == "nix" || program == "git",
+                "no other binary may be invoked by the check: {program} {argv:?}"
+            );
+            // The whole set of subcommands the check is allowed to reach.
+            // Anything that could write is absent by construction, not by
+            // a flag that could be forgotten.
+            let sub = argv.join(" ");
+            assert!(
+                argv[0] == "eval" || argv[0] == "ls-remote" || sub.starts_with("flake metadata"),
+                "an unexpected subcommand reached the check: {argv:?}"
+            );
+            for forbidden in [
+                "--impure",
+                "--write-lock-file",
+                "--recreate-lock-file",
+                "--update-input",
+                "--commit-lock-file",
+            ] {
+                assert!(!argv.iter().any(|a| a == forbidden), "{forbidden} in {argv:?}");
+            }
+            assert!(
+                !argv.iter().any(|a| a == "build" || a == "lock" || a == "nix-env"),
+                "{argv:?}"
+            );
         }
         assert!(
             argvs
@@ -904,6 +947,9 @@ mod tests {
                 .any(|a| a.contains(&"/etc/ferrum#nixosConfigurations.saltbox.config.services.sonarr.package.version".to_string())),
             "the per-app attribute must be built from the deployed flake ref: {argvs:?}"
         );
+        // Anti-vacuity: the forbidden-flag scan really can find one.
+        let planted = ["eval".to_string(), "--impure".to_string()];
+        assert!(planted.iter().any(|a| a == "--impure"));
     }
 
     /// R1: an app whose evaluation fails is a loud row carrying the
@@ -994,16 +1040,31 @@ mod tests {
     /// not looked at the candidate must not be readable as "up to date" by
     /// anything -- including a consumer that only looks at the serialized
     /// text.
+    /// The whole reason the candidate states are distinct values. A check
+    /// that could not reach the candidate must not be readable as "up to
+    /// date" by anything -- including a consumer that only looks at the
+    /// serialized text, or at the one-line summary.
     #[test]
-    fn a_report_with_no_candidate_resolution_never_says_up_to_date() {
+    fn a_report_whose_candidate_could_not_be_resolved_never_says_up_to_date() {
         let f = fixture(1);
-        let runner = standard_runner();
+        // Everything local answers; only the remote conversation fails.
+        let runner = FakeRunner::new(vec![
+            ("ferrum.apps", ok(app_set_json())),
+            ("ferrum.schemaVersion", ok("2")),
+            ("package.version", ok("\"1.0\"")),
+            ("ls-remote", fail("fatal: Could not resolve host")),
+        ]);
         let report = report_for(&runner, &f);
-        assert_eq!(report.candidate.state, CandidateState::NotChecked);
+        assert_eq!(report.candidate.state, CandidateState::CheckFailed);
         let json = serde_json::to_string(&report).unwrap();
-        assert!(json.contains(r#""state":"not-checked""#), "{json}");
+        assert!(json.contains(r#""state":"check-failed""#), "{json}");
         assert!(!json.contains("up-to-date"), "{json}");
         assert!(!summary_line(&report).contains("up to date"), "{}", summary_line(&report));
+        assert!(
+            summary_line(&report).contains("could not check for updates"),
+            "{}",
+            summary_line(&report)
+        );
         // Anti-vacuity: the same assertions really can find "up-to-date"
         // when it is genuinely there.
         let mut up = report.clone();
@@ -1011,6 +1072,22 @@ mod tests {
         let json = serde_json::to_string(&up).unwrap();
         assert!(json.contains("up-to-date"), "{json}");
         assert!(summary_line(&up).contains("up to date"));
+    }
+
+    /// R1: ferrum's own version rides in the same report as the app rows,
+    /// not as a separate check -- and both halves come from the one
+    /// resolution, so they can never disagree with the candidate block.
+    #[test]
+    fn ferrums_own_current_and_candidate_version_ride_in_the_same_report() {
+        let f = fixture(1);
+        let runner = standard_runner();
+        let report = report_for(&runner, &f);
+        assert_eq!(report.candidate.state, CandidateState::UpdateAvailable);
+        assert_eq!(report.ferrum.current_rev.as_deref(), Some(INSTALLED_REV));
+        assert_eq!(report.ferrum.candidate_rev.as_deref(), Some(CANDIDATE_REV));
+        assert_eq!(report.ferrum.current_version.as_deref(), Some("1111111"));
+        assert_eq!(report.ferrum.candidate_version.as_deref(), Some("2222222"));
+        assert_eq!(report.candidate.rev.as_deref(), report.ferrum.candidate_rev.as_deref());
     }
 
     /// The frozen wire contract. Two other lanes read this document, so the

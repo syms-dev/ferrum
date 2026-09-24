@@ -10,6 +10,7 @@ mod request;
 mod restore_state;
 mod rollback;
 mod secrets;
+mod update_candidate;
 mod update_check;
 
 #[derive(Parser)]
@@ -501,6 +502,8 @@ fn run_check_update() -> i32 {
         flake_dir: &flake_dir,
         config_attr: &config_attr,
         settings_path: std::path::Path::new(&settings_path),
+        flake_nix: &flake_nix,
+        flake_lock: &flake_lock,
         now: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
