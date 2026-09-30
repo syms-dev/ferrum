@@ -286,6 +286,12 @@ pub struct StorageConfig {
     pub admin_email: String,
     pub sabnzbd_state_dir: Option<PathBuf>,
     pub sabnzbd_port: u16,
+    /// Where the generated root console password's one-time plaintext is
+    /// written. Not optional and not gated on anything: being able to log
+    /// in at the physical console is the recovery path for every failure
+    /// that takes SSH away, so there is no host configuration for which it
+    /// is the wrong thing to do.
+    pub root_password_file: PathBuf,
 }
 
 /// Names the `ApplyResult` variant without its payload, for the terminal
@@ -333,6 +339,15 @@ fn run_inner(
     // checks file existence at Nix EVAL time, inside the build step right
     // after this.
     progress.event("secrets", "ensuring generated secrets exist");
+
+    // The console password comes first, and unconditionally. Every other
+    // credential here opens something that is only reachable while the
+    // network is; this one opens the machine itself, which is what the
+    // operator needs precisely when the rest has stopped answering. Doing
+    // it before the build also means a host whose build then fails has
+    // still gained a way in.
+    crate::secrets::ensure_root_password(&storage.root_password_file)?;
+
     let servarr_refs: Vec<&str> = storage.servarr_apps.iter().map(String::as_str).collect();
     crate::secrets::ensure_all(&storage.secrets_dir, &storage.host_key_pub, &servarr_refs)?;
     if storage.auth_enabled {

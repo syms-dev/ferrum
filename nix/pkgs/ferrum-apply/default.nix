@@ -1,4 +1,4 @@
-{ rustPlatform, lib, makeWrapper, btrfs-progs, sops, ssh-to-age, authelia, dnsutils }:
+{ rustPlatform, lib, makeWrapper, btrfs-progs, sops, ssh-to-age, authelia, dnsutils, shadow }:
 rustPlatform.buildRustPackage {
   pname = "ferrum-apply";
   version = "0.1.0";
@@ -23,6 +23,23 @@ rustPlatform.buildRustPackage {
   # two ferrum-dns call sites (verify_zone_access, list_records) are HTTPS --
   # so nix/pkgs/ferrum-install/* deliberately does NOT gain this input.
   #
+  # `shadow` supplies `passwd` and `chpasswd`, which
+  # secrets::ensure_root_password uses to ask whether root actually has a
+  # usable password and, if it does not, to give it one. Every NixOS system
+  # already ships shadow -- this input does not add a package to the host,
+  # it only guarantees the two binaries are on PATH for THIS process
+  # wherever it runs, which is the same guarantee the other five inputs get
+  # and for the same reason: a systemd unit that forgot to supply them
+  # would otherwise turn a real failure into an environment one.
+  #
+  # Deliberately NOT in nativeCheckInputs, unlike the rest. No test shells
+  # out to `passwd` or `chpasswd`: setting a real account's password needs
+  # real privilege, which a Nix sandbox does not have and a test must not
+  # need. `ensure_root_password_for` takes the status line and the setter
+  # as arguments precisely so the whole decision is testable without
+  # either, so adding shadow here would be an unused input asserting a
+  # coverage that does not exist.
+  #
   # nativeCheckInputs alone only puts these on PATH during this
   # derivation's own checkPhase -- it does NOT reach the installed binary
   # at runtime, so it's paired here with a wrapper that guarantees they're
@@ -31,6 +48,6 @@ rustPlatform.buildRustPackage {
   nativeCheckInputs = [ btrfs-progs sops ssh-to-age authelia dnsutils ];
   nativeBuildInputs = [ makeWrapper ];
   postFixup = ''
-    wrapProgram $out/bin/ferrum-apply --prefix PATH : ${lib.makeBinPath [ btrfs-progs sops ssh-to-age authelia dnsutils ]}
+    wrapProgram $out/bin/ferrum-apply --prefix PATH : ${lib.makeBinPath [ btrfs-progs sops ssh-to-age authelia dnsutils shadow ]}
   '';
 }

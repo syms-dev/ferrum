@@ -344,6 +344,281 @@ fn sabnzbd_needs_bootstrap(state_dir: &Path, secrets_dir: &Path) -> bool {
         || !secrets_dir.join("sabnzbd-apikey.sops").exists()
 }
 
+/// Where `ensure_root_password` writes the generated console password when
+/// nothing overrides it.
+///
+/// Named here and wired into the real binary by
+/// `modules/core/overlays.nix`'s `FERRUM_ROOT_PASSWORD_FILE`, the same way
+/// every other `FERRUM_*` default reaches this process. The installer's
+/// closing report reads it back over SSH -- see `credential_paths` in
+/// `crates/ferrum-install/src/verify.rs`, which names the same literal for
+/// the same reason it already names `authelia-setup-password`'s: the
+/// installer runs on the operator's own machine and links no code from
+/// this crate.
+pub const DEFAULT_ROOT_PASSWORD_FILE: &str = "/var/lib/ferrum/root-console-password";
+
+/// Ensures root can log in at the physical console, generating a random
+/// password and writing the one-time plaintext to `setup_file` if it
+/// currently cannot.
+///
+/// **THIS EXISTS BECAUSE A FERRUM HOST COULD STRAND ITS OWN OWNER.** Nothing
+/// in this module tree ever set `hashedPassword`, `initialPassword` or
+/// `users.mutableUsers`, so root's password was never set at all and the
+/// account was locked. That is invisible while SSH answers and total the
+/// moment it does not: a real host stopped listening on 22, 80 and 443
+/// while still reaching `ferrum login:`, and that prompt accepted nothing
+/// because there was nothing to accept. The only way back in was editing
+/// the bootloader for `init=/bin/sh`, which then broke the keyboard --
+/// that path never starts systemd, so udev never loads the USB HID driver.
+/// An appliance whose recovery story is "take the boot process apart" is
+/// not finished.
+///
+/// The guard is the REAL STATE, never a marker file: `passwd -S root` is
+/// asked whether root actually has a usable password. That distinction is
+/// the whole design. Three idempotence guards in this file were once keyed
+/// on the first of two artifacts they wrote, so a run killed between the
+/// two writes made every later apply short-circuit past the second
+/// forever; `ensure_first_authelia_user` was the worst, leaving a generated
+/// password that existed only in the RAM of a process about to exit. A
+/// guard keyed on `setup_file.exists()` would reproduce exactly that, and
+/// would lie in the other direction too: an operator who read their
+/// password and deleted the file would be handed a new one on the next
+/// apply, silently replacing the one they had memorised.
+///
+/// Asking the real state also gives the second required property for free.
+/// An operator who has set their own root password by hand -- at the
+/// console, during exactly the incident above -- reports `P`, so this
+/// function does nothing and never overwrites it.
+///
+/// `users.mutableUsers` is left at NixOS's own default of `true`, which is
+/// what makes a password set at runtime survive every later rebuild.
+/// Confirmed on the generated configuration rather than assumed, and kept
+/// that way by `a-host-always-has-a-way-in` in
+/// `nix/modules/flake/checks.nix`: if some module ever set it to `false`,
+/// activation would wipe this password on the next switch and this whole
+/// approach would stop working, so that check is what says so.
+///
+/// # Arguments
+/// * `setup_file` - where the one-time plaintext is written, mode `0400`.
+///
+/// # Errors
+/// When `passwd -S root` cannot be run or reports something this code does
+/// not recognise, when the setup file cannot be written, or when
+/// `chpasswd` refuses the new password.
+pub fn ensure_root_password(setup_file: &Path) -> anyhow::Result<()> {
+    ensure_root_password_for(setup_file, &root_password_status()?, set_root_password)
+}
+
+/// The decision and both effects, with the privileged read and the
+/// privileged write passed in.
+///
+/// Split this way so the whole function -- not merely its parts -- can be
+/// put in front of every state `passwd -S root` can report, from a test
+/// running unprivileged in a sandbox that has neither `passwd` nor
+/// `chpasswd`. Both properties that matter are properties of the
+/// SEQUENCE, so testing the pieces separately would have covered neither.
+///
+/// **The plaintext file is written FIRST, and that order is deliberate.**
+/// The password becomes root's only once `set` returns, so a run killed
+/// between the two leaves root still without one -- which the guard reports
+/// as `L`/`NP`, so the next apply generates again and overwrites the stale
+/// file. Setting the password first would invert that: the guard would
+/// report `P` forever while the plaintext died with the process, and the
+/// operator would be locked out by the very code meant to let them in.
+/// That is precisely how `ensure_first_authelia_user` used to fail.
+///
+/// # Arguments
+/// * `setup_file` - where the one-time plaintext is written.
+/// * `passwd_status` - the raw stdout of `passwd -S root`.
+/// * `set` - applies the password to the real account.
+///
+/// # Errors
+/// When `passwd_status` is unrecognised, the file cannot be written, or
+/// `set` fails.
+fn ensure_root_password_for(
+    setup_file: &Path,
+    passwd_status: &str,
+    set: impl FnOnce(&str) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    if !root_needs_a_password(passwd_status)? {
+        return Ok(());
+    }
+    let password = random_secret_value()?;
+    write_root_password(setup_file, &password)?;
+    set(&password)
+}
+
+/// Whether root currently has no usable password, read from `passwd -S`'s
+/// own output.
+///
+/// shadow's second field is the account's password status: `P` for a
+/// usable password, `NP` for none at all, `L` for locked. A ferrum host
+/// built before this function existed reports `L`.
+///
+/// **An unrecognised status is an error, not a guess.** The two available
+/// guesses are harmful in opposite directions -- assuming "set" strands an
+/// operator who has no password, assuming "not set" overwrites one they
+/// chose -- so neither is taken. A loud failure of `ferrum-apply apply` is
+/// recoverable; silently destroying the operator's own credential is not.
+/// The account name is checked for the same reason: `passwd -S` with no
+/// argument reports on the CALLING user, and a status line describing
+/// somebody else must never be read as an answer about root.
+///
+/// # Arguments
+/// * `passwd_status` - the raw stdout of `passwd -S root`.
+///
+/// # Returns
+/// `true` when root has no usable password and one should be generated.
+///
+/// # Errors
+/// When the output is empty, describes an account other than root, or
+/// carries a status token this code does not recognise.
+fn root_needs_a_password(passwd_status: &str) -> anyhow::Result<bool> {
+    let line = passwd_status
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("`passwd -S root` printed nothing at all"))?;
+    let mut fields = line.split_whitespace();
+    match fields.next() {
+        Some("root") => {}
+        Some(other) => {
+            anyhow::bail!("`passwd -S root` reported on the account {other:?}, not root: {line:?}")
+        }
+        None => anyhow::bail!("`passwd -S root` printed no account name: {line:?}"),
+    }
+    match fields.next() {
+        Some("P") => Ok(false),
+        Some("L" | "NP") => Ok(true),
+        Some(other) => anyhow::bail!(
+            "`passwd -S root` reported the unrecognised password status {other:?} \
+             (expected P, L or NP): {line:?} -- refusing to guess, because either \
+             guess strands you at the console or overwrites a password you chose"
+        ),
+        None => anyhow::bail!("`passwd -S root` printed no password status: {line:?}"),
+    }
+}
+
+/// Asks shadow for root's real account state.
+///
+/// `passwd` reaches this process through the wrapper in
+/// `nix/pkgs/ferrum-apply/default.nix`, which puts `shadow` on PATH the
+/// same way it already supplies `btrfs`, `sops`, `ssh-to-age`, `authelia`
+/// and `dig` -- so this does not depend on a consuming systemd unit
+/// remembering to provide it.
+///
+/// # Returns
+/// The raw stdout of `passwd -S root`.
+///
+/// # Errors
+/// When the binary cannot be run or exits non-zero.
+fn root_password_status() -> anyhow::Result<String> {
+    let output = std::process::Command::new("passwd")
+        .args(["-S", "root"])
+        .output()
+        .map_err(|e| anyhow::anyhow!("failed to run `passwd -S root`: {e}"))?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "`passwd -S root` failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Writes the one-time plaintext where the operator -- and the installer's
+/// closing report -- can read it.
+///
+/// Opened at mode `0400` from the moment of creation via `OpenOptions`,
+/// never write-then-chmod: that sequence leaves a window where a plaintext
+/// root password sits at whatever mode the process umask produced. The
+/// same fix was made to `write_first_user`, for the same reason.
+///
+/// **Any existing file is REMOVED first, and that is not tidiness.**
+/// `OpenOptions::mode` applies only when the file is created; reopening an
+/// existing one leaves whatever mode it already had, so a rewrite over a
+/// file somebody had loosened would silently keep it loose -- a plaintext
+/// root password at the wrong mode is the exact thing the line above
+/// exists to prevent. Reopening also cannot work at all here: this
+/// function's own previous run left the file at `0400`, which is not
+/// writable, and only root's permission bypass hides that. The Nix build
+/// sandbox, which is unprivileged, does not have that bypass and reported
+/// it as `Permission denied` -- so this is also the difference between a
+/// test that passes because it happens to run as root and one that proves
+/// something.
+///
+/// Flushed before returning, so "the password is on disk" is true rather
+/// than merely buffered by the time the caller sets it on the real account.
+///
+/// # Arguments
+/// * `setup_file` - the destination path; its parent directory is created.
+/// * `password` - the generated one-time plaintext.
+///
+/// # Errors
+/// When the parent directory or the file cannot be created or written. A
+/// missing file is not an error to remove.
+fn write_root_password(setup_file: &Path, password: &str) -> anyhow::Result<()> {
+    if let Some(parent) = setup_file.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    match std::fs::remove_file(setup_file) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o400)
+        .open(setup_file)?;
+    f.write_all(format!("{password}\n").as_bytes())?;
+    f.flush()?;
+    Ok(())
+}
+
+/// Applies `password` to the real root account via `chpasswd`.
+///
+/// Fed on stdin rather than passed as an argument, so the plaintext never
+/// appears in this host's process table.
+///
+/// `random_secret_value` produces base64 over `[A-Za-z0-9+/=]`, which
+/// contains neither the `:` that separates chpasswd's two fields nor the
+/// newline that ends its record -- so the line below cannot be split apart
+/// by its own payload.
+///
+/// # Arguments
+/// * `password` - the generated plaintext.
+///
+/// # Errors
+/// When `chpasswd` cannot be run, its stdin cannot be written, or it exits
+/// non-zero.
+fn set_root_password(password: &str) -> anyhow::Result<()> {
+    use std::io::Write as _;
+    let mut child = std::process::Command::new("chpasswd")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("failed to run chpasswd: {e}"))?;
+    child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("chpasswd gave us no stdin to write to"))?
+        .write_all(format!("root:{password}\n").as_bytes())
+        .map_err(|e| anyhow::anyhow!("failed to write root's new password to chpasswd: {e}"))?;
+    let output = child
+        .wait_with_output()
+        .map_err(|e| anyhow::anyhow!("failed to wait for chpasswd: {e}"))?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "chpasswd failed to set root's password: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(())
+}
+
 /// Shells out to Authelia's own `authelia crypto hash generate argon2`
 /// (the package already provides this) rather than reimplementing
 /// argon2id in Rust -- this is the exact hash format Authelia's own
@@ -690,5 +965,217 @@ mod tests {
         let content = std::fs::read_to_string(state_dir.join("sabnzbd.ini")).unwrap();
         assert!(content.contains("port = 9090"), "ini did not contain the configured port: {content}");
         assert!(content.contains("api_key = "), "ini did not contain a generated api_key: {content}");
+    }
+
+    // -----------------------------------------------------------------
+    // The console password: a ferrum host must never boot to a login
+    // prompt that accepts nothing. See `ensure_root_password`'s own
+    // documentation for the incident these tests exist to keep closed.
+    // -----------------------------------------------------------------
+
+    /// Real `passwd -S` output shapes, captured from shadow's documented
+    /// format. The trailing fields are the ageing policy; only the first
+    /// two are read, and the rest are present so the parser is exercised
+    /// against a whole line rather than the two tokens it cares about.
+    const ROOT_LOCKED: &str = "root L 2026-09-30 0 99999 7 -1\n";
+    const ROOT_NO_PASSWORD: &str = "root NP 2026-09-30 0 99999 7 -1\n";
+    const ROOT_HAS_ONE: &str = "root P 2026-09-30 0 99999 7 -1\n";
+
+    /// The defect itself: a host whose root account is locked gets a real,
+    /// random password, and the operator can read it.
+    #[test]
+    fn a_locked_root_account_gets_a_generated_password() {
+        let dir = tempfile::tempdir().unwrap();
+        let setup_file = dir.path().join("state").join("root-console-password");
+        // The stand-in for `chpasswd`: records what it was handed, so the
+        // password the account got can be compared with the one the
+        // operator is told to type.
+        let seen = std::cell::RefCell::new(None::<String>);
+
+        ensure_root_password_for(&setup_file, ROOT_LOCKED, |password| {
+            *seen.borrow_mut() = Some(password.to_string());
+            Ok(())
+        })
+        .unwrap();
+
+        let on_disk = std::fs::read_to_string(&setup_file).unwrap();
+        let applied = seen.into_inner().expect("chpasswd was never called");
+        assert_eq!(
+            on_disk,
+            format!("{applied}\n"),
+            "the password the operator reads must be the password the account got"
+        );
+        assert!(
+            applied.len() >= 20,
+            "a console password this short is not real entropy: {applied:?}"
+        );
+        assert!(
+            !applied.contains(':') && !applied.contains('\n'),
+            "a password carrying chpasswd's own field or record separator could split \
+             its input line: {applied:?}"
+        );
+    }
+
+    /// `NP` -- no password at all -- is the other unusable state, and it
+    /// must be treated exactly like `L`.
+    #[test]
+    fn a_root_account_with_no_password_at_all_gets_one_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let setup_file = dir.path().join("root-console-password");
+        let seen = std::cell::RefCell::new(None::<String>);
+
+        ensure_root_password_for(&setup_file, ROOT_NO_PASSWORD, |password| {
+            *seen.borrow_mut() = Some(password.to_string());
+            Ok(())
+        })
+        .unwrap();
+
+        assert!(
+            seen.into_inner().is_some(),
+            "NP means no usable password, so one must be generated"
+        );
+        assert!(setup_file.exists());
+    }
+
+    /// **The property the whole design turns on.** The operator set their
+    /// own root password by hand -- during exactly the incident this
+    /// mechanism exists to prevent -- and then deleted, or never had, the
+    /// setup file. A later apply must not touch the account.
+    ///
+    /// The setup file is deliberately ABSENT here. That is what makes this
+    /// a test of the guard rather than a test of a marker file: a guard
+    /// keyed on `setup_file.exists()` sees "no file, therefore generate"
+    /// and silently replaces a password the operator has memorised, while
+    /// reporting success. This test fails on that implementation and
+    /// passes on the one that asks `passwd -S root`.
+    #[test]
+    fn a_password_the_operator_chose_is_never_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let setup_file = dir.path().join("root-console-password");
+        assert!(!setup_file.exists(), "the fixture must start with no marker file");
+        let seen = std::cell::RefCell::new(None::<String>);
+
+        ensure_root_password_for(&setup_file, ROOT_HAS_ONE, |password| {
+            *seen.borrow_mut() = Some(password.to_string());
+            Ok(())
+        })
+        .unwrap();
+
+        assert!(
+            seen.into_inner().is_none(),
+            "root already had a usable password and it was overwritten anyway"
+        );
+        assert!(
+            !setup_file.exists(),
+            "nothing should have been written: {:?}",
+            std::fs::read_to_string(&setup_file)
+        );
+    }
+
+    /// The write order, asserted from inside the setter.
+    ///
+    /// The plaintext must already be on disk by the time the account is
+    /// changed, so a run killed between the two leaves root still
+    /// password-less -- recoverable, because the next apply's guard says
+    /// `L` and generates again. The inverse order is what made
+    /// `ensure_first_authelia_user` produce a password that existed only
+    /// in RAM.
+    #[test]
+    fn the_plaintext_is_on_disk_before_the_account_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let setup_file = dir.path().join("root-console-password");
+        let probe = setup_file.clone();
+
+        ensure_root_password_for(&setup_file, ROOT_LOCKED, move |password| {
+            let content = std::fs::read_to_string(&probe).map_err(|e| {
+                anyhow::anyhow!("the setup file was not readable when chpasswd ran: {e}")
+            })?;
+            assert_eq!(
+                content,
+                format!("{password}\n"),
+                "the file must already hold this exact password before the account gets it"
+            );
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    /// A failure applying the password leaves a file whose contents are
+    /// not root's password -- and that is fine, because the guard still
+    /// reports `L` and the next apply regenerates over it. Pinned so that
+    /// nobody "fixes" it by writing the file last.
+    ///
+    /// The rewrite is the part that has actually broken: the first write
+    /// leaves the file at `0400`, which is not writable, so reopening it
+    /// fails for anyone without root's permission bypass. This test runs
+    /// unprivileged in the Nix build sandbox and found exactly that, while
+    /// the same test as root did not. The mode is re-asserted after the
+    /// rewrite because `OpenOptions::mode` applies only at creation, so a
+    /// reopen would have silently kept whatever mode was already there.
+    #[test]
+    fn a_failed_chpasswd_leaves_a_state_the_next_apply_can_recover_from() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let setup_file = dir.path().join("root-console-password");
+
+        let err = ensure_root_password_for(&setup_file, ROOT_LOCKED, |_| {
+            anyhow::bail!("chpasswd exploded")
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("chpasswd exploded"), "the real cause must surface: {err}");
+
+        // The guard is unchanged by the failure, so the retry generates again.
+        let seen = std::cell::RefCell::new(None::<String>);
+        ensure_root_password_for(&setup_file, ROOT_LOCKED, |password| {
+            *seen.borrow_mut() = Some(password.to_string());
+            Ok(())
+        })
+        .unwrap();
+        let applied = seen.into_inner().expect("the retry never called chpasswd");
+        assert_eq!(std::fs::read_to_string(&setup_file).unwrap(), format!("{applied}\n"));
+        let mode = std::fs::metadata(&setup_file).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o400, "the rewrite did not restore root-only mode: {mode:o}");
+    }
+
+    /// Root-only from the instant it exists. A plaintext root password at
+    /// umask-default mode, even briefly, is the window `write_first_user`
+    /// already had to close.
+    #[test]
+    fn the_setup_file_is_root_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let setup_file = dir.path().join("root-console-password");
+        write_root_password(&setup_file, "a-password").unwrap();
+        let mode = std::fs::metadata(&setup_file).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o400, "mode was {mode:o}");
+    }
+
+    /// Every status shadow can report, and every one it cannot.
+    ///
+    /// The unrecognised cases are errors rather than a default, because
+    /// both available defaults are harmful: one strands the operator, the
+    /// other destroys the credential they chose. `nobody P ...` is the
+    /// specific accident this guards -- `passwd -S` with no argument
+    /// reports on the calling user, and that answer says nothing about
+    /// root.
+    #[test]
+    fn only_the_statuses_shadow_really_reports_are_understood() {
+        assert!(root_needs_a_password(ROOT_LOCKED).unwrap());
+        assert!(root_needs_a_password(ROOT_NO_PASSWORD).unwrap());
+        assert!(!root_needs_a_password(ROOT_HAS_ONE).unwrap());
+        // Bare two-field output, as some shadow builds print it.
+        assert!(!root_needs_a_password("root P\n").unwrap());
+
+        for bad in ["", "   \n", "root\n", "root PS 2026-09-30\n", "nobody P 2026-09-30\n"] {
+            let err = match root_needs_a_password(bad) {
+                Ok(answer) => panic!("{bad:?} was silently interpreted as needs-a-password={answer}"),
+                Err(e) => e.to_string(),
+            };
+            assert!(
+                err.contains("passwd -S root"),
+                "the error must name what it could not read: {err}"
+            );
+        }
     }
 }

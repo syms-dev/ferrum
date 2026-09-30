@@ -317,6 +317,16 @@ ssh root@TARGET
 # ferrumd's own first-user password, generated once, root-readable only.
 cat /var/lib/ferrum/daemon/ferrumd-setup-password
 
+# root's CONSOLE password, generated on the first apply that finds root
+# without one. WRITE THIS DOWN somewhere off the machine: it is the only
+# credential here that still works when SSH does not, and it is what you
+# type at the physical keyboard when the host reaches `login:` and nothing
+# is answering on 22. Run `passwd` at the console to replace it with one of
+# your own -- later applies check root's real account state and never
+# overwrite a password you chose. See README.md's "Getting in when SSH is
+# down".
+cat /var/lib/ferrum/root-console-password
+
 # --extra-files copied settings.json root-owned, and the tmpfiles `C` rule
 # will NOT repair an existing file. Without this, ferrumd cannot save
 # anything and the web UI fails silently.
@@ -403,6 +413,14 @@ ferrumd's:
 
 ```bash
 cat /var/lib/authelia-main/authelia-setup-password
+```
+
+Every apply also generates root's console password if root still has none —
+unconditionally, SSO or not, because it is the recovery path for the case
+where nothing on the network answers at all:
+
+```bash
+cat /var/lib/ferrum/root-console-password
 ```
 
 `ferrum-apply` passes `--impure` itself, so this needs no flag from you. Watch

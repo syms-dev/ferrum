@@ -33,36 +33,48 @@
       # port) with both halves of the tree green.
       acceptedLoopbackSpellings = [ "127.0.0.1" "127.0.0.2" "::1" ];
 
+      # The minimal example host, plus any extra modules a single check
+      # needs layered on top.
+      #
+      # Parameterised rather than copied because `a-host-always-has-a-way-in`
+      # needs a CONTROL host that differs from the real one in exactly one
+      # declared way, and a second hand-written copy of this argument list
+      # would let the two drift -- at which point the control stops
+      # controlling for anything. `exampleHosts.minimal` below is this
+      # function applied to no extra modules, so it is byte-for-byte the
+      # host every other check already evaluates.
+      mkMinimalHost = extraModules: ferrumLib.mkHost {
+        inherit system;
+        settings = builtins.fromJSON (builtins.readFile ../../../examples/hosts/minimal/settings.json);
+        modules = [
+          ../../../examples/hosts/minimal/configuration.nix
+          # This host is eval-only (see configuration.nix's own "NOT
+          # BOOTABLE" comment) and has no real deployed box's
+          # /etc/ferrum/secrets to read from. sops.validateSopsFiles
+          # defaults to true and requires each sops.secrets.<name>.sopsFile
+          # to be a genuine Nix path value pointing at a file that
+          # physically exists at eval time (confirmed by reading
+          # sops-nix's own source) -- disabling that check alone (an
+          # earlier version of this override did just that) is NOT
+          # sufficient, since Nix's own path-value semantics
+          # independently require the referenced file to exist the
+          # moment the value is touched, regardless of validateSopsFiles.
+          # The real fix: point ferrum.secretsDir at real (throwaway,
+          # non-production) placeholder secrets committed alongside this
+          # example host, via a path LITERAL relative to this file's own
+          # location -- that makes it part of ferrum's own flake source,
+          # auto-imported into the store at parse time, genuinely
+          # readable under pure evaluation (confirmed for real on
+          # ferrum-dev: this exact override, with placeholders present,
+          # makes checks.eval-example-hosts pass with the real default
+          # validateSopsFiles = true, no override needed at all).
+          { ferrum.secretsDir = toString ../../../examples/hosts/minimal/secrets; }
+        ] ++ extraModules;
+        revision = "ci";
+      };
+
       exampleHosts = {
-        minimal = ferrumLib.mkHost {
-          inherit system;
-          settings = builtins.fromJSON (builtins.readFile ../../../examples/hosts/minimal/settings.json);
-          modules = [
-            ../../../examples/hosts/minimal/configuration.nix
-            # This host is eval-only (see configuration.nix's own "NOT
-            # BOOTABLE" comment) and has no real deployed box's
-            # /etc/ferrum/secrets to read from. sops.validateSopsFiles
-            # defaults to true and requires each sops.secrets.<name>.sopsFile
-            # to be a genuine Nix path value pointing at a file that
-            # physically exists at eval time (confirmed by reading
-            # sops-nix's own source) -- disabling that check alone (an
-            # earlier version of this override did just that) is NOT
-            # sufficient, since Nix's own path-value semantics
-            # independently require the referenced file to exist the
-            # moment the value is touched, regardless of validateSopsFiles.
-            # The real fix: point ferrum.secretsDir at real (throwaway,
-            # non-production) placeholder secrets committed alongside this
-            # example host, via a path LITERAL relative to this file's own
-            # location -- that makes it part of ferrum's own flake source,
-            # auto-imported into the store at parse time, genuinely
-            # readable under pure evaluation (confirmed for real on
-            # ferrum-dev: this exact override, with placeholders present,
-            # makes checks.eval-example-hosts pass with the real default
-            # validateSopsFiles = true, no override needed at all).
-            { ferrum.secretsDir = toString ../../../examples/hosts/minimal/secrets; }
-          ];
-          revision = "ci";
-        };
+        minimal = mkMinimalHost [ ];
       };
 
       # Every app directory with a meta.nix must also have a service.nix, or
@@ -3649,6 +3661,180 @@
           envelopeStatusesTheUiExpectsAndTheDaemonNeverSends = uiOnly daemonEnvelopeStatuses uiEnvelopeStatuses;
         };
 
+      # **ferrum must never ship a host its owner cannot get into.**
+      #
+      # The incident this exists for: a real host stopped answering SSH --
+      # nothing listening on 22, 80 or 443 -- while still reaching
+      # `ferrum login:`. systemd had come up fine. The operator could not
+      # log in, because nothing in this module tree had ever set
+      # `hashedPassword`, `initialPassword` or `users.mutableUsers`: root's
+      # account was locked, so that prompt accepted nothing at all. The only
+      # way back in was editing the bootloader for `init=/bin/sh`, which
+      # then broke the USB keyboard, because that path never starts systemd
+      # and udev never loads the HID driver.
+      #
+      # WHAT THIS ASSERTS, AND WHY IT IS THE GENERATED DOCUMENT AND NOT AN
+      # OPTION. `config.users.users.root.hashedPassword` is a value this
+      # repository's own module tree computes; reading it back would mostly
+      # re-state the tree's intent. `users-groups.json` is the artifact
+      # NixOS's activation actually hands to `update-users-groups.pl`, and
+      # it is what decides, on the real machine, whether root can log in.
+      # It is reached the only way it can be reached cheaply: the generated
+      # users activation script names its store path, and writing that
+      # script out with `writeText` carries the string context that makes
+      # Nix realize the JSON as a build input. No full toplevel, no
+      # sops-install-secrets, none of the cost that keeps
+      # `eval-example-hosts` out of CI.
+      #
+      # The property has two arms, because there are two legitimate ways to
+      # be reachable:
+      #
+      #   1. the generated document already gives root a password, or
+      #   2. `users.mutableUsers` is true (so a password set at runtime
+      #      SURVIVES the next activation instead of being wiped) AND the
+      #      generated ferrum-apply really carries the mechanism that sets
+      #      one -- `FERRUM_ROOT_PASSWORD_FILE`, wired in by
+      #      modules/core/overlays.nix and consumed by
+      #      `secrets::ensure_root_password`.
+      #
+      # Arm 2 needs BOTH halves and that is the whole point. Before the fix,
+      # `mutableUsers` was already true -- it is NixOS's default -- so a
+      # check written against it alone would have passed green on the
+      # locked-out host. A check that passes on the broken configuration is
+      # worse than no check, so the mechanism's presence in the built
+      # artifact is what carries the claim.
+      #
+      # ANTI-VACUITY. Four guards, because every probe here can fail to
+      # find anything and "found nothing" must never read as "found nothing
+      # wrong":
+      #
+      #   a. the users document must be located and must list root at all;
+      #   b. the env-var probe must find a variable that IS there
+      #      (FERRUM_SECRETS_DIR) and must NOT find one that is not, so a
+      #      grep against the wrong file or an empty one cannot pass;
+      #   c. a CONTROL host -- identical but for a declared root
+      #      `hashedPassword` -- must make arm 1 answer true, proving that
+      #      arm is live code and not a branch nothing can ever take;
+      #   d. that same control must differ from the real host, which must
+      #      answer false on arm 1. If both answered the same the probe
+      #      would be reading something other than what it claims.
+      #
+      # It lives in CI's `rust` job rather than `cheap checks` because it
+      # realizes ferrum-apply, exactly like
+      # `production-installer-has-no-api-override` -- which is already
+      # there, for this same reason, sharing that job's warm Cargo closure.
+      aHostAlwaysHasAWayIn =
+        let
+          host = exampleHosts.minimal;
+          # The control differs from `host` in exactly one declared way.
+          # `mutableUsers = false` comes with it deliberately: this is what
+          # a host that ships a fixed password looks like, and arm 1 must
+          # accept it without any help from arm 2.
+          controlHost = mkMinimalHost [{
+            users.mutableUsers = false;
+            users.users.root.hashedPassword =
+              "$6$ferrumcheckcontrol$0000000000000000000000000000000000000000000000000000000000000000000000000000000000000";
+          }];
+          usersActivation = h: name:
+            pkgs.writeText "users-activation-${name}" h.config.system.activationScripts.users.text;
+        in
+        pkgs.runCommand "ferrum-check-a-host-always-has-a-way-in"
+          {
+            realActivation = usersActivation host "real";
+            controlActivation = usersActivation controlHost "control";
+            applier = "${host.pkgs.ferrum-apply}/bin/ferrum-apply";
+          } ''
+          set -eu
+          jq=${pkgs.jq}/bin/jq
+
+          fail() { echo "a-host-always-has-a-way-in: $1" >&2; exit 1; }
+
+          # Locates the generated users document from the activation script
+          # that names it. Realized as a build input via the writeText
+          # above, so the path is genuinely present in the store here.
+          usersDocument() {
+            doc="$(grep -oE '/nix/store/[a-z0-9]+-users-groups\.json' "$1" | head -1 || true)"
+            [ -n "$doc" ] || fail "no users-groups.json named in $1 -- the probe found nothing to read, which is not the same as finding nothing wrong"
+            [ -f "$doc" ] || fail "$1 names $doc, which is not in the store"
+            echo "$doc"
+          }
+
+          # Arm 1, as the generated document answers it. Every field
+          # NixOS's own activation would accept as a password counts --
+          # including hashedPasswordFile, which sets one without the value
+          # ever appearing here.
+          #
+          # Deliberately NOT `jq -e`. That flag makes jq exit non-zero when
+          # its output is `false`, and `false` is this function's most
+          # important legitimate answer -- under `set -e` it killed the
+          # whole check, silently, with an empty build log, before a single
+          # diagnostic could be printed. A missing root user still fails
+          # loudly: jq's own `error` below exits non-zero with a message,
+          # which is what a genuine "cannot answer" should look like, as
+          # distinct from an answer of no.
+          rootHasAPassword() {
+            $jq -r '
+              [ .users[] | select(.name == "root") ] as $root
+              | if ($root | length) == 0 then error("no root user in the generated document") else . end
+              | $root[0]
+              | [ .hashedPassword, .hashedPasswordFile, .initialHashedPassword,
+                  .initialPassword, .password ]
+              | map(select(. != null)) | length > 0
+            ' "$1"
+          }
+
+          real="$(usersDocument "$realActivation")"
+          control="$(usersDocument "$controlActivation")"
+          echo "reading the generated users documents: real=$real control=$control"
+
+          # (a) The document must really describe root. jq -e exits 1 on a
+          # false/null result, so an absent root user fails here rather
+          # than quietly producing an empty answer below.
+          $jq -e '[ .users[] | select(.name == "root") ] | length == 1' "$real" > /dev/null \
+            || fail "the generated users document does not describe exactly one root user -- refusing to read an answer out of it"
+
+          # (c) + (d) The control proves arm 1 is live and that the probe
+          # discriminates. If these two ever agree, the probe has stopped
+          # reading what it claims to read.
+          controlAnswer="$(rootHasAPassword "$control")"
+          realAnswer="$(rootHasAPassword "$real")"
+          [ "$controlAnswer" = "true" ] \
+            || fail "the control host declares users.users.root.hashedPassword and the probe still answered $controlAnswer -- the password arm of this check is dead code"
+          [ "$controlAnswer" != "$realAnswer" ] \
+            || fail "the control host and the real host answered identically ($realAnswer) -- this probe is not measuring what it claims to"
+
+          if [ "$realAnswer" = "true" ]; then
+            echo "root carries a password in the generated users document" > $out
+            exit 0
+          fi
+
+          # Arm 2, half one: a runtime-set password must survive activation.
+          mutable="$($jq -r '.mutableUsers' "$real")"
+          [ "$mutable" = "true" ] \
+            || fail "root has no password in the generated users document AND users.mutableUsers is $mutable -- a password set at runtime would be wiped by the next activation, so this host can never be logged into at the console"
+
+          # (b) The env-var probe's own controls, run before its verdict is
+          # trusted: it must be able to say yes to something present and no
+          # to something absent. A grep against a truncated or wrong file
+          # answers no to both.
+          # Named once and used in both the probe and its message, so a
+          # failure can never describe a variable other than the one it
+          # actually looked for.
+          mustBePresent=FERRUM_SECRETS_DIR
+          mustBeAbsent=FERRUM_NO_SUCH_VARIABLE_EXISTS
+          grep -a -q "$mustBePresent" "$applier" \
+            || fail "the positive control failed: $applier carries no $mustBePresent, so this probe is not reading the wrapper it thinks it is"
+          grep -a -q "$mustBeAbsent" "$applier" \
+            && fail "the negative control failed: $applier appears to carry $mustBeAbsent, which does not exist, so a match here proves nothing" \
+            || true
+
+          # Arm 2, half two: the mechanism itself.
+          grep -a -q FERRUM_ROOT_PASSWORD_FILE "$applier" \
+            || fail "root has no password in the generated users document and this host's ferrum-apply carries no FERRUM_ROOT_PASSWORD_FILE -- nothing will ever give root one, so the machine boots to a login prompt that accepts nothing and the only way in is editing the bootloader"
+
+          echo "root has no declared password, but mutableUsers is true and ferrum-apply generates one" > $out
+        '';
+
       mkAssertionCheck = name: result:
         pkgs.runCommand "ferrum-check-${name}" { } (
           if result.ok then
@@ -3659,6 +3845,7 @@
     in
     {
       checks = {
+        a-host-always-has-a-way-in = aHostAlwaysHasAWayIn;
         auth-model-enforced = mkAssertionCheck "auth-model-enforced" authModelEnforced;
         daemon-vhost-enforced = mkAssertionCheck "daemon-vhost-enforced" daemonVhostEnforced;
         daemon-unpublished-but-running = daemonUnpublishedButRunning;

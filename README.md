@@ -125,6 +125,25 @@ ssh <host> sudo cat /var/lib/authelia-main/authelia-setup-password
 
 Log in at `https://auth.<ferrum.proxy.baseDomain>/`, then change the password from Authelia's own UI — the setup file is never regenerated or deleted automatically once `users_database.yml` exists, so treat it as sensitive until you remove it by hand.
 
+### Getting in when SSH is down — the console password
+
+**Write this one down before you need it.** Every other credential on this page gets you into something over the network; this is the one that works when the network does not.
+
+`ferrum-apply` gives root a random console password on any apply where root has no usable one, and writes the plaintext once to `/var/lib/ferrum/root-console-password` (mode `0400`, root-only). The installer prints it at the end of an install, under `console login`. Read it again any time:
+
+```bash
+ssh <host> sudo cat /var/lib/ferrum/root-console-password
+```
+
+Then, at the machine's own keyboard and monitor, log in as `root` with that password at the `<host> login:` prompt.
+
+Two things about it:
+
+- **A password you set yourself is never replaced.** The guard is `passwd -S root`, the account's real state — not the presence of the file. Run `passwd` at the console to choose your own, and every later apply leaves it alone. (The file then still holds the old generated value, so delete it once you have changed the password.)
+- **It survives rebuilds.** `users.mutableUsers` is left at NixOS's default of `true`, so a password set at runtime is not wiped by the next `ferrum-apply apply`.
+
+This exists because it did not, and a real host was unreachable because of it: SSH stopped answering, the machine still reached its login prompt, and the prompt accepted nothing — root had no password and never had one. The only remaining route was editing the bootloader to boot `init=/bin/sh`, which then broke the USB keyboard, because that path never starts systemd and so udev never loads the HID driver. `a-host-always-has-a-way-in` in `nix/modules/flake/checks.nix` fails the build if ferrum ever ships that shape again.
+
 ### Reaching the dashboard when the proxy or Authelia is broken
 
 ferrumd keeps listening on loopback (`ferrum.daemon.listenAddress`, `127.0.0.1` by default) whether or not it is published. Publishing means nginx reaches it, not that it binds a public interface — so the SSH tunnel remains the recovery route for exactly the situation where you need the UI most: the proxy is down, Authelia will not start, or a bad certificate has made `ferrum.<baseDomain>` unusable.
