@@ -184,6 +184,16 @@ jobs:
       # the two cfg-gated bodies of answers::cloudflare_client into one
       # runtime branch would pass every test while shipping operators a way
       # to finish an install that can publish nothing.
+      #
+      # a-host-always-has-a-way-in is here for exactly the same reason. It
+      # reads two things: the GENERATED users-groups.json (cheap -- a
+      # writeText away) and the generated, host-overlaid ferrum-apply
+      # wrapper, which is a full Rust build and therefore belongs beside the
+      # rest of them rather than in "cheap checks". It is the standing guard
+      # against shipping a host nobody can log into: the incident it
+      # encodes is a real machine that stopped answering SSH, reached
+      # `ferrum login:`, and accepted nothing, because root had no password
+      # and never had one.
       - name: build and test the Rust workspace
         run: |
           nix build --print-build-logs \
@@ -201,7 +211,8 @@ jobs:
             .#checks.x86_64-linux.clippy-ferrum-install \
             .#checks.x86_64-linux.clippy-ferrum-reconcile \
             .#checks.x86_64-linux.clippy-ferrumd \
-            .#checks.x86_64-linux.production-installer-has-no-api-override
+            .#checks.x86_64-linux.production-installer-has-no-api-override \
+            .#checks.x86_64-linux.a-host-always-has-a-way-in
 
   # A mechanical CVE scan of the Rust dependency tree. Cheap, and the
   # alternative is a knowledge-based review whose freshness silently decays

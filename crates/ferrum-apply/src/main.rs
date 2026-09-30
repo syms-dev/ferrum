@@ -238,6 +238,9 @@ fn run_apply() -> i32 {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(8080),
+        root_password_file: std::env::var("FERRUM_ROOT_PASSWORD_FILE")
+            .unwrap_or_else(|_| secrets::DEFAULT_ROOT_PASSWORD_FILE.to_string())
+            .into(),
     };
     let flake_ref = std::env::var("FERRUM_FLAKE_REF")
         .unwrap_or_else(|_| "/etc/ferrum#nixosConfigurations.default.config.system.build.toplevel".to_string());

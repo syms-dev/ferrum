@@ -178,6 +178,23 @@ in
       # `btrfs` via its own postFixup) rather than replacing it --
       # wrapping a wrapper composes fine, since each layer just execs the
       # next and env vars are inherited through exec.
+      #
+      # FERRUM_ROOT_PASSWORD_FILE is the last entry below and is the only
+      # one with no corresponding ferrum.* option, deliberately. It is
+      # where `secrets::ensure_root_password` writes the one-time console
+      # password it generates on a host whose root account has none -- the
+      # recovery path for the failure where SSH stops answering and the
+      # machine still reaches `ferrum login:`. Making it configurable would
+      # invite a host that sets it somewhere the installer's closing report
+      # does not look, so it is a fixed path in ferrum's own state
+      # directory, named identically by `credential_paths` in
+      # crates/ferrum-install/src/verify.rs.
+      #
+      # Its PRESENCE here is also what the `a-host-always-has-a-way-in`
+      # check in nix/modules/flake/checks.nix reads out of the generated
+      # wrapper: with root carrying no password in the generated users
+      # document, this variable is the only evidence in the built
+      # configuration that anything will ever give it one.
       ferrum-apply = prev.runCommand "ferrum-apply"
         { nativeBuildInputs = [ prev.makeWrapper ]; }
         ''
@@ -198,7 +215,8 @@ in
             --set-default FERRUM_AUTHELIA_STATE_DIR "/var/lib/authelia-main" \
             --set-default FERRUM_ADMIN_EMAIL ${lib.escapeShellArg ferrum.auth.adminEmail} \
             --set-default FERRUM_SABNZBD_STATE_DIR ${lib.escapeShellArg (if ferrum.apps.sabnzbd.enable or false then ferrum.apps.sabnzbd.stateDir else "")} \
-            --set-default FERRUM_SABNZBD_PORT ${toString (ferrum.apps.sabnzbd.port or 8080)}
+            --set-default FERRUM_SABNZBD_PORT ${toString (ferrum.apps.sabnzbd.port or 8080)} \
+            --set-default FERRUM_ROOT_PASSWORD_FILE "/var/lib/ferrum/root-console-password"
         '' // {
         meta = (prev.ferrum-apply.meta or { }) // { mainProgram = "ferrum-apply"; };
       };

@@ -75,8 +75,8 @@ fn classify(switch_exit_code: i32, all_units_active: bool) -> ApplyResult {
 /// and a failing DNS reconcile are two facts and the operator needs both.
 /// `Failed` is left alone: an apply that never got as far as switching is
 /// not degraded *by DNS*, and relabelling it would hide the real cause.
-fn fold_dns_outcome(base: ApplyResult, dns: Option<String>) -> ApplyResult {
-    let Some(reason) = dns else {
+fn fold_degradation(base: ApplyResult, reason: Option<String>) -> ApplyResult {
+    let Some(reason) = reason else {
         return base;
     };
     match base {
@@ -286,6 +286,12 @@ pub struct StorageConfig {
     pub admin_email: String,
     pub sabnzbd_state_dir: Option<PathBuf>,
     pub sabnzbd_port: u16,
+    /// Where the generated root console password's one-time plaintext is
+    /// written. Not optional and not gated on anything: being able to log
+    /// in at the physical console is the recovery path for every failure
+    /// that takes SSH away, so there is no host configuration for which it
+    /// is the wrong thing to do.
+    pub root_password_file: PathBuf,
 }
 
 /// Names the `ApplyResult` variant without its payload, for the terminal
@@ -333,6 +339,30 @@ fn run_inner(
     // checks file existence at Nix EVAL time, inside the build step right
     // after this.
     progress.event("secrets", "ensuring generated secrets exist");
+
+    // The console password comes first, and unconditionally. Every other
+    // credential here opens something that is only reachable while the
+    // network is; this one opens the machine itself, which is what the
+    // operator needs precisely when the rest has stopped answering. Doing
+    // it before the build also means a host whose build then fails has
+    // still gained a way in.
+    // NOT `?`. A console password that could not be set must not stop an
+    // apply, for the same reason a failed DNS reconcile must not: the host
+    // still switched, and refusing to apply leaves the operator unable to fix
+    // anything -- on a box whose recovery path is exactly what is broken.
+    // That is the trade the owner already ruled on for exit 3 today, and this
+    // is the same shape. It degrades loudly instead, and the reason names the
+    // consequence rather than the syscall.
+    let console_password: Option<String> = match
+        crate::secrets::ensure_root_password(&storage.root_password_file)
+    {
+        Ok(()) => None,
+        Err(e) => Some(format!(
+            "could not set a console password for root ({e}) -- this host has \
+             no way in if SSH stops. Set one by hand with `passwd root`"
+        )),
+    };
+
     let servarr_refs: Vec<&str> = storage.servarr_apps.iter().map(String::as_str).collect();
     crate::secrets::ensure_all(&storage.secrets_dir, &storage.host_key_pub, &servarr_refs)?;
     if storage.auth_enabled {
@@ -396,7 +426,7 @@ fn run_inner(
         // it skipped reconciliation there would be no way to converge
         // without an unrelated configuration change.
         let dns = crate::dns_reconcile::reconcile_for_apply(&toplevel, progress);
-        return Ok(fold_dns_outcome(healthy, dns));
+        return Ok(fold_degradation(fold_degradation(healthy, dns), console_password));
     }
 
     // 2. Preflight, before touching anything.
@@ -484,7 +514,10 @@ fn run_inner(
     // Cloudflare being unreachable must degrade the verdict, never turn a
     // completed switch into an apply error.
     let dns = crate::dns_reconcile::reconcile_for_apply(&toplevel, progress);
-    Ok(fold_dns_outcome(classify(switch_exit_code, healthy), dns))
+    Ok(fold_degradation(
+        fold_degradation(classify(switch_exit_code, healthy), dns),
+        console_password,
+    ))
 }
 
 /// Unix-seconds-as-a-string, e.g. "1770000000". Not RFC3339 -- deliberately
@@ -563,6 +596,47 @@ mod tests {
         );
     }
 
+    /// A console password that could not be set degrades the apply; it does
+    /// not fail it.
+    ///
+    /// The host still switched. Failing here would leave the operator unable
+    /// to apply anything at all -- on a machine whose way in is precisely
+    /// what is broken, which is the situation this whole feature exists to
+    /// prevent. The reason has to reach the operator, though, because an
+    /// apply that quietly succeeded without a console password would hand
+    /// back the same trap with a green tick on it.
+    #[test]
+    fn a_console_password_that_could_not_be_set_degrades_rather_than_fails() {
+        let r = fold_degradation(
+            ApplyResult::Succeeded,
+            Some("could not set a console password for root (no chpasswd)".to_string()),
+        );
+        match r {
+            ApplyResult::Degraded(reason) => {
+                assert!(reason.contains("console password"), "{reason}");
+            }
+            other => panic!("a switched host must not be reported as failed: {other:?}"),
+        }
+    }
+
+    /// And it composes with a DNS reason rather than replacing it: two things
+    /// went wrong and the operator needs both, which is the property the
+    /// helper was written for and the reason it is not DNS-specific.
+    #[test]
+    fn a_failed_record_and_a_missing_console_password_both_reach_the_operator() {
+        let r = fold_degradation(
+            fold_degradation(ApplyResult::Succeeded, Some("dns record failed".to_string())),
+            Some("could not set a console password".to_string()),
+        );
+        match r {
+            ApplyResult::Degraded(reason) => {
+                assert!(reason.contains("dns record failed"), "{reason}");
+                assert!(reason.contains("console password"), "{reason}");
+            }
+            other => panic!("expected both causes: {other:?}"),
+        }
+    }
+
     /// D-08. A switch and a health check that both passed do not make the
     /// apply a success if the records nobody can reach were never created --
     /// that is precisely the shape of the incident R1 exists to fix.
@@ -572,7 +646,7 @@ mod tests {
     #[test]
     fn a_clean_switch_with_a_failed_record_is_degraded_not_succeeded() {
         assert_eq!(
-            fold_dns_outcome(
+            fold_degradation(
                 ApplyResult::Succeeded,
                 Some("1 of 2 DNS record(s) could not be reconciled: auth.example.com (create): refused".to_string()),
             ),
@@ -586,11 +660,11 @@ mod tests {
     #[test]
     fn a_clean_reconcile_leaves_the_switchs_own_verdict_alone() {
         assert_eq!(
-            fold_dns_outcome(ApplyResult::Succeeded, None),
+            fold_degradation(ApplyResult::Succeeded, None),
             ApplyResult::Succeeded
         );
         assert_eq!(
-            fold_dns_outcome(ApplyResult::Degraded("a unit is down".to_string()), None),
+            fold_degradation(ApplyResult::Degraded("a unit is down".to_string()), None),
             ApplyResult::Degraded("a unit is down".to_string())
         );
     }
@@ -599,7 +673,7 @@ mod tests {
     /// the operator did not see unfixed.
     #[test]
     fn a_degraded_switch_and_a_failed_record_report_both_causes() {
-        let ApplyResult::Degraded(reason) = fold_dns_outcome(
+        let ApplyResult::Degraded(reason) = fold_degradation(
             ApplyResult::Degraded("a unit is down".to_string()),
             Some("auth.example.com (create): refused".to_string()),
         ) else {
@@ -614,7 +688,7 @@ mod tests {
     #[test]
     fn a_failed_apply_keeps_its_own_cause() {
         assert_eq!(
-            fold_dns_outcome(
+            fold_degradation(
                 ApplyResult::Failed("nix build failed".to_string()),
                 Some("auth.example.com (create): refused".to_string()),
             ),
