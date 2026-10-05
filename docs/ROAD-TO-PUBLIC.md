@@ -142,7 +142,20 @@ Last updated at HEAD `288f2b3`, branch `grounding-and-install-path`. Nothing pus
         three branches agreed *because all three were empty*. The branch comparison alone would
         have passed with the defect fully present; only the length floor caught it.
 
-- [ ] **6. R14.**
+- [~] **6. R14 — updates.** The **discovery slice is BUILT, MERGED and DEPLOYED** to the owner's
+      host (2026-10-05): R1 discovery + R3 preview + R6 the Updates view. `/api/updates` answers
+      on the box and the view is in the served `app.js`.
+      - **Deliberately NOT built**, and still open: Phase 1.6's **R2** (pin-advance
+        authorization), **R4** (applying an update as a generation), **R5** (rollback of a bad
+        update), **R7** (selective vs wholesale), **R8** (recording the pin a generation was built
+        from). Spec: `docs/superpowers/specs/2026-09-16-phase-1-6-updates-design.md`.
+      - **Live consequence on the owner's host:** nixpkgs is pinned at **2026-06-11**, so Prowlarr
+        sits at 2.4.0.5397 while 2.6.5.5623 is upstream. Prowlarr cannot self-update — its binary
+        is in the read-only nix store — so nothing was ever going to surface this before R14.
+        **You can now SEE the update; you cannot APPLY it from the UI.** That is Phase 1.6 R4.
+      - Security review of the shipped slice: `docs/security/r14-update-discovery_security-review.md`
+        — 0 Critical, 0 High, both Mediums fixed before merge.
+
 - [x] **7. The three R13 deferred tickets.** ALL THREE DONE 2026-09-23.
       - ~~`modules/proxy/dns.nix` `daemonRecords` never consults `daemon.enable`, so a daemon-off
         host still gets a DNS record for a hostname nginx closes. **Whoever fixes this must also
@@ -228,29 +241,48 @@ Last updated at HEAD `288f2b3`, branch `grounding-and-install-path`. Nothing pus
         14:46 on 22 Sep; the last green run was 13:56. `nginx -t` **binds** every listen address,
         and a CI builder is unprivileged.
 
-- [ ] **10. A real install on real hardware, start to finish, no manual steps.** The standing
-      test: from a bare machine, does the operator end up with a working, published, logged-in
-      system without being told to do anything by hand?
-      - **Audited 2026-09-24. The installer's own output is clean** — no "do this by hand", no
-        "then log in to", no residual instructions in the closing report.
-      - **One genuine gap found: Plex is never claimed.** `modules/apps/plex/service.nix:48` wires
-        `PLEX_CLAIM` from `apps.plex.settings.claimToken`, and `meta.nix:87` defaults it to `""` —
-        but **the installer never asks for it**, and nothing else supplies it. `plex` appears in
-        `answers.rs` only as a selectable app name. So a fresh install with Plex enabled ends with
-        an unclaimed server the operator must claim in Plex's own web UI, which is the exact step
-        this requirement forbids.
-      - **Why it is awkward rather than an oversight:** a Plex claim token is fetched from plex.tv
-        while signed in and expires in about four minutes, so it cannot be pre-seeded or derived.
-        That argues for asking during the install — the one moment the operator is present and the
-        token can be used immediately — rather than for automating it away.
-      - **Not fixed here.** It needs a new installer question plus a secret write, and it is a
-        product decision about how to prompt for a credential the operator has to go and fetch
-        mid-install. Worth settling before the hardware run, because it is the difference between
-        that run proving the hands-off claim and quietly disproving it.
+- [~] **10. A real install on real hardware.** **Substantially proven 2026-10-05** — the owner's
+      host now runs this branch end to end: pool 17 TB across two branches, 7.0 TB library, all
+      seven apps active, Authelia, qBittorrent inside a Proton tunnel with the kill switch,
+      dashboard published at `ferrum.thesyms.ca` with a real certificate, nine DNS records
+      correct, **zero failed units**.
+      - **What is still NOT proven:** a *fresh* install from bare metal with no manual steps. This
+        host was upgraded in place, not installed from nothing.
+      - **The manual step that remains is R3 of the field-defects spec** — Plex is never claimed by
+        the installer. The owner's Plex was claimed by hand previously.
+      - Four defects were found only by running it, and are specced: see Phase 7 below.
 
 - [ ] **11. Confirm the SSH-tunnel recovery route in a real browser.** The `__Host-` cookie
       prefix over `http://127.0.0.1` is correct per spec and unexercised. It is the only way in
       when the proxy is broken — exactly when you need it.
+
+## Phase 7 — Field defects (found by running it, not reading it)
+
+Spec: `docs/superpowers/specs/2026-10-05-field-defects-design.md`, approved by the owner
+2026-10-05, to be done **in spec order**. Every one was invisible to the test suite: four cannot
+be reproduced in a Nix sandbox or a tempdir, and the fifth was contradicted by its own comments.
+
+- [~] **F2. A multi-address WireGuard config must work.** IN FLIGHT. `service.nix:125` hands the
+      whole `Address` value to `ip addr add`; Proton issues `10.2.0.2/32, 2a07:b944::2:2/128` and
+      it is refused. **Every Proton config fails as issued.** Worked around on the host by deleting
+      the IPv6 address by hand.
+- [~] **F4. A data disk ferrum did not format must still work.** IN FLIGHT. `/mnt/ferrum-disk-1`
+      was owned by UID 1001 — a user that does not exist on the host — and `systemd-tmpfiles`
+      refused the ownership transition, failing `ferrum-media-tree.service` with `CANTCREAT`.
+      **Not a regression from that unit:** the previous rules met the same condition and failed
+      silently at boot. Worked around with `chown root:ferrum-media`.
+- [ ] **F1. DDNS must detect the host's public address.** The one that cost a night. The updater
+      republishes a **static** address from `settings.json`; **nothing in `crates/` queries a
+      public address at all**, while three separate comments claim it corrects records against the
+      host's current one. The owner's IP moved and seven records silently went stale.
+- [ ] **F3. The installer must obtain a Plex claim token.** `claimToken` defaults to `""`, the
+      installer never asks, so a fresh install ends with an unclaimed server — a manual step in a
+      product whose pitch is not having any.
+- [ ] **F5. Dashboard single sign-on — AS A PAIR, in order.** The dashboard needs two logins
+      because ferrumd refuses forward-auth headers, enforced by
+      `no_source_file_reads_a_forward_auth_header`. **That refusal is the compensating control for
+      the accepted risk SEC-M02.** Scope Authelia's cookie first, *then* trust the headers —
+      doing the second alone deletes the control and turns an accepted Medium into a live one.
 
 ## Phase 5 — The pre-public cleanup (your four steps)
 
