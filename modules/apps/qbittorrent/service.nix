@@ -122,11 +122,18 @@ lib.mkIf app.enable {
       # (found during the final whole-branch review). Because this
       # bypasses wg-quick's own Address/DNS handling, both are parsed from
       # the runtime-read config below instead.
-      wg_address=$(awk -F'=' '/^[[:space:]]*Address[[:space:]]*=/ { gsub(/[ \t]/, "", $2); print $2; exit }' /run/qbt-vpn/wg0.conf)
-      if [ -z "$wg_address" ]; then
-        echo "qbt-vpn-netns-setup: no Address= line in the WireGuard config" >&2
-        exit 1
-      fi
+      # One usable address PER LINE, because a provider config carries
+      # several of them and `ip address add` takes exactly one. Everything
+      # about which entries survive -- splitting the list, the deliberate
+      # IPv4-only decision and the journal notice that states it, and the
+      # refusal that names the config line instead of letting ip(8)
+      # complain about a string it was never meant to be handed -- lives in
+      # wg-parse.awk next to this file, where it can be exercised against a
+      # real provider config without a privileged namespace. `set -e` turns
+      # a refusal there into a failure here with the parser's own message
+      # already in the journal.
+      wg_addresses=$(awk -v key=Address -v allowPrefix=1 -v required=1 \
+        -f ${./wg-parse.awk} /run/qbt-vpn/wg0.conf)
 
       # wg0 is created in the root namespace, ahead of the `ip netns del
       # qbt-vpn` cleanup above having anything to do with it -- if a prior
@@ -137,10 +144,29 @@ lib.mkIf app.enable {
       # final whole-branch review's re-review).
       ip link del wg0 2>/dev/null || true
       ip link add wg0 type wireguard
+      # AllowedIPs is comma-separated in exactly the same way Address= is
+      # ("AllowedIPs = 0.0.0.0/0, ::/0" in every provider config), but it is
+      # NOT sitting on the same defect and deliberately gets no handling
+      # here: wg-quick strip leaves it untouched and wg(8)'s own parser
+      # splits it. Confirmed for real against the fixture in
+      # tests/fixtures/wireguard/ -- the provider's line as issued gets as
+      # far as "Unable to modify interface", which is the device, while
+      # replacing it with one bad value makes the same command answer
+      # "Unable to parse IP address" / "Configuration parsing error". The
+      # wireguard-config-with-many-addresses check keeps that differential
+      # and its negative control, so the day wg(8) stops splitting the list
+      # this stops being a comment and becomes a failing check. That check
+      # also asserts no ferrum code path reads AllowedIPs at all, which is
+      # the real reason it is safe. The one half it cannot run is wg-quick
+      # strip itself -- wg-quick re-execs through sudo whenever it is not
+      # uid 0, and a build sandbox is neither -- so the passthrough was
+      # confirmed by hand instead, against the same fixture.
       wg setconf wg0 <(wg-quick strip /run/qbt-vpn/wg0.conf)
       ip link set wg0 netns qbt-vpn
       ip netns exec qbt-vpn ip link set lo up
-      ip netns exec qbt-vpn ip address add "$wg_address" dev wg0
+      while IFS= read -r wg_address; do
+        ip netns exec qbt-vpn ip address add "$wg_address" dev wg0
+      done <<< "$wg_addresses"
       ip netns exec qbt-vpn ip link set wg0 up
       ip netns exec qbt-vpn ip route add default dev wg0
 
@@ -155,14 +181,20 @@ lib.mkIf app.enable {
       # below points it at this same file directly. No DNS= line means no
       # resolver is configured for the namespace, matching "the namespace
       # only has what's explicitly given."
+      #
+      # DNS= goes through the same parser as Address=, with allowPrefix=0:
+      # a resolver has no prefix, and "nameserver 10.2.0.1/32" is a line
+      # that resolves nothing while looking plausible. required=0 keeps the
+      # documented "no DNS= line means no resolver" behaviour -- the parser
+      # says so in the journal and exits 0.
       mkdir -p /etc/netns/qbt-vpn
-      wg_dns=$(awk -F'=' '/^[[:space:]]*DNS[[:space:]]*=/ { gsub(/[ \t]/, "", $2); print $2; exit }' /run/qbt-vpn/wg0.conf)
+      wg_dns=$(awk -v key=DNS -v allowPrefix=0 -v required=0 \
+        -f ${./wg-parse.awk} /run/qbt-vpn/wg0.conf)
       : > /etc/netns/qbt-vpn/resolv.conf
       if [ -n "$wg_dns" ]; then
-        IFS=',' read -ra dns_servers <<< "$wg_dns"
-        for server in "''${dns_servers[@]}"; do
+        while IFS= read -r server; do
           echo "nameserver $server" >> /etc/netns/qbt-vpn/resolv.conf
-        done
+        done <<< "$wg_dns"
       fi
 
       # A management-only veth pair to the host is always created,

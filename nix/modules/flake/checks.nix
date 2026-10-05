@@ -4078,6 +4078,271 @@
           echo "root has no declared password, but mutableUsers is true and ferrum-apply generates one" > $out
         '';
 
+      # R2: a WireGuard config with more than one address must work.
+      #
+      # The defect this pins is not subtle and was not caught by anything
+      # here: qbt-vpn-netns-setup read the whole `Address =` line with one
+      # awk one-liner and handed it to `ip address add` as a single
+      # argument. Every mainstream provider issues several addresses, so on
+      # the owner's real Proton config the unit died at boot with
+      #
+      #   Error: any valid prefix is expected rather than "10.2.0.2/32,2a07:b944::2:2/128".
+      #
+      # and qbittorrent.service, which bindsTo it, never started. Nothing in
+      # this file noticed, because nothing in this file had ever read a real
+      # provider config -- the unit's script was only ever asserted about as
+      # text, and the text was fine.
+      #
+      # So this check does three things no existing check here does:
+      #
+      #   1. It runs the parsing. The parsing now lives in
+      #      modules/apps/qbittorrent/wg-parse.awk precisely so it CAN be
+      #      run without standing up a privileged network namespace, and the
+      #      path to it is grepped out of the GENERATED unit script rather
+      #      than named here, so a module that stopped using it fails rather
+      #      than leaving this check exercising an orphan.
+      #   2. It feeds it the real thing -- tests/fixtures/wireguard/
+      #      proton-multiaddress.conf is the provider's own output, keys
+      #      aside. A hand-minimised fixture is what would have been written
+      #      before the bug and is exactly what would have missed it.
+      #   3. It keeps the RED. The superseded one-liner is re-run here on
+      #      the same file and its output is still handed to the real ip(8),
+      #      so the check carries its own evidence that the corpus is the
+      #      defective input rather than trusting a comment for it.
+      #
+      # Nothing here needs privilege or touches the sandbox's network: every
+      # ip(8) and wg(8) call names a device that does not exist, which is
+      # enough because both tools parse their arguments before they look for
+      # the device. That is deliberate -- checks in this file have twice
+      # been broken by a fixture that quietly depended on being root.
+      wireguardConfigWithManyAddresses =
+        let
+          host = ferrumLib.mkHost {
+            inherit system;
+            settings = {
+              schemaVersion = realMigrations.currentVersion;
+              apps.qbittorrent.enable = true;
+            };
+            modules = [
+              ../../../examples/hosts/minimal/configuration.nix
+              # Declaring the secret name is what switches the VPN-gated
+              # namespace on (service.nix's `vpnEnabled`), and therefore the
+              # only way to make the unit under test exist at all.
+              { ferrum.secrets."qbittorrent-vpn" = { }; }
+            ];
+          };
+        in
+        pkgs.runCommand "ferrum-check-wireguard-config-with-many-addresses"
+          {
+            nativeBuildInputs = [
+              pkgs.gawk
+              pkgs.gnugrep
+              pkgs.gnused
+              pkgs.diffutils
+              pkgs.iproute2
+              pkgs.wireguard-tools
+            ];
+            # The generated script, carried in as a derivation attribute so
+            # its string context brings wg-parse.awk's store path into the
+            # sandbox with it. Reading the option values instead would have
+            # passed throughout the period the bug existed.
+            script = host.config.systemd.services.qbt-vpn-netns-setup.script;
+            fixture = ../../../tests/fixtures/wireguard/proton-multiaddress.conf;
+          }
+          ''
+            set -eu
+
+            fail() {
+              echo "wireguard-config-with-many-addresses: $1" >&2
+              exit 1
+            }
+
+            mutate() {
+              sed "$2" "$conf" > "$1"
+              if cmp -s "$conf" "$1"; then
+                fail "the mutation [$2] changed nothing, so the variant it was supposed to build is the original fixture and whatever it proves below is vacuous"
+              fi
+            }
+
+            printf '%s' "$script" > unit-script.sh
+
+            # Comment lines stripped once, here. The module's own commentary
+            # quotes both the superseded extraction and AllowedIPs while
+            # explaining them, and every "this must NOT appear" assertion
+            # below is a question about code, not about prose.
+            grep -v '^[[:space:]]*#' unit-script.sh > unit-code.sh
+
+            parser=$(grep -o '/nix/store/[a-z0-9]\{32\}-wg-parse\.awk' unit-script.sh | head -n1)
+            [ -n "$parser" ] \
+              || fail "the generated qbt-vpn-netns-setup script does not name wg-parse.awk anywhere, so this check has nothing to exercise -- if the WireGuard parsing moved, this check has to move with it rather than quietly testing a file the host no longer uses"
+            [ -r "$parser" ] \
+              || fail "$parser is named by the generated unit script but is not readable here"
+
+            # Anti-vacuity, structural. The defect was ONE `ip address add`
+            # taking a whole line, so the fix is only present if the
+            # generated script loops over what the parser printed. Asserted
+            # on the script, not on the parser, because a correct parser
+            # whose output is still passed as one argument is the original
+            # bug with extra steps.
+            grep -q 'while IFS= read -r wg_address; do' unit-script.sh \
+              || fail "the generated script does not loop over the parsed addresses -- a provider config with more than one address would reach ip(8) as a single argument again"
+            grep -q 'while IFS= read -r server; do' unit-script.sh \
+              || fail "the generated script does not loop over the parsed resolvers"
+            if grep -q "awk -F'='" unit-code.sh; then
+              fail "the generated script still carries the single-line awk extraction this check exists to keep deleted"
+            fi
+
+            conf=wg0.conf
+            cp "$fixture" "$conf"
+            chmod 0600 "$conf"
+
+            # Anti-vacuity, corpus. A fixture that had lost its second
+            # address would satisfy every assertion below while proving
+            # nothing at all, which is precisely the tidied-up fixture that
+            # would have missed the bug in the first place.
+            grep -qx 'Address = 10\.2\.0\.2/32, 2a07:b944::2:2/128' "$conf" \
+              || fail "the fixture's Address= line is no longer the two-entry line a provider issues, so nothing below tests multi-address parsing"
+            grep -qx 'DNS = 10\.2\.0\.1, 2a07:b944::2:1' "$conf" \
+              || fail "the fixture's DNS= line is no longer the two-entry line a provider issues"
+            grep -qx 'AllowedIPs = 0\.0\.0\.0/0, ::/0' "$conf" \
+              || fail "the fixture's AllowedIPs= line is no longer the two-entry line a provider issues"
+
+            # ---- the RED, kept ------------------------------------------
+            blob=$(awk -F'=' '/^[[:space:]]*Address[[:space:]]*=/ { gsub(/[ \t]/, "", $2); print $2; exit }' "$conf")
+            [ "$blob" = "10.2.0.2/32,2a07:b944::2:2/128" ] \
+              || fail "the superseded extraction no longer produces the exact argument the owner's host died on -- it produced [$blob], so this check is no longer reproducing the reported defect"
+            if ip address add "$blob" dev ferrum-no-such-dev 2> old.err; then
+              fail "ip(8) accepted the whole comma-separated list, so the defect this check pins no longer exists in iproute2 -- rewrite this check rather than deleting it"
+            fi
+            grep -q 'any valid prefix is expected' old.err \
+              || fail "ip(8) refused the old single-argument form for a reason this check does not recognise, so the reproduction is not reproducing what it claims: $(cat old.err)"
+
+            # ---- Address: the real provider config ----------------------
+            addresses=$(awk -v key=Address -v allowPrefix=1 -v required=1 -f "$parser" "$conf" 2> addr.err) \
+              || fail "the parser refused the owner's real provider config outright: $(cat addr.err)"
+            [ "$addresses" = "10.2.0.2/32" ] \
+              || fail "parsing Address= out of the real provider config produced [$addresses] rather than the single IPv4 entry it carries"
+            grep -q 'skipping the IPv6 Address entry 2a07:b944::2:2/128' addr.err \
+              || fail "the IPv6 address was dropped without telling the operator which entry went or why -- that decision has to be visible in the journal: $(cat addr.err)"
+
+            # Every surviving entry has to be something ip(8) will actually
+            # take. This is the assertion the original code could not make.
+            printf '%s\n' "$addresses" > addresses.txt
+            while IFS= read -r one; do
+              if ip address add "$one" dev ferrum-no-such-dev 2> new.err; then
+                fail "ip(8) found a device named ferrum-no-such-dev, which should not exist -- this sandbox is not what this check assumes"
+              fi
+              if grep -q 'any valid prefix is expected' new.err; then
+                fail "the parser emitted [$one], which ip(8) still refuses as a prefix: $(cat new.err)"
+              fi
+              grep -q 'Cannot find device' new.err \
+                || fail "ip(8) answered something this check does not understand for [$one]: $(cat new.err)"
+            done < addresses.txt
+
+            # ---- DNS: the same list, the same treatment -----------------
+            resolvers=$(awk -v key=DNS -v allowPrefix=0 -v required=0 -f "$parser" "$conf" 2> dns.err) \
+              || fail "the parser refused the provider config's DNS= line: $(cat dns.err)"
+            [ "$resolvers" = "10.2.0.1" ] \
+              || fail "parsing DNS= out of the real provider config produced [$resolvers] rather than the single IPv4 resolver it carries"
+            grep -q 'skipping the IPv6 DNS entry 2a07:b944::2:1' dns.err \
+              || fail "the IPv6 resolver was dropped silently: $(cat dns.err)"
+
+            # ---- several usable entries really do come out separately ---
+            # The real fixture has one IPv4 address and one IPv6, so on its
+            # own it cannot show two entries being applied separately. This
+            # variant, derived from it, carries two IPv4 addresses plus the
+            # two punctuation accidents the spec calls out -- a blank entry
+            # and a trailing comma -- and must produce exactly two lines.
+            mutate two-v4.conf 's|^Address = .*|Address = 10.2.0.2/32, , 10.2.0.3/32,|'
+            twoAddresses=$(awk -v key=Address -v allowPrefix=1 -v required=1 -f "$parser" two-v4.conf 2> two.err) \
+              || fail "a two-address IPv4 config was refused: $(cat two.err)"
+            printf '%s\n' "$twoAddresses" > two.actual
+            printf '10.2.0.2/32\n10.2.0.3/32\n' > two.expected
+            cmp -s two.actual two.expected \
+              || fail "two IPv4 entries, a blank entry and a trailing comma did not parse to exactly two addresses on their own lines -- got [$twoAddresses]"
+
+            # ---- a malformed entry names the config line ----------------
+            mutate bad-addr.conf 's|^Address = 10\.2\.0\.2/32|Address = 10.2.0.300/32|'
+            if awk -v key=Address -v allowPrefix=1 -v required=1 -f "$parser" bad-addr.conf > bad.out 2> bad.err; then
+              fail "the parser accepted 10.2.0.300/32, which is not an address -- it would reach ip(8) and fail there instead, which is the whole complaint"
+            fi
+            grep -q 'line 3: Address = 10.2.0.300/32, 2a07:b944::2:2/128' bad.err \
+              || fail "the refusal does not quote the config line that caused it, so the operator is sent looking: $(cat bad.err)"
+            if grep -q 'any valid prefix is expected' bad.err; then
+              fail "the malformed entry still reached ip(8) -- the operator gets iproute2's stderr instead of their own config line"
+            fi
+            [ ! -s bad.out ] \
+              || fail "the parser printed addresses despite refusing: $(cat bad.out)"
+
+            # ---- an IPv6-only config is refused, not silently empty -----
+            mutate v6-only.conf 's|^Address = 10\.2\.0\.2/32, |Address = |'
+            if awk -v key=Address -v allowPrefix=1 -v required=1 -f "$parser" v6-only.conf > v6.out 2> v6.err; then
+              fail "an IPv6-only config was accepted, which would leave the namespace with no address at all and qBittorrent starting into silence"
+            fi
+            grep -q 'every Address= entry in the WireGuard config is IPv6' v6.err \
+              || fail "an IPv6-only config was refused without saying why: $(cat v6.err)"
+
+            # ---- no DNS= line stays non-fatal ---------------------------
+            grep -v '^DNS' "$conf" > no-dns.conf
+            if cmp -s "$conf" no-dns.conf; then
+              fail "stripping the DNS= line changed nothing, so the no-resolver case below is vacuous"
+            fi
+            noDns=$(awk -v key=DNS -v allowPrefix=0 -v required=0 -f "$parser" no-dns.conf 2> no-dns.err) \
+              || fail "a config with no DNS= line was treated as fatal, changing this unit's documented behaviour: $(cat no-dns.err)"
+            [ -z "$noDns" ] \
+              || fail "a config with no DNS= line produced resolvers out of nowhere: [$noDns]"
+
+            # ---- AllowedIPs is NOT on the same defect -------------------
+            # It has the identical comma-separated shape, so the spec asks
+            # whether it is broken too. It is not, for two reasons, and both
+            # are asserted here rather than asserted in a comment.
+            #
+            # First, ferrum never reads it: the unit hands the whole config
+            # to `wg setconf wg0 <(wg-quick strip ...)` and does no parsing
+            # of its own, so there is no ferrum code path for the list to be
+            # mishandled by -- which is exactly what was NOT true of
+            # Address=.
+            grep -q 'wg setconf wg0 <(wg-quick strip /run/qbt-vpn/wg0.conf)' unit-script.sh \
+              || fail "the generated script no longer delegates the peer configuration to wg(8) via wg-quick strip, so whatever reads AllowedIPs now is ferrum's problem and needs the same treatment Address= got"
+            if grep -q AllowedIPs unit-code.sh; then
+              fail "the generated script mentions AllowedIPs, so ferrum has started parsing it -- it is now on the same defect as Address= was and needs the same comma handling"
+            fi
+
+            # Second, wg(8) itself splits the list. Proved against the real
+            # provider lines rather than asserted: the [Peer] section below
+            # is copied verbatim out of the fixture, and the [Interface]
+            # half is the PrivateKey line alone, which is what `wg-quick
+            # strip` leaves behind (confirmed by hand against the real tool
+            # -- it is not run here because wg-quick re-execs itself through
+            # sudo whenever it is not uid 0, and a build sandbox is
+            # deliberately neither root nor in possession of a sudo).
+            grep -x '\[Interface\]' "$conf" > setconf.conf
+            grep '^PrivateKey = ' "$conf" >> setconf.conf
+            echo >> setconf.conf
+            awk '/^\[Peer\]/ { peer = 1 } peer { print }' "$conf" >> setconf.conf
+            grep -qx 'AllowedIPs = 0\.0\.0\.0/0, ::/0' setconf.conf \
+              || fail "the config assembled for wg setconf does not carry the provider's AllowedIPs line, so the probe below would prove nothing"
+
+            if wg setconf ferrum-no-such-dev setconf.conf 2> wg-good.err; then
+              fail "wg setconf succeeded against a device that does not exist -- this sandbox is not what this check assumes"
+            fi
+            if grep -q 'Configuration parsing error' wg-good.err; then
+              fail "wg(8) refuses the comma-separated AllowedIPs every provider issues, so AllowedIPs IS sitting on the same defect as Address= and needs the same treatment: $(cat wg-good.err)"
+            fi
+
+            sed 's|^AllowedIPs = .*|AllowedIPs = not-an-address|' setconf.conf > wg-bad.conf
+            if cmp -s setconf.conf wg-bad.conf; then
+              fail "breaking the AllowedIPs line changed nothing, so the negative control below is the positive one again"
+            fi
+            if wg setconf ferrum-no-such-dev wg-bad.conf 2> wg-bad.err; then
+              fail "wg setconf accepted a plainly unparseable AllowedIPs"
+            fi
+            grep -q 'Configuration parsing error' wg-bad.err \
+              || fail "the negative control failed: wg setconf reports no parsing error even for a plainly unparseable AllowedIPs, so the probe above could not have detected one either: $(cat wg-bad.err)"
+
+            echo "a real multi-address provider config parses into separate addresses" > $out
+          '';
+
       mkAssertionCheck = name: result:
         pkgs.runCommand "ferrum-check-${name}" { } (
           if result.ok then
@@ -4100,6 +4365,7 @@
         nginx-emits-no-cors-headers =
           mkAssertionCheck "nginx-emits-no-cors-headers" nginxEmitsNoCorsHeaders;
         root-folders-reach-the-apps = rootFoldersReachTheApps;
+        wireguard-config-with-many-addresses = wireguardConfigWithManyAddresses;
         dns-record-set = dnsRecordSet;
         catalog-consistency = mkAssertionCheck "catalog-consistency" catalogConsistency;
         schema-uniformity = mkAssertionCheck "schema-uniformity" schemaUniformity;
