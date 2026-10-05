@@ -63,6 +63,8 @@ jobs:
             .#checks.x86_64-linux.pool-branches-are-all-seeded \
             .#checks.x86_64-linux.pool-assertions-can-fire \
             .#checks.x86_64-linux.media-tree-waits-for-its-mounts \
+            .#checks.x86_64-linux.branch-roots-are-ownership-checked \
+            .#checks.x86_64-linux.branch-ownership-guard-behaves \
             .#checks.x86_64-linux.fixed-ports-are-enforced \
             .#checks.x86_64-linux.selfsigned-cert-tracks-its-domain \
             .#checks.x86_64-linux.recyclarr-needs-an-arr \

@@ -3066,6 +3066,40 @@
             controlRefused controlWired;
         };
 
+      # The data-disk fixtures, shared by the two checks that read the
+      # ferrum-media-tree unit: mediaTreeWaitsForItsMounts (is the unit
+      # ORDERED after its mounts) and branchRootsAreOwnershipChecked (is the
+      # ownership of those mounts CHECKED before it writes to them). Both
+      # need the identical host shapes, and a second hand-written copy would
+      # let the two drift -- the ordering check would go on passing against
+      # a host the ownership check no longer describes.
+      nofailDisk = mountPoint: label: {
+        fileSystems.${mountPoint} = {
+          device = "/dev/disk/by-label/${label}";
+          fsType = "btrfs";
+          options = [ "nofail" ];
+        };
+      };
+
+      mediaTreeHostWith = { storage ? { }, extra ? [ ] }: ferrumLib.mkHost {
+        inherit system;
+        settings = {
+          schemaVersion = realMigrations.currentVersion;
+          inherit storage;
+        };
+        modules = [ ../../../examples/hosts/minimal/configuration.nix ] ++ extra;
+      };
+
+      mediaTreeUnitOf = args:
+        let cfg = (mediaTreeHostWith args).config; in
+        if cfg.systemd.units ? "ferrum-media-tree.service"
+        then {
+          present = true;
+          text = cfg.systemd.units."ferrum-media-tree.service".text;
+          script = cfg.systemd.services.ferrum-media-tree.script;
+        }
+        else { present = false; text = ""; script = ""; };
+
       # The media tree is seeded AFTER the data mounts, not alongside them.
       #
       # Every ferrum data mount carries `nofail`, and per systemd.mount(5)
@@ -3097,39 +3131,12 @@
       #     per-branch tree -- went unwaited and unseeded.
       mediaTreeWaitsForItsMounts =
         let
-          nofailDisk = mountPoint: label: {
-            fileSystems.${mountPoint} = {
-              device = "/dev/disk/by-label/${label}";
-              fsType = "btrfs";
-              options = [ "nofail" ];
-            };
-          };
-
-          hostWith = { storage ? { }, extra ? [ ] }: ferrumLib.mkHost {
-            inherit system;
-            settings = {
-              schemaVersion = realMigrations.currentVersion;
-              inherit storage;
-            };
-            modules = [ ../../../examples/hosts/minimal/configuration.nix ] ++ extra;
-          };
-
-          unitOf = args:
-            let cfg = (hostWith args).config; in
-            if cfg.systemd.units ? "ferrum-media-tree.service"
-            then {
-              present = true;
-              text = cfg.systemd.units."ferrum-media-tree.service".text;
-              script = cfg.systemd.services.ferrum-media-tree.script;
-            }
-            else { present = false; text = ""; script = ""; };
-
           waitsFor = u: root: lib.hasInfix "\nRequiresMountsFor=${root}\n" u.text;
           seeds = u: root: lib.hasInfix "--prefix=${root}" u.script;
 
-          bare = unitOf { };
-          single = unitOf { extra = [ (nofailDisk "/data" "ferrum-data") ]; };
-          pooled = unitOf {
+          bare = mediaTreeUnitOf { };
+          single = mediaTreeUnitOf { extra = [ (nofailDisk "/data" "ferrum-data") ]; };
+          pooled = mediaTreeUnitOf {
             storage.pool = { enable = true; branches = [ "/mnt/d0" "/mnt/d1" ]; };
             extra = [ (nofailDisk "/mnt/d0" "d0") (nofailDisk "/mnt/d1" "d1") ];
           };
@@ -3154,6 +3161,242 @@
           pooledUnwaited = builtins.filter (r: !(waitsFor pooled r)) pooledRoots;
           pooledUnseeded = builtins.filter (r: !(seeds pooled r)) pooledRoots;
         };
+
+      # Nothing is seeded on a branch root until its OWNERSHIP has been
+      # checked -- and the check runs over every root, with the host's own
+      # media group.
+      #
+      # The field failure: /mnt/ferrum-disk-1 arrived owned by UID 1001, a
+      # user that does not exist on the host, and systemd-tmpfiles refused
+      # to descend through it ("Detected unsafe path transition", exit
+      # 73/CANTCREAT). modules/core/branch-ownership.nix carries the
+      # decision about what to do; this asserts the unit actually asks it,
+      # and asks it FIRST.
+      #
+      # Position is the whole claim, so it is read off the generated
+      # `.script` rather than from the module: a guard that ran after
+      # systemd-tmpfiles would be a log line about a failure that had
+      # already happened. Asserting the guard call is the script's first
+      # line proves ordering without parsing the rest of it.
+      #
+      # Three anti-vacuity floors:
+      #
+      #   * a host with no declared media mount still produces NO unit, so
+      #     "guarded" is a property of hosts that have branches rather than
+      #     one that holds by absence;
+      #   * the guarded script still contains every --prefix= seeding call,
+      #     so a guard that had replaced the seeding instead of preceding it
+      #     fails here;
+      #   * a host with a NON-DEFAULT ferrum.storage.mediaGroup must pass
+      #     that group through. Without it, every assertion here would also
+      #     pass against a module that hardcoded "ferrum-media" -- and the
+      #     chown this guard performs would then name a group that does not
+      #     exist on such a host.
+      branchRootsAreOwnershipChecked =
+        let
+          # The literal spelling the generated script must contain. Built
+          # from lib.escapeShellArgs because that is what the module uses to
+          # render the call, and written out as a store-path suffix (the
+          # hash differs between this evaluation's pkgs and the host's) so
+          # the assertion stays about the call rather than about a path.
+          guardCall = group: roots:
+            "-ferrum-branch-ownership ${lib.escapeShellArgs ([ group ] ++ roots)} || exit $?";
+          firstLine = u: lib.head (lib.splitString "\n" u.script);
+          guardsFirst = u: group: roots:
+            lib.hasPrefix "/nix/store/" (firstLine u)
+            && lib.hasSuffix (guardCall group roots) (firstLine u);
+          seeds = u: root: lib.hasInfix "--prefix=${root}" u.script;
+
+          poolFixture = extraStorage: mediaTreeUnitOf {
+            storage = extraStorage // {
+              pool = { enable = true; branches = [ "/mnt/d0" "/mnt/d1" ]; };
+            };
+            extra = [ (nofailDisk "/mnt/d0" "d0") (nofailDisk "/mnt/d1" "d1") ];
+          };
+
+          bare = mediaTreeUnitOf { };
+          single = mediaTreeUnitOf { extra = [ (nofailDisk "/data" "ferrum-data") ]; };
+          pooled = poolFixture { };
+          regrouped = poolFixture { mediaGroup = "ferrum-check-group"; };
+          pooledRoots = [ "/mnt/d0" "/mnt/d1" "/data" ];
+        in
+        {
+          ok = !bare.present
+            && guardsFirst single "ferrum-media" [ "/data" ]
+            && guardsFirst pooled "ferrum-media" pooledRoots
+            && guardsFirst regrouped "ferrum-check-group" pooledRoots
+            && seeds single "/data"
+            && lib.all (seeds pooled) pooledRoots;
+          message =
+            "the ferrum media tree is seeded on branch roots whose ownership "
+            + "was never checked";
+          bareHostHasNoUnit = !bare.present;
+          singleGuarded = guardsFirst single "ferrum-media" [ "/data" ];
+          pooledGuarded = guardsFirst pooled "ferrum-media" pooledRoots;
+          customGroupPassedThrough =
+            guardsFirst regrouped "ferrum-check-group" pooledRoots;
+          stillSeeds = builtins.filter (r: !(seeds pooled r)) pooledRoots;
+          singleFirstLine = firstLine single;
+          pooledFirstLine = firstLine pooled;
+          regroupedFirstLine = firstLine regrouped;
+        };
+
+      # The guard's four arms, taken for real.
+      #
+      # modules/core/branch-ownership.nix decides between normalising a
+      # branch root and refusing it, and that decision is the requirement.
+      # An assertion over the module's TEXT would prove only that the words
+      # are present, so this executes the real shipped script against real
+      # directories and reads what it did to them.
+      #
+      # WHY fakeroot. Three of the four arms need a directory owned by
+      # somebody who is not the user running the check, and whether that
+      # user is root is not a property of this repository: on a hosted
+      # runner the build is a nixbld user who cannot chown at all, and in a
+      # container it may be root, who can. A check that quietly behaves
+      # differently in those two places is the kind this repo has shipped
+      # before. fakeroot makes chown and stat agree with each other under
+      # both, so every arm is driven the same way wherever it runs -- and
+      # the fixture preconditions below fail loudly rather than silently
+      # skipping if it did not take effect.
+      #
+      # The read-only arm needs no fakeroot and cannot be faked: the branch
+      # root for it is a directory in /nix/store, which the build sandbox
+      # mounts read-only, so access(2) returns EROFS to root and non-root
+      # alike. It is a real read-only mount, which is exactly the edge case.
+      branchOwnershipGuardBehaves =
+        let
+          guard = import ../../../modules/core/branch-ownership.nix { inherit pkgs; };
+
+          # A genuine directory on a genuine read-only filesystem: the store
+          # is mounted ro inside the build sandbox.
+          readOnlyBranch = pkgs.runCommand "ferrum-check-read-only-branch" { }
+            "mkdir -p $out/branch";
+
+          probe = pkgs.writeShellScript "ferrum-branch-ownership-probe" ''
+            set -u
+
+            work="$1"
+            fail() { echo "branch-ownership-guard-behaves: $1" >&2; exit 1; }
+
+            mkdir -p "$work/orphan" "$work/real" "$work/rooted" \
+                     "$work/many-ok" "$work/many-bad"
+
+            # --- the fixtures, and the proof that they took ---------------
+            #
+            # Without these three preconditions the whole probe could run
+            # against five root-owned directories, take the "already root"
+            # arm five times, and pass having tested nothing at all.
+            orphan_uid=1001
+            if getent passwd "$orphan_uid" >/dev/null 2>&1; then
+              fail "uid $orphan_uid resolves on this builder, so it cannot stand in for an orphaned owner"
+            fi
+
+            real_entry="$(getent passwd nobody)" \
+              || fail "no 'nobody' account on this builder to stand in for a real local owner"
+            real_uid="$(printf '%s' "$real_entry" | cut -d: -f3)"
+            [ -n "$real_uid" ] || fail "could not read nobody's uid out of '$real_entry'"
+            [ "$real_uid" != 0 ] || fail "'nobody' is uid 0 here, which is the arm this probe must NOT take"
+
+            # The group is set away from 0 too, so that the "did the guard
+            # set the group" assertion below is answering a question rather
+            # than observing a builder default.
+            chown "$orphan_uid:65534" "$work/orphan" || fail "could not chown the orphan fixture"
+            chown "$real_uid" "$work/real" || fail "could not chown the real-user fixture"
+            chown "$real_uid" "$work/many-bad" || fail "could not chown the mixed-pool fixture"
+            chown 0 "$work/rooted" "$work/many-ok" || fail "could not chown the control fixtures to root"
+
+            [ "$(stat -c %u "$work/orphan")" = "$orphan_uid" ] \
+              || fail "the orphan fixture is not owned by $orphan_uid -- fakeroot did not take effect, so nothing below would be testing anything"
+            [ "$(stat -c %g "$work/orphan")" = 65534 ] \
+              || fail "the orphan fixture's group did not take"
+            [ "$(stat -c %u "$work/real")" = "$real_uid" ] \
+              || fail "the real-user fixture is not owned by $real_uid"
+            [ "$(stat -c %u "$work/rooted")" = 0 ] \
+              || fail "the control fixture is not owned by root"
+
+            # --- orphan UID: normalised in place --------------------------
+            #
+            # The group is passed as the numeric gid 0 rather than by name:
+            # chown resolves a group NAME, and no builder has a
+            # ferrum-media group. The name is what the module passes on a
+            # real host, and that it passes the host's own value is proved
+            # by branchRootsAreOwnershipChecked's regrouped fixture; what
+            # is proved here is the chown itself.
+            if ! ${guard} 0 "$work/orphan" > orphan.log 2>&1; then
+              cat orphan.log >&2
+              fail "the guard refused a branch root owned by an orphaned uid instead of normalising it"
+            fi
+            [ "$(stat -c %u "$work/orphan")" = 0 ] \
+              || fail "the guard left the orphan-owned branch root owned by $(stat -c %u "$work/orphan")"
+            [ "$(stat -c %g "$work/orphan")" = 0 ] \
+              || fail "the guard did not set the group of the orphan-owned branch root"
+            grep -qF "$work/orphan" orphan.log \
+              || fail "the guard took ownership of a branch root without saying which"
+            if grep -qF "will not change it for you" orphan.log; then
+              fail "the guard reported refusing a branch root it had just normalised"
+            fi
+
+            # --- a real local user: refused, and left alone ---------------
+            if ${guard} ferrum-media "$work/real" > real.log 2>&1; then
+              cat real.log >&2
+              fail "the guard accepted a branch root owned by a real local user"
+            fi
+            [ "$(stat -c %u "$work/real")" = "$real_uid" ] \
+              || fail "the guard changed the ownership of a branch root owned by a real local user"
+            grep -qF "$work/real" real.log || fail "the refusal does not name the path"
+            grep -qF "uid $real_uid" real.log || fail "the refusal does not name the owner it found"
+            grep -qF "chown root:ferrum-media $work/real" real.log \
+              || fail "the refusal does not print the command that fixes it"
+            # A non-zero exit is NOT enough to tell a refusal from a chown
+            # that was attempted and failed, and the difference is the whole
+            # decision: one leaves the operator's disk alone on purpose, the
+            # other tried to take it and could not. Measured -- deleting the
+            # refuse arm outright left every assertion above still passing.
+            grep -qF "will not change it for you" real.log \
+              || fail "the guard did not refuse the branch root; it reports having tried to take it"
+            if grep -qF "Taking ownership" real.log; then
+              fail "the guard tried to take ownership of a branch root owned by a real local user"
+            fi
+
+            # --- already root: untouched, and not refused -----------------
+            if ! ${guard} ferrum-media "$work/rooted" > rooted.log 2>&1; then
+              cat rooted.log >&2
+              fail "the guard refused a branch root that was already owned by root"
+            fi
+            [ -s rooted.log ] && fail "the guard had something to say about a branch root that was already correct"
+
+            # --- several branches, only one foreign -----------------------
+            if ${guard} ferrum-media "$work/many-ok" "$work/many-bad" > many.log 2>&1; then
+              fail "a pool whose second branch root is foreign-owned was accepted"
+            fi
+            grep -qF "$work/many-bad" many.log || fail "the refusal does not name WHICH branch root is foreign"
+            if grep -qF "$work/many-ok" many.log; then
+              fail "the refusal names a branch root that was perfectly fine"
+            fi
+
+            # --- a read-only branch: refused, with the mount named --------
+            ro=${readOnlyBranch}/branch
+            if touch "$ro/precondition" 2>/dev/null; then
+              fail "$ro is writable, so it cannot stand in for a read-only branch"
+            fi
+            if ${guard} ferrum-media "$ro" > ro.log 2>&1; then
+              fail "the guard accepted a branch root on a read-only filesystem"
+            fi
+            grep -qF "$ro" ro.log || fail "the read-only refusal does not name the mount"
+            grep -qF "read-only" ro.log || fail "the read-only refusal does not say what is wrong"
+
+            exit 0
+          '';
+        in
+        pkgs.runCommand "ferrum-check-branch-ownership-guard-behaves"
+          { nativeBuildInputs = [ pkgs.fakeroot pkgs.coreutils pkgs.getent ]; }
+          ''
+            set -eu
+            mkdir -p work
+            fakeroot ${probe} "$PWD/work"
+            echo 'branch-ownership-guard-behaves: ok' > $out
+          '';
 
       # ferrum.daemon.publish: the daemon RUNS and is reachable from
       # nowhere but a tunnel.
@@ -3870,6 +4113,9 @@
           mkAssertionCheck "pool-assertions-can-fire" poolAssertionsCanFire;
         media-tree-waits-for-its-mounts =
           mkAssertionCheck "media-tree-waits-for-its-mounts" mediaTreeWaitsForItsMounts;
+        branch-roots-are-ownership-checked =
+          mkAssertionCheck "branch-roots-are-ownership-checked" branchRootsAreOwnershipChecked;
+        branch-ownership-guard-behaves = branchOwnershipGuardBehaves;
         fixed-ports-are-enforced =
           mkAssertionCheck "fixed-ports-are-enforced" fixedPortsAreEnforced;
         selfsigned-cert-tracks-its-domain =
