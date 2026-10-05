@@ -13,9 +13,15 @@
 #      never separate subvolumes -- btrfs forbids hardlinks across
 #      subvolumes, and the *arr import workflow depends on hardlinks.
 #   3. snapshotDir must not nest inside stateDir.
-{ config, lib, options, ... }:
+{ config, lib, options, pkgs, ... }:
 let
   cfg = config.ferrum.storage;
+
+  # The ownership gate the media-tree seeding below runs behind. See
+  # modules/core/branch-ownership.nix for the field failure it exists for,
+  # and for the recorded decision about when ferrum may take ownership of an
+  # operator's disk and when it must refuse and say so.
+  branchOwnership = import ./branch-ownership.nix { inherit pkgs; };
 
   # Is ferrum's media root actually backed by a mount, and does this host
   # look like one that has data disks at all?
@@ -357,9 +363,35 @@ in
       # --prefix scopes this to the media roots, so it re-applies the rules
       # written above and nothing else on the host. config.systemd.package
       # rather than pkgs.systemd: the same systemd the host actually runs.
-      script = lib.concatMapStringsSep "\n"
-        (root: "${config.systemd.package}/bin/systemd-tmpfiles --create --prefix=${root}")
-        mountedTreeRoots;
+      #
+      # The ownership gate runs FIRST, and the unit stops there if it
+      # refuses. systemd-tmpfiles will not descend from a branch root owned
+      # by a non-root user into root-owned children -- it exits
+      # 73/CANTCREAT with "Detected unsafe path transition" -- so on a disk
+      # carried over from another system every line below this one fails,
+      # and it fails saying nothing about what to do. Running the gate
+      # afterwards would only annotate a failure that had already happened.
+      #
+      # WHAT THE GATE DOES NOT COVER, stated rather than hidden: NixOS
+      # re-processes the tmpfiles rules declared above on every
+      # switch-to-configuration (modules/proxy/authelia.nix:102-104 records
+      # that), and that re-run is not ordered against this unit. So the
+      # FIRST apply after attaching a foreign-owned disk may still print the
+      # unsafe-transition error from NixOS's own tmpfiles pass before this
+      # unit gets to normalise the root. It is noise, not damage -- the
+      # rules it failed on are the ones this unit then applies -- and every
+      # run after it is clean, because by then the root is owned by root. At
+      # boot the question does not arise: the data mounts carry `nofail` and
+      # so land after systemd-tmpfiles-setup, which therefore sees the empty
+      # root-owned mountpoint rather than the disk.
+      script = lib.concatStringsSep "\n" (
+        [
+          "${branchOwnership} ${lib.escapeShellArgs ([ cfg.mediaGroup ] ++ mountedTreeRoots)} || exit $?"
+        ]
+        ++ map
+          (root: "${config.systemd.package}/bin/systemd-tmpfiles --create --prefix=${root}")
+          mountedTreeRoots
+      );
     };
 
     boot.supportedFilesystems = [ "btrfs" ];
