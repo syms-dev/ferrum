@@ -156,7 +156,7 @@ Last updated at HEAD `288f2b3`, branch `grounding-and-install-path`. Nothing pus
       - Security review of the shipped slice: `docs/security/r14-update-discovery_security-review.md`
         — 0 Critical, 0 High, both Mediums fixed before merge.
 
-- [x] **7. The three R13 deferred tickets.** ALL THREE DONE 2026-09-23.
+- [~] **7. The three R13 deferred tickets.** Two done; the third was ticked in error and is reopened — see below.
       - ~~`modules/proxy/dns.nix` `daemonRecords` never consults `daemon.enable`, so a daemon-off
         host still gets a DNS record for a hostname nginx closes. **Whoever fixes this must also
         update `checks.nix`'s anti-vacuity guard, which currently depends on it staying
@@ -181,22 +181,26 @@ Last updated at HEAD `288f2b3`, branch `grounding-and-install-path`. Nothing pus
         prose for the four sentences R13 falsified, with
         `the_stale_claim_scan_really_reads_comments_and_only_comments` as its positive control.
         Mutation-proved: the old paragraph makes it **exit 101**.
-      - ~~`examples/hosts/minimal` does not evaluate.~~ **DONE 2026-09-23 — zero failing
-        assertions, proved by evaluating `config.assertions` directly.** It had **five**, not two,
-        and the reason it kept failing while keeping its name is that it was not minimal: it
-        published seven apps on a real domain, the same shape as `examples/hosts/template`.
-        - **Three** were the committed servarr secrets, fixed by **deleting** them — the remedy
-          those assertions themselves print. They were encrypted to an age recipient nobody
-          cloning the repo has, so the template looked like a working starting point and was not.
-        - **Two** were one fact in two messages. Exposure defaults to `public` whenever the proxy
-          is on, so six apps were published; publishing needs a certificate, which needs a
-          Cloudflare token that cannot be committed. Declaring the secret without shipping it only
-          moves the failure from "not declared" to "declared but the file is missing".
-        - **Fix: make the name true.** Every app moves to `lan`, the dashboard stays unpublished
-          — a line only expressible because `daemon.publish` now exists — so no certificate and
-          no secret are needed. The proxy stays **on**, so the example still demonstrates nginx
-          and the lan allow rules rather than switching the interesting part off to pass a check.
-          Publishing is what `template` is for, and it already carries that shape.
+      - **`examples/hosts/minimal` STILL DOES NOT EVALUATE — my earlier tick was wrong.**
+        I proved `config.assertions` is empty and called the ticket done. That was the wrong
+        measure: the ticket says the example does not *evaluate*, and realizing its toplevel still
+        fails with `path '.../secrets/prowlarr-apikey.sops' does not exist`.
+        - **The five assertions ARE fixed** and that work stands — three stale servarr secrets
+          deleted, and `daemon.publish = false` + all-LAN exposure closing the auth and acme-dns
+          pair. Assertions go 5 -> 0, verified.
+        - **What remains is structural, not a loose end.** `modules/apps/*/service.nix` declares
+          `sops.secrets."<app>-apikey"` unconditionally with a `sopsFile` path nix must resolve at
+          eval time. A real host has that file because `ferrum-apply` generates it before the
+          build; a checked-out example never can. **No example host enabling a servarr app can
+          fully evaluate from a clean clone**, which is why `eval-example-hosts` has always been
+          excluded from CI rather than merely being expensive.
+        - Deleting the committed secrets did not cause this; it moved the failure earlier. Before,
+          the files existed and eval failed later on the missing `-raw` counterparts.
+        - **Real options, none taken yet:** gate the sops declaration on `pathExists` (changes
+          real-host behaviour and risks silently skipping a secret); ship an example that enables
+          no secret-generating app (makes the example nearly contentless); or state plainly that
+          examples are templates to copy rather than configurations that evaluate, and retire
+          `eval-example-hosts`. **Owner decision.**
 
 ## Phase 3 — The dashboard people will actually see
 
