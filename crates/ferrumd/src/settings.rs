@@ -203,17 +203,61 @@ fn publication_matches_auth(proposed: &Value) -> Result<(), String> {
 /// project already had one correct answer to this and did not need a
 /// second.
 ///
+/// Writes IN PLACE, without truncating first and without a temp file.
+///
+/// A temp sibling plus `rename` is the textbook atomic write and it cannot
+/// work here. Creating `settings.json.tmp` needs write permission on
+/// `/etc/ferrum`, and ferrumd has it on neither axis: the directory is
+/// `root:root 0755` by deliberate provision (`modules/core/bootstrap.nix:78`,
+/// whose header states the intent as "ferrumd can traverse, NOT create"), and
+/// `ReadWritePaths` names the FILE rather than the directory
+/// (`modules/core/daemon.nix:275-281`, "no parent of any of them"). An
+/// earlier version of this function did exactly that and would have made
+/// `PUT /api/settings` fail with EACCES on every host. Confirmed on real
+/// hardware, not reasoned: `touch` as the `ferrum` user in that directory is
+/// refused.
+///
+/// Granting the directory would also hand ferrumd rename and delete over
+/// `/etc/ferrum/custom/`, which the same module keeps unreachable on purpose
+/// -- directory write is create, delete and rename on every name inside it.
+/// That is a security property this project advertises, so it is not worth
+/// trading for atomicity here.
+///
+/// What this does instead removes the window that actually mattered. The old
+/// `tokio::fs::write` opened with `O_TRUNC`, so the file was length zero on
+/// disk before a single byte of the new document landed -- and a crash in
+/// that window left the host's entire configuration permanently empty, with
+/// the startup check still passing because it only opens the file. Writing
+/// over the existing inode and truncating to the NEW length afterwards means
+/// the file is never empty: a crash mid-write leaves a mixture of two valid
+/// documents, which fails to parse loudly, rather than nothing at all, which
+/// fails silently and cannot be repaired from the UI.
+///
+/// This is not atomic and the file is not fsynced. Both are real residuals,
+/// recorded rather than hidden: a reader of a partial write sees invalid
+/// JSON. Closing them properly needs the file to live somewhere ferrumd owns,
+/// which is a design change rather than a bug fix.
+///
 /// # Arguments
-/// * `path` - the destination file, replaced wholesale.
+/// * `path` - the destination file, rewritten in place.
 /// * `content` - the complete document to leave there.
 ///
 /// # Errors
-/// Any I/O failure writing the temp file or renaming it into place. On
-/// either, the destination still holds its previous contents.
+/// Any I/O failure opening, writing or truncating. The destination is left
+/// holding whatever had been written when the failure occurred.
 async fn write_settings(path: &std::path::Path, content: &str) -> std::io::Result<()> {
-    let tmp = path.with_extension("json.tmp");
-    tokio::fs::write(&tmp, content).await?;
-    tokio::fs::rename(&tmp, path).await
+    use tokio::io::AsyncWriteExt;
+    let mut f = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create(false)
+        .truncate(false)
+        .open(path)
+        .await?;
+    f.write_all(content.as_bytes()).await?;
+    // AFTER the write, never before: this is the whole point. Truncating
+    // first is what made an interrupted write leave an empty file.
+    f.set_len(content.len() as u64).await?;
+    f.flush().await
 }
 
 pub async fn put_settings(
@@ -779,13 +823,81 @@ mod tests {
     /// time anyone goes to look at it.
     ///
     /// The window belongs to `O_TRUNC`, not to the size of the payload:
-    /// `tokio::fs::write` opens the destination truncating, so the file is
-    /// length 0 on disk before a single byte of the new document is
+    /// `tokio::fs::write` opens the destination truncating, so the file was
+    /// length 0 on disk before a single byte of the new document was
     /// written, however small that document is. A reader polling across a
-    /// few hundred writes hits it comfortably. With a temp-file-and-rename
-    /// the window does not exist at any size, because the destination inode
-    /// is only ever swapped for one that is already complete -- so this
-    /// test cannot fail on the fixed code rather than merely tending not to.
+    /// few hundred writes hits it comfortably.
+    ///
+    /// The fix is NOT a temp file and rename, which an earlier version of
+    /// this comment claimed: that needs create permission in /etc/ferrum,
+    /// which ferrumd deliberately does not have, and it made every real
+    /// settings write fail with EACCES. The file is now written over its own
+    /// inode and truncated to the new length afterwards, so it is never
+    /// empty -- a reader can still catch a mixture of two documents, but
+    /// never nothing, which is the state that was unrepairable.
+    /// The write must not create ANYTHING beside the settings file.
+    ///
+    /// This is the test that was missing, and its absence is why a broken
+    /// write shipped. Every other test here runs against `tempfile::tempdir()`,
+    /// which the test process owns outright, so none of them could observe
+    /// the one constraint that actually governs this code: ferrumd may write
+    /// `/etc/ferrum/settings.json` and may create nothing in `/etc/ferrum`.
+    /// A temp-sibling write is green in a tempdir and EACCES on every real
+    /// host, which is exactly what happened.
+    ///
+    /// Asserting on the directory's contents rather than on permissions is
+    /// deliberate: a permission test would pass vacuously when the suite runs
+    /// as root, which it does under Docker here, and a check that cannot fail
+    /// is worse than no check. Counting entries holds whoever runs it.
+    #[tokio::test]
+    async fn the_write_creates_no_sibling_file_because_it_may_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        tokio::fs::write(&path, "{}").await.unwrap();
+
+        super::write_settings(&path, r#"{"schemaVersion":1}"#).await.unwrap();
+
+        let mut names: Vec<String> = Vec::new();
+        let mut rd = tokio::fs::read_dir(dir.path()).await.unwrap();
+        while let Some(e) = rd.next_entry().await.unwrap() {
+            names.push(e.file_name().to_string_lossy().into_owned());
+        }
+        names.sort();
+        assert_eq!(
+            names,
+            vec!["settings.json".to_string()],
+            "the write must touch no name but its own -- ferrumd cannot create in /etc/ferrum"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(&path).await.unwrap(),
+            r#"{"schemaVersion":1}"#,
+            "and it must still have written the document"
+        );
+    }
+
+    /// A shorter document must not leave the tail of the longer one behind.
+    ///
+    /// Writing over an inode without truncating first is what removes the
+    /// empty-file window, and it introduces exactly one hazard in exchange:
+    /// forget the truncate afterwards and a shrink leaves trailing bytes,
+    /// producing invalid JSON that parses as corruption rather than as a
+    /// short write. Mutation check: drop the `set_len` and this fails.
+    #[tokio::test]
+    async fn a_shorter_document_does_not_leave_the_old_tail_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let long = r#"{"schemaVersion":1,"proxy":{"enable":true,"baseDomain":"example.test"}}"#;
+        tokio::fs::write(&path, long).await.unwrap();
+
+        let short = r#"{"schemaVersion":1}"#;
+        super::write_settings(&path, short).await.unwrap();
+
+        let got = tokio::fs::read_to_string(&path).await.unwrap();
+        assert_eq!(got, short, "a shrink must truncate; got {got:?}");
+        serde_json::from_str::<serde_json::Value>(&got)
+            .expect("what is left on disk must still be valid JSON");
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_concurrent_reader_never_sees_a_half_written_settings_file() {
         let dir = tempfile::tempdir().unwrap();
@@ -797,9 +909,12 @@ mod tests {
         let content = serde_json::to_string_pretty(&document).unwrap();
         let expected_len = content.len();
 
-        // Seed it, so "the file is absent" is never a legitimate reading and
-        // every observation below is of a file that genuinely exists.
-        write_settings(&path, &content).await.unwrap();
+        // Seeded with a plain write, NOT with write_settings: that function
+        // deliberately refuses to create the file (`create(false)`), because
+        // ferrumd cannot create anything in /etc/ferrum and pretending
+        // otherwise is how the EACCES bug reached a merge. On a real host
+        // tmpfiles provisions settings.json before ferrumd ever runs.
+        tokio::fs::write(&path, &content).await.unwrap();
 
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let torn = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
@@ -832,6 +947,13 @@ mod tests {
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         reader.join().unwrap();
 
+        // What is asserted is NOT atomicity. An in-place write cannot give
+        // that, and claiming it would be the third false comment about this
+        // function. Every write here carries identical bytes of identical
+        // length, so a reader can only observe a difference if the file is
+        // momentarily SHORT -- which is precisely the O_TRUNC window that
+        // made a crash leave the host's configuration permanently empty.
+        // That window is what this proves gone.
         let torn = torn.lock().unwrap();
         assert!(
             torn.is_empty(),
