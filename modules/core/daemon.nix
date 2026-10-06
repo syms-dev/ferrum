@@ -18,9 +18,8 @@ let
   # consumer reads (modules/proxy/lib.nix), so the vhost, the Authelia cookie
   # scope, the certificate, the DNS record and this all appear and disappear
   # together. One definition rather than a sixth re-spelling of the condition.
-  ssoEnabled =
-    (import ../proxy/lib.nix { inherit lib; }).daemonPublished ferrum
-    && ferrum.auth.enable;
+  proxyLib = import ../proxy/lib.nix { inherit lib; };
+  ssoEnabled = proxyLib.daemonPublished ferrum && ferrum.auth.enable;
   # 127.0.0.0/8 by its first octet, plus the two other spellings of the
   # same thing. Split rather than prefix-matched so that "127.0.0.1.example"
   # -- a string that starts with "127." and is not an address at all -- is
@@ -290,8 +289,16 @@ lib.mkIf ferrum.daemon.enable {
     # ferrumd sends as X-Original-URL, so Authelia decides against the control
     # plane's cookie scope and no other. It is derived here, from the host's
     # own configuration, precisely so that it can never come from a request.
+    #
+    # L-04. From proxyLib.controlPlaneCookieDomain rather than re-spelled from
+    # subdomain and baseDomain. The two were byte-identical, but they are the
+    # SAME fact -- "the hostname whose cookie scope the control plane keeps to
+    # itself" -- and modules/proxy/lib.nix exists because a second copy of a
+    # derivation drifts from the first. If this one ever drifted, ferrumd
+    # would ask Authelia about a different scope than the one authelia.nix
+    # configured, which is exactly the isolation SEC-M02 bought, handed back.
     // lib.optionalAttrs ssoEnabled {
-      FERRUMD_SSO_ORIGIN = "https://${ferrum.daemon.subdomain}.${ferrum.proxy.baseDomain}";
+      FERRUMD_SSO_ORIGIN = "https://${proxyLib.controlPlaneCookieDomain ferrum}";
       # The same loopback address modules/proxy/nginx.nix writes into every
       # /authelia subrequest location. Set explicitly rather than left to
       # sso.rs's default so the two places that name Authelia's port are both

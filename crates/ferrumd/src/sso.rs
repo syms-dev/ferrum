@@ -64,7 +64,7 @@
 use crate::audit;
 use crate::auth;
 use crate::client_addr::ClientAddr;
-use crate::{run_blocking, AppState, SESSION_COOKIE};
+use crate::{run_blocking, session_cookie, AppState};
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
@@ -72,6 +72,7 @@ use axum::Json;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 /// Authelia's forward-auth verification endpoint.
 const VERIFY_PATH: &str = "/api/verify";
@@ -98,6 +99,43 @@ const VERIFY_TIMEOUT: Duration = Duration::from_secs(5);
 /// misconfigured or hostile listener on the configured port cannot make
 /// ferrumd buffer without bound.
 const RESPONSE_LIMIT: usize = 64 * 1024;
+
+/// How many `POST /api/sso` exchanges may be asking Authelia at once.
+///
+/// M-02. `/api/sso` is unauthenticated by ferrumd's own session -- it is the
+/// call you make when you have not got one -- and every call opens a fresh
+/// `TcpStream` to Authelia and holds it for up to [`VERIFY_TIMEOUT`]. Unlike
+/// `/api/login` it sits under nginx's generic `/api/` location, so it has
+/// neither that route's `limit_req zone=ferrum_login` nor ferrumd's own
+/// password lockout, and before this constant existed nothing bounded the
+/// fan-out at all: N concurrent calls meant N concurrent sockets into
+/// Authelia, for five seconds each, for free.
+///
+/// **Four**, and the number is a ceiling on legitimate use rather than a
+/// tuned capacity. An SSO exchange happens once when an operator opens the
+/// dashboard; the honest concurrent demand on a single-household ferrum host
+/// is one, and four leaves room for a second operator, a reloaded tab and a
+/// retry without ever admitting a flood. The worst case it permits is four
+/// sockets and four [`RESPONSE_LIMIT`] buffers against an Authelia running
+/// on the same small box -- which that Authelia answers comfortably, and
+/// which is the point: the bound must be well under what the dependency can
+/// take, not near it.
+///
+/// Deliberately fixed rather than adaptive, against
+/// `.claude/rules/resilience-engineering.md`'s preference for a limit that
+/// finds itself from latency. An adaptive controller earns its keep when the
+/// true capacity moves and is unknown; here the legitimate ceiling is a human
+/// sign-in rate, and the controller would be more machinery than the call it
+/// bounds.
+///
+/// What this deliberately does NOT do is share a bucket with the password
+/// lockout, or with `require_session`'s re-check. Sharing with the lockout
+/// would let SSO traffic lock an operator out of password login -- the
+/// recovery path that exists for when the proxy is broken. Sharing with the
+/// re-check would let an unauthenticated flood shed the verify that keeps an
+/// already-signed-in operator's dashboard alive mid-apply. One bucket, for
+/// the one unauthenticated route that opens the connections.
+pub(crate) const SSO_MAX_IN_FLIGHT: usize = 4;
 
 /// What Authelia said about the cookie it was shown.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -144,6 +182,15 @@ pub struct AutheliaVerifier {
     /// apps' cookie scope -- which is precisely the isolation R5's first half
     /// established, handed back on the next line.
     original_url: String,
+    /// M-02's bulkhead: the permits `sso_handler` must hold to ask Authelia.
+    ///
+    /// [`SSO_MAX_IN_FLIGHT`] of them, shared by every clone of this verifier
+    /// -- an `Arc` rather than a bare `Semaphore` precisely so a clone is a
+    /// second handle on ONE bound rather than a second bound. A per-verifier
+    /// semaphore rather than a process-wide static so each test drives its
+    /// own, and so two verifiers (which only tests build) cannot shed each
+    /// other.
+    exchange_slots: Arc<Semaphore>,
 }
 
 impl AutheliaVerifier {
@@ -173,7 +220,50 @@ impl AutheliaVerifier {
             return Err(format!("FERRUMD_SSO_ORIGIN must be an absolute URL: {origin:?}"));
         }
         let original_url = format!("{}/", origin.trim_end_matches('/'));
-        Ok(Self { address, original_url })
+        Ok(Self {
+            address,
+            original_url,
+            exchange_slots: Arc::new(Semaphore::new(SSO_MAX_IN_FLIGHT)),
+        })
+    }
+
+    /// Claims one of the [`SSO_MAX_IN_FLIGHT`] slots, or refuses immediately.
+    ///
+    /// `try_acquire` rather than `acquire`: waiting would turn the flood into
+    /// a queue, and a queued request still costs a connection, a task and a
+    /// caller's patience while adding latency to the legitimate exchange
+    /// behind it. `.claude/rules/resilience-engineering.md` §1 is explicit
+    /// that the shed must be early and cheap, and the cheapest possible shed
+    /// is one taken before the `TcpStream` to Authelia is opened at all --
+    /// which is where this sits in [`sso_handler`].
+    ///
+    /// # Returns
+    /// `Some(permit)` to proceed, held for exactly as long as the Authelia
+    /// call; `None` when every slot is busy and the request must be shed.
+    pub(crate) fn try_claim_exchange_slot(&self) -> Option<OwnedSemaphorePermit> {
+        self.exchange_slots.clone().try_acquire_owned().ok()
+    }
+
+    /// Holds `count` exchange slots for as long as the returned permits live.
+    ///
+    /// Test-only, and the only way to drive the shed deterministically: the
+    /// alternative is a fake Authelia that stalls while several real requests
+    /// pile up against it, which tests the scheduler as much as the bulkhead
+    /// and flakes under a loaded CI machine.
+    ///
+    /// # Arguments
+    /// * `count` - how many of the [`SSO_MAX_IN_FLIGHT`] slots to occupy.
+    ///
+    /// # Panics
+    /// If fewer than `count` slots are free, which would mean the test was
+    /// about to assert against a bulkhead in a state it did not set up.
+    #[cfg(test)]
+    pub(crate) fn hold_exchange_slots(&self, count: usize) -> Vec<OwnedSemaphorePermit> {
+        (0..count)
+            .map(|_| {
+                self.try_claim_exchange_slot().expect("the fixture must be able to hold the slot")
+            })
+            .collect()
     }
 
     /// Builds a verifier from the environment, or `None` when this host has no
@@ -439,7 +529,11 @@ pub struct SsoResponse {
 /// * `404` when this host has no SSO configured at all.
 /// * `401` when Authelia recognises nobody.
 /// * `403` when Authelia recognises somebody ferrumd has no account for.
-/// * `503` when Authelia could not be asked.
+/// * `503` when Authelia could not be asked -- either because it did not
+///   answer, or because [`SSO_MAX_IN_FLIGHT`] exchanges were already in
+///   flight and this one was shed (M-02). The two carry different bodies and
+///   different audit lines; both mean "ask again, or use your password",
+///   which is why they share a status.
 pub async fn sso_handler(
     State(state): State<Arc<AppState>>,
     peer: Option<axum::extract::ConnectInfo<std::net::SocketAddr>>,
@@ -453,6 +547,26 @@ pub async fn sso_handler(
         // no SSO here" and shows the password form, which is the only way in
         // on a tunnel-only recovery host and must stay that way.
         return (StatusCode::NOT_FOUND, "single sign-on is not configured on this host")
+            .into_response();
+    };
+
+    // M-02. The bulkhead, claimed BEFORE the cookie is even read and long
+    // before a socket is opened, because a shed that costs a connection is
+    // not a shed. `_slot` is held for exactly the Authelia call and released
+    // when this function returns.
+    let Some(_slot) = verifier.try_claim_exchange_slot() else {
+        audit::record(
+            "sso",
+            "denied",
+            "",
+            &client,
+            &format!("shed: {SSO_MAX_IN_FLIGHT} single sign-on exchanges already in flight"),
+        );
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "too many single sign-on attempts at once -- try again shortly, or log in with your \
+             ferrum password",
+        )
             .into_response();
     };
 
@@ -491,17 +605,14 @@ pub async fn sso_handler(
 
     match outcome {
         auth::SsoSessionOutcome::Started(result) => {
-            // Byte-for-byte the cookie `login_handler` sets, built the same
-            // way. The `__Host-` prefix, `Secure`, `HttpOnly`, `SameSite=Strict`
-            // and `Path=/` are all load-bearing and all explained on
-            // `SESSION_COOKIE`; a second spelling here would be a second place
-            // for one of them to go missing.
-            let mut cookie = tower_cookies::Cookie::new(SESSION_COOKIE, result.session_token);
-            cookie.set_http_only(true);
-            cookie.set_secure(true);
-            cookie.set_same_site(tower_cookies::cookie::SameSite::Strict);
-            cookie.set_path("/");
-            cookies.add(cookie);
+            // M-01. Literally the cookie `login_handler` sets, from the one
+            // function that builds it. This used to be a second hand-written
+            // copy of the same five attributes, which is a second place for
+            // one of them to go missing -- and dropping `Secure` from THIS
+            // copy was measured to leave the entire suite green, because
+            // every test on this route read the cookie's value and discarded
+            // its attributes.
+            cookies.add(session_cookie(result.session_token));
             audit::record("sso", "success", &username, &client, "");
             (StatusCode::OK, Json(SsoResponse { csrf_token: result.csrf_token })).into_response()
         }
