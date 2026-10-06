@@ -453,15 +453,34 @@ pub fn desired_records(
 ///
 /// Two types rather than one because they answer different questions: the
 /// installer's is what a human typed at a prompt, the seam's is what goes
-/// into a Cloudflare body. They happen to have the same two shapes today,
-/// and a conversion here is cheaper than either crate depending on the
-/// other's vocabulary.
+/// into a Cloudflare body. A conversion here is cheaper than either crate
+/// depending on the other's vocabulary.
+///
+/// **An updater host has no address yet**, and this is the one place that
+/// has to put *something* in the A record's content field anyway. The dry
+/// run writes nothing -- it exists to show the operator which names already
+/// carry a foreign record, before anything is erased -- so the content only
+/// ever reaches a comparison and a report. [`UNKNOWN_ADDRESS`] is used for
+/// the comparison and is deliberately never shown: [`describe_target`]
+/// renders this case in words, and a test holds it to that.
+///
+/// The comparison it produces is honest in the only direction that matters.
+/// A record ferrum already owns compares unequal and is planned as an
+/// *update*, which is exactly what the first apply will do to it once the
+/// host has measured its real address. The failure worth avoiding is the
+/// opposite one -- a false "unchanged" -- and an address no host can hold
+/// cannot produce that.
 fn to_dns_target(target: &RecordTarget) -> ferrum_dns::RecordTarget {
     match target {
-        RecordTarget::A(address) => ferrum_dns::RecordTarget::A(*address),
+        RecordTarget::A(Some(address)) => ferrum_dns::RecordTarget::A(*address),
+        RecordTarget::A(None) => ferrum_dns::RecordTarget::A(UNKNOWN_ADDRESS),
         RecordTarget::Cname(host) => ferrum_dns::RecordTarget::Cname(host.clone()),
     }
 }
+
+/// The placeholder content for a record whose address the host has not
+/// measured yet. See [`to_dns_target`]; never rendered to an operator.
+const UNKNOWN_ADDRESS: std::net::Ipv4Addr = std::net::Ipv4Addr::UNSPECIFIED;
 
 /// Mints the client's token from the answers, refusing every shape that
 /// would produce a blank listing (D-11).
@@ -591,9 +610,17 @@ pub fn not_published_yet_lines(detail: &str) -> Vec<String> {
 }
 
 /// Renders a target the way the operator stated it, type included.
+///
+/// The address-free `A` case is spelled out in words rather than shown as
+/// [`UNKNOWN_ADDRESS`]: that value exists only so the dry run can compare
+/// records, and printing `A 0.0.0.0` would describe the finished host as
+/// pointing somewhere it never will.
 fn describe_target(target: &RecordTarget) -> String {
     match target {
-        RecordTarget::A(address) => format!("A {address}"),
+        RecordTarget::A(Some(address)) => format!("A {address}"),
+        RecordTarget::A(None) => {
+            "A (the public address this host discovers for itself, hourly)".to_string()
+        }
         RecordTarget::Cname(host) => format!("CNAME {host}"),
     }
 }
@@ -921,10 +948,40 @@ mod tests {
             apps: apps.iter().map(|a| (*a).to_string()).collect(),
             cloudflare_token: Some(Secret::new(TEST_TOKEN.to_string())),
             dns: Some(DnsDecision {
-                target: RecordTarget::A(HOST),
+                target: RecordTarget::A(Some(HOST)),
                 ddns_updater: true,
             }),
         }
+    }
+
+    /// F3/R3b. The dry run describes an updater host's records in words.
+    ///
+    /// [`UNKNOWN_ADDRESS`] exists so `plan_records` has something to compare
+    /// against; it is not a claim about where anything points, and showing
+    /// it would tell the operator their apps resolve to `0.0.0.0`.
+    ///
+    /// Mutation check: render the placeholder instead of the sentence and
+    /// the first assertion fails with it quoted. Both halves are asserted,
+    /// so deleting the stated-address arm to satisfy the first one fails
+    /// the second.
+    #[test]
+    fn a_discovered_address_is_described_never_printed() {
+        let discovered = super::describe_target(&RecordTarget::A(None));
+        assert!(
+            !discovered.contains(&super::UNKNOWN_ADDRESS.to_string()),
+            "the comparison placeholder must never reach an operator: \
+             {discovered}"
+        );
+        assert!(
+            discovered.starts_with("A ") && discovered.contains("discovers for itself"),
+            "it still has to say what kind of record it is, and where the \
+             address comes from: {discovered}"
+        );
+        // ...and a stated address is still printed exactly as stated.
+        assert_eq!(
+            super::describe_target(&RecordTarget::A(Some(HOST))),
+            format!("A {HOST}")
+        );
     }
 
     /// One visible zone covering `thesyms.ca`, delegated nowhere.

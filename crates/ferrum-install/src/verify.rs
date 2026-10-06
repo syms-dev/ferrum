@@ -357,9 +357,14 @@ pub fn read_credential_command(path: &str) -> String {
 ///   auth host and no app, the dashboard's own hostname is asked for: it is
 ///   published whenever the proxy is, so "nothing is published" stopped
 ///   being true at R13.
-/// * `dns` - the operator's record decision. `None`, or a `CNAME`, yields
-///   no checks: A8 is about the static address ferrum writes, and under a
-///   `CNAME` ferrum states no address to prove.
+/// * `dns` - the operator's record decision. `None`, a `CNAME`, or an `A`
+///   whose address the host discovers for itself, yields no checks: this
+///   probe proves that traffic sent to an address ferrum *stated* arrives
+///   here, and in each of those three cases ferrum states no address. That
+///   is a real cost of the updater and is named rather than hidden -- an
+///   updater host gets its proof instead from the first reconcile, which
+///   refuses to publish unless two independently-operated echo services
+///   agree on the answer (`crates/ferrum-dns/src/public_ip.rs`).
 ///
 /// # Returns
 /// At most one check. One probe answers the question -- does traffic sent
@@ -372,7 +377,7 @@ pub fn external_reachability_checks(
     dns: Option<&DnsDecision>,
 ) -> Vec<ExternalCheck> {
     let Some(DnsDecision {
-        target: RecordTarget::A(address),
+        target: RecordTarget::A(Some(address)),
         ..
     }) = dns
     else {
@@ -1210,7 +1215,7 @@ mod tests {
 
     fn dns_a(address: &str) -> DnsDecision {
         DnsDecision {
-            target: RecordTarget::A(address.parse().expect("a literal address")),
+            target: RecordTarget::A(Some(address.parse().expect("a literal address"))),
             ddns_updater: true,
         }
     }

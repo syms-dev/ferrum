@@ -323,18 +323,20 @@ in
           example = "203.0.113.10";
           description = ''
             The public IPv4 address every A record points at, used when
-            recordMode = "a". The installer detects a candidate from the
-            target host itself and shows it for confirmation rather than
-            writing it silently -- an address detected from the operator's
-            own machine can easily be a VPN or office egress, not the
-            server's.
+            recordMode = "a". When the installer asks for one it detects a
+            candidate from the target host itself and shows it for
+            confirmation rather than writing it silently -- an address
+            detected from the operator's own machine can easily be a VPN or
+            office egress, not the server's.
 
             With ddnsUpdater.enable this stops being the published address
             and becomes a cross-check: ferrum publishes the address it
             discovers and warns, naming both values, if this one disagrees.
             It may then be left empty, which is the recommended shape for a
             host whose address is not contractually static -- there is no
-            second place for the truth to go stale.
+            second place for the truth to go stale. That is also what the
+            installer writes: it offers the updater first and, when it is
+            taken, asks for no address and sets none here.
 
             IPv4 only: ferrum publishes no AAAA record today.
           '';

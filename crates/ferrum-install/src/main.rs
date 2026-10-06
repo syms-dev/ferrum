@@ -1778,7 +1778,7 @@ mod tests {
             // `answers::validate_and_verify_cloudflare_token`.
             cloudflare_token: None,
             dns: Some(answers::DnsDecision {
-                target: answers::RecordTarget::A("203.0.113.10".parse().expect("a literal")),
+                target: answers::RecordTarget::A(Some("203.0.113.10".parse().expect("a literal"))),
                 ddns_updater: true,
             }),
         }

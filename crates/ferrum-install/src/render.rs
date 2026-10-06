@@ -557,10 +557,22 @@ fn dns_settings(decision: &DnsDecision, adoption: &Adoption) -> serde_json::Valu
     match &decision.target {
         RecordTarget::A(address) => {
             dns.insert("recordMode".into(), serde_json::json!("a"));
-            dns.insert(
-                "staticAddress".into(),
-                serde_json::json!(address.to_string()),
-            );
+            // Written only when the operator actually stated one. An
+            // updater host has no address to state, and persisting a
+            // literal there would be a second copy of a fact the host
+            // re-measures hourly: `crates/ferrum-apply/src/dns_reconcile.rs`
+            // publishes what it measured and warns, naming both values,
+            // whenever `staticAddress` disagrees -- so a literal written
+            // here turns every genuine address change into a warning about
+            // a value nobody asked for. modules/proxy/dns.nix's
+            // `recordMode = "a"` assertion accepts the empty case on
+            // exactly this condition.
+            if let Some(address) = address {
+                dns.insert(
+                    "staticAddress".into(),
+                    serde_json::json!(address.to_string()),
+                );
+            }
         }
         RecordTarget::Cname(hostname) => {
             dns.insert("recordMode".into(), serde_json::json!("cname"));
@@ -1275,7 +1287,7 @@ mod tests {
             apps: vec!["sonarr".into(), "plex".into()],
             cloudflare_token: Some(crate::answers::Secret::new("tok".into())),
             dns: Some(DnsDecision {
-                target: RecordTarget::A("203.0.113.10".parse().expect("a literal address")),
+                target: RecordTarget::A(Some("203.0.113.10".parse().expect("a literal address"))),
                 ddns_updater: true,
             }),
         }
@@ -1875,6 +1887,42 @@ mod tests {
         // The interval keeps its module default rather than freezing
         // today's value into this host forever.
         assert!(dns.pointer("/ddnsUpdater/intervalMinutes").is_none(), "{s}");
+    }
+
+    /// F3/R3b. The settings an updater install produces: `recordMode = "a"`
+    /// with the updater on and **no `staticAddress` key at all**.
+    ///
+    /// Writing one would be a second copy of a fact the host re-measures
+    /// hourly, and `crates/ferrum-apply/src/dns_reconcile.rs` warns -- naming
+    /// both values -- whenever the two disagree. So a literal written here
+    /// would turn every genuine address change into a warning about a value
+    /// nobody asked for, which is the opposite of what the updater is for.
+    ///
+    /// Mutation check: render `staticAddress` unconditionally (the shape
+    /// this replaced) and the key assertion fails. Delete the updater key
+    /// and the host no longer evaluates at all -- `modules/proxy/dns.nix`
+    /// accepts an empty address only on that condition -- which the
+    /// `ddnsUpdater` assertion below holds.
+    #[test]
+    fn an_updater_host_persists_no_static_address() {
+        let mut a = answers();
+        a.dns = Some(DnsDecision {
+            target: RecordTarget::A(None),
+            ddns_updater: true,
+        });
+        let f = render(&a, &approved(Firmware::Uefi), &keys(), "abc1234").unwrap();
+        let s: serde_json::Value = serde_json::from_str(&f["settings.stage2.json"]).unwrap();
+        let dns = &s["proxy"]["dns"];
+        assert_eq!(dns["enable"], true, "{s}");
+        assert_eq!(dns["recordMode"], "a", "{s}");
+        assert!(
+            dns.get("staticAddress").is_none(),
+            "an address the host discovers for itself must not be frozen \
+             into settings.json: {s}"
+        );
+        assert!(dns.get("cnameTarget").is_none(), "{s}");
+        // The term that makes the absent address legal at evaluation time.
+        assert_eq!(dns["ddnsUpdater"]["enable"], true, "{s}");
     }
 
     /// R1 A2 and A8. CNAME mode is the mirror image, and the updater must

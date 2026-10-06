@@ -71,13 +71,26 @@ impl std::fmt::Debug for Secret {
 /// that is not this one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RecordTarget {
-    /// `A` records to a stated public IPv4 address.
+    /// `A` records to a public IPv4 address, when one is stated.
     ///
-    /// Held as an [`std::net::Ipv4Addr`] rather than a `String` so that a
-    /// value which got this far cannot be anything else: it is parsed once,
-    /// at the prompt where a human can fix it, and no later reader has to
-    /// ask the question again.
-    A(std::net::Ipv4Addr),
+    /// `Some` is held as an [`std::net::Ipv4Addr`] rather than a `String` so
+    /// that a value which got this far cannot be anything else: it is parsed
+    /// once, at the prompt where a human can fix it, and no later reader has
+    /// to ask the question again.
+    ///
+    /// `None` means **the host finds its own address**, and is legal only
+    /// alongside `ddns_updater`. F1/R1 gave `ferrum.proxy.dns.ddnsUpdater`
+    /// real discovery -- three address-echo services, two distinct operators
+    /// required to agree -- and `modules/proxy/dns.nix`'s `recordMode = "a"`
+    /// assertion was relaxed to accept an empty `staticAddress` once the
+    /// updater is on. An operator who runs the updater therefore has nothing
+    /// to type here, and writing a literal anyway would create a second
+    /// place for the truth to go stale: `crates/ferrum-apply`'s
+    /// `dns_reconcile.rs` warns, naming both values, when a persisted
+    /// `staticAddress` disagrees with what it measured, so a literal written
+    /// at install time turns every later address change into a warning about
+    /// a value nobody asked for.
+    A(Option<std::net::Ipv4Addr>),
     /// `CNAME` records following a stated hostname -- typically a
     /// dynamic-DNS name maintained outside ferrum.
     Cname(String),
@@ -485,13 +498,25 @@ fn ask_a_record_address(
 /// running and its certificates stay valid, with no error logged anywhere.
 /// That is why the updater's default is on rather than off.
 ///
+/// **The updater question comes first in `A` mode**, because its answer
+/// decides whether there is an address question at all. ferrum's install is
+/// meant to finish with a working system and no manual follow-up, and an
+/// operator who turns the updater on has nothing further to supply: F1/R1
+/// taught the host to discover its own public address, and
+/// `modules/proxy/dns.nix` was relaxed in the same change to accept an empty
+/// `staticAddress` on exactly that condition. Asking for one anyway would
+/// put a literal into `settings.json` that nothing consults and that
+/// `crates/ferrum-apply/src/dns_reconcile.rs` will later warn about every
+/// time the real address moves away from it.
+///
 /// # Arguments
 /// * `domain` - `ferrum.proxy.baseDomain`, used only to make the question
 ///   concrete about which names are at stake.
 /// * `io` - the question-and-answer channel with the operator.
 /// * `detect` - A8's address detection, described on [`Detector`]. Used
-///   only in `A` mode: a CNAME follows a name, so there is no address to
-///   find.
+///   only in `A` mode with the updater off: a CNAME follows a name and an
+///   updater host finds its own address, so in neither case is there an
+///   address for the installer to find.
 ///
 /// # Returns
 /// The decision, ready to be rendered into `ferrum.proxy.dns`.
@@ -519,7 +544,46 @@ pub fn decide_dns(
         parse_record_mode(if raw.trim().is_empty() { "a" } else { raw })
     })?;
 
+    // Asked BEFORE the address, and that order is the requirement rather
+    // than a preference. An operator who runs the updater has no address to
+    // state -- the host discovers its own, hourly -- so asking for one first
+    // and then offering to make it irrelevant collects an answer the install
+    // is about to stop using, and persists it where
+    // `crates/ferrum-apply/src/dns_reconcile.rs` will later warn that it
+    // disagrees with reality. Not offered at all in CNAME mode:
+    // `modules/proxy/dns.nix` asserts the updater and CNAME are
+    // incompatible, so an operator who said yes there would meet that
+    // assertion instead of an install.
+    let ddns_updater = match mode {
+        RecordMode::Cname => false,
+        RecordMode::A => {
+            io.say(
+                "\nIf this server's public address ever changes, those A records go \
+                 stale and every\napp becomes unreachable from outside -- while the host \
+                 stays healthy, the services\nkeep running and the certificates stay \
+                 valid, with nothing anywhere reporting an\nerror. An hourly check on \
+                 the host finds its real public address and corrects them,\nand only \
+                 ever touches records ferrum created. Say yes and there is nothing \
+                 to\ntype: no address to look up now, and none to come back and change \
+                 later.\nRecommended unless this address is contractually static.",
+            );
+            let answer = io.ask("Keep the records up to date automatically? [Y/n]")?;
+            !matches!(answer.to_lowercase().as_str(), "n" | "no")
+        }
+    };
+
     let target = match mode {
+        // The whole point of the question above: with the updater on there
+        // is no address to ask for and none to write down.
+        RecordMode::A if ddns_updater => {
+            io.say(&format!(
+                "\n  A records for every app under {domain} will point at whatever \
+                 public address\n  this host finds for itself -- checked hourly, and \
+                 again five minutes after\n  every boot. Nothing is written into \
+                 settings.json for you to keep in step."
+            ));
+            RecordTarget::A(None)
+        }
         RecordMode::A => {
             let (address, source) = ask_a_record_address(io, detect)?;
             // A8: shown before it is used, every time, with its provenance.
@@ -537,32 +601,13 @@ pub fn decide_dns(
                      unreachable from the\n  internet. Continuing with it, as you asked."
                 ));
             }
-            RecordTarget::A(address)
+            RecordTarget::A(Some(address))
         }
         RecordMode::Cname => RecordTarget::Cname(ask_valid(
             io,
             "Hostname the records should follow:",
             validate_cname_target,
         )?),
-    };
-
-    let ddns_updater = match &target {
-        // Not offered, rather than merely defaulted off: modules/proxy/dns.nix
-        // asserts the updater and CNAME mode are incompatible, so an operator
-        // who said yes here would meet that assertion instead of an install.
-        RecordTarget::Cname(_) => false,
-        RecordTarget::A(_) => {
-            io.say(
-                "\nIf this server's public address ever changes, those A records go \
-                 stale and every\napp becomes unreachable from outside -- while the host \
-                 stays healthy, the services\nkeep running and the certificates stay \
-                 valid, with nothing anywhere reporting an\nerror. An hourly check \
-                 corrects them, and only ever touches records ferrum\ncreated. \
-                 Recommended unless this address is contractually static.",
-            );
-            let answer = io.ask("Keep the records up to date automatically? [Y/n]")?;
-            !matches!(answer.to_lowercase().as_str(), "n" | "no")
-        }
     };
 
     Ok(DnsDecision {
@@ -1058,7 +1103,10 @@ pub fn from_stage2(body: &str, hostname: &str) -> anyhow::Result<Answers> {
 /// # Errors
 /// A record mode that is neither `a` nor `cname`, a target that fails the
 /// same validation the prompt applies, or the updater enabled alongside
-/// CNAME mode -- the one combination `modules/proxy/dns.nix` rejects.
+/// CNAME mode -- the one combination `modules/proxy/dns.nix` rejects. An
+/// **absent** `staticAddress` in `a` mode is an error only with the updater
+/// off, mirroring that module's own `recordMode = "a"` assertion: with the
+/// updater on there is deliberately no address to recover.
 fn dns_from_settings(doc: &serde_json::Value) -> anyhow::Result<Option<DnsDecision>> {
     let Some(dns) = doc.pointer("/proxy/dns") else {
         return Ok(None);
@@ -1071,16 +1119,32 @@ fn dns_from_settings(doc: &serde_json::Value) -> anyhow::Result<Option<DnsDecisi
         return Ok(None);
     }
 
+    let ddns_updater = dns
+        .pointer("/ddnsUpdater/enable")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+
     let target = match parse_record_mode(
         dns.get("recordMode")
             .and_then(serde_json::Value::as_str)
             .unwrap_or("a"),
     )? {
-        RecordMode::A => RecordTarget::A(validate_public_ipv4(
-            dns.get("staticAddress")
+        RecordMode::A => {
+            let raw = dns
+                .get("staticAddress")
                 .and_then(serde_json::Value::as_str)
-                .unwrap_or_default(),
-        )?),
+                .unwrap_or_default();
+            // An absent address is the NORMAL shape for an updater host --
+            // `decide_dns` writes none, and modules/proxy/dns.nix's
+            // recordMode = "a" assertion accepts that exact combination.
+            // With the updater off it is still the error it always was, and
+            // the message below is the one that assertion gives.
+            if raw.trim().is_empty() && ddns_updater {
+                RecordTarget::A(None)
+            } else {
+                RecordTarget::A(Some(validate_public_ipv4(raw)?))
+            }
+        }
         RecordMode::Cname => RecordTarget::Cname(validate_cname_target(
             dns.get("cnameTarget")
                 .and_then(serde_json::Value::as_str)
@@ -1088,10 +1152,6 @@ fn dns_from_settings(doc: &serde_json::Value) -> anyhow::Result<Option<DnsDecisi
         )?),
     };
 
-    let ddns_updater = dns
-        .pointer("/ddnsUpdater/enable")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
     if ddns_updater && matches!(target, RecordTarget::Cname(_)) {
         anyhow::bail!(
             "the recovered settings enable ferrum.proxy.dns.ddnsUpdater with \
@@ -1297,9 +1357,8 @@ mod tests {
             "", // SSO: default yes
             "admin@thesyms.ca",
             "cftokenvalue1234567890abcdefghijklmnopqr",
-            "",             // record target: default 'a'
-            "203.0.113.10", // this server's public address
-            "",             // updater: default yes
+            "", // record target: default 'a'
+            "", // updater: default yes -- and so no address is asked for
         ]);
         let fake = healthy_cloudflare();
         let a = collect(&mut io, &verifying_against(&fake), &mut no_detection()).unwrap();
@@ -1314,7 +1373,7 @@ mod tests {
         assert_eq!(
             a.dns,
             Some(DnsDecision {
-                target: RecordTarget::A("203.0.113.10".parse().unwrap()),
+                target: RecordTarget::A(None),
                 ddns_updater: true,
             })
         );
@@ -1448,11 +1507,11 @@ mod tests {
     #[test]
     fn both_record_shapes_are_collected() {
         let fake = healthy_cloudflare();
-        let a = collect_with_dns(&fake, &["a", "203.0.113.10", "n"]).unwrap();
+        let a = collect_with_dns(&fake, &["a", "n", "203.0.113.10"]).unwrap();
         assert_eq!(
             a.dns,
             Some(DnsDecision {
-                target: RecordTarget::A("203.0.113.10".parse().unwrap()),
+                target: RecordTarget::A(Some("203.0.113.10".parse().unwrap())),
                 ddns_updater: false,
             })
         );
@@ -1476,7 +1535,7 @@ mod tests {
     fn the_updater_defaults_to_on_and_says_why() {
         let fake = healthy_cloudflare();
         let mut script = upto_token(GOOD_TOKEN);
-        script.extend_from_slice(&["a", "203.0.113.10", ""]);
+        script.extend_from_slice(&["a", ""]);
         let mut io = Scripted::new(&script);
         let a = collect(&mut io, &verifying_against(&fake), &mut no_detection()).unwrap();
         assert_eq!(
@@ -1492,8 +1551,66 @@ mod tests {
 
         // ...and 'n' is still honoured. It is a recommendation, not a gate.
         script_healthy_zone(&fake);
-        let off = collect_with_dns(&fake, &["a", "203.0.113.10", "no"]).unwrap();
+        let off = collect_with_dns(&fake, &["a", "no", "203.0.113.10"]).unwrap();
         assert_eq!(off.dns.map(|d| d.ddns_updater), Some(false));
+    }
+
+    /// F3/R3b. An operator who turns the updater on is asked for nothing
+    /// else: the host discovers its own address, so there is no literal to
+    /// look up now and none to come back and correct later. This is the
+    /// hands-off requirement -- an install must finish with a working
+    /// system and no manual follow-up -- arriving at the one question that
+    /// was still contradicting it.
+    ///
+    /// Mutation check: ask for the address before the updater question (the
+    /// order this replaced) and the first assertion fails, naming the
+    /// question that was asked. Write `staticAddress` anyway and
+    /// `render::tests::an_updater_host_persists_no_static_address` fails.
+    #[test]
+    fn an_updater_host_is_never_asked_for_a_static_address() {
+        let mut io = Scripted::new(&["a", "y"]);
+        // Fails loudly if the address path runs at all: an updater host has
+        // no reason to reach the target for an address it will not use.
+        let mut detect = || panic!("detection must not run once the updater is on");
+        let d = decide_dns("thesyms.ca", &mut io, &mut detect).unwrap();
+        assert_eq!(
+            d,
+            DnsDecision {
+                target: RecordTarget::A(None),
+                ddns_updater: true,
+            }
+        );
+        assert!(
+            !io.asked.iter().any(|q| q.contains("IPv4 address")),
+            "asked for an address the updater makes unnecessary: {:?}",
+            io.asked
+        );
+        // And the operator is told why nothing was asked, rather than left
+        // wondering which address their records point at.
+        let t = io.transcript();
+        assert!(
+            t.contains("this host finds for itself"),
+            "the absent question has to be explained: {t}"
+        );
+
+        // Anti-vacuity: declining the updater still asks, and still
+        // records what was typed. The assertion above is about the
+        // updater's branch, not about the question having been deleted.
+        let mut io = Scripted::new(&["a", "n", "203.0.113.10"]);
+        let d = decide_dns("thesyms.ca", &mut io, &mut no_detection()).unwrap();
+        assert_eq!(
+            d,
+            DnsDecision {
+                target: RecordTarget::A(Some("203.0.113.10".parse().unwrap())),
+                ddns_updater: false,
+            }
+        );
+        assert!(
+            io.asked.iter().any(|q| q.contains("IPv4 address")),
+            "with the updater off the address is still the operator's to \
+             state: {:?}",
+            io.asked
+        );
     }
 
     /// R1 A8 / modules/proxy/dns.nix's own assertion: the updater exists to
@@ -1569,12 +1686,12 @@ mod tests {
         let mut script = upto_token(GOOD_TOKEN);
         // 100.64/10 -- carrier-grade NAT, the case a residential connection
         // hits when the ISP hands out no real address.
-        script.extend_from_slice(&["a", "100.64.1.5", "n"]);
+        script.extend_from_slice(&["a", "n", "100.64.1.5"]);
         let mut io = Scripted::new(&script);
         let a = collect(&mut io, &verifying_against(&fake), &mut no_detection()).unwrap();
         assert_eq!(
             a.dns.map(|d| d.target),
-            Some(RecordTarget::A("100.64.1.5".parse().unwrap())),
+            Some(RecordTarget::A(Some("100.64.1.5".parse().unwrap()))),
             "the answer is the operator's"
         );
         assert!(
@@ -1617,10 +1734,10 @@ mod tests {
     #[test]
     fn a_detected_public_address_is_shown_then_taken_by_pressing_enter() {
         let fake = healthy_cloudflare();
-        let (a, io) = collect_detecting(&fake, "203.0.113.10\n", &["a", "", "n"]);
+        let (a, io) = collect_detecting(&fake, "203.0.113.10\n", &["a", "n", ""]);
         assert_eq!(
             a.dns.map(|d| d.target),
-            Some(RecordTarget::A("203.0.113.10".parse().unwrap()))
+            Some(RecordTarget::A(Some("203.0.113.10".parse().unwrap())))
         );
         let t = io.transcript();
         assert!(
@@ -1646,10 +1763,10 @@ mod tests {
     #[test]
     fn an_override_is_honoured_labelled_and_still_validated() {
         let fake = healthy_cloudflare();
-        let (a, io) = collect_detecting(&fake, "203.0.113.10", &["a", "198.51.100.7", "n"]);
+        let (a, io) = collect_detecting(&fake, "203.0.113.10", &["a", "n", "198.51.100.7"]);
         assert_eq!(
             a.dns.map(|d| d.target),
-            Some(RecordTarget::A("198.51.100.7".parse().unwrap())),
+            Some(RecordTarget::A(Some("198.51.100.7".parse().unwrap()))),
             "the operator's answer wins over the detected one"
         );
         assert!(
@@ -1665,11 +1782,11 @@ mod tests {
         let (b, _) = collect_detecting(
             &fake,
             "203.0.113.10",
-            &["a", "not-an-address", "198.51.100.8", "n"],
+            &["a", "n", "not-an-address", "198.51.100.8"],
         );
         assert_eq!(
             b.dns.map(|d| d.target),
-            Some(RecordTarget::A("198.51.100.8".parse().unwrap()))
+            Some(RecordTarget::A(Some("198.51.100.8".parse().unwrap())))
         );
     }
 
@@ -1678,7 +1795,7 @@ mod tests {
     fn the_operator_can_ask_it_to_look_again() {
         let fake = healthy_cloudflare();
         let mut script = upto_token(GOOD_TOKEN);
-        script.extend_from_slice(&["a", "r", "", "n"]);
+        script.extend_from_slice(&["a", "n", "r", ""]);
         let mut io = Scripted::new(&script);
         let mut looks = 0usize;
         let a = collect(&mut io, &verifying_against(&fake), &mut || {
@@ -1689,7 +1806,7 @@ mod tests {
         assert_eq!(looks, 2, "'r' must run detection again, not parse as input");
         assert_eq!(
             a.dns.map(|d| d.target),
-            Some(RecordTarget::A("203.0.113.10".parse().unwrap()))
+            Some(RecordTarget::A(Some("203.0.113.10".parse().unwrap())))
         );
     }
 
@@ -1702,10 +1819,10 @@ mod tests {
     #[test]
     fn a_detected_cgnat_address_is_reported_never_offered() {
         let fake = healthy_cloudflare();
-        let (a, io) = collect_detecting(&fake, "100.64.1.5", &["a", "203.0.113.10", "n"]);
+        let (a, io) = collect_detecting(&fake, "100.64.1.5", &["a", "n", "203.0.113.10"]);
         assert_eq!(
             a.dns.map(|d| d.target),
-            Some(RecordTarget::A("203.0.113.10".parse().unwrap())),
+            Some(RecordTarget::A(Some("203.0.113.10".parse().unwrap()))),
             "the CGNAT address must not have become the record's value"
         );
         let t = io.transcript();
@@ -1733,10 +1850,10 @@ mod tests {
     #[test]
     fn a_detected_ipv6_address_never_becomes_an_a_record() {
         let fake = healthy_cloudflare();
-        let (a, io) = collect_detecting(&fake, "2001:db8::1", &["a", "203.0.113.10", "n"]);
+        let (a, io) = collect_detecting(&fake, "2001:db8::1", &["a", "n", "203.0.113.10"]);
         assert_eq!(
             a.dns.map(|d| d.target),
-            Some(RecordTarget::A("203.0.113.10".parse().unwrap()))
+            Some(RecordTarget::A(Some("203.0.113.10".parse().unwrap())))
         );
         let t = io.transcript();
         assert!(t.contains("2001:db8::1"), "it must be shown: {t}");
@@ -1768,10 +1885,10 @@ mod tests {
     #[test]
     fn detection_that_finds_nothing_states_it_and_asks() {
         let fake = healthy_cloudflare();
-        let (a, io) = collect_detecting(&fake, "", &["a", "203.0.113.10", "n"]);
+        let (a, io) = collect_detecting(&fake, "", &["a", "n", "203.0.113.10"]);
         assert_eq!(
             a.dns.map(|d| d.target),
-            Some(RecordTarget::A("203.0.113.10".parse().unwrap())),
+            Some(RecordTarget::A(Some("203.0.113.10".parse().unwrap()))),
             "an empty detection must not degrade into a default address"
         );
         let t = io.transcript();
@@ -1784,7 +1901,7 @@ mod tests {
         // And a detection that could not run at all behaves the same way.
         script_healthy_zone(&fake);
         let mut script = upto_token(GOOD_TOKEN);
-        script.extend_from_slice(&["a", "203.0.113.10", "n"]);
+        script.extend_from_slice(&["a", "n", "203.0.113.10"]);
         let mut io = Scripted::new(&script);
         let b = collect(&mut io, &verifying_against(&fake), &mut || {
             address::detect(|_| anyhow::bail!("ssh target failed: no route to host"))
@@ -1792,7 +1909,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             b.dns.map(|d| d.target),
-            Some(RecordTarget::A("203.0.113.10".parse().unwrap()))
+            Some(RecordTarget::A(Some("203.0.113.10".parse().unwrap())))
         );
         assert!(
             io.transcript().contains("no route to host"),
@@ -1829,18 +1946,18 @@ mod tests {
     #[test]
     fn a8_prompts_read_correctly_to_an_operator() {
         for (case, detected, extra) in [
-            ("detected and usable", "203.0.113.10", &["a", "", "n"][..]),
+            ("detected and usable", "203.0.113.10", &["a", "n", ""][..]),
             (
                 "detected but CGNAT",
                 "100.64.1.5",
-                &["a", "203.0.113.10", "n"][..],
+                &["a", "n", "203.0.113.10"][..],
             ),
             (
                 "detected IPv6",
                 "2001:db8::1",
-                &["a", "203.0.113.10", "n"][..],
+                &["a", "n", "203.0.113.10"][..],
             ),
-            ("detection failed", "", &["a", "203.0.113.10", "n"][..]),
+            ("detection failed", "", &["a", "n", "203.0.113.10"][..]),
         ] {
             let fake = healthy_cloudflare();
             let (_, io) = collect_detecting(&fake, detected, extra);
@@ -1929,20 +2046,52 @@ mod tests {
         assert_eq!(
             a.dns,
             Some(DnsDecision {
-                target: RecordTarget::A("203.0.113.10".parse().unwrap()),
+                target: RecordTarget::A(Some("203.0.113.10".parse().unwrap())),
                 ddns_updater: true,
             })
         );
 
-        // A hand-blanked address is the exact shape of D-11(b)'s failure:
-        // an empty value that reads as "nothing to do".
-        let blanked = from_stage2(
-            &doc(serde_json::json!({ "enable": true, "recordMode": "a", "staticAddress": "" })),
+        // F3/R3b: the settings an updater install actually writes. No
+        // staticAddress at all, which modules/proxy/dns.nix's own
+        // `recordMode = "a"` assertion accepts on exactly this condition --
+        // so a resume must accept it too, rather than refusing the
+        // documents this installer now produces.
+        let discovered = from_stage2(
+            &doc(serde_json::json!({
+                "enable": true,
+                "recordMode": "a",
+                "ddnsUpdater": { "enable": true },
+            })),
             "saltbox",
         )
-        .unwrap_err()
-        .to_string();
-        assert!(blanked.contains("staticAddress"), "{blanked}");
+        .unwrap();
+        assert_eq!(
+            discovered.dns,
+            Some(DnsDecision {
+                target: RecordTarget::A(None),
+                ddns_updater: true,
+            })
+        );
+
+        // With the updater OFF a hand-blanked address is still the exact
+        // shape of D-11(b)'s failure: an empty value that reads as "nothing
+        // to do". The relaxation above is scoped to the updater and nothing
+        // else -- which is also what makes it a check rather than a hole.
+        for blank in [
+            serde_json::json!({ "enable": true, "recordMode": "a", "staticAddress": "" }),
+            serde_json::json!({ "enable": true, "recordMode": "a" }),
+            serde_json::json!({
+                "enable": true,
+                "recordMode": "a",
+                "staticAddress": "",
+                "ddnsUpdater": { "enable": false },
+            }),
+        ] {
+            let blanked = from_stage2(&doc(blank.clone()), "saltbox")
+                .unwrap_err()
+                .to_string();
+            assert!(blanked.contains("staticAddress"), "{blank}: {blanked}");
+        }
 
         // The one combination dns.nix rejects, caught here instead.
         let impossible = from_stage2(
