@@ -22,6 +22,15 @@ pub enum Request {
     /// fetch. What is checked comes from the operator's own root-owned
     /// /etc/ferrum/flake.nix, which ferrumd cannot write.
     CheckUpdate,
+    /// The update commit: advance the pin, then apply. Zero fields, for the
+    /// same reason `CheckUpdate` has none and with more at stake -- this is
+    /// the one kind that WRITES /etc/ferrum/flake.lock and then builds and
+    /// switches the host as root. The repository, the ref, and therefore
+    /// the candidate are all computed by ferrum-apply from the operator's
+    /// own root-owned /etc/ferrum/flake.nix, which ferrumd cannot write.
+    /// A `Update { flakeRef }` shape -- the rejected one -- would have made
+    /// the request file a way to choose what a root process builds.
+    Update,
 }
 
 impl Request {
@@ -43,6 +52,7 @@ impl Request {
             Request::RestoreState => "restore_state",
             Request::Gc => "gc",
             Request::CheckUpdate => "check_update",
+            Request::Update => "update",
         }
     }
 }
@@ -73,6 +83,7 @@ mod tests {
             (r#"{"kind":"restore_state"}"#, "restore_state"),
             (r#"{"kind":"gc"}"#, "gc"),
             (r#"{"kind":"check_update"}"#, "check_update"),
+            (r#"{"kind":"update"}"#, "update"),
         ] {
             let path = dir.path().join("req.json");
             std::fs::write(&path, json).unwrap();
@@ -124,6 +135,35 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(read_request(&path).unwrap(), Request::CheckUpdate));
+    }
+
+    /// The commit kind carries no fields either, and the injected-field
+    /// case matters more here than it does for the check: this is the
+    /// variant that writes flake.lock and then builds and switches as root.
+    /// An extra field on the wire must be provably inert -- the variant has
+    /// nowhere to put one, which is why the whole candidate resolution
+    /// happens inside ferrum-apply from root-owned inputs.
+    #[test]
+    fn update_carries_no_fields_and_ignores_any_that_are_injected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("req.json");
+        std::fs::write(&path, r#"{"kind":"update"}"#).unwrap();
+        assert!(matches!(read_request(&path).unwrap(), Request::Update));
+
+        for injected in [
+            r#"{"kind":"update","flakeRef":"github:attacker/evil"}"#,
+            r#"{"kind":"update","rev":"deadbeef"}"#,
+            r#"{"kind":"update","to":3}"#,
+            r#"{"kind":"update","flake_lock":"/tmp/mine.lock"}"#,
+        ] {
+            std::fs::write(&path, injected).unwrap();
+            let req = read_request(&path).unwrap();
+            assert!(
+                matches!(req, Request::Update),
+                "an injected field must not change which variant runs: {injected}"
+            );
+            assert_eq!(req.kind(), "update");
+        }
     }
 
     #[test]

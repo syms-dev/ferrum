@@ -12,6 +12,7 @@ mod request;
 mod restore_state;
 mod rollback;
 mod secrets;
+mod update_apply;
 mod update_candidate;
 mod update_check;
 mod update_deltas;
@@ -95,6 +96,17 @@ enum Command {
     /// so `request::Request`'s own rule holds: every variant maps onto a
     /// subcommand an operator can also run by hand over SSH.
     CheckUpdate,
+    /// Advance this host's ferrum pin to the newest tested release and
+    /// apply it, as one action.
+    ///
+    /// Writes `/etc/ferrum/flake.lock` and nothing else, then runs the
+    /// ordinary apply pipeline -- an update is not a special case of the
+    /// rollback story, it is an ordinary instance of it. Refuses if the
+    /// flake directory has uncommitted changes, if the candidate is not
+    /// strictly newer, if the advance would repoint the input at a
+    /// different repository, or if it lands on a revision other than the
+    /// one just resolved; every refusal leaves `flake.lock` untouched.
+    Update,
 }
 
 /// Writes the job's `started` line, then runs it.
@@ -188,8 +200,21 @@ fn run_preflight_inner() -> anyhow::Result<()> {
     )
 }
 
-fn run_apply() -> i32 {
-    let storage = apply::StorageConfig {
+/// Everything `apply::run` needs, resolved from the environment ferrumd's
+/// systemd unit sets.
+///
+/// Extracted from `run_apply` so the update commit reaches the apply
+/// pipeline through the IDENTICAL configuration an ordinary apply uses.
+/// R4's first criterion is that an update runs through the unmodified
+/// `apply::run`; a second, independently-assembled `StorageConfig` would
+/// satisfy that letter while breaking its point, and would be free to drift
+/// -- a differing free-space threshold, a differing health-check timeout --
+/// until an update behaved unlike an apply for reasons nobody chose.
+///
+/// # Returns
+/// The storage, health-check and secrets configuration for one apply.
+fn storage_from_env() -> apply::StorageConfig {
+    apply::StorageConfig {
         state_dir: std::env::var("FERRUM_STATE_DIR")
             .unwrap_or_else(|_| "/var/lib/ferrum/state".to_string())
             .into(),
@@ -243,10 +268,24 @@ fn run_apply() -> i32 {
         root_password_file: std::env::var("FERRUM_ROOT_PASSWORD_FILE")
             .unwrap_or_else(|_| secrets::DEFAULT_ROOT_PASSWORD_FILE.to_string())
             .into(),
-    };
-    let flake_ref = std::env::var("FERRUM_FLAKE_REF")
-        .unwrap_or_else(|_| "/etc/ferrum#nixosConfigurations.default.config.system.build.toplevel".to_string());
-    handle_apply_result(apply::run(&flake_ref, &storage))
+    }
+}
+
+/// The flake reference every build in this process starts from.
+///
+/// One reader, shared by the apply and the update, for the reason
+/// `storage_from_env` exists: two copies of this default could disagree,
+/// and the one that disagreed would build a different host.
+///
+/// # Returns
+/// `$FERRUM_FLAKE_REF`, or this crate's compiled-in default.
+fn flake_ref_from_env() -> String {
+    std::env::var("FERRUM_FLAKE_REF")
+        .unwrap_or_else(|_| "/etc/ferrum#nixosConfigurations.default.config.system.build.toplevel".to_string())
+}
+
+fn run_apply() -> i32 {
+    handle_apply_result(apply::run(&flake_ref_from_env(), &storage_from_env()))
 }
 
 fn run_rollback(to: u32) -> i32 {
@@ -609,6 +648,349 @@ fn run_check_update() -> i32 {
     )
 }
 
+/// Everything the update commit reads out of the environment, resolved once.
+///
+/// Split from the run below for the reason `CheckUpdateJob` was: the
+/// composition it performs -- refuse a dirty tree, resolve, advance, apply,
+/// undo on failure -- is the part with no second chance if it is wrong, and
+/// it is not reachable from a test while it reads the environment.
+struct UpdateJob {
+    /// The reference `apply::run` will be given, unchanged.
+    flake_ref: String,
+    /// The flake directory, e.g. `/etc/ferrum`.
+    flake_dir: String,
+    /// The file that must stay byte-identical.
+    flake_nix: std::path::PathBuf,
+    /// The one file this job writes.
+    flake_lock: std::path::PathBuf,
+    /// The host clock, as seconds since the epoch.
+    now: u64,
+}
+
+impl UpdateJob {
+    /// Resolve the job from the environment ferrumd sets.
+    ///
+    /// # Returns
+    /// The paths and clock the run below needs.
+    fn from_env() -> Self {
+        let flake_ref = flake_ref_from_env();
+        let (flake_dir, _) = update_check::split_flake_ref(&flake_ref);
+        Self {
+            flake_nix: std::path::Path::new(&flake_dir).join("flake.nix"),
+            flake_lock: std::path::Path::new(&flake_dir).join("flake.lock"),
+            now: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            flake_dir,
+            flake_ref,
+        }
+    }
+}
+
+/// What an update's apply did to the generation sequence.
+///
+/// The distinction `apply::run` does not draw and R4's last edge case
+/// requires: when the advanced pin builds a closure identical to the one
+/// already running, `apply::run` returns early after a health check -- no
+/// preflight, no snapshot, no journal entry, no new generation -- and
+/// reports `Succeeded`. Telling the operator "applied" there would be a
+/// lie in a status line. This is read from the generation NUMBER before and
+/// after rather than from the result, because the number is the thing that
+/// did or did not move, and reading it requires no change to `apply::run`.
+#[derive(Debug, PartialEq, Eq)]
+enum Produced {
+    /// A new generation exists.
+    Generation(u32),
+    /// The build produced the closure already running.
+    NoChange,
+    /// The generation could not be read on one side or the other, so
+    /// neither claim can be made. Reported as itself, never as "no change".
+    Unknown,
+}
+
+/// Classify what the apply produced from the generation number either side
+/// of it.
+///
+/// # Arguments
+/// * `before` - the system generation before the apply, if it could be read.
+/// * `after` - the system generation after it, if it could be read.
+///
+/// # Returns
+/// The new generation, `NoChange` when the number did not move, or
+/// `Unknown` when either side is missing.
+fn produced(before: Option<u32>, after: Option<u32>) -> Produced {
+    match (before, after) {
+        (Some(b), Some(a)) if a != b => Produced::Generation(a),
+        (Some(_), Some(_)) => Produced::NoChange,
+        _ => Produced::Unknown,
+    }
+}
+
+/// The operator-facing sentence for one update outcome.
+///
+/// # Arguments
+/// * `produced` - what the apply did to the generation sequence.
+/// * `to` - the revision the pin was advanced to.
+///
+/// # Returns
+/// The `detail` of the job's terminal progress line, which is what the
+/// Updates view renders.
+fn update_detail(produced: &Produced, to: &str) -> String {
+    let rev = update_candidate::short_rev(to);
+    match produced {
+        Produced::Generation(n) => {
+            format!("updated to {rev} as generation {n}")
+        }
+        // The exact words R4's last edge case requires. "Nothing to apply"
+        // rather than "applied": no generation was created, so there is
+        // also nothing new to roll back to.
+        Produced::NoChange => format!(
+            "no change — nothing to apply. The pin now records {rev}, and it builds the system \
+             this host is already running, so no new generation was created"
+        ),
+        Produced::Unknown => format!(
+            "the pin now records {rev} and the apply finished, but this host's generation \
+             number could not be read either before or after, so whether a new generation was \
+             created is unknown -- check the Generations view"
+        ),
+    }
+}
+
+/// Advance the pin and apply it, as one operator action.
+///
+/// One action rather than two staged steps (Open Question 5's resolution):
+/// a lock that has been advanced but not applied is exactly the drift R8
+/// exists to prevent -- a later, unrelated settings apply would pick the new
+/// versions up with the operator never having reviewed them.
+///
+/// # Arguments
+/// * `job` - the resolved paths and clock.
+/// * `runner` - the subprocess seam, so a test can drive the whole
+///   composition without a real `nix` or `git`.
+/// * `progress` - the job's event stream.
+/// * `apply` - the apply pipeline. Injected so the composition is testable;
+///   production passes the real, unmodified `apply::run`.
+/// * `generation` - reads the system generation number, for the no-change
+///   case above.
+///
+/// # Returns
+/// A process exit code: 0 when the update was applied (or when there was
+/// nothing to apply), 3 when the resulting apply degraded, 1 when anything
+/// was refused or failed.
+fn run_update_job(
+    job: &UpdateJob,
+    runner: &dyn update_check::CommandRunner,
+    progress: &mut progress::Progress,
+    apply_fn: impl FnOnce(&str) -> anyhow::Result<apply::ApplyResult>,
+    generation: impl Fn() -> Option<u32>,
+) -> i32 {
+    progress.event(
+        "update",
+        &format!("checking that {} has no uncommitted changes", job.flake_dir),
+    );
+    if let Err(e) = update_apply::require_clean_tree(runner, &job.flake_dir) {
+        progress.complete("failed", &e);
+        eprintln!("update: {e}");
+        return 1;
+    }
+
+    progress.event("update", "resolving the candidate revision");
+    let outcome = update_candidate::resolve(runner, &job.flake_nix, &job.flake_lock, job.now);
+    let report = &outcome.report;
+    let rev = match report.state {
+        update_check::CandidateState::UpdateAvailable => match report.rev.as_deref() {
+            Some(r) => r.to_string(),
+            None => {
+                let detail =
+                    "an update was found but no revision came back with it, so there is \
+                     nothing this host can be advanced to"
+                        .to_string();
+                progress.complete("failed", &detail);
+                eprintln!("update: {detail}");
+                return 1;
+            }
+        },
+        // Not a failure, and deliberately not phrased as one: the host is
+        // where it should be and nothing was written.
+        update_check::CandidateState::UpToDate => {
+            let detail = format!(
+                "already at the newest release this host tracks ({}) — nothing to apply",
+                update_candidate::short_rev(report.rev.as_deref().unwrap_or("unknown"))
+            );
+            progress.complete("succeeded", &detail);
+            println!("{detail}");
+            return 0;
+        }
+        // Monotonicity, enforced here and not only at discovery (DA-1):
+        // discovery and this job resolve independently and minutes apart.
+        // `OrderUnknown` is refused for the same reason `NotNewer` is --
+        // "we cannot tell whether this is newer" must never be treated as
+        // "it is".
+        other => {
+            let detail = format!(
+                "refusing to update: {}{}",
+                match other {
+                    update_check::CandidateState::NotNewer =>
+                        "the tracked reference points at a revision that is not newer than the \
+                         one this host runs",
+                    update_check::CandidateState::OrderUnknown =>
+                        "ferrum could not establish that the candidate is newer than what this \
+                         host runs",
+                    _ => "the update check failed",
+                },
+                report
+                    .error
+                    .as_deref()
+                    .map(|e| format!(" ({e})"))
+                    .unwrap_or_default()
+            );
+            progress.complete("failed", &detail);
+            eprintln!("update: {detail}");
+            return 1;
+        }
+    };
+
+    progress.event(
+        "update",
+        &format!(
+            "advancing the ferrum pin to {} -- flake.lock only",
+            update_candidate::short_rev(&rev)
+        ),
+    );
+    let advanced = match update_apply::advance(
+        runner,
+        &job.flake_dir,
+        &job.flake_nix,
+        &job.flake_lock,
+        &rev,
+    ) {
+        Ok(a) => a,
+        Err(e) => {
+            progress.complete("failed", &e);
+            eprintln!("update: {e}");
+            return 1;
+        }
+    };
+
+    // From here on this is an ordinary apply. Not a copy of one, not a
+    // variant of one: the same function, the same configuration, the same
+    // Succeeded/Degraded/Failed vocabulary, and therefore the same rollback
+    // guarantee. R4's first criterion is that this feature does not fork,
+    // duplicate, or branch `apply::run`, and the way that is kept true is
+    // that there is nothing update-shaped on the other side of this call.
+    let before = generation();
+    let result = apply_fn(&job.flake_ref);
+    let after = generation();
+
+    // Used by the `Failed` arm only. A build that failed at the candidate
+    // pin leaves an advanced lock that the next unrelated settings apply
+    // would silently build from -- the exact drift R8 names. A DEGRADED
+    // apply is not undone: that host did switch, and reverting the pin
+    // under a running generation would make the lock disagree with what is
+    // actually installed.
+    let undo = |why: String| undo_pin(job, &advanced.previous_lock, why);
+
+    let (name, detail, code) = match result {
+        Ok(apply::ApplyResult::Succeeded) => {
+            let p = produced(before, after);
+            ("succeeded", update_detail(&p, &advanced.to.rev), 0)
+        }
+        Ok(apply::ApplyResult::Degraded(reason)) => (
+            "degraded",
+            format!(
+                "updated to {}, but: {reason}",
+                update_candidate::short_rev(&advanced.to.rev)
+            ),
+            3,
+        ),
+        Ok(apply::ApplyResult::Failed(reason)) => (
+            "failed",
+            undo(format!("the update could not be applied: {reason}")),
+            1,
+        ),
+        // NOT undone, unlike `Failed` above, and the difference is not an
+        // oversight. `ApplyResult::Failed` is a classified verdict from a
+        // pipeline that got far enough to classify one; an `Err` is
+        // `apply::run` giving up part-way, and it can be raised AFTER
+        // `nix-env --set` and the switch ("apply failed mid-sequence"). So
+        // "nothing switched" is exactly what cannot be assumed here, and
+        // putting the pin back under a system that may already be running
+        // the new closure would make flake.lock name a revision the host is
+        // not on -- the same disagreement, pointed the other way. The one
+        // honest move left is to say so and let the operator look.
+        Err(e) => (
+            "failed",
+            format!(
+                "the update could not be applied: {e}. The pin was already advanced to {}, and \
+                 whether the switch happened is not knowable from here -- it has deliberately \
+                 NOT been put back. Check the Generations view and `git -C {} diff flake.lock` \
+                 before applying anything else",
+                update_candidate::short_rev(&advanced.to.rev),
+                job.flake_dir
+            ),
+            1,
+        ),
+    };
+    if code == 0 {
+        println!("{detail}");
+    } else {
+        eprintln!("update {name}: {detail}");
+    }
+    progress.complete(name, &detail);
+    code
+}
+
+/// Put the pin back after an apply that classified itself as failed, and
+/// say so.
+///
+/// Reached only from `ApplyResult::Failed`, which `apply::run` returns from
+/// the build step and from a switch it classified — never from a sequence it
+/// abandoned mid-way (see the `Err` arm at the call site). An advanced lock
+/// under an unchanged running generation is the drift R8 exists to prevent:
+/// the next unrelated settings apply would build from it, with no preview
+/// and no confirmation.
+///
+/// # Arguments
+/// * `job` - the paths, for the message's `git -C` hint.
+/// * `previous` - the lock's bytes before the advance.
+/// * `why` - what failed, in the words of whatever failed.
+///
+/// # Returns
+/// The operator-facing detail, saying both what went wrong and what state
+/// the pin is now in -- including, loudly, the case where the undo itself
+/// failed, which is the only outcome here an operator must act on by hand.
+fn undo_pin(job: &UpdateJob, previous: &[u8], why: String) -> String {
+    match update_apply::restore(&job.flake_lock, previous) {
+        Ok(()) => format!(
+            "{why}. The pin has been put back where it was, so nothing else will build from it"
+        ),
+        Err(e) => format!(
+            "{why}. WORSE: the pin could not be put back ({e}), so this host's flake.lock now \
+             names a revision it is not running. Check `git -C {} diff flake.lock` before \
+             applying anything else",
+            job.flake_dir
+        ),
+    }
+}
+
+/// The environment-reading wrapper the CLI and the dispatcher both call.
+///
+/// # Returns
+/// The process exit code from `run_update_job`.
+fn run_update() -> i32 {
+    let mut progress = progress::Progress::open();
+    let job = UpdateJob::from_env();
+    let storage = storage_from_env();
+    run_update_job(
+        &job,
+        &update_check::RealRunner,
+        &mut progress,
+        |flake_ref| apply::run(flake_ref, &storage),
+        || apply::current_generation().ok().map(|(g, _)| g),
+    )
+}
+
 /// A real GC pass: prunes state snapshots beyond `ferrum.storage.keepGenerations`.
 ///
 /// Was a stub returning exit 1 until 2026-09-15, while
@@ -811,6 +1193,7 @@ fn main() -> anyhow::Result<()> {
         Command::Gc => run_gc(),
         Command::PreviewMigration => run_preview_migration(),
         Command::CheckUpdate => run_check_update(),
+        Command::Update => run_update(),
         Command::ReconcileDns { config } => run_reconcile_dns(&config),
         Command::PutSecret { name, replace } => run_put_secret(&name, replace),
         Command::RunRequest { path } => match request::read_request(&path) {
@@ -821,6 +1204,7 @@ fn main() -> anyhow::Result<()> {
                 request::Request::RestoreState => run_restore_state(),
                 request::Request::Gc => run_gc(),
                 request::Request::CheckUpdate => run_check_update(),
+                request::Request::Update => run_update(),
             }),
             Err(e) => {
                 eprintln!("run-request: {e}");
@@ -1422,6 +1806,406 @@ mod tests {
                 body.contains("flake.nix"),
                 "the published report must carry the violation: {body}"
             );
+        }
+    }
+
+    /// The update commit, composed end to end: refuse a dirty tree, resolve,
+    /// advance the pin, hand off to the ordinary apply, and undo the advance
+    /// when nothing was switched.
+    ///
+    /// Every test here asserts on FILES afterwards as well as on the exit
+    /// code, because the two claims this feature actually makes -- flake.nix
+    /// is byte-identical, and a failed update leaves no advanced pin behind
+    /// -- are claims about files and cannot be made any other way.
+    mod update_composition {
+        use super::*;
+        use crate::update_check::{CommandOutput, CommandRunner};
+        use std::cell::RefCell;
+
+        const INSTALLED: &str = "1111111111111111111111111111111111111111";
+        const CANDIDATE: &str = "2222222222222222222222222222222222222222";
+
+        fn lock_for(rev: &str, last_modified: i64) -> String {
+            serde_json::json!({
+                "nodes": {
+                    "root": {"inputs": {"ferrum": "ferrum"}},
+                    "ferrum": {"locked": {
+                        "type": "github", "owner": "syms-dev", "repo": "ferrum",
+                        "rev": rev, "narHash": format!("sha256-{rev}="),
+                        "lastModified": last_modified}}
+                },
+                "version": 7
+            })
+            .to_string()
+        }
+
+        /// A runner that answers `git status`, `git ls-remote` and
+        /// `nix flake metadata`, and performs the real side effect of
+        /// `nix flake lock --update-input`: it rewrites the lock.
+        struct Runner {
+            flake_lock: std::path::PathBuf,
+            /// What `git status --porcelain` says. Empty is a clean tree.
+            dirty: String,
+            /// The revision `git ls-remote` reports for the tracked ref.
+            remote_rev: String,
+            /// The revision the lock ends up pinning after the advance.
+            lands_on: String,
+            argvs: RefCell<Vec<String>>,
+        }
+
+        impl CommandRunner for Runner {
+            fn run(&self, program: &str, args: &[String]) -> Result<CommandOutput, String> {
+                let joined = args.join(" ");
+                self.argvs.borrow_mut().push(format!("{program} {joined}"));
+                let stdout = if joined.contains("status") {
+                    self.dirty.clone()
+                } else if joined.contains("ls-remote") {
+                    format!("{}\tHEAD\n", self.remote_rev)
+                } else if joined.contains("flake lock") {
+                    std::fs::write(&self.flake_lock, lock_for(&self.lands_on, 300)).unwrap();
+                    String::new()
+                } else {
+                    // nix flake metadata, for the ordering comparison.
+                    serde_json::json!({"lastModified": 300, "revision": self.remote_rev})
+                        .to_string()
+                };
+                Ok(CommandOutput { success: true, stdout, stderr: String::new() })
+            }
+        }
+
+        struct Host {
+            _dir: tempfile::TempDir,
+            job: UpdateJob,
+            progress_path: std::path::PathBuf,
+            nix_bytes: Vec<u8>,
+            lock_bytes: Vec<u8>,
+        }
+
+        fn host() -> Host {
+            let dir = tempfile::tempdir().unwrap();
+            let flake_dir = dir.path().join("etc");
+            std::fs::create_dir_all(&flake_dir).unwrap();
+            let flake_nix = flake_dir.join("flake.nix");
+            std::fs::write(&flake_nix, "{ inputs.ferrum.url = \"github:syms-dev/ferrum\"; }\n")
+                .unwrap();
+            let flake_lock = flake_dir.join("flake.lock");
+            std::fs::write(&flake_lock, lock_for(INSTALLED, 100)).unwrap();
+            Host {
+                progress_path: dir.path().join("job.jsonl"),
+                nix_bytes: std::fs::read(&flake_nix).unwrap(),
+                lock_bytes: std::fs::read(&flake_lock).unwrap(),
+                job: UpdateJob {
+                    flake_ref: format!(
+                        "{}#nixosConfigurations.saltbox.config.system.build.toplevel",
+                        flake_dir.display()
+                    ),
+                    flake_dir: flake_dir.to_string_lossy().into_owned(),
+                    flake_nix,
+                    flake_lock,
+                    now: 1_758_700_000,
+                },
+                _dir: dir,
+            }
+        }
+
+        impl Host {
+            fn runner(&self) -> Runner {
+                Runner {
+                    flake_lock: self.job.flake_lock.clone(),
+                    dirty: String::new(),
+                    remote_rev: CANDIDATE.to_string(),
+                    lands_on: CANDIDATE.to_string(),
+                    argvs: RefCell::new(Vec::new()),
+                }
+            }
+            fn flake_nix_is_byte_identical(&self) -> bool {
+                std::fs::read(&self.job.flake_nix).unwrap() == self.nix_bytes
+            }
+            fn flake_lock_is_byte_identical(&self) -> bool {
+                std::fs::read(&self.job.flake_lock).unwrap() == self.lock_bytes
+            }
+            fn stream(&self) -> String {
+                std::fs::read_to_string(&self.progress_path).unwrap()
+            }
+        }
+
+        /// The clean path. Without it every refusal below could pass on a
+        /// composition that refuses everything.
+        #[test]
+        fn a_newer_candidate_is_advanced_applied_and_reported_as_a_generation() {
+            let h = host();
+            let runner = h.runner();
+            let mut progress = progress::Progress::to_path(&h.progress_path);
+
+            let code = run_update_job(
+                &h.job,
+                &runner,
+                &mut progress,
+                |flake_ref| {
+                    assert_eq!(flake_ref, h.job.flake_ref, "the apply gets the host's own ref");
+                    Ok(apply::ApplyResult::Succeeded)
+                },
+                {
+                    let n = RefCell::new(vec![10u32, 9]); // popped: 9 before, 10 after
+                    move || n.borrow_mut().pop()
+                },
+            );
+
+            assert_eq!(code, 0);
+            assert!(!h.flake_lock_is_byte_identical(), "the lock is the file an update writes");
+            assert!(h.flake_nix_is_byte_identical(), "flake.nix is never written");
+            let stream = h.stream();
+            assert!(stream.contains("succeeded"), "{stream}");
+            assert!(stream.contains("generation 10"), "{stream}");
+            assert!(stream.contains("2222222"), "the applied revision is named: {stream}");
+        }
+
+        /// R4's last edge case, and the one the spec singles out as the
+        /// thing that ships as a lie in a status line. `apply::run` returns
+        /// early on an unchanged closure -- no preflight, no snapshot, no
+        /// journal entry, no generation -- and the operator must be told
+        /// exactly that.
+        #[test]
+        fn an_advance_that_builds_the_running_closure_says_no_change_nothing_to_apply() {
+            let h = host();
+            let runner = h.runner();
+            let mut progress = progress::Progress::to_path(&h.progress_path);
+
+            let code = run_update_job(
+                &h.job,
+                &runner,
+                &mut progress,
+                |_| Ok(apply::ApplyResult::Succeeded),
+                || Some(9), // the generation number never moved
+            );
+
+            assert_eq!(code, 0, "nothing failed -- there was simply nothing to apply");
+            let stream = h.stream();
+            assert!(
+                stream.contains("no change — nothing to apply"),
+                "the operator must be told exactly this: {stream}"
+            );
+            assert!(
+                !stream.contains("generation 9"),
+                "no generation was created, so none may be claimed: {stream}"
+            );
+        }
+
+        /// And the no-change wording is not what a real generation gets --
+        /// without this, a composition that always said "no change" would
+        /// pass the test above.
+        #[test]
+        fn the_no_change_wording_is_never_used_for_a_real_generation() {
+            assert!(update_detail(&Produced::Generation(11), CANDIDATE).contains("generation 11"));
+            assert!(!update_detail(&Produced::Generation(11), CANDIDATE).contains("no change"));
+            assert!(update_detail(&Produced::NoChange, CANDIDATE).contains("no change — nothing to apply"));
+            // An unreadable generation number is its own answer, never the
+            // no-change one: "we could not look" and "there was nothing" are
+            // different facts, the same distinction CandidateState draws.
+            let unknown = update_detail(&Produced::Unknown, CANDIDATE);
+            assert!(unknown.contains("unknown"), "{unknown}");
+            assert!(!unknown.contains("no change"), "{unknown}");
+            assert_eq!(produced(Some(4), Some(5)), Produced::Generation(5));
+            assert_eq!(produced(Some(4), Some(4)), Produced::NoChange);
+            assert_eq!(produced(None, Some(5)), Produced::Unknown);
+            assert_eq!(produced(Some(4), None), Produced::Unknown);
+        }
+
+        /// DA-5: a machine-written flake.lock in a dirty tree is one
+        /// `git checkout` away from being silently reverted, after which
+        /// the next ordinary apply downgrades the whole host.
+        #[test]
+        fn a_dirty_flake_directory_refuses_before_anything_privileged_runs() {
+            let h = host();
+            let mut runner = h.runner();
+            runner.dirty = " M settings.json\n?? scratch.nix\n".to_string();
+            let mut progress = progress::Progress::to_path(&h.progress_path);
+
+            let code = run_update_job(
+                &h.job,
+                &runner,
+                &mut progress,
+                |_| panic!("the apply must not run on a dirty tree"),
+                || Some(9),
+            );
+
+            assert_eq!(code, 1);
+            assert!(h.flake_lock_is_byte_identical());
+            assert!(h.flake_nix_is_byte_identical());
+            let stream = h.stream();
+            assert!(stream.contains("settings.json"), "the files are named: {stream}");
+            assert_eq!(
+                runner.argvs.borrow().len(),
+                1,
+                "the only subprocess is the question itself: {:?}",
+                runner.argvs.borrow()
+            );
+        }
+
+        /// Monotonicity enforced at apply, not only at discovery (DA-1).
+        #[test]
+        fn a_candidate_that_is_already_installed_is_reported_as_nothing_to_apply() {
+            let h = host();
+            let mut runner = h.runner();
+            runner.remote_rev = INSTALLED.to_string();
+            let mut progress = progress::Progress::to_path(&h.progress_path);
+
+            let code = run_update_job(
+                &h.job,
+                &runner,
+                &mut progress,
+                |_| panic!("there is nothing to apply"),
+                || Some(9),
+            );
+
+            assert_eq!(code, 0, "being up to date is not a failure");
+            assert!(h.flake_lock_is_byte_identical(), "nothing is written when nothing moves");
+            let stream = h.stream();
+            assert!(stream.contains("nothing to apply"), "{stream}");
+        }
+
+        /// A candidate that resolved but could not be shown to be newer is
+        /// refused, not applied -- `OrderUnknown` must never behave like
+        /// `UpdateAvailable`. Here the lock's own lastModified sits in the
+        /// future, which is the real way this happens.
+        #[test]
+        fn a_candidate_that_cannot_be_shown_to_be_newer_is_refused() {
+            let h = host();
+            std::fs::write(&h.job.flake_lock, lock_for(INSTALLED, 9_000_000_000)).unwrap();
+            let lock_bytes = std::fs::read(&h.job.flake_lock).unwrap();
+            let runner = h.runner();
+            let mut progress = progress::Progress::to_path(&h.progress_path);
+
+            let code = run_update_job(
+                &h.job,
+                &runner,
+                &mut progress,
+                |_| panic!("an unordered candidate must never be applied"),
+                || Some(9),
+            );
+
+            assert_eq!(code, 1);
+            assert_eq!(std::fs::read(&h.job.flake_lock).unwrap(), lock_bytes);
+            assert!(h.stream().contains("refusing to update"), "{}", h.stream());
+        }
+
+        /// A build failure at the candidate pin leaves an advanced lock that
+        /// the next unrelated settings apply would silently build from --
+        /// the exact drift R8 names. It is undone.
+        #[test]
+        fn an_apply_that_failed_puts_the_pin_back() {
+            let h = host();
+            let runner = h.runner();
+            let mut progress = progress::Progress::to_path(&h.progress_path);
+
+            let code = run_update_job(
+                &h.job,
+                &runner,
+                &mut progress,
+                |_| Ok(apply::ApplyResult::Failed("nix build failed: hash mismatch".to_string())),
+                || Some(9),
+            );
+
+            assert_eq!(code, 1);
+            assert!(
+                h.flake_lock_is_byte_identical(),
+                "a failed update must leave no advanced pin behind"
+            );
+            assert!(h.flake_nix_is_byte_identical());
+            let stream = h.stream();
+            assert!(stream.contains("hash mismatch"), "nix's own words reach the operator: {stream}");
+            assert!(stream.contains("put back"), "{stream}");
+        }
+
+        /// An apply that gave up part-way is NOT undone, and the operator is
+        /// told that in so many words. `apply::run` raises this after
+        /// `nix-env --set` as readily as before it ("apply failed
+        /// mid-sequence"), so whether the host switched is genuinely
+        /// unknown here -- and putting the pin back under a system that did
+        /// switch would be the same disagreement pointed the other way.
+        #[test]
+        fn an_apply_that_gave_up_mid_sequence_leaves_the_pin_and_says_so() {
+            let h = host();
+            let runner = h.runner();
+            let mut progress = progress::Progress::to_path(&h.progress_path);
+
+            let code = run_update_job(
+                &h.job,
+                &runner,
+                &mut progress,
+                |_| Err(anyhow::anyhow!("apply failed mid-sequence (apps have been restarted)")),
+                || Some(9),
+            );
+
+            assert_eq!(code, 1);
+            assert!(
+                !h.flake_lock_is_byte_identical(),
+                "an ambiguous outcome must not be guessed at by reverting"
+            );
+            let stream = h.stream();
+            assert!(stream.contains("mid-sequence"), "the real error reaches the operator: {stream}");
+            assert!(
+                stream.contains("NOT been put back"),
+                "the operator must be told the pin stands: {stream}"
+            );
+        }
+
+        /// A DEGRADED update did switch, so the pin stays: reverting it
+        /// under a running generation would make the lock disagree with
+        /// what is actually installed. Reported in the same vocabulary a
+        /// degraded settings apply uses, with the same exit code 3.
+        #[test]
+        fn a_degraded_update_keeps_the_pin_and_speaks_the_ordinary_vocabulary() {
+            let h = host();
+            let runner = h.runner();
+            let mut progress = progress::Progress::to_path(&h.progress_path);
+
+            let code = run_update_job(
+                &h.job,
+                &runner,
+                &mut progress,
+                |_| {
+                    Ok(apply::ApplyResult::Degraded(
+                        "one or more managed units failed to become active".to_string(),
+                    ))
+                },
+                {
+                    let n = RefCell::new(vec![10u32, 9]); // popped: 9 before, 10 after
+                    move || n.borrow_mut().pop()
+                },
+            );
+
+            assert_eq!(code, 3, "the same code a degraded settings apply exits with");
+            assert!(!h.flake_lock_is_byte_identical(), "the host switched; the pin stands");
+            let stream = h.stream();
+            assert!(stream.contains("degraded"), "{stream}");
+            assert!(
+                stream.contains("one or more managed units failed to become active"),
+                "the same words a degraded settings apply uses: {stream}"
+            );
+        }
+
+        /// DA-1 at the composition level: `nix` re-resolves the ref itself,
+        /// so a push landing mid-job would otherwise apply a revision the
+        /// operator never saw.
+        #[test]
+        fn an_advance_that_landed_elsewhere_is_refused_and_never_applied() {
+            let h = host();
+            let mut runner = h.runner();
+            runner.lands_on = "3333333333333333333333333333333333333333".to_string();
+            let mut progress = progress::Progress::to_path(&h.progress_path);
+
+            let code = run_update_job(
+                &h.job,
+                &runner,
+                &mut progress,
+                |_| panic!("a revision nobody reviewed must never be applied"),
+                || Some(9),
+            );
+
+            assert_eq!(code, 1);
+            assert!(h.flake_lock_is_byte_identical());
+            assert!(h.stream().contains("3333333"), "{}", h.stream());
         }
     }
 }

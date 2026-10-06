@@ -260,6 +260,22 @@ an explicit state rather than an empty body, so the UI can tell "never checked" 
 and up to date". Reports are read from `FERRUM_UPDATE_REPORT_DIR`, falling back to
 `FERRUM_JOBS_DIR` and then to `/var/lib/ferrum/jobs`, which is where the job writes them today.
 
+`POST /api/jobs` takes a body of exactly `{"kind": "<kind>"}` — `preflight`, `apply`, `rollback`
+(plus `"to": <generation>`), `restore_state`, `gc`, `check_update`, or `update`. Every kind but
+`check_update` claims the daemon's single-job interlock and gets `409` while one is running; the
+read-only check is exempt because a rollback must never be blocked by one.
+
+`update` is the commit path for an update: it advances the `ferrum` input in
+`/etc/ferrum/flake.lock` with `nix flake lock --update-input ferrum` and then runs the ordinary
+apply pipeline, as one action. It carries no fields — the repository and ref come from the
+operator's own root-owned `/etc/ferrum/flake.nix`, which ferrumd cannot write and which this path
+never writes either. It refuses, leaving `flake.lock` byte-for-byte untouched, when `/etc/ferrum`
+has uncommitted changes, when the candidate is not strictly newer than what the host runs, when
+the advance would repoint the input at a different repository, or when it lands on a revision
+other than the one just resolved. When the advanced pin builds the closure already running,
+`apply::run` returns early and the job reports "no change — nothing to apply": no new generation
+was created, and none is claimed.
+
 ## Development
 
 See the design doc's "Dev loop" section for the intended setup (an aarch64 dev VM plus a real x86_64 test target provisioned via `nixos-anywhere`).
