@@ -299,10 +299,19 @@ be reproduced in a Nix sandbox or a tempdir, and the fifth was contradicted by i
       refused the ownership transition, failing `ferrum-media-tree.service` with `CANTCREAT`.
       **Not a regression from that unit:** the previous rules met the same condition and failed
       silently at boot. Worked around with `chown root:ferrum-media`.
-- [~] **F1. DDNS must detect the host's public address.** IN FLIGHT. The one that cost a night. The updater
-      republishes a **static** address from `settings.json`; **nothing in `crates/` queries a
-      public address at all**, while three separate comments claim it corrects records against the
-      host's current one. The owner's IP moved and seven records silently went stale.
+- [x] **F1. DDNS must detect the host's public address.** DONE 2026-10-05, merged `79cf536`. The one
+      that cost a night: the updater republished a **static** address from `settings.json` and
+      nothing in `crates/` ever queried a public address, while three comments claimed it corrected
+      records against the host's current one. Three sources run by three different parties now have
+      to agree, a quorum counts **distinct operators** rather than endpoints, and every tie resolves
+      towards publishing nothing — a wrong record is worse than a stale one, because it republishes
+      every hostname at somebody else's server under certificates ferrum obtained itself.
+      `reconcile-dns` grew a fourth exit code so *refused* is distinguishable from *could not find
+      out*, and neither writes the last-success marker, so a host behind CGNAT cannot age quietly
+      into looking healthy. Verified on the merged tree: tests exit 0, clippy 0 lines, new flake
+      check exit 0.
+      **Left open, now folded into F3's lane:** the installer still asks for a static address and
+      never offers the updater, so discovery only helps someone who hand-edits settings.
 - [ ] **F3. The installer must obtain a Plex claim token.** `claimToken` defaults to `""`, the
       installer never asks, so a fresh install ends with an unclaimed server — a manual step in a
       product whose pitch is not having any.
