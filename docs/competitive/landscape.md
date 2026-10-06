@@ -153,11 +153,58 @@ user config into one archive, automatically, with the container stopped, before 
 **community-scripts/ProxmoxVE** (29.7k★) gets accidental per-app OS+data rollback for free, because
 one LXC per app means Proxmox's own snapshot covers both.
 
-## Is anyone building this on NixOS?
+## nixarr — our nearest neighbour, audited at source
 
-Shape-wise yes, substance-wise no. **nixarr** (431★, GPL-3.0, pushed 2026-09-22, no releases ever)
-is the closest NixOS media-stack module set: \*arrs, Jellyfin, VPN via wg-quick, declarative
-Prowlarr wiring — but **no DNS, no TLS automation, no SSO, no pooling, and OS-only rollback**. Two
+Worth its own section, because it is the project most likely to make a NixOS user decide ferrum is
+unnecessary. Audited by cloning `nix-media-server/nixarr` at commit `0f960a2` (2026-09-22) and
+reading the module source. 431 stars, GPL-3.0, created 2024-02-21, **zero releases and zero tags
+ever** — consumption is off `main`, and `CHANGELOG.md`'s top section is still "Unreleased".
+
+**It does not ship closure+state rollback, and it never tried.** Grepping the entire repository for
+snapshot, btrfs, zfs, rollback and mergerfs returns **two hits**, both in the secrets documentation,
+both caveats that a NixOS rollback will *not* restore secrets. Its state model is the inverse of
+ferrum's: state is concentrated in `/data/.state/nixarr/*` and you are told to back it up yourself.
+Roll back a generation there and you get **yesterday's Sonarr binary against today's `sonarr.db`** —
+precisely the version-skew hazard ferrum exists to eliminate.
+
+Where it is at **parity** with ferrum, and ferrum should stop claiming otherwise:
+
+- **TLS on your own domain.** Every service has an `expose.https` block configuring an nginx vhost
+  with `enableACME = true` — real Let's Encrypt via HTTP-01. (An earlier draft of this survey said
+  nixarr had no TLS; that came from website copy and the source contradicts it.)
+- **VPN architecture is the same idea** — a WireGuard network namespace via `VPN-Confinement`, with a
+  firewall and DNS-leak kill switch, opted into per service. Treat as parity, not an advantage.
+- **x86_64 and aarch64** both supported.
+- **A broader app list than ferrum's** — a superset including Lidarr, Bazarr, Whisparr, Jellyseerr,
+  Audiobookshelf, Komga, Autobrr and Recyclarr.
+- **Declarative inter-app wiring**: Prowlarr indexers and applications, \*arr download clients and
+  Bazarr connections, all expressed in Nix. ferrum achieves the same outcome through
+  `crates/ferrum-reconcile`, which registers download clients and Prowlarr applications at runtime.
+  Different mechanism, same promise — **so "no hand-editing config files" is not a line ferrum owns
+  on this axis**, and we should expect to be compared on it.
+
+Where ferrum is genuinely different:
+
+- **nixarr does not install the OS.** It is a flake input and a NixOS module; you must already run
+  NixOS and have already partitioned. ferrum converts a bare machine over SSH. **This is the
+  structural difference.**
+- **No DNS record creation** — two dynamic-DNS providers (Njalla and 1984) that update a hostname you
+  made by hand. No Cloudflare, no zone management.
+- **No SSO at all.** Zero references to Authelia, Authentik, OIDC or forward-auth. Authentication is
+  handed back to each app, with the warning *"Do not enable this without setting up Jellyfin
+  authentication through localhost first!"*
+- **No storage pooling, no web UI, no control plane, no job system, no audit log.**
+
+Activity is maintenance cadence, not a race: five commits in the last eight weeks, and `flake.nix`
+still pins nixpkgs to `nixos-25.11` while 26.05 is current. Bus factor approximately one.
+
+**The risk is not that nixarr ships the rollback — the source says it never tried. It is that a user
+already running NixOS decides nixarr is close enough and stops looking.** ferrum's answer has to be
+the install path and the rollback, not the app list, because on the app list nixarr wins.
+
+## Is anyone else building this on NixOS?
+
+Shape-wise yes, substance-wise no. Two
 people are independently building ferrum's exact *shape* right now — **YoLab** (NixOS installer ISO
 plus web UI, per-app subdomain and TLS, 1,404 commits, **0 stars**) and **imperfect-homelab** (NixOS
 installer ISO and configurator, explicitly a nod to Perfect Media Server, **0 stars**). Pre-traction
