@@ -10,7 +10,7 @@ Saltbox deploys a containerised media stack (Plex/Jellyfin, the *arr apps, downl
 - **User edits are destroyed by design.** `sb update` runs `git clean -df` and `git reset --hard @{u}` twice with no stash. Customisation is confined to a variable surface the maintainers chose; anything outside it is explicitly unsupported.
 - **Silent state drift.** [#495](https://github.com/saltyorg/Saltbox/issues/495): container state declared in the inventory was ignored because `state: started` is hardcoded. [#475](https://github.com/saltyorg/Saltbox/issues/475): a failed `mv` was `ignoring`-ed and cleanup deleted user data anyway.
 - **Secrets in plaintext**, with a Cloudflare *Global* API key as the documented default.
-- **Backups off by default**, uncompressed, unencrypted at rest, hours of downtime.
+- **Backups off by default**, uncompressed, unencrypted at rest. (Downtime is hours on the common ext4 install; on btrfs Saltbox snapshots and restarts containers in seconds. Corrected 2026-10-06 — the unqualified claim was wrong.)
 - **Ubuntu-only, x86_64-only, clean-dedicated-machine-only**, enforced by an Ansible assert. ARM is explicitly refused.
 - **No GUI and none planned** — the docs state all setup happens in text editors and on the command line.
 
@@ -214,7 +214,9 @@ Parameters go in a root-read JSON file rather than the unit name, which removes 
 
 The resulting property is statable: **compromising ferrumd gets you the power expressed by the settings schema, not arbitrary Nix evaluation as root.** It holds only because `settings` is restricted to JSON scalars and `custom/` is unwritable — which is exactly what `checks.schema-uniformity` mechanically enforces.
 
-Auth: local accounts, argon2id, server-side sessions, CSRF on mutations, rate-limited login. First run generates a one-time setup token readable only over SSH. **No default password, ever** — Saltbox ships `password1234`.
+Auth: local accounts, argon2id, server-side sessions, CSRF on mutations, rate-limited login. First run generates a one-time setup token readable only over SSH. **No default password, ever.**
+
+> **Correction, 2026-10-06.** This paragraph originally ended "— Saltbox ships `password1234`". That was already wrong when it was written: Saltbox changed the default to `password12345678` in commit `ce48beb9` on 2025-03-22, eleven months earlier, and its `schema/accounts.schema.yml` now carries `not_equals: "password1234"`, actively rejecting the value we accused it of shipping. Verified against the live repository. The claim is withdrawn rather than reworded — ferrum's own "no default password, ever" stands on its own and needed no foil.
 
 Progress streams as JSONL written by `ferrum-apply` and re-emitted over SSE, so a job survives a ferrumd restart and replays cleanly for a reconnecting client.
 

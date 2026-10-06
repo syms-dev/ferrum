@@ -29,7 +29,7 @@ Saltbox deploys Plex/Jellyfin, the *arr apps, download clients and a reverse pro
 ferrum's two goals:
 
 1. **Atomic updates with real rollback.** NixOS generations only roll back the system closure, not application state or databases — rolling back a migrated database just moves the outage. ferrum pairs every update with a btrfs snapshot of application state, keyed to the generation, so a rollback restores *both* together.
-2. **Setup and maintenance without hand-editing config.** A local web UI reads and writes a typed `settings.json`; it never generates Nix. A `custom/` directory holds hand-written Nix the UI never touches, so — unlike Saltbox — your customisations survive an update.
+2. **Setup and maintenance without hand-editing config.** A local web UI reads and writes a typed `settings.json`; it never generates Nix. A `custom/` directory holds hand-written Nix the UI never touches, and `sb update`'s equivalent here cannot reach it. Saltbox has a sanctioned override surface too — its inventory system and `/opt/saltbox_mod` both survive an update by design — so the narrower, accurate difference is that ferrum's unit of customisation is a declarative module evaluated with everything else, not a variable the maintainers chose to expose.
 
 The full design, including why each of these choices was made, is in [`docs/design/2026-08-19-phase-1-design.md`](docs/design/2026-08-19-phase-1-design.md).
 
