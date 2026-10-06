@@ -8,9 +8,11 @@ Built and tested: the rollback engine, the seven-app catalog, the reverse proxy 
 
 Proven on a real machine, not just in CI: a rollback that reverted both the system closure and application state together; Plex reachable on a real domain with a real Let's Encrypt certificate, served through ferrum's own nginx vhost from a typed `settings.json` with no hand-written Nix.
 
-Not built: **any way to update an app**. App versions come from the nixpkgs revision ferrum's own flake pins, so updating means hand-editing pins across two repositories and re-applying; see [the Phase 1.6 spec](docs/superpowers/specs/2026-09-16-phase-1-6-updates-design.md), whose planning gate is currently open.
+Updates are built. App versions come from the nixpkgs revision ferrum's own flake pins, so there is no per-app update and ferrum does not pretend otherwise: a pending update is one host-wide event listing every affected app's delta together, because accepting it advances the single pin they all share. `check-update` reports what would change without touching anything; committing advances only `flake.lock` and then runs the ordinary apply pipeline, so an update is an ordinary generation rather than a special case. If the rebuilt system turns out identical to the one already running, you are told "no change — nothing to apply" and no generation is created. See [the Phase 1.6 spec](docs/superpowers/specs/2026-09-16-phase-1-6-updates-design.md).
 
-`ferrum-apply gc` **is** implemented (it was a stub until 2026-09-15) and prunes to `ferrum.storage.keepGenerations`, default 10. No timer runs it, so it is operator-triggered. Note that it protects only the *currently-running* generation's snapshot, so an older generation's snapshot can be pruned and that generation then becomes unrollbackable.
+Every generation records the ferrum revision it was built from, because rollback reverts the closure and not the pin. Without that record, rolling back a bad update and then changing any unrelated setting a week later would quietly reinstall it. Instead the next apply stops and names the revision it would move you to, and you decide.
+
+`ferrum-apply gc` **is** implemented (it was a stub until 2026-09-15) and prunes to `ferrum.storage.keepGenerations`, default 10. No timer runs it, so it is operator-triggered. It protects the *currently-running* generation's snapshot, and every unconfirmed update's pre-image — so an update's way back is not retired by the next ten applies, and you release those by confirming the update is good. Any other generation's snapshot can still be pruned, after which that generation becomes unrollbackable.
 
 It has now been installed on a real machine end to end, and rollback has been exercised there for real. That is one machine, run by its author — **still do not point this at a server holding data you care about.**
 
@@ -24,11 +26,17 @@ Split-horizon DNS is out of scope: every record points at the public address, so
 
 ## Why
 
-Saltbox deploys Plex/Jellyfin, the *arr apps, download clients and a reverse proxy onto a dedicated Ubuntu box via Ansible, and it works, but it has no rollback of any kind, destroys local edits on every update (`git clean -df && git reset --hard`, twice, no stash), and ships secrets in plaintext YAML.
+Saltbox deploys Plex/Jellyfin, the *arr apps, download clients and a reverse proxy onto a dedicated Ubuntu box via Ansible, and it works. It has a far larger catalog than ferrum — roughly 300 installable roles against ferrum's seven — and nine years of accumulated edge cases behind it.
+
+What it does not have is rollback of any kind: its own recovery documentation is to delete the application's directory and restore a backup. It has **zero releases and zero tags**, and 171 of its roles pin a floating image tag, so running the same install next week installs different software. Its update resets both role repositories to upstream with no stash, so edits to tracked role files are destroyed — though its inventory system and `/opt/saltbox_mod` are sanctioned override surfaces that survive by design. Secrets are plaintext YAML, hardened to `0600` rather than encrypted.
+
+The fuller comparison, including the rows where Saltbox wins and three claims ferrum itself had wrong, is in [`docs/competitive/saltbox.md`](docs/competitive/saltbox.md).
 
 ferrum's two goals:
 
-1. **Atomic updates with real rollback.** NixOS generations only roll back the system closure, not application state or databases — rolling back a migrated database just moves the outage. ferrum pairs every update with a btrfs snapshot of application state, keyed to the generation, so a rollback restores *both* together.
+1. **Atomic updates with real rollback.** NixOS generations only roll back the system closure, not application state or databases — rolling back a migrated database just moves the outage. ferrum pairs every update with a btrfs snapshot of application state, keyed to the generation, so a rollback restores *both* together, and the apps are stopped before the snapshot is taken so it is a clean image rather than a crash image.
+
+   **This is not a first, and ferrum does not claim one.** Ubuntu's ZSys shipped system-plus-user rollback as two literal GRUB entries before being removed from the archive in 2025. TrueNAS offers it today as a per-app checkbox — though *"data in mounted host paths is not rolled back"*, which is exactly where a homelab keeps its configuration. Start9 snapshots before every service update, but only to undo a failure, not to go back on request. Each of those fails a different clause of what ferrum does, and the narrower claim is the one that holds: **ferrum is the only one that does it for the whole machine, operator-initiated, at any generation, including host-path data.** Who else is in this space, and what each actually ships, is in [`docs/competitive/landscape.md`](docs/competitive/landscape.md).
 2. **Setup and maintenance without hand-editing config.** A local web UI reads and writes a typed `settings.json`; it never generates Nix. A `custom/` directory holds hand-written Nix the UI never touches, and `sb update`'s equivalent here cannot reach it. Saltbox has a sanctioned override surface too — its inventory system and `/opt/saltbox_mod` both survive an update by design — so the narrower, accurate difference is that ferrum's unit of customisation is a declarative module evaluated with everything else, not a variable the maintainers chose to expose.
 
 The full design, including why each of these choices was made, is in [`docs/design/2026-08-19-phase-1-design.md`](docs/design/2026-08-19-phase-1-design.md).
