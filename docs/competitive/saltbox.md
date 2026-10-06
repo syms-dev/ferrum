@@ -24,7 +24,7 @@ also one.
 
 | | Saltbox | ferrum |
 |---|---|---|
-| **App catalog** | **301 installable roles**, ~267 documented | **7 apps** |
+| **App catalog** | **301 installable roles**; **235 documented applications** (65 core + 170 sandbox pages) plus 32 module pages | **7 apps** |
 | **Maturity** | 2017 onward, thousands of installs | pre-alpha, proven on one machine by its author |
 | **Community** | ~2,081 Discord, nine years | none yet |
 | **Documentation** | 354 pages, **266 auto-generated from role metadata** | design docs and a README |
@@ -215,6 +215,27 @@ Two honesty notes that cut against ferrum's framing, kept deliberately:
 - Cloudbox, archived since 2023-03-15, still carries 2,381 stars to Saltbox's 891. Worth a line;
   don't over-read it.
 
-**Still unverified after both passes:** no "I moved off Saltbox because…" post could be found by
-either researcher; Discord rules and moderation behaviour are unobtainable, **so ferrum cannot claim
-Saltbox turns people away for a dirty machine — only that the documentation demands a clean one**.
+**Still unverified after three passes:** no "I moved off Saltbox because…" post could be found by any
+researcher, and it was searched for explicitly; Discord rules and moderation behaviour are
+unobtainable, **so ferrum cannot claim Saltbox turns people away for a dirty machine — only that the
+documentation demands a clean one**; and no Saltbox-specific discussion of the Google Workspace
+unlimited-storage shutdown surfaced, despite the documentation still carrying a six-page Google Drive
+apparatus while community traffic has visibly moved to debrid-and-symlinks.
+
+### The two numbers the sentiment pass did establish
+
+- **The Discord has 2,081 members with 576 online** (Discord invite API, 2026-10-06). Roughly 28% of
+  members present at once is unusually dense. This is a small, expert community rather than a
+  mass-market product — a useful corrective to framing Saltbox as a large incumbent.
+- **Cloudbox, archived since 2023, still carries 2,381 stars to Saltbox's 891.** The successor never
+  recaptured the predecessor's GitHub footprint.
+
+And one finding that cuts against ferrum's framing, kept because it is true: the top answer on a
+2024-03-09 r/selfhosted thread asking for "the modern all-in-one media server" is *"there is no
+all-in-one solution"*. **Saltbox is not the default answer that community gives**, so positioning it
+as the incumbent to beat probably overstates its reach.
+
+The most useful single artifact found in three passes is **issue #440** (2025-11-17): a user reports
+that an update broke qBittorrent, and the maintainer's entire reply is *"Support is handled on
+discord."* Closed. Update fragility, the support policy and the GitHub deflection, in five lines —
+and all of it primary-sourced, which the Reddit material is not.
