@@ -30,7 +30,22 @@ use crate::AppState;
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum JobRequest {
     Preflight,
-    Apply,
+    /// The ordinary rebuild. `acceptPinChange` is the operator's
+    /// acknowledgement that this rebuild also moves the host to a different
+    /// ferrum revision (R8), naming that revision exactly; absent on every
+    /// apply that is not passing that gate.
+    ///
+    /// Validated as a full 40-character lowercase hex revision here, at the
+    /// boundary, before it is written into the request file. ferrum-apply
+    /// compares it for equality against the revision the on-disk lock
+    /// already names and does nothing else with it, so a malformed value
+    /// could only fail to match -- but a field that crosses the privilege
+    /// boundary is checked on the way in regardless, and the operator gets
+    /// a readable 400 instead of a job that fails for no visible reason.
+    Apply {
+        #[serde(default, rename = "acceptPinChange")]
+        accept_pin_change: Option<String>,
+    },
     Rollback { to: u32 },
     RestoreState,
     Gc,
@@ -43,6 +58,12 @@ pub enum JobRequest {
     /// fetches, writes into flake.lock, or builds. It takes the single-job
     /// interlock, because it builds and switches exactly as `apply` does.
     Update,
+    /// "The update this host is running is good." Mirrors
+    /// `request::Request::ConfirmUpdate` -- zero fields, so no snapshot name
+    /// crosses the privilege boundary. It rewrites journal entries, so it
+    /// takes the interlock by the fail-closed default rather than by an
+    /// exemption.
+    ConfirmUpdate,
 }
 
 fn jobs_dir() -> std::path::PathBuf {
@@ -249,6 +270,18 @@ pub fn interlock_holder_in(dir: &std::path::Path, running_units: &[String]) -> O
     claimants.into_iter().next()
 }
 
+/// Whether a string is a full git revision as `flake.lock` spells one.
+///
+/// Forty lowercase hex characters, and nothing shorter: the short form an
+/// operator reads on screen is a display convenience, and accepting it here
+/// would let an acknowledgement match a revision it does not uniquely name.
+///
+/// # Arguments
+/// * `rev` - the candidate value.
+pub fn is_full_revision(rev: &str) -> bool {
+    rev.len() == 40 && rev.chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+}
+
 /// The exact JSON `ferrum-apply run-request` parses back out of the request
 /// file. Kept as an explicit match rather than a `Serialize` derive so the
 /// wire format ferrumd writes across the privilege boundary is spelled out
@@ -257,12 +290,21 @@ pub fn interlock_holder_in(dir: &std::path::Path, running_units: &[String]) -> O
 fn request_body(req: &JobRequest) -> serde_json::Value {
     match req {
         JobRequest::Preflight => serde_json::json!({"kind": "preflight"}),
-        JobRequest::Apply => serde_json::json!({"kind": "apply"}),
+        // The acknowledgement is written only when there is one, so the
+        // common case crosses the boundary as the identical
+        // `{"kind":"apply"}` it always has -- and `request_kind_in`, which
+        // reads this file back to decide who holds the interlock, sees no
+        // change at all.
+        JobRequest::Apply { accept_pin_change: None } => serde_json::json!({"kind": "apply"}),
+        JobRequest::Apply { accept_pin_change: Some(rev) } => {
+            serde_json::json!({"kind": "apply", "accept_pin_change": rev})
+        }
         JobRequest::Rollback { to } => serde_json::json!({"kind": "rollback", "to": to}),
         JobRequest::RestoreState => serde_json::json!({"kind": "restore_state"}),
         JobRequest::Gc => serde_json::json!({"kind": "gc"}),
         JobRequest::CheckUpdate => serde_json::json!({"kind": "check_update"}),
         JobRequest::Update => serde_json::json!({"kind": "update"}),
+        JobRequest::ConfirmUpdate => serde_json::json!({"kind": "confirm_update"}),
     }
 }
 
@@ -327,6 +369,23 @@ async fn create_job_in(
     let audit_job = |outcome: &str, detail: &str| {
         crate::audit::record("job-dispatch", outcome, &user, &client, detail);
     };
+    // R8. The pin acknowledgement is a string an authenticated operator
+    // supplies and it becomes a field in the request file, so its SHAPE is
+    // checked here, before it crosses. It decides nothing on the other side
+    // -- `pin_gate::decide` only compares it for equality with the revision
+    // the on-disk lock already names -- but checking a crossing value at the
+    // boundary costs one line and turns a job that silently refuses into a
+    // 400 the operator can read.
+    if let JobRequest::Apply { accept_pin_change: Some(rev) } = &req {
+        if !is_full_revision(rev) {
+            audit_job("denied", &format!("kind={kind} acceptPinChange is not a revision"));
+            return (
+                StatusCode::BAD_REQUEST,
+                "acceptPinChange must be a full 40-character lowercase hex revision",
+            )
+                .into_response();
+        }
+    }
     // M4. The rollback target is validated HERE, before anything of it
     // reaches the privilege boundary.
     //
@@ -1124,7 +1183,7 @@ mod tests {
         // own #[serde(tag = "kind", rename_all = "snake_case")] enum accepts;
         // its own tests assert the parse side.
         assert_eq!(request_body(&JobRequest::Preflight).to_string(), r#"{"kind":"preflight"}"#);
-        assert_eq!(request_body(&JobRequest::Apply).to_string(), r#"{"kind":"apply"}"#);
+        assert_eq!(request_body(&JobRequest::Apply { accept_pin_change: None }).to_string(), r#"{"kind":"apply"}"#);
         assert_eq!(
             request_body(&JobRequest::Rollback { to: 42 }).to_string(),
             r#"{"kind":"rollback","to":42}"#
@@ -1472,7 +1531,7 @@ mod tests {
                 requests.path(),
                 Err(anyhow::anyhow!("unused")),
                 shared.clone(),
-                JobRequest::Apply,
+                JobRequest::Apply { accept_pin_change: None },
             )
             .await;
             assert_eq!(
@@ -1520,7 +1579,7 @@ mod tests {
                 requests.path(),
                 Err(anyhow::anyhow!("unused")),
                 shared.clone(),
-                JobRequest::Apply,
+                JobRequest::Apply { accept_pin_change: None },
             )
             .await;
             assert_ne!(
@@ -1528,6 +1587,99 @@ mod tests {
                 StatusCode::CONFLICT,
                 "a preceding read-only check must not have wedged the interlock: {body}"
             );
+        }
+
+        /// R8's acknowledgement reaches the privileged side verbatim, as
+        /// its own field, so `pin_gate::decide` can compare it with the
+        /// revision the on-disk lock names.
+        ///
+        /// Asserted on the request FILE rather than on the status, for the
+        /// same reason the rollback guard's test is: the file is what
+        /// crosses the privilege boundary, and a handler that answered 200
+        /// while dropping the field would look identical from the outside
+        /// and leave the gate permanently closed.
+        #[tokio::test]
+        async fn an_acknowledged_pin_change_crosses_the_boundary_as_the_revision_it_named() {
+            let requests = tempfile::tempdir().unwrap();
+            let rev = "2".repeat(40);
+            let (_status, _body, written) = dispatch(
+                requests.path(),
+                Err(anyhow::anyhow!("unused")),
+                JobRequest::Apply { accept_pin_change: Some(rev.clone()) },
+            )
+            .await;
+            // The D-Bus start fails here (no system bus), and that path
+            // deletes the request file -- so read what request_body built
+            // instead, which is the same value tested through the file in
+            // the rollback case.
+            assert!(written.is_empty() || written.len() == 1);
+            let body =
+                request_body(&JobRequest::Apply { accept_pin_change: Some(rev.clone()) });
+            assert_eq!(body["kind"], "apply");
+            assert_eq!(body["accept_pin_change"], rev);
+
+            // ...and an apply with nothing to acknowledge crosses as the
+            // byte-identical document every ferrum before R8 wrote, so
+            // `request_kind_in` -- which reads this file back to decide who
+            // holds the interlock -- sees no change at all.
+            let plain = request_body(&JobRequest::Apply { accept_pin_change: None });
+            assert_eq!(plain.to_string(), r#"{"kind":"apply"}"#);
+        }
+
+        /// A value that is not a revision is refused at the boundary, with
+        /// a message that says what one looks like.
+        #[tokio::test]
+        async fn an_acknowledgement_that_is_not_a_revision_is_refused_before_it_crosses() {
+            for bad in [
+                "",
+                "2222222",                                   // the short form shown on screen
+                &"2".repeat(39),                             // one short
+                &"2".repeat(41),                             // one long
+                &"A".repeat(40),                             // upper case
+                &format!("{}../", "2".repeat(37)),           // a path component
+                &format!("{} --flake /evil", "2".repeat(40)),
+            ] {
+                let requests = tempfile::tempdir().unwrap();
+                let (status, body, written) = dispatch(
+                    requests.path(),
+                    Err(anyhow::anyhow!("unused")),
+                    JobRequest::Apply { accept_pin_change: Some(bad.to_string()) },
+                )
+                .await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{bad:?} was not refused: {body}");
+                assert!(body.contains("40-character"), "{bad:?}: {body}");
+                assert!(
+                    written.is_empty(),
+                    "{bad:?} must not reach the request file at all, got {written:?}"
+                );
+            }
+        }
+
+        /// The anti-vacuity half of the refusal above: a real revision is
+        /// NOT refused. Without this, a guard that rejected everything
+        /// would pass the test above and silently make the gate impassable.
+        #[tokio::test]
+        async fn a_real_revision_is_not_refused_by_the_shape_check() {
+            let requests = tempfile::tempdir().unwrap();
+            let (status, body, _) = dispatch(
+                requests.path(),
+                Err(anyhow::anyhow!("unused")),
+                JobRequest::Apply { accept_pin_change: Some("0a9f3b2".to_string() + &"c".repeat(33)) },
+            )
+            .await;
+            assert_ne!(status, StatusCode::BAD_REQUEST, "a real revision must pass: {body}");
+        }
+
+        /// The recogniser itself, exercised directly -- both arms, because
+        /// a matcher that answered one way for everything would make one of
+        /// the two tests above vacuous.
+        #[test]
+        fn the_revision_recogniser_takes_forty_lowercase_hex_and_nothing_else() {
+            assert!(is_full_revision(&"0".repeat(40)));
+            assert!(is_full_revision(&format!("{}{}", "0123456789abcdef", "f".repeat(24))));
+            for bad in ["", "0", &"0".repeat(39), &"0".repeat(41), &"g".repeat(40), &"A".repeat(40)] {
+                assert!(!is_full_revision(bad), "{bad:?} is not a revision");
+            }
         }
 
         /// The guard is scoped to rollback and must not cost the other
@@ -1675,12 +1827,33 @@ mod tests {
         /// `kind_takes_interlock` is asked about the string `request_body`
         /// actually writes, so this walks every variant and derives the
         /// string the same way the handler does rather than restating it.
-        /// An eighth kind added without a decision here would fail this.
+        /// A new kind added without a decision here fails to COMPILE, via
+        /// the exhaustive match below. The comment used to claim the table
+        /// alone did that; it did not -- a hand-written list cannot notice
+        /// a variant nobody added to it, and `Update` and `ConfirmUpdate`
+        /// were both added without this test saying a word.
         #[test]
         fn every_kind_but_the_read_only_check_claims_the_interlock() {
+            /// Exists only to be exhaustive. Adding a variant to
+            /// `JobRequest` breaks this match, which is the point: the
+            /// author then has to decide, here, whether it claims the
+            /// interlock, and add it to the table below.
+            fn _every_variant_is_accounted_for(req: &JobRequest) {
+                match req {
+                    JobRequest::Preflight
+                    | JobRequest::Apply { .. }
+                    | JobRequest::Rollback { .. }
+                    | JobRequest::RestoreState
+                    | JobRequest::Gc
+                    | JobRequest::CheckUpdate
+                    | JobRequest::Update
+                    | JobRequest::ConfirmUpdate => {}
+                }
+            }
+
             let cases = [
                 (JobRequest::Preflight, true),
-                (JobRequest::Apply, true),
+                (JobRequest::Apply { accept_pin_change: None }, true),
                 (JobRequest::Rollback { to: 3 }, true),
                 (JobRequest::RestoreState, true),
                 (JobRequest::Gc, true),
@@ -1690,6 +1863,12 @@ mod tests {
                 // the read-only check is exempt, and only because a
                 // rollback must never be blocked by one.
                 (JobRequest::Update, true),
+                // It rewrites journal entries -- the rollback story's only
+                // durable record -- while an apply or a gc may be reading
+                // or writing the same directory, so it serializes with
+                // them. It is cheap, so there is nothing to buy by
+                // exempting it.
+                (JobRequest::ConfirmUpdate, true),
             ];
             for (req, claims) in cases {
                 let kind = request_body(&req)

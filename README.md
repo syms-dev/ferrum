@@ -260,10 +260,34 @@ an explicit state rather than an empty body, so the UI can tell "never checked" 
 and up to date". Reports are read from `FERRUM_UPDATE_REPORT_DIR`, falling back to
 `FERRUM_JOBS_DIR` and then to `/var/lib/ferrum/jobs`, which is where the job writes them today.
 
-`POST /api/jobs` takes a body of exactly `{"kind": "<kind>"}` — `preflight`, `apply`, `rollback`
-(plus `"to": <generation>`), `restore_state`, `gc`, `check_update`, or `update`. Every kind but
+`POST /api/jobs` takes a body of exactly `{"kind": "<kind>"}` — `preflight`, `apply` (plus an
+optional `"acceptPinChange": "<40-hex revision>"`), `rollback` (plus `"to": <generation>`),
+`restore_state`, `gc`, `check_update`, `update`, or `confirm_update`. Every kind but
 `check_update` claims the daemon's single-job interlock and gets `409` while one is running; the
 read-only check is exempt because a rollback must never be blocked by one.
+
+`acceptPinChange` is the operator's acknowledgement that this rebuild also moves the host to a
+different ferrum revision. **A rollback reverts the system closure and never
+`/etc/ferrum/flake.lock`**, while every apply rebuilds from whatever the lock pins — so without
+this an unrelated settings change days later would quietly reinstall the update that was rolled
+back. `apply` therefore compares the on-disk pin with the pin the running generation was built
+from (`built_pin`/`built_toplevel` in the snapshot journal) and refuses, before anything is built,
+when they differ and the operator has not acknowledged the on-disk revision by name. The gate is
+passable, not a wall; the Apply view offers the acknowledged retry. A `400` names the required
+shape for anything that is not a full lowercase hex revision. **Either pin being unknown — which
+is every generation applied before ferrum recorded one — proceeds silently: an absence is an
+artifact of age, not a disagreement.** `GET /api/updates`'s `pinProvenance` block reports the same
+comparison as a first-class state (`matches`, `differs`, `on-disk-unknown`, `running-unknown`,
+`both-unknown`), never an error.
+
+`confirm_update` says the update this host is running is good, and releases the snapshots `gc` was
+holding back for it. An update's way back is the state snapshot taken immediately before its pin
+moved, and `ferrum.storage.keepGenerations` (default 10) would retire that after ten more applies
+— so the update commit marks its pre-image and `gc` refuses to prune a marked snapshot. The
+Generations view shows how many are being held and offers the one control that releases them;
+confirming deletes nothing, it returns them to ordinary retention. It carries no fields: a
+per-snapshot form would put a snapshot name, which becomes a path component on the privileged
+side, into the request file for no gain.
 
 `update` is the commit path for an update: it advances the `ferrum` input in
 `/etc/ferrum/flake.lock` with `nix flake lock --update-input ferrum` and then runs the ordinary

@@ -40,7 +40,8 @@ pub struct GcPlan {
 /// count. Pure: no filesystem access beyond what the caller already read,
 /// so the policy is testable on its own.
 ///
-/// Two rules, and the second is the one that matters:
+/// Three rules. The first is the policy; the other two are the interlocks
+/// that keep it from removing somebody's only way back:
 ///
 /// 1. Keep the `keep_generations` newest snapshots, ranked by the timestamp
 ///    embedded in the snapshot name (`<unix_ts>-gen<N>`), which is what
@@ -55,6 +56,16 @@ pub struct GcPlan {
 ///    easily be older than `keep_generations` newer ones. Pruning it would
 ///    silently remove the operator's way back, which is the single worst
 ///    thing this file could do.
+///
+/// 3. **Never prune an unconfirmed update's pre-image snapshot** (R5). An
+///    update's way back is the snapshot taken immediately before the pin
+///    moved, and retention defaults to ten -- so an operator who updates
+///    and then applies ten more times loses it, and "an update is never a
+///    one-way door" turns out to have meant "for about ten applies". The
+///    mark is set by the update commit alone and cleared by `confirm_update`
+///    when the operator says the update is good, which is what keeps this
+///    a bounded, endable exception rather than a retention rule that
+///    silently grows for the life of the host.
 pub fn plan(entries: Vec<JournalEntry>, keep_generations: usize, current_generation: u32) -> GcPlan {
     let mut sorted = entries;
     // Newest first. `snapshot_ts` is the shared parser -- see rule 1.
@@ -75,6 +86,14 @@ pub fn plan(entries: Vec<JournalEntry>, keep_generations: usize, current_generat
     // rollback::prepare's own max_by_key on the same key).
     if let Some(current) = sorted.iter().find(|e| e.generation == current_generation) {
         protected.insert(current.snapshot.clone());
+    }
+
+    // Rule 3. Unlike rule 2 this protects EVERY marked snapshot rather than
+    // the newest: two updates applied without a confirmation in between are
+    // two separate ways back, and silently dropping the older one would
+    // make the second update a one-way door past the first.
+    for entry in sorted.iter().filter(|e| e.update_pre_image) {
+        protected.insert(entry.snapshot.clone());
     }
 
     for entry in sorted {
@@ -144,10 +163,25 @@ pub fn run(
     let total = entries.len();
     let plan = plan(entries, keep_generations, current_generation);
 
+    // The held-back count is stated rather than left implicit. A retention
+    // rule nobody can see is its own defect: an operator looking at disk
+    // usage after a gc that "kept 11 of 10" needs to be told why, and
+    // needs to know there is something they can do about it.
+    let held = plan.keep.iter().filter(|e| e.update_pre_image).count();
+    let held_note = match held {
+        0 => String::new(),
+        1 => "; 1 of those is an unconfirmed update's way back, kept until you confirm the \
+              update is good"
+            .to_string(),
+        n => format!(
+            "; {n} of those are unconfirmed updates' ways back, kept until you confirm those \
+             updates are good"
+        ),
+    };
     progress.event(
         "gc_plan",
         &format!(
-            "{total} snapshots journalled; keeping {}, pruning {}",
+            "{total} snapshots journalled; keeping {}, pruning {}{held_note}",
             plan.keep.len(),
             plan.prune.len()
         ),
@@ -179,6 +213,8 @@ mod tests {
             taken_at: "2026-09-15 12:00:00".to_string(),
             quiesced: true,
             built_pin: None,
+            built_toplevel: None,
+            update_pre_image: false,
         }
     }
 
@@ -233,6 +269,55 @@ mod tests {
         assert_eq!(plan.prune.len(), 2);
     }
 
+    /// An update's way back survives the ten applies that would otherwise
+    /// retire it -- which is the whole of R5's "an update is never a
+    /// one-way door", and was true for about ten applies before this.
+    #[test]
+    fn an_unconfirmed_updates_pre_image_is_never_pruned() {
+        let mut pre_image = entry(100, 1);
+        pre_image.update_pre_image = true;
+        let entries = vec![pre_image, entry(200, 2), entry(300, 3), entry(400, 4)];
+
+        // Retention of 2, and the marked snapshot is the oldest of four --
+        // squarely outside the window, and running on generation 4 so rule
+        // 2 does not protect it either.
+        let plan = plan(entries, 2, 4);
+        let pruned: Vec<_> = plan.prune.iter().map(|e| e.snapshot.as_str()).collect();
+        assert!(
+            !pruned.contains(&"100-gen1"),
+            "an unconfirmed update's way back must survive retention, got {pruned:?}"
+        );
+        assert!(plan.keep.iter().any(|e| e.snapshot == "100-gen1"));
+        // ...and it protects only itself. Without this the test above would
+        // pass against a plan that stopped pruning entirely.
+        assert_eq!(pruned, vec!["200-gen2"], "everything else still prunes normally");
+    }
+
+    /// Two updates with no confirmation between them are two separate ways
+    /// back, and both are held. Protecting only the newest would make the
+    /// second update a one-way door past the first.
+    #[test]
+    fn every_unconfirmed_pre_image_is_held_not_just_the_newest() {
+        let mut first = entry(100, 1);
+        first.update_pre_image = true;
+        let mut second = entry(200, 2);
+        second.update_pre_image = true;
+        let plan = plan(vec![first, second, entry(300, 3)], 0, 3);
+        let kept: Vec<_> = plan.keep.iter().map(|e| e.snapshot.as_str()).collect();
+        assert!(kept.contains(&"100-gen1") && kept.contains(&"200-gen2"), "{kept:?}");
+    }
+
+    /// The anti-vacuity half of both: with the mark cleared -- which is
+    /// what confirming the update does -- the identical journal prunes the
+    /// identical snapshot. The protection is the mark, not the position.
+    #[test]
+    fn a_confirmed_updates_pre_image_prunes_like_any_other() {
+        let entries = vec![entry(100, 1), entry(200, 2), entry(300, 3), entry(400, 4)];
+        let plan = plan(entries, 2, 4);
+        let pruned: Vec<_> = plan.prune.iter().map(|e| e.snapshot.as_str()).collect();
+        assert_eq!(pruned, vec!["100-gen1", "200-gen2"]);
+    }
+
     #[test]
     fn keeping_more_than_exist_prunes_nothing() {
         let entries = vec![entry(100, 1), entry(200, 2)];
@@ -246,6 +331,60 @@ mod tests {
         let plan = plan(Vec::new(), 3, 1);
         assert!(plan.prune.is_empty());
         assert!(plan.keep.is_empty());
+    }
+
+    /// A retention rule nobody can see is its own defect, so the run says
+    /// how many snapshots it is holding and why -- and says nothing extra
+    /// when it is holding none.
+    ///
+    /// Drives the real `run`: no snapshot subvolume exists here, so
+    /// `delete_one` skips the `btrfs` call entirely and the pass is a
+    /// journal sweep, which is exactly the part under test.
+    #[test]
+    fn the_run_says_how_many_snapshots_an_unconfirmed_update_is_holding() {
+        let dir = tempfile::tempdir().unwrap();
+        let snapshots = dir.path().join("snapshots");
+        let journal_dir = dir.path().join("journal");
+        std::fs::create_dir_all(&snapshots).unwrap();
+
+        let mut held = entry(100, 1);
+        held.update_pre_image = true;
+        for e in [&held, &entry(200, 2), &entry(300, 3)] {
+            journal::write(&journal_dir, e).unwrap();
+        }
+
+        let plan_line = |progress_path: &Path| {
+            std::fs::read_to_string(progress_path)
+                .unwrap()
+                .lines()
+                .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+                .find(|v| v["event"] == "gc_plan")
+                .expect("every run writes a plan line")["detail"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+
+        let held_path = dir.path().join("held.jsonl");
+        let mut progress = crate::progress::Progress::to_path(&held_path);
+        crate::gc::run(&snapshots, &journal_dir, 1, 3, &mut progress).unwrap();
+        let line = plan_line(&held_path);
+        assert!(line.contains("keeping 2"), "the held snapshot is kept beyond retention: {line}");
+        assert!(line.contains("1 of those is an unconfirmed update"), "{line}");
+        assert!(line.contains("until you confirm"), "the operator needs the way out: {line}");
+
+        // Anti-vacuity: with nothing held, the sentence is absent rather
+        // than present-and-zero.
+        let clear_path = dir.path().join("clear.jsonl");
+        let clear_journal = dir.path().join("journal-clear");
+        for e in [&entry(100, 1), &entry(200, 2), &entry(300, 3)] {
+            journal::write(&clear_journal, e).unwrap();
+        }
+        let mut progress = crate::progress::Progress::to_path(&clear_path);
+        crate::gc::run(&snapshots, &clear_journal, 1, 3, &mut progress).unwrap();
+        let line = plan_line(&clear_path);
+        assert!(line.contains("keeping 1"), "{line}");
+        assert!(!line.contains("unconfirmed"), "nothing is held, so nothing is said: {line}");
     }
 
     #[test]

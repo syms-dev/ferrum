@@ -292,6 +292,15 @@ pub struct StorageConfig {
     /// that takes SSH away, so there is no host configuration for which it
     /// is the wrong thing to do.
     pub root_password_file: PathBuf,
+    /// Whether the snapshot this apply takes is an update's PRE-image --
+    /// the host as it was immediately before its ferrum pin moved.
+    ///
+    /// Set by the `update` job only (`main.rs::run_update`), and carried
+    /// through to the journal entry so `gc::plan` can keep that snapshot out
+    /// of ordinary retention pruning until the operator confirms the update
+    /// is good. An ordinary apply leaves it false and nothing changes for
+    /// it.
+    pub update_pre_image: bool,
 }
 
 /// Names the `ApplyResult` variant without its payload, for the terminal
@@ -478,6 +487,15 @@ fn run_inner(
             taken_at: chrono_taken_at(),
             quiesced: true,
             built_pin: built_pin.clone(),
+            // The closure this apply produced, recorded so `built_pin` can
+            // be attributed to a generation later: a generation's own
+            // `system-<N>-link` resolves to exactly this path, and nothing
+            // else in the entry identifies the generation the apply created.
+            built_toplevel: Some(toplevel.clone()),
+            // Marked only when this apply is the second half of an update
+            // commit, so `gc` keeps the way back until the operator says the
+            // update is good.
+            update_pre_image: storage.update_pre_image,
         };
         journal::write(&storage.journal_dir, &entry)?;
 
