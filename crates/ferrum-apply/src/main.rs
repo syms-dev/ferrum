@@ -4,6 +4,7 @@ mod address_history;
 mod apply;
 mod dns_reconcile;
 mod gc;
+mod pin;
 mod preflight;
 mod progress;
 mod put_secret;

@@ -200,6 +200,7 @@ mod tests {
                 toplevel: "/nix/store/x".to_string(),
                 taken_at: "2026-08-20T00:00:00Z".to_string(),
                 quiesced: true,
+                built_pin: None,
             },
         )
         .unwrap();

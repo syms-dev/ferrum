@@ -178,6 +178,7 @@ mod tests {
             toplevel: "/nix/store/whatever".to_string(),
             taken_at: "2026-09-15 12:00:00".to_string(),
             quiesced: true,
+            built_pin: None,
         }
     }
 

@@ -41,7 +41,7 @@ pub struct GenerationRow {
     /// `JournalEntry::taken_at` already uses. The browser localises it.
     pub date: String,
     pub current: bool,
-    /// The full five-field `JournalEntry`, serialised as-is rather than
+    /// The full six-field `JournalEntry`, serialised as-is rather than
     /// trimmed into a second struct that would have to be kept in step with
     /// the crate.
     pub snapshot: Option<JournalEntry>,
@@ -281,6 +281,7 @@ mod tests {
                 toplevel: format!("/nix/store/toplevel-gen{generation}"),
                 taken_at: unix_ts.to_string(),
                 quiesced: true,
+                built_pin: None,
             },
         )
         .unwrap();
@@ -683,7 +684,7 @@ mod tests {
     /// structs; nothing asserted the JSON a browser actually receives. A
     /// `#[serde(rename)]`, a field renamed on `GenerationRow`, a `u32`
     /// retyped to `String`, a `skip_serializing_if` added to an `Option`, or
-    /// a sixth field appearing on `JournalEntry` would all ship green.
+    /// a seventh field appearing on `JournalEntry` would all ship green.
     /// This pins field names, types, `null`-vs-absent, and the exact key set
     /// at both levels.
     #[test]
@@ -742,8 +743,8 @@ mod tests {
         snap.sort_unstable();
         assert_eq!(
             snap,
-            vec!["generation", "quiesced", "snapshot", "taken_at", "toplevel"],
-            "the nested JournalEntry's five fields are part of this endpoint's contract"
+            vec!["built_pin", "generation", "quiesced", "snapshot", "taken_at", "toplevel"],
+            "the nested JournalEntry's six fields are part of this endpoint's contract"
         );
         assert_eq!(two["snapshot"]["snapshot"], serde_json::json!("1770000000-gen2"));
         assert!(two["snapshot"]["quiesced"].is_boolean());
