@@ -40,7 +40,8 @@ pub struct GcPlan {
 /// count. Pure: no filesystem access beyond what the caller already read,
 /// so the policy is testable on its own.
 ///
-/// Two rules, and the second is the one that matters:
+/// Three rules. The first is the policy; the other two are the interlocks
+/// that keep it from removing somebody's only way back:
 ///
 /// 1. Keep the `keep_generations` newest snapshots, ranked by the timestamp
 ///    embedded in the snapshot name (`<unix_ts>-gen<N>`), which is what
@@ -330,6 +331,60 @@ mod tests {
         let plan = plan(Vec::new(), 3, 1);
         assert!(plan.prune.is_empty());
         assert!(plan.keep.is_empty());
+    }
+
+    /// A retention rule nobody can see is its own defect, so the run says
+    /// how many snapshots it is holding and why -- and says nothing extra
+    /// when it is holding none.
+    ///
+    /// Drives the real `run`: no snapshot subvolume exists here, so
+    /// `delete_one` skips the `btrfs` call entirely and the pass is a
+    /// journal sweep, which is exactly the part under test.
+    #[test]
+    fn the_run_says_how_many_snapshots_an_unconfirmed_update_is_holding() {
+        let dir = tempfile::tempdir().unwrap();
+        let snapshots = dir.path().join("snapshots");
+        let journal_dir = dir.path().join("journal");
+        std::fs::create_dir_all(&snapshots).unwrap();
+
+        let mut held = entry(100, 1);
+        held.update_pre_image = true;
+        for e in [&held, &entry(200, 2), &entry(300, 3)] {
+            journal::write(&journal_dir, e).unwrap();
+        }
+
+        let plan_line = |progress_path: &Path| {
+            std::fs::read_to_string(progress_path)
+                .unwrap()
+                .lines()
+                .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+                .find(|v| v["event"] == "gc_plan")
+                .expect("every run writes a plan line")["detail"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+
+        let held_path = dir.path().join("held.jsonl");
+        let mut progress = crate::progress::Progress::to_path(&held_path);
+        crate::gc::run(&snapshots, &journal_dir, 1, 3, &mut progress).unwrap();
+        let line = plan_line(&held_path);
+        assert!(line.contains("keeping 2"), "the held snapshot is kept beyond retention: {line}");
+        assert!(line.contains("1 of those is an unconfirmed update"), "{line}");
+        assert!(line.contains("until you confirm"), "the operator needs the way out: {line}");
+
+        // Anti-vacuity: with nothing held, the sentence is absent rather
+        // than present-and-zero.
+        let clear_path = dir.path().join("clear.jsonl");
+        let clear_journal = dir.path().join("journal-clear");
+        for e in [&entry(100, 1), &entry(200, 2), &entry(300, 3)] {
+            journal::write(&clear_journal, e).unwrap();
+        }
+        let mut progress = crate::progress::Progress::to_path(&clear_path);
+        crate::gc::run(&snapshots, &clear_journal, 1, 3, &mut progress).unwrap();
+        let line = plan_line(&clear_path);
+        assert!(line.contains("keeping 1"), "{line}");
+        assert!(!line.contains("unconfirmed"), "nothing is held, so nothing is said: {line}");
     }
 
     #[test]
