@@ -42,7 +42,11 @@ export function setUnauthenticatedHandler(fn) {
 /// -- the first browser load of this UI failed with "no CSRF token yet"
 /// because login went down the guarded path and demanded the very token you
 /// log in to obtain.
-async function request(method, path, { body, raw = false, csrf = true } = {}) {
+/// `signalExpiry: false` suppresses the drop-to-login-view side effect on a
+/// 401. Exactly one caller wants that: the single-sign-on probe at boot, which
+/// EXPECTS a 401 from /api/session before it has a ferrumd session and would
+/// otherwise paint the password form a moment before replacing it.
+async function request(method, path, { body, raw = false, csrf = true, signalExpiry = true } = {}) {
   const headers = {};
   const mutating = csrf && !["GET", "HEAD", "OPTIONS", "TRACE"].includes(method);
 
@@ -81,7 +85,7 @@ async function request(method, path, { body, raw = false, csrf = true } = {}) {
     // fault. Drop to the login view rather than surfacing a raw error the
     // operator can do nothing with.
     csrfToken = null;
-    onUnauthenticated();
+    if (signalExpiry) onUnauthenticated();
     throw new ApiError(401, "session expired");
   }
 
@@ -124,13 +128,30 @@ export async function logout() {
   csrfToken = null;
 }
 
+/// Trade an Authelia session for a ferrumd one -- R5.
+///
+/// `csrf: false` for the same reason login uses it: this route is outside the
+/// protected router because it is what you call when you have no session to
+/// have a token for. `signalExpiry: false` because a 401 here is the ordinary
+/// answer on a host where the operator is not signed in to Authelia either,
+/// and it must not be reported as an expired ferrumd session.
+///
+/// Throws `ApiError(404)` on a host with no single sign-on configured, which
+/// is the normal state of a tunnel-only recovery host -- the caller falls
+/// through to the password form.
+export async function sso() {
+  const result = await request("POST", "/api/sso", { csrf: false, signalExpiry: false });
+  csrfToken = result.csrf_token;
+  return result;
+}
+
 /// Who am I, and what token do my mutating requests need?
 ///
 /// Called on every load. The cookie survives a refresh but the token does not
 /// -- the cookie is HttpOnly, so this page can never read it back -- which is
 /// exactly the gap this endpoint exists to close.
-export async function session() {
-  const result = await request("GET", "/api/session");
+export async function session({ signalExpiry = true } = {}) {
+  const result = await request("GET", "/api/session", { signalExpiry });
   csrfToken = result.csrf_token;
   return result;
 }

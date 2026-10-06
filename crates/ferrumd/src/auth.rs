@@ -113,6 +113,68 @@ pub struct LoginResult {
     pub csrf_token: String,
 }
 
+/// How a session was obtained -- R5.
+///
+/// Not decoration: `main.rs`'s `require_session` reads this to decide whether
+/// the session needs re-checking against Authelia on every request. The two
+/// origins are genuinely different promises. A `Password` session is ferrumd's
+/// own claim and stands on its own, which is what keeps the SSH-tunnel
+/// recovery route working on a host whose proxy or Authelia is broken. An
+/// `Authelia` session is a cached restatement of somebody else's claim, and a
+/// cached claim that is never re-checked is exactly how an Authelia logout
+/// leaves a live session behind here.
+///
+/// An enum rather than a bare string so the two spellings cannot drift between
+/// the writer and the reader; stored as text because the column is readable in
+/// a `sqlite3` session an operator opens during an incident.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionOrigin {
+    /// ferrumd's own username-and-password login.
+    Password,
+    /// An identity Authelia asserted, exchanged by `POST /api/sso`.
+    Authelia,
+}
+
+impl SessionOrigin {
+    /// The value stored in `sessions.origin`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SessionOrigin::Password => "password",
+            SessionOrigin::Authelia => "authelia",
+        }
+    }
+
+    /// Reads a stored value back.
+    ///
+    /// # Arguments
+    /// * `stored` - the `sessions.origin` column.
+    ///
+    /// # Returns
+    /// The origin. An unrecognised value reads as [`SessionOrigin::Authelia`],
+    /// which is the fail-closed direction: an unknown origin gets the stricter
+    /// treatment (re-checked against Authelia, and refused if it cannot be),
+    /// rather than being waved through as a password session.
+    pub fn from_stored(stored: &str) -> Self {
+        match stored {
+            "password" => SessionOrigin::Password,
+            _ => SessionOrigin::Authelia,
+        }
+    }
+}
+
+/// What an SSO exchange produced.
+///
+/// Two outcomes rather than `Option`, for the reason `LoginOutcome` has three:
+/// the handler maps them to different status codes, and "Authelia knows you
+/// and ferrum does not" is a 403 that must not be reported as the 401 that
+/// means "Authelia does not know you".
+pub enum SsoSessionOutcome {
+    /// A session was issued for an existing ferrumd account.
+    Started(LoginResult),
+    /// Authelia named an identity this ferrum has no account for.
+    NoSuchUser,
+}
+
 /// What a login attempt actually was.
 ///
 /// Three outcomes rather than `Option` plus a stringly-typed error, because
@@ -478,19 +540,136 @@ pub fn login(
         return Ok(LoginOutcome::BadCredentials);
     }
     let (user_id, _) = row.expect("succeeded implies row was Some");
+    Ok(LoginOutcome::Success(create_session(db, user_id, SessionOrigin::Password)?))
+}
 
+/// Issues a session row and the pair of secrets that address it.
+///
+/// Factored out of `login` when R5 added a second way to reach one. Both
+/// callers must produce the IDENTICAL session -- same lifetime, same idle
+/// seeding, same pruning -- and the one difference that matters, the origin,
+/// is a parameter rather than a second copy of the `INSERT`. A duplicated
+/// statement here is how one path would quietly acquire a different lifetime
+/// from the other.
+///
+/// # Arguments
+/// * `db` - the open database.
+/// * `user_id` - the account the session authenticates as. The caller is
+///   responsible for having established that identity; this function does not
+///   re-check it.
+/// * `origin` - how the identity was established.
+///
+/// # Returns
+/// The new session token and its CSRF token.
+///
+/// # Errors
+/// A failure generating the secrets, or any SQLite failure inserting the row
+/// or pruning dead ones.
+fn create_session(
+    db: &Db,
+    user_id: i64,
+    origin: SessionOrigin,
+) -> anyhow::Result<LoginResult> {
     let session_token = ferrum_secrets::random_secret_value()?;
     let csrf_token = ferrum_secrets::random_secret_value()?;
     db.conn().execute(
-        "INSERT INTO sessions (token, user_id, csrf_token, created_at, expires_at, last_seen_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?4)",
-        rusqlite::params![session_token, user_id, csrf_token, now(), now() + SESSION_LIFETIME_SECS],
+        "INSERT INTO sessions (token, user_id, csrf_token, created_at, expires_at, last_seen_at, origin) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?4, ?6)",
+        rusqlite::params![
+            session_token,
+            user_id,
+            csrf_token,
+            now(),
+            now() + SESSION_LIFETIME_SECS,
+            origin.as_str()
+        ],
     )?;
-    // Login is the only thing that creates a session, so it is the natural
-    // place to clear out the dead ones.
+    // Creating a session is the natural place to clear out the dead ones, and
+    // it is still the only thing that creates them.
     prune_sessions(db)?;
+    Ok(LoginResult { session_token, csrf_token })
+}
 
-    Ok(LoginOutcome::Success(LoginResult { session_token, csrf_token }))
+/// Exchanges an identity Authelia has already asserted for a ferrumd session.
+///
+/// **No password, no throttle, and no credential check.** That is correct and
+/// is the whole reason this function is separate from `login`: the
+/// authentication happened at Authelia, and `sso::AutheliaVerifier` is what
+/// confirmed it by asking Authelia directly rather than by believing a header.
+/// Nothing in this function may be reached without that confirmation, which is
+/// why its only caller is `sso::sso_handler`.
+///
+/// There is deliberately no login-attempt record and no lockout here either.
+/// Both exist to slow a password guesser, and there is no password to guess on
+/// this path; counting SSO successes into the same buckets would let a busy
+/// operator throttle their own password login (the lockout-is-a-denial-of-
+/// service shape this codebase has now met three times).
+///
+/// # The identity that does not match: refuse, never provision
+///
+/// Recorded here because it is a decision rather than an omission, and because
+/// the alternative is one line away.
+///
+/// ferrum refuses. An Authelia identity with no ferrumd account of the same
+/// name gets [`SsoSessionOutcome::NoSuchUser`] and a 403, every time, on every
+/// host. It is never provisioned.
+///
+/// Three reasons, in the order they decided it:
+///
+///  1. **Provisioning would make Authelia's user database ferrumd's
+///     authorization source.** `/var/lib/authelia-main/users_database.yml` is
+///     written by `ferrum-apply`'s bootstrap AND by Authelia itself on a
+///     password change, and nothing in ferrum constrains who else may appear
+///     in it. Auto-provisioning would turn "an account exists over there" into
+///     apply, rollback, settings and the secrets API over here -- silently,
+///     and on a file ferrumd does not own.
+///  2. **The matching case is the one ferrum builds.** `ensure_first_user`
+///     creates exactly one ferrumd account and `ensure_first_authelia_user`
+///     creates exactly one Authelia account, and both are named `admin`. A
+///     mismatch therefore means the operator did something ferrum did not do
+///     for them, which is exactly when a surprise is least welcome.
+///  3. **Refusing is reversible and loud; provisioning is neither.** A 403
+///     naming both identities is a thing an operator can read and fix in one
+///     command. An account quietly created with full control-plane rights is
+///     not something they will ever be told about.
+///
+/// # Arguments
+/// * `db` - the open database.
+/// * `username` - the identity Authelia asserted, verbatim.
+///
+/// # Returns
+/// [`SsoSessionOutcome::Started`] with a new session, or
+/// [`SsoSessionOutcome::NoSuchUser`].
+///
+/// # Errors
+/// Any SQLite failure. `QueryReturnedNoRows` -- and only that -- is the
+/// no-such-user branch, for the reason `login` gives at length: a blanket
+/// `.ok()` here would report an unreadable database as a rejected identity.
+pub fn start_sso_session(db: &Db, username: &str) -> anyhow::Result<SsoSessionOutcome> {
+    let user_id: Option<i64> = db
+        .conn()
+        .query_row(
+            "SELECT id FROM users WHERE username = ?1",
+            rusqlite::params![username],
+            |row| row.get(0),
+        )
+        .map(Some)
+        .or_else(|e| {
+            if matches!(e, rusqlite::Error::QueryReturnedNoRows) {
+                Ok(None)
+            } else {
+                Err(anyhow::Error::from(e))
+            }
+        })?;
+
+    match user_id {
+        Some(user_id) => Ok(SsoSessionOutcome::Started(create_session(
+            db,
+            user_id,
+            SessionOrigin::Authelia,
+        )?)),
+        None => Ok(SsoSessionOutcome::NoSuchUser),
+    }
 }
 
 /// Everything `require_session` needs about a session, from ONE lookup.
@@ -518,6 +697,13 @@ pub struct SessionInfo {
     /// into a 401 that tells the operator to log in again and would not
     /// help if they did.
     pub username: Option<String>,
+    /// How this session was obtained, read in the SAME row as the rest.
+    ///
+    /// `require_session` decides from this whether the session still needs
+    /// Authelia's assent. A second query for it would be a second lookup that
+    /// could disagree with the first -- the identical reason `username` and
+    /// `csrf_token` are here rather than fetched separately.
+    pub origin: SessionOrigin,
 }
 
 /// Returns the session's own identity and CSRF token if `token` is a real,
@@ -531,7 +717,7 @@ pub fn validate_session(db: &Db, token: &str) -> anyhow::Result<Option<SessionIn
     let session: Option<SessionInfo> = db
         .conn()
         .query_row(
-            "SELECT s.user_id, s.csrf_token, u.username FROM sessions s \
+            "SELECT s.user_id, s.csrf_token, u.username, s.origin FROM sessions s \
              LEFT JOIN users u ON u.id = s.user_id \
              WHERE s.token = ?1 AND s.expires_at > ?2 AND s.last_seen_at > ?3",
             rusqlite::params![token, now(), now() - IDLE_TIMEOUT_SECS],
@@ -540,6 +726,7 @@ pub fn validate_session(db: &Db, token: &str) -> anyhow::Result<Option<SessionIn
                     user_id: row.get(0)?,
                     csrf_token: row.get(1)?,
                     username: row.get(2)?,
+                    origin: SessionOrigin::from_stored(&row.get::<_, String>(3)?),
                 })
             },
         )

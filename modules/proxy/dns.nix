@@ -157,10 +157,30 @@ let
     (daemonPublished && ferrum.daemon.dns.includeRecord)
     (mkRecord "daemon" "${ferrum.daemon.subdomain}.${baseDomain}");
 
+  # R5/SEC-M02. The control plane's own Authelia portal.
+  #
+  # The dashboard has a session cookie scope of its own now, and Authelia
+  # refuses an `authelia_url` outside the scope it serves, so the portal that
+  # issues that cookie is at auth.<dashboard hostname> rather than
+  # auth.<baseDomain>. modules/proxy/nginx.nix serves it and
+  # modules/proxy/acme.nix orders its certificate on exactly these
+  # conditions; this is the third of the three, and the pairing is the
+  # auth.thesyms.ca lesson applied in advance rather than after the incident.
+  #
+  # Conjoined with includeRecord like daemonRecords above, not like
+  # authRecords: this name exists only because the dashboard is published, so
+  # an operator who has taken the dashboard's own record into their own hands
+  # takes this one with it. The two always appear and disappear together.
+  controlPortalRecords = lib.optional
+    (daemonPublished && ferrum.auth.enable && ferrum.daemon.dns.includeRecord)
+    (mkRecord "auth-control"
+      (proxyLib.autheliaPortalFor "${ferrum.daemon.subdomain}.${baseDomain}"));
+
   # Sorted so a rebuild that changes nothing produces a byte-identical file,
   # and so a diff of two generations' documents is readable.
   records = lib.sort (a: b: a.name < b.name)
-    (lib.optionals haveDomain (appRecords ++ authRecords ++ daemonRecords));
+    (lib.optionals haveDomain
+      (appRecords ++ authRecords ++ daemonRecords ++ controlPortalRecords));
 
   dnsConfigFile = pkgs.writeText "ferrum-dns-config.json" (builtins.toJSON {
     enable = dnsEnabled;

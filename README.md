@@ -191,16 +191,42 @@ That is expected behaviour, not a bug, and the fix is to use the loopback addres
 
 ### What Authelia does and does not defend
 
-Authelia's session cookie is issued for the whole base domain (`session.domain = ferrum.proxy.baseDomain`, `modules/proxy/authelia.nix`). That is what makes single sign-on single: log in once at `auth.<baseDomain>` and every app under that domain accepts you.
+Authelia issues **two** session cookies on a host that publishes the dashboard (`session.cookies`, `modules/proxy/authelia.nix`):
 
-The consequence is worth stating plainly, because the natural assumption is the opposite one. **Authelia defends the control plane against the unauthenticated stranger from the internet, and against nothing else.** A *compromised app already behind the same SSO* — a sonarr with a remote-code-execution bug, say — makes requests to `ferrum.<baseDomain>` that carry that same domain-wide cookie, so they pass nginx's `auth_request` exactly as a legitimate browser's would. Authelia is not a boundary between two apps on one base domain; it never was.
+| Cookie | Scope | Issued at | Covers |
+|--------|-------|-----------|--------|
+| `authelia_session` | `<baseDomain>` | `auth.<baseDomain>` | every published catalog app |
+| `ferrum_control_session` | `ferrum.<baseDomain>` | `auth.ferrum.<baseDomain>` | the control plane, and nothing else |
 
-Two things, and only these two, stand between a compromised sibling app and this host's settings, secrets and system generations:
+The first is what makes single sign-on single across the apps: log in once at `auth.<baseDomain>` and every app under that domain accepts you. The second is deliberately **not** part of that: it is a separate scope with a separate cookie name and a portal hostname of its own, so a cookie obtained in an app's context is not a cookie for the dashboard.
 
+That separation is the fix for `SEC-M02` (`docs/security/SEC-M02_authelia-cookie-scope.md`), and it costs a second interactive login at the control plane — which is exactly what the risk acceptance said it would cost, and why it was deferred until something needed it.
+
+Its price is also structural rather than optional. Authelia refuses an `authelia_url` that sits outside the cookie scope it serves, so the control plane's portal cannot be `auth.<baseDomain>`; it needs its own vhost (`modules/proxy/nginx.nix`), its own certificate (`modules/proxy/acme.nix`) and its own DNS record (`modules/proxy/dns.nix`). All four files are held in agreement by the `authelia-cookie-scope`, `daemon-vhost-enforced` and `dns-record-set` checks.
+
+The consequence for the **apps** is worth stating plainly, because the natural assumption is the opposite one. **Within the base domain's own scope, Authelia defends against the unauthenticated stranger from the internet, and against nothing else.** A *compromised app already behind the same SSO* — a sonarr with a remote-code-execution bug, say — holds a cookie every other app under that domain accepts. Authelia is not a boundary between two apps on one base domain; it never was. What it is now is a boundary between the apps and the control plane.
+
+Three things stand between a compromised sibling app and this host's settings, secrets and system generations:
+
+- **The dashboard's Authelia cookie scope is not the apps'.** A sibling app's `authelia_session` is not a `ferrum_control_session`, so it does not clear the control plane's edge gate at all. This is the newest of the three and the only one of them that stops the request at nginx.
 - **ferrumd serves no CORS headers at all.** No `Access-Control-Allow-Origin` means a script running on `sonarr.<baseDomain>` cannot *read* any response it provokes from `ferrum.<baseDomain>`. This is enforced by a test that fails if such a header ever appears, rather than by the fact that nobody has added one.
 - **The session cookie is `__Host-ferrumd_session`, with `Secure`, `HttpOnly`, `SameSite=Strict` and `Path=/`.** `SameSite=Strict` stops a sibling origin's requests from carrying it; `HttpOnly` stops script from reading it; and the `__Host-` prefix makes browsers reject any version of that cookie sent with a `Domain` attribute — which is what stops a compromised sibling from *planting* a session cookie for the whole base domain and having ferrumd honour it.
 
-ferrumd also requires its own valid session on every request regardless of what Authelia concluded; it trusts no `Remote-User` header. Nothing on this host runs in a network namespace that would stop a local process from talking straight to `127.0.0.1:7788`, so a header set by nginx would be a header any compromised app could forge.
+ferrumd also requires its own valid session on every request regardless of what Authelia concluded, and it trusts no `Remote-User` header on any request it receives. Nothing on this host runs in a network namespace that would stop a local process from talking straight to `127.0.0.1:7788`, so a header set by nginx would be a header any compromised app could forge.
+
+### Single sign-on for the dashboard
+
+Where the dashboard is published and Authelia is on, `POST /api/sso` turns an Authelia login into a ferrumd session, so the control plane takes one login rather than two.
+
+It does **not** work by trusting a forwarded identity header, for the reason in the paragraph above. ferrumd takes the cookie the caller presented and asks Authelia, over loopback, who it belongs to — so what a forger would have to produce is not a header but a valid Authelia session cookie **in the dashboard's own cookie scope**, which is the thing the two-cookie split above makes unobtainable from an app's context. The two halves are one feature: `crates/ferrumd/src/sso.rs` is only safe because `ferrum_control_session` exists.
+
+That is measured rather than asserted. The `authelia-asserts-only-its-own-scope` check starts the real Authelia on the real generated configuration and proves five things on every build: the dashboard's own cookie is accepted at the dashboard's URL and names its user; **an apps-scoped cookie is refused there**; an anonymous request is refused; the same apps cookie still works at an app's own URL (so the refusal is about scope, not a dud cookie); and a cookie logged out at Authelia stops verifying.
+
+Three consequences worth knowing:
+
+- **A session obtained this way is re-checked against Authelia on every request.** Logging out of Authelia therefore stops it working immediately. The cost is one loopback round trip per API call, and a brief window of `503` while `authelia-main.service` restarts — a `503`, deliberately, never a `401`: Authelia being down must not look like your login failing.
+- **An Authelia identity ferrum has no account for is refused, never provisioned.** `ferrum-apply` creates one ferrumd account and one Authelia account, both `admin`, so the matching case is the one ferrum builds. Auto-creating one would make Authelia's user database ferrumd's authorization source.
+- **The SSH-tunnel recovery route is untouched.** A tunnel-only host (`ferrum.daemon.publish = false`) gets no `FERRUMD_SSO_ORIGIN`, so `POST /api/sso` answers `404` and the password login is all there is — which is exactly right for the way in you use when the proxy is broken. A password session never consults Authelia even on a host that has it.
 
 ## Dashboard API
 
@@ -212,6 +238,7 @@ checks that the two agree — so where they disagree, the router is right.
 |--------|------|--------------|------|
 | POST | `/api/login` | Exchanges a username and password for a session cookie and a CSRF token | none |
 | POST | `/api/logout` | Clears the session | none (see `logout_is_still_unguarded_and_the_ui_still_depends_on_that`) |
+| POST | `/api/sso` | Exchanges an Authelia session for a ferrumd one. `404` where single sign-on is off, `401` where Authelia recognises nobody, `403` where it recognises somebody ferrum has no account for, `503` where it cannot be reached | an Authelia cookie in the dashboard's own scope — verified by asking Authelia, never by reading a header |
 | GET | `/api/session` | The current session's user and CSRF token | session |
 | POST | `/api/password` | Changes the signed-in user's password | session + CSRF |
 | GET | `/api/catalog` | The app catalog and the settings JSON Schema the UI renders its form from | session |

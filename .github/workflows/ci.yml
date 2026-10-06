@@ -48,6 +48,8 @@ jobs:
             .#checks.x86_64-linux.auth-model-enforced \
             .#checks.x86_64-linux.daemon-vhost-enforced \
             .#checks.x86_64-linux.daemon-unpublished-but-running \
+            .#checks.x86_64-linux.authelia-cookie-scope \
+            .#checks.x86_64-linux.authelia-asserts-only-its-own-scope \
             .#checks.x86_64-linux.nginx-config-parses \
             .#checks.x86_64-linux.nginx-emits-no-cors-headers \
             .#checks.x86_64-linux.reserved-subdomain-collision \

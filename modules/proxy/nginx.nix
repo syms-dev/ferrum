@@ -21,6 +21,21 @@ let
   daemonVhostName = vhostNameFor daemonApp;
   daemonAuthGated = proxyLib.authGated ferrum daemonApp;
 
+  # R5/SEC-M02. The control plane's own Authelia portal.
+  #
+  # The dashboard now has a session cookie scope of its own
+  # (modules/proxy/authelia.nix), and Authelia refuses an `authelia_url`
+  # outside the scope it serves -- so the portal that issues that cookie
+  # cannot be auth.<baseDomain>, which is outside it. It has to live inside
+  # ferrum.<baseDomain>, which means a second vhost, a second certificate
+  # (modules/proxy/acme.nix) and a second record (modules/proxy/dns.nix).
+  # That is the real, non-obvious price of isolating the cookie, and it is
+  # paid in those three files plus this one.
+  #
+  # Same Authelia instance behind it: one process, two portal hostnames, which
+  # is exactly what Authelia's multi-domain cookie support is for.
+  controlPortalVhostName = proxyLib.autheliaPortalFor daemonVhostName;
+
   # A real certificate is needed for the auth vhost as soon as ANYTHING on
   # this host is published on a real name -- a public app, or now the
   # dashboard on its own. Without the daemon disjunct, the dashboard-only host
@@ -326,7 +341,7 @@ let
         proxyWebsockets = true;
         extraConfig = daemonStreamConfig + daemonAuthConfig
           + lib.optionalString daemonAuthGated ''
-          error_page 401 =302 https://auth.${ferrum.proxy.baseDomain}/?rd=$target_url;
+          error_page 401 =302 https://${controlPortalVhostName}/?rd=$target_url;
         '';
       };
 
@@ -380,7 +395,17 @@ let
   # Checked for every ENABLED app rather than only the exposed ones: a
   # colliding app at exposure = "local" is a trap armed for whenever someone
   # publishes it, and reporting that at eval time costs nothing.
-  reservedSubdomains = [ ferrum.daemon.subdomain "auth" ];
+  # "auth.<daemon subdomain>" joins the set with R5: the control plane's own
+  # Authelia portal is served at that name, and `subdomain` is types.str with
+  # no shape constraint, so an operator (or `PUT /api/settings`) can write a
+  # dotted value into it. An app claiming it would shadow the login page the
+  # dashboard redirects to -- the dashboard would still be gated, and the gate
+  # would be an app.
+  reservedSubdomains = [
+    ferrum.daemon.subdomain
+    "auth"
+    "auth.${ferrum.daemon.subdomain}"
+  ];
   enabledApps = lib.filterAttrs (_: app: app.enable) ferrum.apps;
   reservedCollisions = lib.mapAttrsToList
     (name: app: "ferrum.apps.${name}.subdomain = \"${app.subdomain}\"")
@@ -452,7 +477,8 @@ let
         and would silently shadow it: ${lib.concatStringsSep "; " reservedCollisions}.
         Reserved on this host: ${lib.concatStringsSep ", " (map (s: "\"${s}\"") reservedSubdomains)}
         -- the first is ferrum.daemon.subdomain (the dashboard itself), the
-        second is Authelia's own vhost. Give the app a different
+        second is Authelia's own vhost, and the third is the Authelia portal
+        that issues the dashboard's own session cookie. Give the app a different
         ferrum.apps.<name>.subdomain, or move the dashboard by setting
         ferrum.daemon.subdomain.
       '';
@@ -539,6 +565,23 @@ lib.mkMerge [
             useACMEHost = lib.mkIf realCertsNeeded "auth.${ferrum.proxy.baseDomain}";
             sslCertificate = lib.mkIf (!realCertsNeeded) "${selfSignedCertDir}/cert.pem";
             sslCertificateKey = lib.mkIf (!realCertsNeeded) "${selfSignedCertDir}/key.pem";
+            locations."/".proxyPass = "http://127.0.0.1:9091";
+          };
+        }
+        // lib.optionalAttrs (ferrum.auth.enable && daemonPublished) {
+          # The control plane's portal (R5/SEC-M02). Byte-for-byte the same
+          # shape as the apps' portal above, proxying to the SAME Authelia
+          # instance -- what differs is only the name it is reached by, which
+          # is what puts it inside the dashboard's cookie scope.
+          #
+          # No self-signed branch, unlike the vhost above: this one exists
+          # only when daemonPublished, and realCertsNeeded is
+          # `publicApps != { } || daemonPublished`, so a real certificate is
+          # never in doubt here. A `lib.mkIf realCertsNeeded` would read as
+          # though it could be.
+          "${controlPortalVhostName}" = {
+            forceSSL = true;
+            useACMEHost = controlPortalVhostName;
             locations."/".proxyPass = "http://127.0.0.1:9091";
           };
         };
