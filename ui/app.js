@@ -426,6 +426,19 @@ function confirmRollback(gen) {
           "app's state directory — its database, its settings, its library index. " +
           `Anything an app wrote after ${taken} is discarded.`,
       }),
+      // Said by name rather than left to be inferred from "the whole
+      // system" above. One apply is one generation regardless of what went
+      // into it, so a settings change staged into the same apply as an
+      // update is reverted by the same rollback — and an operator who
+      // thinks they are only undoing the update will not go looking for the
+      // setting they also lost.
+      el("p", {
+        text:
+          "Including whatever else was applied at the same time. If a settings change — a port, " +
+          "an app enabled, a root folder — was staged into the same apply as the thing you are " +
+          "undoing, it goes back too. One apply is one generation, whatever changed inside it, " +
+          "and a rollback cannot take back one half of it.",
+      }),
       el("h4", { text: "What does NOT come back" }),
       el("p", {
         text:
@@ -435,11 +448,23 @@ function confirmRollback(gen) {
           "Authelia users, including any password changed since — that new password " +
           "still works after the rollback.",
       }),
+      // R8's fourth criterion, in the same register as the rest of this
+      // dialog. The pin is the one thing a rollback leaves ahead of the
+      // system it just reverted, and the operator finds out either here or
+      // the next time they press Apply.
+      el("p", {
+        text:
+          "And ferrum's own pin does not move. /etc/ferrum/flake.lock still names whatever " +
+          "revision it names now, so the next rebuild would start from that one — not from the " +
+          "revision you are going back to. Nothing rebuilds behind your back: the Apply screen " +
+          "will tell you, and name the revision, before it moves this host. If you want the pin " +
+          "back as well, `git -C /etc/ferrum checkout flake.lock` on the host does it.",
+      }),
       el("p", {
         class: "hint",
         text:
-          "In short: the system and its databases go back in time; your files and " +
-          "logins do not. Where those two disagree, an app may need to rescan.",
+          "In short: the system and its databases go back in time; your files, logins and " +
+          "the pin do not. Where those two disagree, an app may need to rescan.",
       }),
       el("div", { class: "row" }, [
         el("button", { value: "cancel", text: "Cancel" }),

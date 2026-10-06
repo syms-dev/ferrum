@@ -78,6 +78,7 @@ pub fn run(
     journal_dir: &Path,
     intent_path: &Path,
     snapshot_dir: &Path,
+    pin_notice: Option<&str>,
 ) -> anyhow::Result<()> {
     let mut progress = crate::progress::Progress::open();
     let outcome = run_inner(
@@ -85,13 +86,41 @@ pub fn run(
         journal_dir,
         intent_path,
         snapshot_dir,
+        pin_notice,
         &mut progress,
     );
     match &outcome {
-        Ok(()) => progress.complete("succeeded", &format!("rebooting into generation {target_generation}")),
+        // The notice rides on the terminal line as well as on its own event
+        // above, because the two are read in different circumstances: the
+        // event is what a live stream shows, and this is what survives in
+        // the job file for an operator reading back afterwards. On a prompt
+        // reboot neither is guaranteed to be seen, which is exactly why the
+        // apply gate -- not this sentence -- is what actually holds the line.
+        Ok(()) => progress.complete(
+            "succeeded",
+            &completion_detail(target_generation, pin_notice),
+        ),
         Err(e) => progress.complete("failed", &e.to_string()),
     }
     outcome
+}
+
+/// The terminal `complete` line's detail for a rollback that succeeded.
+///
+/// # Arguments
+/// * `target_generation` - the generation being booted into.
+/// * `pin_notice` - what `pin_gate::rollback_notice` found, if anything.
+///
+/// # Returns
+/// The sentence, carrying the pin notice when there is one. Separate from
+/// `run` so the composition is exercised without a reboot: `run`'s success
+/// path reaches it only on a machine that did not go down, which is not a
+/// path a test can take.
+fn completion_detail(target_generation: u32, pin_notice: Option<&str>) -> String {
+    match pin_notice {
+        Some(notice) => format!("rebooting into generation {target_generation}. But {notice}"),
+        None => format!("rebooting into generation {target_generation}"),
+    }
 }
 
 fn run_inner(
@@ -99,6 +128,7 @@ fn run_inner(
     journal_dir: &Path,
     intent_path: &Path,
     snapshot_dir: &Path,
+    pin_notice: Option<&str>,
     progress: &mut crate::progress::Progress,
 ) -> anyhow::Result<()> {
     progress.event(
@@ -107,6 +137,14 @@ fn run_inner(
     );
     prepare(target_generation, journal_dir, intent_path, snapshot_dir)?;
     progress.event("write-intent", "rollback intent written");
+
+    // Said before the profile is touched, so an operator watching the
+    // stream reads it while the machine is still theirs to stop. R8's
+    // second criterion: a rollback may leave the on-disk pin where it is,
+    // but never without saying so.
+    if let Some(notice) = pin_notice {
+        progress.event("pin", notice);
+    }
 
     progress.event("switch-generation", "pointing the system profile at the target generation");
     let status = Command::new("nix-env")
@@ -264,6 +302,23 @@ mod tests {
     #[test]
     fn a_reboot_that_cannot_be_spawned_is_an_error() {
         assert!(request_reboot("/nonexistent/reboot").is_err());
+    }
+
+    /// A rollback that leaves the pin ahead of the system carries that
+    /// fact into its own terminal line, where an operator reading the job
+    /// back afterwards finds it.
+    #[test]
+    fn a_pin_notice_reaches_the_terminal_line_and_absence_leaves_it_alone() {
+        let with = completion_detail(3, Some("this rollback does NOT move flake.lock"));
+        assert!(with.starts_with("rebooting into generation 3"), "{with}");
+        assert!(with.contains("does NOT move flake.lock"), "{with}");
+
+        let without = completion_detail(3, None);
+        assert_eq!(without, "rebooting into generation 3");
+        assert!(
+            !without.contains("But"),
+            "an ordinary rollback must not grow a sentence about a pin that did not move"
+        );
     }
 
     #[test]

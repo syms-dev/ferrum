@@ -171,6 +171,69 @@ pub fn decide(state: &PinState, generation: u32, accepted: Option<&str>) -> Deci
     })
 }
 
+/// What a rollback must say about the pin before it reboots, if anything.
+///
+/// R8's second criterion offers two remedies for a rollback whose target
+/// was built from a different pin than the one on disk: revert the on-disk
+/// pin, or refuse to complete SILENTLY. This is the second, and the choice
+/// is not a preference.
+///
+/// Reverting is not available honestly. A journal entry records a revision
+/// and a NAR hash, which is an identity, not a `flake.lock` -- the rest of
+/// that document (`lastModified`, the input's own URL shape, every other
+/// node) is not recorded anywhere and cannot be reconstructed. Rewriting it
+/// faithfully would mean re-resolving the old revision through `nix flake
+/// lock`, which is a network fetch, as root, in the middle of a rollback --
+/// on a host the operator has just declared broken, with the reboot already
+/// being prepared. A rollback that can fail because a remote is unreachable
+/// is a worse product than one that leaves a pin behind and says so.
+///
+/// So the pin stays, the operator is told in the same breath as the
+/// reboot, and the apply gate (`decide`, above) holds the line afterwards
+/// rather than relying on them remembering. The three together are what
+/// "not silently" means here.
+///
+/// # Arguments
+/// * `state` - the comparison between the on-disk pin and the pin the
+///   ROLLBACK TARGET was built from.
+/// * `target` - the generation being rolled back to.
+///
+/// # Returns
+/// The sentence to show, or `None` when the pins match or either side is
+/// unknown -- there is nothing to warn about, and a warning on a host whose
+/// journal merely predates these fields would be noise that teaches the
+/// operator to ignore the real one.
+pub fn rollback_notice(state: &PinState, target: u32) -> Option<String> {
+    let PinState::Differs { on_disk, recorded } = state else {
+        return None;
+    };
+    // Same distinction `decide` draws, and for the same reason: "it pins
+    // abc1234, where generation 3 was built from abc1234" reads as a bug in
+    // this sentence rather than as the finding, which is that the tree
+    // behind that one revision moved.
+    let how = if on_disk.rev == recorded.rev {
+        format!(
+            "It still pins ferrum {}, and so was generation {target} -- but to a different tree: \
+             the lock records {} where that generation was built from {}",
+            short(&on_disk.rev),
+            on_disk.nar_hash,
+            recorded.nar_hash
+        )
+    } else {
+        format!(
+            "It still pins ferrum {}, while generation {target} was built from {}",
+            short(&on_disk.rev),
+            short(&recorded.rev)
+        )
+    };
+    Some(format!(
+        "this rollback does NOT move /etc/ferrum/flake.lock. {how}. The system and every app's \
+         state go back; the pin does not. The next apply will say so, and name the revision, \
+         before it moves this host -- or put the pin back first with \
+         `git -C /etc/ferrum checkout flake.lock`."
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -306,6 +369,48 @@ mod tests {
             "the revision did not move, so the message must not say it did: {}",
             refusal.message
         );
+    }
+
+    /// A rollback whose target was built from a different pin says so,
+    /// names both revisions, and says plainly that the pin is NOT reverted.
+    #[test]
+    fn a_rollback_across_a_pin_change_is_never_silent_about_it() {
+        let state = classify(Some(pin(NEW, "h2")), Some(pin(OLD, "h1")));
+        let notice = rollback_notice(&state, 3).expect("a pin difference must be announced");
+        assert!(notice.contains("does NOT move"), "{notice}");
+        assert!(notice.contains("1111111"), "names the pin the target was built from: {notice}");
+        assert!(notice.contains("2222222"), "names the pin left on disk: {notice}");
+        assert!(notice.contains("generation 3"), "{notice}");
+        assert!(
+            notice.contains("checkout flake.lock"),
+            "the operator needs the way to put it back: {notice}"
+        );
+    }
+
+    /// A rollback across a tree that moved under one revision says THAT,
+    /// rather than naming the same revision twice and reading as a bug.
+    #[test]
+    fn a_rollback_across_a_moved_tree_names_the_hashes_not_one_revision_twice() {
+        let state = classify(Some(pin(OLD, "sha256-NEW=")), Some(pin(OLD, "sha256-OLD=")));
+        let notice = rollback_notice(&state, 3).expect("a moved tree is a difference");
+        assert!(notice.contains("sha256-NEW=") && notice.contains("sha256-OLD="), "{notice}");
+        assert!(notice.contains("a different tree"), "{notice}");
+    }
+
+    /// And says nothing otherwise. A warning on every rollback -- which is
+    /// what an unknown side would produce on the owner's live host, whose
+    /// generations all predate these fields -- is noise that teaches the
+    /// operator to ignore the real one.
+    #[test]
+    fn a_rollback_with_nothing_to_announce_announces_nothing() {
+        for (label, state) in [
+            ("matching pins", classify(Some(pin(OLD, "h")), Some(pin(OLD, "h")))),
+            ("a pin-unknown target", classify(Some(pin(NEW, "h")), None)),
+            ("no lock to read", classify(None, Some(pin(OLD, "h")))),
+            ("neither known", classify(None, None)),
+        ] {
+            assert_eq!(rollback_notice(&state, 3), None, "{label} must be silent");
+        }
     }
 
     #[test]

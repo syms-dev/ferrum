@@ -413,6 +413,53 @@ fn run_apply_gated(
     1
 }
 
+/// The Nix profile directory, from the environment.
+///
+/// # Returns
+/// `$FERRUM_PROFILES_DIR`, or the real `/nix/var/nix/profiles`. The same
+/// variable ferrumd already resolves its generation list from, and
+/// overridable here for the same reason every other path in this crate is:
+/// so the behaviour can be exercised against a real directory.
+fn profiles_dir_from_env() -> std::path::PathBuf {
+    std::env::var("FERRUM_PROFILES_DIR")
+        .unwrap_or_else(|_| "/nix/var/nix/profiles".to_string())
+        .into()
+}
+
+/// What a rollback to `target` must say about the on-disk pin, if anything.
+///
+/// # Arguments
+/// * `target` - the generation being rolled back to.
+/// * `profiles_dir` - the Nix profile directory, where `system-<N>-link`
+///   resolves the target's own closure.
+/// * `journal_dir` - ferrum's snapshot journal.
+/// * `flake_ref` - the reference a later apply would build from, which is
+///   where the on-disk lock lives.
+///
+/// # Returns
+/// The sentence, or `None` when the pins agree or either side is unknown.
+/// Every read that fails contributes `None`: a rollback must not be made
+/// harder by bookkeeping it cannot reach.
+fn rollback_pin_notice(
+    target: u32,
+    profiles_dir: &std::path::Path,
+    journal_dir: &std::path::Path,
+    flake_ref: &str,
+) -> Option<String> {
+    let (flake_dir, _) = update_check::split_flake_ref(flake_ref);
+    let on_disk = pin::read(
+        &std::path::Path::new(&flake_dir).join("flake.lock"),
+        update_candidate::FERRUM_INPUT,
+    );
+    let recorded = std::fs::read_link(profiles_dir.join(format!("system-{target}-link")))
+        .ok()
+        .and_then(|toplevel| {
+            let entries = ferrum_state::journal::list(journal_dir).ok()?;
+            ferrum_state::generations::built_pin_of(&toplevel.to_string_lossy(), &entries)
+        });
+    pin_gate::rollback_notice(&pin_gate::classify(on_disk, recorded), target)
+}
+
 fn run_rollback(to: u32) -> i32 {
     let journal_dir = std::env::var("FERRUM_JOURNAL_DIR")
         .unwrap_or_else(|_| "/var/lib/ferrum/journal".to_string());
@@ -420,11 +467,18 @@ fn run_rollback(to: u32) -> i32 {
         .unwrap_or_else(|_| "/var/lib/ferrum/rollback-intent.json".to_string());
     let snapshot_dir = std::env::var("FERRUM_SNAPSHOT_DIR")
         .unwrap_or_else(|_| "/var/lib/ferrum/snapshots".to_string());
+    let pin_notice = rollback_pin_notice(
+        to,
+        &profiles_dir_from_env(),
+        std::path::Path::new(&journal_dir),
+        &flake_ref_from_env(),
+    );
     match rollback::run(
         to,
         std::path::Path::new(&journal_dir),
         std::path::Path::new(&intent_path),
         std::path::Path::new(&snapshot_dir),
+        pin_notice.as_deref(),
     ) {
         Ok(()) => 0,
         Err(e) => {
@@ -1664,6 +1718,72 @@ mod tests {
                 "{label} must reach the builder and surface its own exit code"
             );
         }
+    }
+
+    /// The rollback notice's three real reads, against real files.
+    ///
+    /// Drives the whole join: `system-<N>-link` resolves the target's
+    /// closure, the journal entry claiming that closure carries the pin it
+    /// was built from, and the lock beside the flake carries the pin that is
+    /// there now.
+    #[test]
+    fn a_rollback_notice_joins_the_profile_link_the_journal_and_the_lock() {
+        use ferrum_state::journal::{self, JournalEntry, Pin};
+        let dir = tempfile::tempdir().unwrap();
+        let profiles = dir.path().join("profiles");
+        let journal_dir = dir.path().join("journal");
+        let closure = dir.path().join("toplevel-gen3");
+        std::fs::create_dir_all(&profiles).unwrap();
+        std::fs::create_dir_all(&closure).unwrap();
+        std::os::unix::fs::symlink(&closure, profiles.join("system-3-link")).unwrap();
+        journal::write(
+            &journal_dir,
+            &JournalEntry {
+                snapshot: "1000-gen2".to_string(),
+                generation: 2,
+                toplevel: "/nix/store/whatever".to_string(),
+                taken_at: "1000".to_string(),
+                quiesced: true,
+                built_pin: Some(Pin { rev: "1".repeat(40), nar_hash: "sha256-OLD=".into() }),
+                built_toplevel: Some(closure.to_string_lossy().into_owned()),
+                update_pre_image: false,
+            },
+        )
+        .unwrap();
+        let flake_ref = format!("{}#nixosConfigurations.default", dir.path().display());
+        // Both halves of the pin are written, because both are compared: a
+        // fixture that varied only the revision would have the hashes
+        // disagreeing in every row and the "unchanged pin" case below would
+        // be a difference after all. (It was, before this took a hash.)
+        let lock = |rev: &str, hash: &str| {
+            format!(
+                r#"{{"nodes":{{"root":{{"inputs":{{"ferrum":"ferrum"}}}},
+                   "ferrum":{{"locked":{{"rev":"{rev}","narHash":"{hash}"}}}}}}}}"#
+            )
+        };
+
+        // The lock has moved on since generation 3 was built.
+        std::fs::write(dir.path().join("flake.lock"), lock(&"2".repeat(40), "sha256-NEW=")).unwrap();
+        let notice = rollback_pin_notice(3, &profiles, &journal_dir, &flake_ref)
+            .expect("a real pin difference must be announced");
+        assert!(notice.contains("1111111") && notice.contains("2222222"), "{notice}");
+
+        // The anti-vacuity half, twice over: the identical pin says
+        // nothing, and so does a target whose link resolves to a closure no
+        // journal entry claims -- which is every generation on a host whose
+        // journal predates these fields.
+        std::fs::write(dir.path().join("flake.lock"), lock(&"1".repeat(40), "sha256-OLD=")).unwrap();
+        assert_eq!(
+            rollback_pin_notice(3, &profiles, &journal_dir, &flake_ref),
+            None,
+            "an unchanged pin must not produce a warning"
+        );
+        std::fs::write(dir.path().join("flake.lock"), lock(&"2".repeat(40), "sha256-NEW=")).unwrap();
+        assert_eq!(
+            rollback_pin_notice(9, &profiles, &journal_dir, &flake_ref),
+            None,
+            "a target with no recorded pin must not produce a warning"
+        );
     }
 
     /// The gate's three real reads, wired together.
