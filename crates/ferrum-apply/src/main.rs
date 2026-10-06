@@ -118,6 +118,20 @@ enum Command {
     /// different repository, or if it lands on a revision other than the
     /// one just resolved; every refusal leaves `flake.lock` untouched.
     Update,
+    /// Confirm the update this host is running is good, releasing the
+    /// snapshots `gc` was holding back for it.
+    ///
+    /// An update's way back is the state snapshot taken immediately before
+    /// its pin moved, and `ferrum.storage.keepGenerations` retires that
+    /// after ten more applies. So an update commit marks its pre-image and
+    /// `gc` refuses to prune a marked snapshot; this is the other end of
+    /// that, and the reason the exception is bounded rather than a
+    /// retention rule that grows for the life of the host.
+    ///
+    /// Reversible in the only direction that matters: it releases snapshots
+    /// to ORDINARY retention, so a confirmed update is still rollbackable
+    /// for as long as any other change of the same age is.
+    ConfirmUpdate,
 }
 
 /// Writes the job's `started` line, then runs it.
@@ -1157,6 +1171,49 @@ fn undo_pin(job: &UpdateJob, previous: &[u8], why: String) -> String {
 ///
 /// # Returns
 /// The process exit code from `run_update_job`.
+/// `ferrum-apply confirm-update`: release the snapshots an unconfirmed
+/// update was holding back from `gc`.
+///
+/// # Returns
+/// 0 on success, including when there was nothing to release -- a host that
+/// has never updated, or one confirmed twice, is not a failure. 1 when the
+/// journal could not be swept, naming the directory: a partial sweep leaves
+/// the remaining entries still protected, which is the safe direction, but
+/// the operator needs to know the release did not finish.
+fn run_confirm_update() -> i32 {
+    let journal_dir = journal_dir_from_env();
+    let mut progress = progress::Progress::open();
+    match ferrum_state::journal::clear_update_marks(&journal_dir) {
+        Ok(0) => {
+            progress.complete(
+                "succeeded",
+                "nothing to confirm: no snapshot was being held back for an update",
+            );
+            0
+        }
+        Ok(n) => {
+            progress.complete(
+                "succeeded",
+                &format!(
+                    "{n} snapshot(s) released to ordinary retention -- this update is no longer \
+                     holding anything back from gc"
+                ),
+            );
+            0
+        }
+        Err(e) => {
+            let detail = format!(
+                "could not release the held snapshots in {}: {e}. Any entry still marked is \
+                 still protected, so nothing has been lost",
+                journal_dir.display()
+            );
+            eprintln!("confirm-update: {detail}");
+            progress.complete("failed", &detail);
+            1
+        }
+    }
+}
+
 fn run_update() -> i32 {
     let mut progress = progress::Progress::open();
     let job = UpdateJob::from_env();
@@ -1378,6 +1435,7 @@ fn main() -> anyhow::Result<()> {
         Command::PreviewMigration => run_preview_migration(),
         Command::CheckUpdate => run_check_update(),
         Command::Update => run_update(),
+        Command::ConfirmUpdate => run_confirm_update(),
         Command::ReconcileDns { config } => run_reconcile_dns(&config),
         Command::PutSecret { name, replace } => run_put_secret(&name, replace),
         Command::RunRequest { path } => match request::read_request(&path) {
@@ -1391,6 +1449,7 @@ fn main() -> anyhow::Result<()> {
                 request::Request::Gc => run_gc(),
                 request::Request::CheckUpdate => run_check_update(),
                 request::Request::Update => run_update(),
+                request::Request::ConfirmUpdate => run_confirm_update(),
             }),
             Err(e) => {
                 eprintln!("run-request: {e}");
@@ -1857,6 +1916,32 @@ mod tests {
         ] {
             Cli::try_parse_from(args).expect("all five subcommands must parse");
         }
+    }
+
+    /// The two shapes of `apply`, and the new `confirm-update`.
+    #[test]
+    fn parses_the_apply_and_confirm_update_subcommands() {
+        let plain = Cli::parse_from(["ferrum-apply", "apply"]);
+        match plain.command {
+            Command::Apply { accept_pin_change } => assert_eq!(accept_pin_change, None),
+            other => panic!("expected Apply, got {other:?}"),
+        }
+        let accepting = Cli::parse_from([
+            "ferrum-apply",
+            "apply",
+            "--accept-pin-change",
+            &"2".repeat(40),
+        ]);
+        match accepting.command {
+            Command::Apply { accept_pin_change } => {
+                assert_eq!(accept_pin_change.as_deref(), Some("2".repeat(40).as_str()));
+            }
+            other => panic!("expected Apply, got {other:?}"),
+        }
+        assert!(matches!(
+            Cli::parse_from(["ferrum-apply", "confirm-update"]).command,
+            Command::ConfirmUpdate
+        ));
     }
 
     #[test]

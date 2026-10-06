@@ -58,6 +58,12 @@ pub enum JobRequest {
     /// fetches, writes into flake.lock, or builds. It takes the single-job
     /// interlock, because it builds and switches exactly as `apply` does.
     Update,
+    /// "The update this host is running is good." Mirrors
+    /// `request::Request::ConfirmUpdate` -- zero fields, so no snapshot name
+    /// crosses the privilege boundary. It rewrites journal entries, so it
+    /// takes the interlock by the fail-closed default rather than by an
+    /// exemption.
+    ConfirmUpdate,
 }
 
 fn jobs_dir() -> std::path::PathBuf {
@@ -298,6 +304,7 @@ fn request_body(req: &JobRequest) -> serde_json::Value {
         JobRequest::Gc => serde_json::json!({"kind": "gc"}),
         JobRequest::CheckUpdate => serde_json::json!({"kind": "check_update"}),
         JobRequest::Update => serde_json::json!({"kind": "update"}),
+        JobRequest::ConfirmUpdate => serde_json::json!({"kind": "confirm_update"}),
     }
 }
 
@@ -1820,9 +1827,30 @@ mod tests {
         /// `kind_takes_interlock` is asked about the string `request_body`
         /// actually writes, so this walks every variant and derives the
         /// string the same way the handler does rather than restating it.
-        /// An eighth kind added without a decision here would fail this.
+        /// A new kind added without a decision here fails to COMPILE, via
+        /// the exhaustive match below. The comment used to claim the table
+        /// alone did that; it did not -- a hand-written list cannot notice
+        /// a variant nobody added to it, and `Update` and `ConfirmUpdate`
+        /// were both added without this test saying a word.
         #[test]
         fn every_kind_but_the_read_only_check_claims_the_interlock() {
+            /// Exists only to be exhaustive. Adding a variant to
+            /// `JobRequest` breaks this match, which is the point: the
+            /// author then has to decide, here, whether it claims the
+            /// interlock, and add it to the table below.
+            fn _every_variant_is_accounted_for(req: &JobRequest) {
+                match req {
+                    JobRequest::Preflight
+                    | JobRequest::Apply { .. }
+                    | JobRequest::Rollback { .. }
+                    | JobRequest::RestoreState
+                    | JobRequest::Gc
+                    | JobRequest::CheckUpdate
+                    | JobRequest::Update
+                    | JobRequest::ConfirmUpdate => {}
+                }
+            }
+
             let cases = [
                 (JobRequest::Preflight, true),
                 (JobRequest::Apply { accept_pin_change: None }, true),
@@ -1835,6 +1863,12 @@ mod tests {
                 // the read-only check is exempt, and only because a
                 // rollback must never be blocked by one.
                 (JobRequest::Update, true),
+                // It rewrites journal entries -- the rollback story's only
+                // durable record -- while an apply or a gc may be reading
+                // or writing the same directory, so it serializes with
+                // them. It is cheap, so there is nothing to buy by
+                // exempting it.
+                (JobRequest::ConfirmUpdate, true),
             ];
             for (req, claims) in cases {
                 let kind = request_body(&req)

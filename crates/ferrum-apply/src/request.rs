@@ -51,6 +51,17 @@ pub enum Request {
     /// A `Update { flakeRef }` shape -- the rejected one -- would have made
     /// the request file a way to choose what a root process builds.
     Update,
+    /// "The update this host is running is good." Clears every
+    /// `update_pre_image` mark in the journal, returning the snapshots an
+    /// update held back from `gc` to ordinary retention.
+    ///
+    /// Zero fields, and that is a design choice rather than an accident of
+    /// this one being simple: a per-snapshot form would put a snapshot NAME
+    /// -- which becomes a path component on the privileged side -- into the
+    /// request file, for no gain. Confirming means "what I am running now
+    /// is fine", which says nothing that distinguishes one held-back
+    /// snapshot from another.
+    ConfirmUpdate,
 }
 
 impl Request {
@@ -73,6 +84,7 @@ impl Request {
             Request::Gc => "gc",
             Request::CheckUpdate => "check_update",
             Request::Update => "update",
+            Request::ConfirmUpdate => "confirm_update",
         }
     }
 }
@@ -104,6 +116,7 @@ mod tests {
             (r#"{"kind":"gc"}"#, "gc"),
             (r#"{"kind":"check_update"}"#, "check_update"),
             (r#"{"kind":"update"}"#, "update"),
+            (r#"{"kind":"confirm_update"}"#, "confirm_update"),
         ] {
             let path = dir.path().join("req.json");
             std::fs::write(&path, json).unwrap();

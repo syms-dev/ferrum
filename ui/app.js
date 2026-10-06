@@ -514,15 +514,73 @@ async function generationsView() {
       el("tr", { class: gen.current ? "current" : "" }, [
         el("td", { text: String(gen.generation) }),
         el("td", { text: localTime(gen.date) }),
-        el("td", { text: gen.current ? "running now" : "" }),
+        el("td", {
+          text: gen.current
+            ? "running now"
+            : gen.snapshot?.update_pre_image
+              ? "kept: the way back from an update"
+              : "",
+        }),
         el("td", {}, [action]),
       ]),
     );
   }
 
+  // Held-back snapshots, and the one control that releases them.
+  //
+  // An update's way back is the snapshot taken immediately before its pin
+  // moved, and `ferrum.storage.keepGenerations` would retire that after ten
+  // more applies — so gc holds it. A retention rule nobody can see is its
+  // own defect, which is why this says so on the screen where snapshots
+  // live rather than only in a gc job's log.
+  const held = data.generations.filter((g) => g.snapshot?.update_pre_image);
+  const status = el("p", { class: "hint", role: "status", "aria-live": "polite" });
+  const confirm = held.length
+    ? el("section", { class: "callout warn" }, [
+        el("h3", {
+          text:
+            held.length === 1
+              ? "One snapshot is being kept for an update you have not confirmed"
+              : `${held.length} snapshots are being kept for updates you have not confirmed`,
+        }),
+        el("p", {
+          text:
+            "These are the states this host was in immediately before an update moved its " +
+            "ferrum pin. Ordinary retention would have retired them after " +
+            "ferrum.storage.keepGenerations more applies; they are held so an update that turns " +
+            "out bad is still reversible weeks later.",
+        }),
+        el("p", {
+          text:
+            "They cost disk, and they go on costing it until you say the update is good. " +
+            "Confirming does not delete anything — it returns them to ordinary retention, so " +
+            "they stay rollbackable for exactly as long as any other change of the same age.",
+        }),
+        el("div", { class: "row" }, [
+          el("button", {
+            type: "button",
+            text: "Confirm these updates are good",
+            onclick: async () => {
+              status.textContent = "";
+              try {
+                const { id } = await api.startJob("confirm_update");
+                setStatus(`Confirming (${id}).`);
+                status.textContent =
+                  "Releasing the held snapshots. Reload this page to see the result.";
+              } catch (err) {
+                setStatus(err.message, "error");
+              }
+            },
+          }),
+        ]),
+        status,
+      ])
+    : null;
+
   view().replaceChildren(
     el("section", {}, [
       el("h2", { text: "Generations" }),
+      confirm,
       el("table", {}, [
         el("thead", {}, [
           el("tr", {}, [

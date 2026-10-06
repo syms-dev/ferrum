@@ -215,7 +215,8 @@ export const putSecret = (name, value) =>
   });
 
 /// Starts a privileged job. `kind` is one of the daemon's closed set:
-/// preflight, apply, rollback, restore_state, gc, check_update.
+/// preflight, apply, rollback, restore_state, gc, check_update, update,
+/// confirm_update.
 ///
 /// Every kind but `check_update` can come back 409 from the daemon's
 /// single-job interlock. `check_update` deliberately does not claim it, so a

@@ -139,6 +139,41 @@ pub fn list(journal_dir: &Path) -> anyhow::Result<Vec<JournalEntry>> {
     Ok(entries)
 }
 
+/// Clear every `update_pre_image` mark in the journal.
+///
+/// This is what "the operator confirms the update is good" does: the
+/// snapshots an update held back from `gc` go back to ordinary retention.
+/// It is deliberately a sweep rather than a per-snapshot operation --
+/// confirming means "what I am running now is fine", which says nothing
+/// that distinguishes one held-back snapshot from another, and a
+/// per-snapshot form would need a snapshot name to cross the privilege
+/// boundary for no gain.
+///
+/// # Arguments
+/// * `journal_dir` - ferrum's snapshot journal.
+///
+/// # Returns
+/// How many entries were cleared. Zero is an ordinary, successful outcome:
+/// nothing was being held back.
+///
+/// # Errors
+/// Any failure reading the directory, parsing an entry, or rewriting one.
+/// A partial sweep is possible and harmless -- an entry still marked is
+/// still protected, which is the safe direction -- so this stops at the
+/// first failure rather than pressing on against a sick filesystem.
+pub fn clear_update_marks(journal_dir: &Path) -> anyhow::Result<usize> {
+    let mut cleared = 0;
+    for mut entry in list(journal_dir)? {
+        if !entry.update_pre_image {
+            continue;
+        }
+        entry.update_pre_image = false;
+        write(journal_dir, &entry)?;
+        cleared += 1;
+    }
+    Ok(cleared)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -277,6 +312,65 @@ mod tests {
             "the key is present even when unknown, got: {raw}"
         );
         assert!(doc["built_pin"].is_null());
+    }
+
+    /// Confirming an update clears exactly the marks, and nothing else
+    /// about the entries it rewrites.
+    #[test]
+    fn confirming_clears_every_mark_and_touches_nothing_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let marked = JournalEntry {
+            update_pre_image: true,
+            built_pin: Some(Pin { rev: "a".repeat(40), nar_hash: "sha256-A=".into() }),
+            built_toplevel: Some("/nix/store/new".into()),
+            ..plain("1000-gen1", 1)
+        };
+        write(dir.path(), &marked).unwrap();
+        write(dir.path(), &plain("2000-gen2", 2)).unwrap();
+
+        assert_eq!(clear_update_marks(dir.path()).unwrap(), 1, "only the marked entry is rewritten");
+
+        let after = read(dir.path(), "1000-gen1").unwrap();
+        assert!(!after.update_pre_image, "the mark is gone");
+        // The rest of the entry is the rollback story's only durable
+        // record; a sweep that reset it would quietly make the generation
+        // unrollbackable and its pin unknown.
+        assert_eq!(after.snapshot, marked.snapshot);
+        assert_eq!(after.generation, marked.generation);
+        assert_eq!(after.toplevel, marked.toplevel);
+        assert_eq!(after.taken_at, marked.taken_at);
+        assert!(after.quiesced);
+        assert_eq!(after.built_pin, marked.built_pin);
+        assert_eq!(after.built_toplevel, marked.built_toplevel);
+
+        // Idempotent, and an already-clear journal is a success, not an
+        // error: the operator may confirm twice, and a host that never
+        // updated has nothing to clear.
+        assert_eq!(clear_update_marks(dir.path()).unwrap(), 0);
+        assert_eq!(list(dir.path()).unwrap().len(), 2, "no entry is lost by the sweep");
+    }
+
+    /// A journal directory that does not exist is "nothing to clear", for
+    /// the same reason `list` treats it as an empty journal: a host that
+    /// has never applied is not a fault.
+    #[test]
+    fn confirming_on_a_host_with_no_journal_is_not_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(clear_update_marks(&dir.path().join("never-created")).unwrap(), 0);
+    }
+
+    /// A five-field entry with a given snapshot name and generation.
+    fn plain(snapshot: &str, generation: u32) -> JournalEntry {
+        JournalEntry {
+            snapshot: snapshot.to_string(),
+            generation,
+            toplevel: "/nix/store/old".to_string(),
+            taken_at: "1000".to_string(),
+            quiesced: true,
+            built_pin: None,
+            built_toplevel: None,
+            update_pre_image: false,
+        }
     }
 
     #[test]
