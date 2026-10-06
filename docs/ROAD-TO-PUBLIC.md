@@ -555,7 +555,22 @@ a public claim can be checked before someone else checks it for us.
 
 Items that analysis surfaced about **ferrum**, not about the projects analysed:
 
-- [ ] **22. ferrumd has no health or readiness endpoint.** Thirteen routes, none of them health; the
+- [x] **22. ferrumd has no health or readiness endpoint.** DONE 2026-10-06 —
+      `crates/ferrumd/src/health.rs`, wired as `GET /api/health` (liveness, dependency-free, no
+      arguments at all so the type system enforces that) and `GET /api/ready` (readiness, four
+      statuses, five checks reported individually). Degraded is 200; 503 is reserved for a dead
+      database, the one state that means "cannot serve at all". `applying` carries the interlock's
+      own job UUID. Both routes bypass Authelia at the proxy, rate-limited at 60/min — a health
+      endpoint behind SSO answers a monitor with the portal's 200 and reports a dead box healthy.
+      The body is a closed vocabulary (no paths, versions, hostnames or error text), guarded by
+      `no_failing_check_discloses_anything_about_the_host`, and the unauthenticated route set is
+      pinned from both source and behaviour by
+      `the_unauthenticated_api_routes_are_exactly_these`. **No watchdog is wired to readiness and
+      none may be.** What readiness does NOT cover is written down in the README and in
+      health.rs's header.
+
+      *The original entry, kept because it is the reasoning:* thirteen routes, none of them health;
+      the
       only health logic in the project lives inside `apply.rs` and ceases to exist when the apply
       ends. There is no steady-state way to ask the box whether it is well. Two handlers and a
       struct. **Degraded must be 200, not 503** — a watcher's reflex on 503 is to restart, which is
