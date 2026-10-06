@@ -230,6 +230,15 @@ Last updated at HEAD `288f2b3`, branch `grounding-and-install-path`. Nothing pus
       - **The aarch64 `smoke` leg failing is EXPECTED** and must not be counted: GitHub's ARM
         runners ship no `/dev/kvm`. It is a deliberate non-blocking live probe with a long comment
         saying exactly that, kept so it starts passing for free the day ARM runners gain KVM.
+      - **2026-10-05: `stage2` now runs for 3h00m and hits its 180-minute cap**, and the four CI
+        jobs beside it were **cancelled** at exactly 15m02s — identical durations across
+        independent jobs, so the queue cut them loose rather than four bugs appearing at once.
+        **`gh pr checks` renders "cancelled" as "fail"**, which made the run look like 8 failures
+        and 1 pass when nothing in the code had broken. Read `.jobs[].conclusion`, not the summary.
+      - That stage2 reaches the cap at all is progress: it is past the cache throttle, the live
+        Cloudflare token check and the drifted answers fixture, and is now simply building a NixOS
+        system twice inside a VM for longer than the budget allows. **Next step is a budget
+        decision, not a defect hunt.**
       - **`stage2`'s REAL cause found 2026-09-23, and it is not the cache.** The `fallback = true`
         fix worked: the job now gets past the cache noise, builds ferrum-install (350 tests pass
         inside the Nix build), boots the target VM, and runs the installer — which then **exits 1
