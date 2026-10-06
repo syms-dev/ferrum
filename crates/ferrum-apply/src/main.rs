@@ -17,6 +17,7 @@ mod update_apply;
 mod update_candidate;
 mod update_check;
 mod update_deltas;
+mod way_in;
 
 #[derive(Parser)]
 #[command(name = "ferrum-apply")]
@@ -40,6 +41,16 @@ enum Command {
         /// passable rather than a wall.
         #[arg(long, value_name = "REV")]
         accept_pin_change: Option<String>,
+        /// Acknowledge that the generation this apply would produce has no
+        /// way back into this machine, naming the lockout exactly.
+        ///
+        /// Only consulted when the resulting configuration really does
+        /// close BOTH the console and SSH (ROAD-TO-PUBLIC 26); on every
+        /// other host it changes nothing. See `way_in` for which
+        /// configurations are fatal, which are merely degraded, and why
+        /// the gate is passable rather than a wall.
+        #[arg(long, value_name = "TOKEN")]
+        accept_no_way_in: Option<String>,
     },
     /// Schedule a reboot into an earlier generation with its matching state.
     Rollback {
@@ -366,11 +377,12 @@ fn pin_state_for_apply(flake_ref: &str, journal_dir: &std::path::Path) -> pin_ga
 ///
 /// # Arguments
 /// * `accept_pin_change` - the revision the operator acknowledged, if any.
+/// * `accept_no_way_in` - the lockout the operator acknowledged, if any.
 ///
 /// # Returns
-/// The process exit code: 1 when the gate refuses (before anything is built
-/// or stopped), otherwise whatever the apply itself produced.
-fn run_apply(accept_pin_change: Option<&str>) -> i32 {
+/// The process exit code: 1 when either gate refuses (before anything is
+/// built or stopped), otherwise whatever the apply itself produced.
+fn run_apply(accept_pin_change: Option<&str>, accept_no_way_in: Option<&str>) -> i32 {
     let flake_ref = flake_ref_from_env();
     let state = pin_state_for_apply(&flake_ref, &journal_dir_from_env());
     // The running generation's NUMBER is only needed to name it in the
@@ -383,8 +395,55 @@ fn run_apply(accept_pin_change: Option<&str>) -> i32 {
         generation,
         accept_pin_change,
         &mut progress::Progress::open(),
-        || handle_apply_result(apply::run(&flake_ref, &storage_from_env())),
+        // The way-in gate runs INSIDE the pin gate's closure, so its `nix
+        // eval` never happens on an apply the cheaper gate already
+        // refused -- and, when it does, it still runs before anything is
+        // built, stopped or snapshotted. Each gate opens its own
+        // `Progress`; they append to the same job file, exactly as
+        // `apply::run` already does.
+        || {
+            run_way_in_gated(
+                || way_in::decide(way_in::evaluate(&flake_ref).as_ref(), accept_no_way_in),
+                &mut progress::Progress::open(),
+                || handle_apply_result(apply::run(&flake_ref, &storage_from_env())),
+            )
+        },
     )
+}
+
+/// The way-in gate: refuse, or hand off to the apply.
+///
+/// Separated from `run_apply` for the reason `run_apply_gated` is: the
+/// property worth pinning is that a refused apply NEVER reaches the
+/// builder, and that is only observable if the builder is a value a test
+/// can hand in. The decision arrives as a closure rather than a value so
+/// the `nix eval` behind it is not paid on a path that will not use it.
+///
+/// # Arguments
+/// * `decide` - produces the decision, evaluating the resulting generation.
+/// * `progress` - the job's progress file.
+/// * `run` - the real apply. Called only when the gate lets it through, and
+///   its exit code is returned unchanged.
+///
+/// # Returns
+/// 1 on a refusal -- before anything is built, stopped, or snapshotted --
+/// otherwise whatever `run` returned.
+fn run_way_in_gated(
+    decide: impl FnOnce() -> way_in::Decision,
+    progress: &mut progress::Progress,
+    run: impl FnOnce() -> i32,
+) -> i32 {
+    let way_in::Decision::Refuse(refusal) = decide() else {
+        return run();
+    };
+    // The same `<machine-readable>: <prose>` shape the pin gate writes and
+    // `splitCompletion` in ui/app.js already parses, so the token the retry
+    // must carry arrives verbatim instead of being scraped out of a
+    // sentence the page would then depend on.
+    progress.event("way-in-gate", &format!("{}: {}", refusal.accept_token, refusal.message));
+    progress.complete("failed", &refusal.message);
+    eprintln!("apply refused: {}", refusal.message);
+    1
 }
 
 /// The gate itself: refuse, or hand off to the apply.
@@ -1440,7 +1499,9 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let exit_code = match cli.command {
         Command::Preflight => run_preflight(),
-        Command::Apply { accept_pin_change } => run_apply(accept_pin_change.as_deref()),
+        Command::Apply { accept_pin_change, accept_no_way_in } => {
+            run_apply(accept_pin_change.as_deref(), accept_no_way_in.as_deref())
+        }
         Command::Rollback { to } => run_rollback(to),
         Command::RestoreState => run_restore_state(),
         Command::Gc => run_gc(),
@@ -1453,8 +1514,8 @@ fn main() -> anyhow::Result<()> {
         Command::RunRequest { path } => match request::read_request(&path) {
             Ok(req) => run_request(req, &mut progress::Progress::open(), |req| match req {
                 request::Request::Preflight => run_preflight(),
-                request::Request::Apply { accept_pin_change } => {
-                    run_apply(accept_pin_change.as_deref())
+                request::Request::Apply { accept_pin_change, accept_no_way_in } => {
+                    run_apply(accept_pin_change.as_deref(), accept_no_way_in.as_deref())
                 }
                 request::Request::Rollback { to } => run_rollback(to),
                 request::Request::RestoreState => run_restore_state(),
@@ -1727,7 +1788,11 @@ mod tests {
     fn run_request_returns_the_runners_exit_code() {
         let dir = tempfile::tempdir().unwrap();
         let mut progress = progress::Progress::to_path(&dir.path().join("j.jsonl"));
-        assert_eq!(run_request(request::Request::Apply { accept_pin_change: None }, &mut progress, |_| 3), 3);
+        assert_eq!(run_request(
+                request::Request::Apply { accept_pin_change: None, accept_no_way_in: None },
+                &mut progress,
+                |_| 3
+            ), 3);
     }
 
     /// A refused apply never reaches the builder, and says so in the job's
@@ -1789,6 +1854,101 @@ mod tests {
                 "{label} must reach the builder and surface its own exit code"
             );
         }
+    }
+
+    /// The way-in gate's wiring, held to the same two properties as the pin
+    /// gate's: a refused apply never reaches the builder, and the refusal
+    /// arrives as its own event in the `<token>: <prose>` shape the Apply
+    /// view splits -- so the token the retry must carry is handed back
+    /// verbatim rather than scraped out of a sentence.
+    #[test]
+    fn a_way_in_gated_apply_never_builds_and_names_the_token_the_retry_must_accept() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("j.jsonl");
+        let mut progress = progress::Progress::to_path(&path);
+
+        let refusal = way_in::Refusal {
+            accept_token: "console-locked+ssh-disabled".to_string(),
+            message: "this apply would leave no way back into this machine. Nothing has been \
+                      built."
+                .to_string(),
+        };
+        let code = run_way_in_gated(
+            || way_in::Decision::Refuse(refusal.clone()),
+            &mut progress,
+            || panic!("the builder must not run for a gated apply"),
+        );
+        assert_eq!(code, 1);
+
+        let lines = std::fs::read_to_string(&path).unwrap();
+        let events: Vec<serde_json::Value> =
+            lines.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        let gate = events
+            .iter()
+            .find(|e| e["event"] == "way-in-gate")
+            .expect("the refusal must be its own event, not only the terminal line");
+        let detail = gate["detail"].as_str().unwrap();
+        let (token, message) =
+            detail.split_once(": ").expect("`<token>: <prose>` is the shape the UI splits");
+        assert_eq!(
+            token, "console-locked+ssh-disabled",
+            "the UI hands this back verbatim as the acknowledgement"
+        );
+        assert!(message.contains("no way back into this machine"), "{message}");
+        assert_eq!(events.last().unwrap()["event"], "complete");
+        assert!(events.last().unwrap()["detail"].as_str().unwrap().starts_with("failed: "));
+    }
+
+    /// The anti-vacuity half: a decision to proceed reaches the builder and
+    /// returns ITS exit code, so the test above cannot be satisfied by a
+    /// gate that refuses everything.
+    #[test]
+    fn an_ungated_way_in_decision_reaches_the_builder_and_returns_its_exit_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut progress = progress::Progress::to_path(&dir.path().join("j.jsonl"));
+        assert_eq!(
+            run_way_in_gated(|| way_in::Decision::Proceed, &mut progress, || 3),
+            3,
+            "an apply with a way back in must reach the builder and surface its own exit code",
+        );
+    }
+
+    /// The decision is not even computed when the apply is not going to use
+    /// it. The `nix eval` behind it costs real seconds on a real host, and
+    /// a pin-gated apply has already been refused.
+    #[test]
+    fn the_way_in_decision_is_not_computed_when_the_builder_is_not_reached() {
+        use std::cell::Cell;
+        let dir = tempfile::tempdir().unwrap();
+        let mut progress = progress::Progress::to_path(&dir.path().join("j.jsonl"));
+        let evaluated = Cell::new(false);
+        // The control: it IS computed on the ordinary path, so the
+        // assertion below is measuring laziness rather than a closure that
+        // is never called at all.
+        run_way_in_gated(
+            || {
+                evaluated.set(true);
+                way_in::Decision::Proceed
+            },
+            &mut progress,
+            || 0,
+        );
+        assert!(evaluated.get(), "the gate must consult its decision on the ordinary path");
+
+        let refused = pin_gate::classify(
+            Some(ferrum_state::journal::Pin { rev: "2".repeat(40), nar_hash: "h2".into() }),
+            Some(ferrum_state::journal::Pin { rev: "1".repeat(40), nar_hash: "h1".into() }),
+        );
+        let reached = Cell::new(false);
+        run_apply_gated(&refused, 7, None, &mut progress, || {
+            reached.set(true);
+            0
+        });
+        assert!(
+            !reached.get(),
+            "the pin gate refuses first, so nothing inside its closure -- including the way-in \
+             evaluation -- may run",
+        );
     }
 
     /// The rollback notice's three real reads, against real files.
@@ -1935,7 +2095,10 @@ mod tests {
     fn parses_the_apply_and_confirm_update_subcommands() {
         let plain = Cli::parse_from(["ferrum-apply", "apply"]);
         match plain.command {
-            Command::Apply { accept_pin_change } => assert_eq!(accept_pin_change, None),
+            Command::Apply { accept_pin_change, accept_no_way_in } => {
+                assert_eq!(accept_pin_change, None);
+                assert_eq!(accept_no_way_in, None);
+            }
             other => panic!("expected Apply, got {other:?}"),
         }
         let accepting = Cli::parse_from([
@@ -1945,7 +2108,7 @@ mod tests {
             &"2".repeat(40),
         ]);
         match accepting.command {
-            Command::Apply { accept_pin_change } => {
+            Command::Apply { accept_pin_change, .. } => {
                 assert_eq!(accept_pin_change.as_deref(), Some("2".repeat(40).as_str()));
             }
             other => panic!("expected Apply, got {other:?}"),

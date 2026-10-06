@@ -183,6 +183,31 @@ Two things about it:
 
 This exists because it did not, and a real host was unreachable because of it: SSH stopped answering, the machine still reached its login prompt, and the prompt accepted nothing — root had no password and never had one. The only remaining route was editing the bootloader to boot `init=/bin/sh`, which then broke the USB keyboard, because that path never starts systemd and so udev never loads the HID driver. `a-host-always-has-a-way-in` in `nix/modules/flake/checks.nix` fails the build if ferrum ever ships that shape again.
 
+### Apply refuses to lock you out
+
+`a-host-always-has-a-way-in` fails the *build* if ferrum's own module tree ever ships that shape. It cannot see your `custom/` modules. So the same question is asked again, on your machine, about the generation an apply is **about to** produce — before anything is built, stopped, snapshotted or switched, with rollback still a no-op.
+
+This is a check only a declarative system can write. Everything an apply would change is evaluable before any of it exists, so `ferrum-apply` reads the *final, merged* configuration — `services.openssh.openFirewall` has already contributed its ports, a `custom/` `mkForce` has already won or lost — and asks whether anyone could still get in.
+
+It refuses **only** when every route is shut at once:
+
+| Route | Shut when |
+|-------|-----------|
+| The console password | `users.mutableUsers = false` **and** root carries no password in the resulting configuration — so the password `ferrum-apply` writes to `/var/lib/ferrum/root-console-password` is erased by this activation and nothing will ever set another |
+| SSH | `services.openssh.enable = false`, **or** the firewall admits nothing on sshd's port, **or** no account that can reach a shell has an authorized key (declared or already on disk) or a usable password |
+
+Either one alone is a legitimate configuration, not a lockout, and is never refused. **The dashboard is deliberately not a route here**: it cannot restore SSH or a console password, and a dashboard that is merely broken — Authelia down, a bad certificate — is exactly what the SSH tunnel below is the answer to. A gate that fired on a degraded host would teach you to bypass it, which is worse than not having it.
+
+A predicate it cannot evaluate has not failed. A firewall carrying hand-written `ACCEPT` rules, an `AuthorizedKeysCommand` that could supply a key from anywhere, an authorized-keys file it could not read, a `nix eval` that did not answer — each is *unknown*, and the apply proceeds.
+
+The refusal names both closed routes and what would reopen each, and the Apply view offers one button that proceeds anyway. That button sends back the exact lockout it showed you (`console-locked+ssh-disabled` and the like), so an acknowledgement given for one lockout cannot pass a different one later. Over SSH, the same thing:
+
+```bash
+ferrum-apply apply --accept-no-way-in console-locked+ssh-disabled
+```
+
+The gate exists to make the decision visible, not to prevent it — you may genuinely have a route ferrum cannot see.
+
 ### Reaching the dashboard when the proxy or Authelia is broken
 
 ferrumd keeps listening on loopback (`ferrum.daemon.listenAddress`, `127.0.0.1` by default) whether or not it is published. Publishing means nginx reaches it, not that it binds a public interface — so the SSH tunnel remains the recovery route for exactly the situation where you need the UI most: the proxy is down, Authelia will not start, or a bad certificate has made `ferrum.<baseDomain>` unusable.

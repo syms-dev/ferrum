@@ -29,9 +29,21 @@ pub enum Request {
     /// `#[serde(default)]` so `{"kind":"apply"}` -- what every ferrumd
     /// before this wrote, and what the common case still writes -- keeps
     /// parsing.
+    ///
+    /// `accept_no_way_in` is the second field of the same kind and obeys
+    /// the same rule: it is compared for EQUALITY against the token
+    /// `way_in::decide` would issue for the lockout it actually found
+    /// (`console-locked+ssh-disabled` and the like), and used for nothing
+    /// else. It cannot name a route, a port, a user or a file -- a value
+    /// that matches nothing simply leaves the gate closed. What it carries
+    /// is the operator's acknowledgement that the generation this apply
+    /// would produce has no way back in, named specifically enough that an
+    /// acknowledgement of one lockout cannot pass a different one.
     Apply {
         #[serde(default)]
         accept_pin_change: Option<String>,
+        #[serde(default)]
+        accept_no_way_in: Option<String>,
     },
     Rollback { to: u32 },
     RestoreState,
@@ -138,7 +150,10 @@ mod tests {
         let path = dir.path().join("req.json");
         std::fs::write(&path, r#"{"kind":"apply"}"#).unwrap();
         match read_request(&path).unwrap() {
-            Request::Apply { accept_pin_change } => assert_eq!(accept_pin_change, None),
+            Request::Apply { accept_pin_change, accept_no_way_in } => {
+                assert_eq!(accept_pin_change, None);
+                assert_eq!(accept_no_way_in, None);
+            }
             other => panic!("expected Apply, got {other:?}"),
         }
     }
@@ -156,7 +171,7 @@ mod tests {
         )
         .unwrap();
         match read_request(&path).unwrap() {
-            Request::Apply { accept_pin_change } => {
+            Request::Apply { accept_pin_change, .. } => {
                 assert_eq!(accept_pin_change.as_deref(), Some("2".repeat(40).as_str()));
             }
             other => panic!("expected Apply, got {other:?}"),
