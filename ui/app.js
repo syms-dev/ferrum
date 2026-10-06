@@ -790,12 +790,14 @@ function renderUpdateReport(target, report, catalogApps, jobId) {
       el("dd", { text: orUnknown(candidate.reference) }),
       // Named as the pin, not as the running revision. This value is read
       // out of /etc/ferrum/flake.lock, which is the pin the NEXT build would
-      // start from; the pin the running generation was actually built from is
-      // recorded nowhere -- not in the journal, not anywhere else -- so the
-      // two can differ and ferrum has no way to tell. Declining to report the
-      // difference is honest; asserting the equality in a label was not, and
-      // it landed on the one field the operator is asked to read and refuse
-      // in place of a signature check.
+      // start from. Journal entries now record the pin each apply built from
+      // (`built_pin`), so the two ARE comparable on a host whose generations
+      // postdate that field -- but nothing on this screen reads it yet, and
+      // the gate that acts on a disagreement is a separate piece of work. So
+      // the label still says only what this value is, which stays honest:
+      // asserting the equality here was what the earlier wording got wrong,
+      // on the one field the operator is asked to read and refuse in place
+      // of a signature check.
       el("dt", { text: "Revision pinned in /etc/ferrum/flake.lock" }),
       el("dd", {}, [el("code", { class: "rev", text: orUnknown(candidate.currentRev) })]),
       el("dt", { text: "Candidate revision" }),
@@ -803,7 +805,7 @@ function renderUpdateReport(target, report, catalogApps, jobId) {
     ]),
     el("p", {
       class: "hint",
-      text: "That is the pin on disk. ferrum cannot confirm the generation now running was built from it — nothing records the pin a generation was built with.",
+      text: "That is the pin on disk, which is where the next build starts. ferrum now records the pin each generation was built from, but this screen does not yet compare the two — so it is not telling you the running system was built from the revision above.",
     }),
 
     el("h3", { text: "ferrum itself" }),
@@ -838,16 +840,102 @@ function renderUpdateReport(target, report, catalogApps, jobId) {
   );
 }
 
-/// The Updates view: what a read-only check found, and nothing that acts on it.
+/// Ask before committing to an update, naming the exact revision.
+///
+/// The same "review, then commit" shape the Apply view and `confirmRollback`
+/// already use — this screen does not invent a second one. What it adds over
+/// those two is the revision itself: DA-1 makes seeing the exact commit, and
+/// being able to refuse it, the control that stands in place of signature
+/// verification, so a dialog that said "apply the update?" without naming it
+/// would remove the only thing being verified.
+///
+/// @param {object} candidate - The report's `candidate` object.
+/// @returns {Promise<boolean>} True when the operator confirmed.
+function confirmUpdate(candidate) {
+  const dialog = el("dialog", { class: "confirm" });
+  const rev = candidate.rev || "an unknown revision";
+
+  dialog.appendChild(
+    el("form", { method: "dialog" }, [
+      el("h3", { text: "Update this host?" }),
+      el("p", { text: "ferrum will move the pin in /etc/ferrum/flake.lock to this exact revision:" }),
+      el("p", {}, [el("code", { class: "rev", text: rev })]),
+      el("h4", { text: "What this does" }),
+      el("p", {
+        text:
+          "It rewrites one line of bookkeeping — flake.lock — and then rebuilds and switches " +
+          "the system, exactly as “Apply now” does. Your apps stop while it switches. The " +
+          "result is an ordinary generation you can roll back from, with its own state " +
+          "snapshot, like any other change.",
+      }),
+      el("h4", { text: "What it does not do" }),
+      el("p", {
+        text:
+          "It never writes /etc/ferrum/flake.nix — the file that decides which repository and " +
+          "which reference this host trusts stays byte-for-byte as you wrote it. It cannot " +
+          "update one app without the others. And it does not commit anything to your git " +
+          "tree: flake.lock will be left modified for you to review and commit.",
+      }),
+      el("p", {
+        class: "hint",
+        text:
+          "ferrum verifies no signature on this revision, and evaluates it as root. Reading " +
+          "the revision above and refusing it if it is not what you expect is the whole of " +
+          "that control.",
+      }),
+      el("div", { class: "row" }, [
+        el("button", { value: "cancel", text: "Cancel" }),
+        el("button", { value: "confirm", class: "danger", text: "Update and rebuild" }),
+      ]),
+    ]),
+  );
+
+  document.body.appendChild(dialog);
+  return new Promise((resolve) => {
+    dialog.addEventListener("close", () => {
+      const ok = dialog.returnValue === "confirm";
+      dialog.remove();
+      resolve(ok);
+    });
+    dialog.showModal();
+  });
+}
+
+/// Split a job's terminal `complete` detail into its result and its message.
+///
+/// `progress::complete` writes `"<result>: <detail>"` into one `detail`
+/// field, so the result the job reached and the sentence explaining it
+/// arrive as one string. Parsed on the FIRST separator only: an update's own
+/// message contains colons of its own, and splitting on all of them would
+/// truncate the sentence the operator is meant to read.
+///
+/// @param {string} detail - The `complete` event's detail.
+/// @returns {{result: string, message: string}} The job's result word and
+///   its message; the whole string as the message when there is no separator.
+function splitCompletion(detail) {
+  const text = String(detail ?? "");
+  const at = text.indexOf(": ");
+  if (at < 0) return { result: text.trim(), message: "" };
+  return { result: text.slice(0, at).trim(), message: text.slice(at + 2).trim() };
+}
+
+/// The Updates view: what a read-only check found, and the one deliberate
+/// step that acts on it.
 ///
 /// @returns {Promise<void>} Resolves once the shell is painted and either a
-///   stored report has been rendered or an in-flight check reattached to.
+///   stored report has been rendered or an in-flight job reattached to.
 async function updatesView() {
   closeStream();
 
   const error = el("p", { class: "error" });
   const pending = el("p", { class: "hint", role: "status", "aria-live": "polite" });
   const report = el("div", {});
+  // Painted directly BELOW the report, never above it: R4 requires the
+  // preview to be what the operator read immediately before committing, and
+  // a control above the thing it commits to is a control you can press
+  // without having read it.
+  const commit = el("section", {});
+  const outcome = el("p", { role: "status", "aria-live": "polite" });
   const log = el("pre", { class: "log", hidden: true });
 
   // Whether a check this view started or reattached to is still in flight.
@@ -865,6 +953,15 @@ async function updatesView() {
   // A UI latch is not a substitute for a daemon-side bound. It is the part of
   // the mitigation that belongs here.
   let checking = false;
+
+  /// Whether an update this view started or reattached to is still running.
+  ///
+  /// Separate from `checking` because the two jobs are not interchangeable:
+  /// the daemon's single-job interlock already bounds concurrent updates
+  /// (an update takes it, a check does not), so this latch is an affordance
+  /// rather than the only bound — the opposite of `checking`, which IS the
+  /// only bound there is.
+  let updating = false;
 
   /// Moves the check control in or out of its in-flight state.
   ///
@@ -911,6 +1008,7 @@ async function updatesView() {
             error.textContent = problem;
           } else {
             renderUpdateReport(report, envelope.report, state.catalog?.apps || {}, envelope.jobId);
+            renderCommit(envelope.report.candidate || null);
             setStatus("Check finished.", "ok");
           }
         } catch (err) {
@@ -943,6 +1041,147 @@ async function updatesView() {
         setChecking(false);
       },
     });
+  }
+
+  /// Follow a running update job and report what it did.
+  ///
+  /// @param {string} id - The job id.
+  /// @returns {void}
+  function attachUpdate(id) {
+    closeStream();
+    updating = true;
+    log.hidden = false;
+    log.textContent = "";
+    outcome.textContent = "";
+    pending.textContent =
+      "Updating. The system is rebuilding and will switch when the build finishes; your apps " +
+      "stop during the switch.";
+    state.stream = api.streamJob(id, {
+      onEvent: (e) => {
+        log.textContent += `${e.event}: ${e.detail}\n`;
+        log.scrollTop = log.scrollHeight;
+      },
+      onDone: (e) => {
+        pending.textContent = "";
+        updating = false;
+        const { result, message } = splitCompletion(e.detail);
+        // The job's own words, not a sentence this file composes from the
+        // result word. "no change — nothing to apply" is a distinct outcome
+        // from "updated to <rev> as generation N", and only the job knows
+        // which happened — it is the side that can see whether a generation
+        // was created. A UI that said "Updated." for both would be stating
+        // something nobody checked.
+        outcome.textContent = message || result;
+        // Only classes style.css actually defines. A degraded update gets
+        // the same callout a warning on this screen already gets; a failure
+        // gets the same `.error` every other failure here gets. Colour is
+        // never the only signal: the sentence itself says what happened,
+        // and the live region announces it.
+        outcome.className =
+          result === "succeeded" ? "" : result === "degraded" ? "callout warn" : "error";
+        setStatus(`Update ${result}.`, result === "succeeded" ? "ok" : "error");
+        // The report on screen described the host as it was before this ran,
+        // so it is now stale whatever the outcome. Said rather than silently
+        // left there to be read as current.
+        renderCommit(null, "This report predates the update you just ran. Check again to see where this host stands now.");
+      },
+      onError: () => {
+        if (state.stream?.readyState !== EventSource.CLOSED) return;
+        closeStream();
+        pending.textContent = "";
+        updating = false;
+        error.textContent =
+          "Lost the connection to this update's progress log. The update may still be running on the host — reload this page to pick it up again.";
+      },
+    });
+  }
+
+  /// Paint the commit control, or the reason there is none.
+  ///
+  /// @param {object|null} candidate - The report's `candidate` object, or
+  ///   null when there is no usable report.
+  /// @param {string|null} [note] - A replacement explanation, used after an
+  ///   update has made the report on screen stale.
+  /// @returns {void}
+  function renderCommit(candidate, note = null) {
+    if (note) {
+      commit.replaceChildren(el("p", { class: "hint", text: note }));
+      return;
+    }
+    if (!candidate) {
+      commit.replaceChildren();
+      return;
+    }
+    // Keyed on the one state that means "there is something newer, and
+    // ferrum established that it is newer". Every other state — including
+    // order-unknown, where ferrum found a different revision and could not
+    // say which way — renders no control at all, because the daemon would
+    // refuse the job anyway and an affordance that always fails is worse
+    // than none.
+    if (candidate.state !== "update-available") {
+      commit.replaceChildren(
+        el("p", {
+          class: "hint",
+          text:
+            candidate.state === "up-to-date"
+              ? "Nothing to apply: this host already runs the revision the tracked reference points at."
+              : "No update can be applied from this report. Nothing above establishes a newer revision to move to, and ferrum will not move to one it cannot order.",
+        }),
+      );
+      return;
+    }
+
+    const update = el("button", {
+      type: "button",
+      class: "danger",
+      text: "Update and rebuild",
+      onclick: async () => {
+        if (updating) return;
+        error.textContent = "";
+        if (!(await confirmUpdate(candidate))) return;
+        updating = true;
+        update.disabled = true;
+        pending.textContent = "Starting the update…";
+        try {
+          const { id } = await api.startJob("update");
+          setStatus(`Update started (${id}).`);
+          attachUpdate(id);
+        } catch (err) {
+          // An update takes the daemon's single-job interlock, exactly as
+          // an apply does, so 409 is a real and ordinary answer here —
+          // unlike on the check above, which is exempt from it.
+          if (err.status === 409) {
+            const running = (await api.jobs(5)).jobs.find((j) => j.status === "running");
+            error.textContent = running
+              ? `A ${running.kind || "job"} started at ${localTime(running.started_at)} is still running (${running.id}). Wait for it to finish.`
+              : "A job is already running.";
+          } else {
+            error.textContent = err.message;
+          }
+          pending.textContent = "";
+          updating = false;
+          update.disabled = false;
+        }
+      },
+    });
+
+    commit.replaceChildren(
+      el("h3", { text: "Apply this update" }),
+      el("p", {
+        text:
+          "Everything above is what this will change. Checking never applies anything; this is " +
+          "the separate, deliberate step — the same split Save and Apply already use for " +
+          "settings.",
+      }),
+      el("div", { class: "row" }, [update]),
+      el("p", {
+        class: "hint",
+        text:
+          "If the rebuilt system turns out identical to the one already running, ferrum will " +
+          "say “no change — nothing to apply” and create no generation. That is a real outcome, " +
+          "not a failure.",
+      }),
+    );
   }
 
   const check = el("button", {
@@ -988,7 +1227,7 @@ async function updatesView() {
       el("h2", { text: "Updates" }),
       el("p", {
         text:
-          "Checking reads only. It resolves what the tracked reference points at and works out what your configuration would become — it writes nothing, builds nothing and switches nothing. Nothing on this screen applies an update.",
+          "Checking reads only. It resolves what the tracked reference points at and works out what your configuration would become — it writes nothing, builds nothing and switches nothing. Applying is a separate, deliberate step below the report, the same split Save and Apply already use for settings.",
       }),
       el("p", {
         class: "hint",
@@ -998,8 +1237,10 @@ async function updatesView() {
       el("div", { class: "row" }, [check]),
       pending,
       error,
+      outcome,
       log,
       report,
+      commit,
       el("section", {}, [
         el("h3", { text: "What you are trusting" }),
         el("p", {
@@ -1030,8 +1271,10 @@ async function updatesView() {
       error.textContent = problem;
     } else if (envelope.status === "never-checked") {
       renderNeverChecked(report);
+      renderCommit(null);
     } else {
       renderUpdateReport(report, envelope.report, state.catalog?.apps || {}, envelope.jobId);
+      renderCommit(envelope.report.candidate || null);
     }
   } catch (err) {
     error.textContent = err.message;
@@ -1041,14 +1284,24 @@ async function updatesView() {
   // Nothing to reattach to when this view is already following a check: a
   // click that landed while the two awaits above were outstanding has already
   // attached to the very job this finder would go looking for.
-  if (checking) return;
+  if (checking || updating) return;
 
-  // Reattach to a check still running from a previous page load. Filtered on
-  // kind as well as status, unlike the Apply view's finder above: an
-  // unfiltered one here would tail a rollback or a gc job into this screen's
-  // log and then ask /api/updates for a report that job never produced.
+  // Reattach to a check or an update still running from a previous page
+  // load. Filtered on kind as well as status, unlike the Apply view's finder
+  // above: an unfiltered one here would tail a rollback or a gc job into
+  // this screen's log and then ask /api/updates for a report that job never
+  // produced. The two kinds are found separately and attached by different
+  // handlers, because what happens when the stream ends differs -- a check
+  // has a report to fetch, an update has an outcome sentence to show and a
+  // now-stale report on screen to disown.
   try {
     const recent = await api.jobs(10);
+    const update = recent.jobs.find((j) => j.status === "running" && j.kind === "update");
+    if (update) {
+      setStatus("Reattached to an update already running.");
+      attachUpdate(update.id);
+      return;
+    }
     const running = recent.jobs.find((j) => j.status === "running" && j.kind === "check_update");
     if (running) {
       setStatus("Reattached to an update check already running.");

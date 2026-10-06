@@ -409,6 +409,14 @@ fn run_inner(
     }
     let toplevel = String::from_utf8(build_output.stdout)?.trim().to_string();
 
+    // Read immediately after the build, from the same flake directory the
+    // build just resolved, so the recorded pin is the one that produced
+    // `toplevel` rather than whatever the lock says minutes later. `None`
+    // when the flake reference is not a local directory (a remote flakeref
+    // has no on-disk lock to read) or the lock cannot be read -- see pin.rs
+    // for why that is never an error here.
+    let built_pin = built_pin_for(flake_ref);
+
     let (current, running_toplevel) = current_generation()?;
     if Path::new(&toplevel) == running_toplevel {
         // Nothing to switch. But a *prior* apply may have left the system
@@ -469,6 +477,7 @@ fn run_inner(
             toplevel: running_toplevel.display().to_string(),
             taken_at: chrono_taken_at(),
             quiesced: true,
+            built_pin: built_pin.clone(),
         };
         journal::write(&storage.journal_dir, &entry)?;
 
@@ -520,6 +529,31 @@ fn run_inner(
     ))
 }
 
+/// The `ferrum` pin the flake reference an apply just built from records.
+///
+/// R8's first criterion: a generation must carry the pin it was built from,
+/// because nothing else in the system records it -- `rollback.rs` never
+/// mentions `flake.nix`, `flake.lock` or `FERRUM_FLAKE_REF`, while every
+/// apply rebuilds from the live on-disk flake, so a rolled-back host whose
+/// pin was advanced will silently return to the rejected revision on the
+/// next unrelated settings apply. This field is what makes that detectable.
+/// It does not yet gate anything; the gate is a separate story.
+///
+/// # Arguments
+/// * `flake_ref` - the reference `nix build` was given, e.g.
+///   `/etc/ferrum#nixosConfigurations.default.config.system.build.toplevel`.
+///
+/// # Returns
+/// The pin, or `None` when the reference names no local directory (a remote
+/// flakeref has no on-disk lock to read) or the lock cannot be read.
+fn built_pin_for(flake_ref: &str) -> Option<ferrum_state::journal::Pin> {
+    let (flake_dir, _) = crate::update_check::split_flake_ref(flake_ref);
+    crate::pin::read(
+        &Path::new(&flake_dir).join("flake.lock"),
+        crate::update_candidate::FERRUM_INPUT,
+    )
+}
+
 /// Unix-seconds-as-a-string, e.g. "1770000000". Not RFC3339 -- deliberately
 /// avoids pulling in the `chrono` crate for one call site, and this format
 /// is what Task 8's VM test fixture expects, so keep it as-is.
@@ -531,6 +565,43 @@ fn chrono_taken_at() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const A_LOCK: &str = r#"{"nodes":{
+        "root":{"inputs":{"ferrum":"ferrum"}},
+        "ferrum":{"locked":{"rev":"3333333333333333333333333333333333333333",
+                            "narHash":"sha256-APPLY="}}}}"#;
+
+    /// The pin an apply records comes from the flake.lock sitting beside
+    /// the flake it built, resolved out of the SAME reference `nix build`
+    /// was given rather than from a second environment variable that could
+    /// disagree with it.
+    #[test]
+    fn the_recorded_pin_is_read_from_the_built_flakes_own_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("flake.lock"), A_LOCK).unwrap();
+        let flake_ref = format!(
+            "{}#nixosConfigurations.default.config.system.build.toplevel",
+            dir.path().display()
+        );
+        let pin = built_pin_for(&flake_ref).expect("the lock beside the flake pins ferrum");
+        assert_eq!(pin.rev, "3".repeat(40));
+        assert_eq!(pin.nar_hash, "sha256-APPLY=");
+    }
+
+    /// Anti-vacuity for the test above: it must be reading THAT directory's
+    /// lock, not any lock it can find. A reference naming a directory with
+    /// no lock records no pin rather than borrowing another one.
+    #[test]
+    fn a_flake_reference_with_no_lock_beside_it_records_no_pin() {
+        let dir = tempfile::tempdir().unwrap();
+        let flake_ref = format!(
+            "{}#nixosConfigurations.default.config.system.build.toplevel",
+            dir.path().display()
+        );
+        assert!(built_pin_for(&flake_ref).is_none());
+        // And a remote flakeref, which has no on-disk lock at all.
+        assert!(built_pin_for("github:owner/repo#nixosConfigurations.default").is_none());
+    }
 
     #[test]
     fn exit_0_with_all_units_active_is_succeeded() {

@@ -38,6 +38,11 @@ pub enum JobRequest {
     /// -- zero fields, so nothing an API caller supplies ever decides what
     /// the root process fetches.
     CheckUpdate,
+    /// The update commit. Mirrors `request::Request::Update` -- zero fields,
+    /// so nothing an API caller supplies decides what the root process
+    /// fetches, writes into flake.lock, or builds. It takes the single-job
+    /// interlock, because it builds and switches exactly as `apply` does.
+    Update,
 }
 
 fn jobs_dir() -> std::path::PathBuf {
@@ -257,6 +262,7 @@ fn request_body(req: &JobRequest) -> serde_json::Value {
         JobRequest::RestoreState => serde_json::json!({"kind": "restore_state"}),
         JobRequest::Gc => serde_json::json!({"kind": "gc"}),
         JobRequest::CheckUpdate => serde_json::json!({"kind": "check_update"}),
+        JobRequest::Update => serde_json::json!({"kind": "update"}),
     }
 }
 
@@ -1137,6 +1143,34 @@ mod tests {
             request_body(&JobRequest::CheckUpdate).to_string(),
             r#"{"kind":"check_update"}"#
         );
+        // And the commit, where the same property matters more: this is the
+        // kind that writes /etc/ferrum/flake.lock and then builds and
+        // switches the host as root. A flake ref, a revision, or a path
+        // reaching it from an API caller is the shape R2 exists to forbid.
+        assert_eq!(request_body(&JobRequest::Update).to_string(), r#"{"kind":"update"}"#);
+    }
+
+    /// The commit kind accepts no body field beyond `kind`. `request_body`
+    /// is a hand-written match, so a field an API caller sends has nowhere
+    /// to go -- asserted against the real deserializer rather than trusted,
+    /// because this is the exact bytes ferrumd writes across the privilege
+    /// boundary.
+    #[test]
+    fn the_update_kind_accepts_no_field_an_api_caller_can_send() {
+        for injected in [
+            r#"{"kind":"update"}"#,
+            r#"{"kind":"update","flakeRef":"github:attacker/evil"}"#,
+            r#"{"kind":"update","rev":"deadbeef"}"#,
+            r#"{"kind":"update","to":9}"#,
+        ] {
+            let parsed: JobRequest = serde_json::from_str(injected).unwrap();
+            assert!(matches!(parsed, JobRequest::Update), "parsed {injected} as something else");
+            assert_eq!(
+                request_body(&parsed).to_string(),
+                r#"{"kind":"update"}"#,
+                "nothing from {injected} may reach the request file"
+            );
+        }
     }
 
     #[test]
@@ -1641,7 +1675,7 @@ mod tests {
         /// `kind_takes_interlock` is asked about the string `request_body`
         /// actually writes, so this walks every variant and derives the
         /// string the same way the handler does rather than restating it.
-        /// A seventh kind added without a decision here would fail this.
+        /// An eighth kind added without a decision here would fail this.
         #[test]
         fn every_kind_but_the_read_only_check_claims_the_interlock() {
             let cases = [
@@ -1651,6 +1685,11 @@ mod tests {
                 (JobRequest::RestoreState, true),
                 (JobRequest::Gc, true),
                 (JobRequest::CheckUpdate, false),
+                // The commit builds and switches exactly as `apply` does,
+                // so it claims the interlock exactly as `apply` does. Only
+                // the read-only check is exempt, and only because a
+                // rollback must never be blocked by one.
+                (JobRequest::Update, true),
             ];
             for (req, claims) in cases {
                 let kind = request_body(&req)
