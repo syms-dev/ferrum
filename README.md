@@ -259,6 +259,85 @@ checks that the two agree — so where they disagree, the router is right.
 | GET | `/api/jobs` | Recent jobs (`?limit=`) | session |
 | GET | `/api/jobs/:id` | One job's summary and its progress events | session |
 | GET | `/api/jobs/:id/stream` | That job's progress as server-sent events | session |
+| GET | `/api/health` | Liveness. `200` as soon as the server is up | **none** |
+| GET | `/api/ready` | Readiness, with every dependency reported separately | **none** |
+
+### Health and readiness
+
+`GET /api/health` is liveness and is **dependency-free**: it touches no database, no systemd, no
+catalog and no file, and answers `200 {"status":"alive"}` as soon as ferrumd is serving. It is the
+endpoint that tells you the process is alive and the *dependency* is what is broken.
+
+`GET /api/ready` is readiness, and reports four statuses:
+
+| `status` | HTTP | Meaning |
+|----------|------|---------|
+| `ready` | 200 | Every check passed |
+| `applying` | 200 | An apply, rollback or other interlock-taking job owns the system right now; `job` carries its id |
+| `degraded` | 200 | At least one dependency failed; `checks` names which |
+| `unready` | 503 | ferrumd's own database is unusable, so nothing it does works |
+
+**A degraded answer still returns 200, so read the body.** This is deliberate and it is the
+decision that matters most here: a watcher's reflex on 503 is to restart the process, and
+restarting repairs no dependency. 503 is reserved for the one state that means *cannot serve at
+all*.
+
+**Point no watchdog, no `Restart=` policy and no alerting automation at `/api/ready`.** An apply
+switches to a new generation, and that switch can restart ferrumd while the apply is still running
+— so readiness is legitimately not `ready` during an apply. Anything that restarts ferrumd on an
+unready answer turns every apply into a restart loop. ferrum ships no `WatchdogSec=` wiring, and
+none should be added. Readiness is a thing to **read**, never a thing to act on automatically.
+
+The `applying` status is why: `AppState.interlock` already holds the UUID of the job that owns the
+system, so ferrum reports an apply in flight as its own status rather than leaving an operator to
+infer it from logs. A watcher can tell *mid-switch* from *broken* without reading anything.
+
+```json
+{ "status": "degraded", "job": null,
+  "checks": { "database":       { "ok": true,  "reason": null },
+              "catalog":        { "ok": false, "reason": "unparseable" },
+              "settingsSchema": { "ok": true,  "reason": null },
+              "systemd":        { "ok": false, "reason": "unavailable" },
+              "generation":     { "ok": true,  "reason": null } } }
+```
+
+`reason` is one of `unset`, `unreadable`, `unparseable`, `unavailable`, `unresolved`, and is
+`null` on a passing check.
+
+#### What readiness does **not** check
+
+An undocumented health endpoint manufactures false confidence rather than removing it, so this
+list is part of the feature. A green `/api/ready` means ferrumd's own dependencies answered. It
+does **not** mean:
+
+- that any app is running, serving or reachable — readiness asks nothing about Sonarr, Plex,
+  qBittorrent or any other unit;
+- that the qBittorrent VPN kill switch is intact, or that any app's network namespace is correct;
+- that the media pool is mounted, that every mergerfs branch is present, or that there is free
+  space;
+- that nginx, Authelia, ACME or DNS are healthy;
+- that the catalog and settings schema are *semantically* usable — the check is "readable and
+  parseable" only;
+- that polkit would authorize an apply — the systemd check proves the bus is reachable, never that
+  `StartUnit` would be permitted;
+- that the last apply succeeded, or that the running generation is good.
+
+Every check is taken live, per request; no answer in the body is a cached or last-known reading.
+
+#### Reachability and what they disclose
+
+Both routes are **unauthenticated** — the only `/api/` routes besides login, logout and sso that
+are — and on a published host both bypass Authelia's forward-auth at the proxy. A health endpoint
+behind SSO is not secured, it is broken: a monitor follows the redirect to the portal, receives the
+portal's own HTML with a `200`, and reports a dead box healthy forever. On a tunnel-only host (no
+`ferrum.proxy.baseDomain`) there is no vhost at all and both are reachable only through the SSH
+tunnel, unchanged.
+
+Because they are unauthenticated, the response body is a **closed vocabulary**: the status words,
+the fixed check names, booleans, the fixed reason words, and the UUID of an apply in flight. No
+path, hostname, version, generation number, secret name or error string ever reaches it. Both
+locations are rate-limited at the proxy (60/min, burst 10) because every readiness probe does real
+work.
 
 `GET /api/updates` serves a document ferrum-apply's `check_update` job wrote; ferrumd only reads
 it, and runs no `nix` of its own. It answers `200` with

@@ -9,6 +9,38 @@
 use axum::{http::StatusCode, response::IntoResponse, Json};
 use serde_json::Value;
 
+/// Which of the three ways reading an environment-named JSON document can
+/// fail -- the discriminant alone, carrying no message and naming no path.
+///
+/// Separating the discriminant from the message is what lets two callers
+/// with opposite disclosure rules share ONE vocabulary. `get_catalog` is
+/// session-gated and serves the MESSAGE, because an operator fixing the host
+/// needs the real variable and the real path. `health.rs` answers an
+/// UNAUTHENTICATED caller and serves only this discriminant. The alternative
+/// -- a second, hand-written set of reason strings in `health.rs` -- is a
+/// vocabulary nothing forces to agree with this one, and the two would drift
+/// the first time a failure mode was added here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JsonDocumentFault {
+    /// The environment variable itself is not set.
+    Unset,
+    /// The variable names a path that could not be read.
+    Unreadable,
+    /// The file was read in full, and is not valid JSON.
+    Unparseable,
+}
+
+/// One failure to read an environment-named JSON document: which fault it
+/// was, and the operator-facing sentence describing it.
+#[derive(Debug, Clone)]
+pub struct JsonDocumentError {
+    /// The machine-readable discriminant. Safe to disclose to anyone.
+    pub fault: JsonDocumentFault,
+    /// The human-readable sentence, naming the real variable and the real
+    /// path. NEVER safe to hand an unauthenticated caller.
+    pub message: String,
+}
+
 /// Reads one JSON document named by an environment variable, distinguishing
 /// the three ways it can fail.
 ///
@@ -18,11 +50,29 @@ use serde_json::Value;
 /// something was uninstalled. `settings.rs::validate_against_schema`
 /// established this error style for `$FERRUM_SETTINGS_SCHEMA`; this matches
 /// it deliberately rather than inventing a second one.
-fn read_json_from_env(var: &str) -> Result<Value, String> {
-    let path = std::env::var(var).map_err(|_| format!("{var} not set"))?;
-    let raw = std::fs::read_to_string(&path)
-        .map_err(|e| format!("failed to read {var} at {path}: {e}"))?;
-    serde_json::from_str(&raw).map_err(|e| format!("{var} at {path} is not valid JSON: {e}"))
+///
+/// # Arguments
+/// * `var` - the environment variable naming the document's path.
+///
+/// # Returns
+/// The parsed JSON document.
+///
+/// # Errors
+/// A `JsonDocumentError` whose `fault` says which of unset, unreadable or
+/// unparseable occurred, and whose `message` says the same thing in words.
+pub fn read_json_from_env(var: &str) -> Result<Value, JsonDocumentError> {
+    let path = std::env::var(var).map_err(|_| JsonDocumentError {
+        fault: JsonDocumentFault::Unset,
+        message: format!("{var} not set"),
+    })?;
+    let raw = std::fs::read_to_string(&path).map_err(|e| JsonDocumentError {
+        fault: JsonDocumentFault::Unreadable,
+        message: format!("failed to read {var} at {path}: {e}"),
+    })?;
+    serde_json::from_str(&raw).map_err(|e| JsonDocumentError {
+        fault: JsonDocumentFault::Unparseable,
+        message: format!("{var} at {path} is not valid JSON: {e}"),
+    })
 }
 
 /// Builds the catalog document: the built catalog with the settings schema
@@ -35,8 +85,10 @@ fn read_json_from_env(var: &str) -> Result<Value, String> {
 /// catalog its own binary no longer matches. The cost is two file reads on an
 /// endpoint a human drives, which is not worth optimising away.
 pub fn build_catalog() -> Result<Value, String> {
-    let mut catalog = read_json_from_env("FERRUM_CATALOG")?;
-    let schema = read_json_from_env("FERRUM_SETTINGS_SCHEMA")?;
+    // The message, not the fault: this document is served to a session-gated
+    // caller, who is entitled to know which path on their own host is broken.
+    let mut catalog = read_json_from_env("FERRUM_CATALOG").map_err(|e| e.message)?;
+    let schema = read_json_from_env("FERRUM_SETTINGS_SCHEMA").map_err(|e| e.message)?;
 
     let obj = catalog
         .as_object_mut()

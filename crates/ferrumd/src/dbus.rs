@@ -148,6 +148,33 @@ pub async fn start_ferrum_apply_unit(uuid: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Whether the system bus answers at all, within a bounded wait.
+///
+/// The readiness probe's systemd check. It opens a connection and discards
+/// it, rather than calling a method: the one method ferrumd really needs is
+/// `StartUnit`, which is privileged, polkit-gated, and would actually START
+/// something -- so a probe cannot exercise it, and readiness deliberately
+/// does not claim to. What a successful connect does prove is the half that
+/// fails in practice: that the bus socket exists, that it is accepting, and
+/// that the unprivileged `ferrum` user can authenticate to it. `main.rs`
+/// already treats "systemd did not answer" as a real startup state worth
+/// printing a warning about; this is the steady-state form of that question.
+///
+/// Bounded because the caller is UNAUTHENTICATED (`health.rs`). An unbounded
+/// connect would let anyone who can reach the endpoint park a request -- and
+/// a tokio task, and a half-open socket -- in ferrumd per probe, against a
+/// bus that is hung rather than refusing. Timing out IS the answer here:
+/// a bus that cannot answer inside the deadline cannot serve an apply either.
+///
+/// # Arguments
+/// * `within` - how long to wait before calling the bus unreachable.
+///
+/// # Returns
+/// `true` if a system bus connection was established inside `within`.
+pub async fn system_bus_is_reachable(within: std::time::Duration) -> bool {
+    matches!(tokio::time::timeout(within, Connection::system()).await, Ok(Ok(_)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

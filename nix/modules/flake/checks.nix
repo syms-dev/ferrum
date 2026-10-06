@@ -807,6 +807,28 @@
           loginLoc = locOf "/api/login";
           hasIn = needle: hay: lib.hasInfix needle hay;
 
+          # ROAD-TO-PUBLIC item 22. The ONLY daemon-vhost locations that are
+          # allowed to reach ferrumd without Authelia in front of them, named
+          # one by one.
+          #
+          # `/authelia` is the forward-auth subrequest itself (it is `internal`
+          # and cannot be requested from outside) and `@ferrum_api_401` is a
+          # named error location, so neither is a reachable bypass. The two
+          # health paths are, and that is the deliberate decision recorded in
+          # modules/proxy/nginx.nix: a health endpoint behind SSO answers a
+          # monitor with the portal's own 200 and reports a dead box healthy.
+          healthLocationNames = [ "= /api/health" "= /api/ready" ];
+          authExemptLocations = healthLocationNames ++ [ "/authelia" "@ferrum_api_401" ];
+          # Every location that reaches the daemon WITHOUT forward-auth, minus
+          # the ones named above. This is the general form of the /api/login
+          # guard below -- that one catches a single known path losing its
+          # auth_request, this catches ANY new location being added without
+          # one, which is the mistake the health endpoints make cheap.
+          unexpectedlyUnauthed = builtins.filter
+            (loc: !(builtins.elem loc authExemptLocations)
+              && !(hasIn "auth_request /authelia" (locOf loc)))
+            (builtins.attrNames (if daemonV == null then { } else daemonV.locations or { }));
+
           # The daemon vhost's SERVER-level config, and the http-level block
           # every vhost inherits. Both are read because nginx's add_header
           # makes them interdependent in a way that reading either alone
@@ -1416,6 +1438,26 @@
             ++ lib.optional (daemonV != null && (daemonV.locations."/api/login" or null) != null
                 && !(hasIn "error_page 401 = @ferrum_api_401" loginLoc))
               "the daemon vhost's /api/login does not override the 401 redirect, so the SPA's own login request comes back as an opaque cross-origin redirect instead of a readable 401 (D8/M-02)"
+            # ROAD-TO-PUBLIC item 22, all four legs.
+            #
+            # The health endpoints are the first locations on this vhost that
+            # Authelia deliberately does not gate, which makes "a location
+            # with no auth_request" stop being self-evidently a bug. These
+            # assertions are what keeps it from becoming a place to hide one:
+            # the exemption is a NAMED LIST, not a shape.
+            ++ lib.optional (daemonV != null
+                && !(builtins.all (loc: (daemonV.locations.${loc} or null) != null) healthLocationNames))
+              "the daemon vhost does not publish ${lib.concatStringsSep " and " healthLocationNames}, so an external monitor has no way to ask this host whether it is well -- which was the whole of ROAD-TO-PUBLIC item 22"
+            ++ lib.optional (daemonV != null
+                && builtins.any (loc: hasIn "auth_request" (locOf loc)) healthLocationNames)
+              "a health endpoint is behind forward-auth. That does not secure it, it breaks it: a monitor follows the 302 to the Authelia portal, gets the portal's own HTML with a 200, and reports this box healthy forever -- including while ferrumd is down (item 22)"
+            ++ lib.optional (daemonV != null
+                && !(builtins.all (loc: hasIn "limit_req zone=ferrum_health" (locOf loc)) healthLocationNames))
+              "a health endpoint has no rate limit, though it is unauthenticated and every readiness probe does real work (a SQLite query, two JSON parses, a D-Bus connect) -- so anyone on the internet can use it to amplify load against the daemon (item 22)"
+            ++ lib.optional (!(hasIn "limit_req_zone $binary_remote_addr zone=ferrum_health" commonHttp))
+              "limit_req zone=ferrum_health is referenced but the zone is never declared in http context, so nginx refuses the WHOLE config file at nginx.service start -- every vhost on the host down after a successful apply (item 22)"
+            ++ lib.optional (unexpectedlyUnauthed != [ ])
+              "these daemon-vhost locations reach ferrumd with NO forward-auth and are not on the exemption list: ${lib.concatStringsSep ", " unexpectedlyUnauthed}. A longer or exact-match location wins in nginx, so adding one without auth_request publishes whatever it proxies to, unauthenticated. If it is deliberate, add it to authExemptLocations here and say why (A2/item 22)"
             # H-03, all three directions.
             ++ lib.optional (authOffFailures == [ ])
               "a host with ferrum.proxy.enable, a real ferrum.proxy.baseDomain and ferrum.auth.enable = false evaluates cleanly: the control plane is published on a real ACME certificate with auth_request absent entirely, and nothing tells the operator. ferrum.auth.enable is an mkEnableOption (default FALSE) while ferrum.daemon.enable defaults to TRUE, so this is the configuration a host reaches by doing nothing (H-03)"
