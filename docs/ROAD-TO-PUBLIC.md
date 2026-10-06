@@ -619,12 +619,34 @@ Items that analysis surfaced about **ferrum**, not about the projects analysed:
       explicit override is a feature no competitor has.
 - [ ] **26e. TRaSH Guides deserves its own analysis.** Arguably more load-bearing for our app layer
       than PMS — it is the \*arr configuration bible and we ship \*arr apps with defaults.
-- [ ] **26. The SSO lockout path is undocumented.** The dashboard is behind Authelia as of F5. The
-      console password and the SSH tunnel both exist, and `POST /api/sso` correctly 404s on
-      tunnel-only hosts — but none of it is written down, and it is the highest-severity
-      undocumented failure mode in the product. Better still, and uniquely available to a
-      declarative system: **`preflight` should hard-fail an apply whose resulting generation leaves
-      no reachable authentication path**, with rollback still available and nothing yet changed.
+- [~] **26. The SSO lockout path is undocumented.** The preflight half is **DONE**; the prose half
+      is not. `crates/ferrum-apply/src/way_in.rs` refuses an apply whose resulting generation leaves
+      no way back in, wired into the apply gate beside `pin_gate` — before anything is built,
+      stopped, snapshotted or switched. README gained "Apply refuses to lock you out".
+      - **It refuses only when EVERY route is shut at once**: the console password
+        (`users.mutableUsers = false` AND no declared root password, so the password
+        `ferrum-apply` writes is erased by that activation) AND SSH (sshd off, or its port
+        firewalled, or no account that can reach a shell has a key or a usable password). Either
+        alone is a legitimate configuration and is never refused.
+      - **The dashboard is deliberately not counted as a route.** It cannot restore SSH or a
+        console password — those live in `custom/`, which it does not write — and a dashboard that
+        is merely broken is exactly what the SSH tunnel is documented as the answer to. A gate that
+        fired on a degraded host would teach operators to bypass it.
+      - **Unknown is not closed.** Hand-written firewall `ACCEPT` rules, an `AuthorizedKeysCommand`,
+        an unreadable authorized-keys file, a `nix eval` that did not answer: each proceeds.
+      - **Passable, the way the pin gate is passable** — `--accept-no-way-in <token>`, where the
+        token names which routes were found shut, so an acknowledgement of one lockout cannot pass
+        a different one.
+      - **Two defects only real `nix eval` output could find**, both of which passed every
+        hand-written test first: `toString u.shell` yields the shell PACKAGE's store directory, so
+        all fifty-odd system users looked like they had a login shell called `shadow-4.18.0`; and
+        `networking.firewall.extraCommands` is non-empty on EVERY stock NixOS host (nixpkgs' own
+        nat module appends a teardown block to it), so reading it as "rules this check cannot see"
+        made the firewall arm permanently dead. The captured documents are now regression fixtures
+        under `crates/ferrum-apply/src/way_in_fixtures/`.
+      - **Still open:** the prose half. `POST /api/sso` correctly 404s on tunnel-only hosts and the
+        console password and SSH tunnel both exist, but the SSO lockout path itself is still
+        written down nowhere.
 
 ---
 

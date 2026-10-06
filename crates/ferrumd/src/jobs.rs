@@ -42,9 +42,25 @@ pub enum JobRequest {
     /// could only fail to match -- but a field that crosses the privilege
     /// boundary is checked on the way in regardless, and the operator gets
     /// a readable 400 instead of a job that fails for no visible reason.
+    ///
+    /// `acceptNoWayIn` is the operator's acknowledgement that the
+    /// generation this apply would produce leaves no way back into the
+    /// machine (ROAD-TO-PUBLIC 26), naming the lockout exactly; absent on
+    /// every apply that is not passing that gate.
+    ///
+    /// Validated as a short token of `[a-z0-9+-]` here, at the boundary,
+    /// before it is written into the request file. Deliberately a SHAPE
+    /// check rather than a copy of the three tokens `way_in` can issue: the
+    /// privileged side compares it for equality against the token it
+    /// computed itself and does nothing else with it, so a value that
+    /// matches nothing can only leave the gate closed -- while a hardcoded
+    /// list here would be a second authority on which lockouts exist, free
+    /// to drift from the one that decides.
     Apply {
         #[serde(default, rename = "acceptPinChange")]
         accept_pin_change: Option<String>,
+        #[serde(default, rename = "acceptNoWayIn")]
+        accept_no_way_in: Option<String>,
     },
     Rollback { to: u32 },
     RestoreState,
@@ -282,6 +298,24 @@ pub fn is_full_revision(rev: &str) -> bool {
     rev.len() == 40 && rev.chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
 }
 
+/// True when `token` has the shape of a way-in refusal's acknowledgement.
+///
+/// `way_in::Refusal::accept_token` is a `+`-joined list of stable,
+/// lowercase reason codes (`console-locked+ssh-disabled`). This recognises
+/// that alphabet and a sane length and nothing more, for the reason given
+/// on `JobRequest::Apply`: the token decides nothing on the privileged
+/// side, so the boundary's job is to keep shell metacharacters, path
+/// components and unbounded strings out of the request file -- not to be a
+/// second opinion about which lockouts exist.
+///
+/// # Arguments
+/// * `token` - the candidate value.
+pub fn is_way_in_token(token: &str) -> bool {
+    !token.is_empty()
+        && token.len() <= 64
+        && token.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '+')
+}
+
 /// The exact JSON `ferrum-apply run-request` parses back out of the request
 /// file. Kept as an explicit match rather than a `Serialize` derive so the
 /// wire format ferrumd writes across the privilege boundary is spelled out
@@ -295,9 +329,20 @@ fn request_body(req: &JobRequest) -> serde_json::Value {
         // `{"kind":"apply"}` it always has -- and `request_kind_in`, which
         // reads this file back to decide who holds the interlock, sees no
         // change at all.
-        JobRequest::Apply { accept_pin_change: None } => serde_json::json!({"kind": "apply"}),
-        JobRequest::Apply { accept_pin_change: Some(rev) } => {
-            serde_json::json!({"kind": "apply", "accept_pin_change": rev})
+        JobRequest::Apply { accept_pin_change, accept_no_way_in } => {
+            let mut body = serde_json::json!({"kind": "apply"});
+            // Each acknowledgement is written only when there is one, so an
+            // ordinary apply crosses as the byte-identical
+            // `{"kind":"apply"}` it always has -- and `request_kind_in`,
+            // which reads this file back to decide who holds the interlock,
+            // sees no change at all.
+            if let Some(rev) = accept_pin_change {
+                body["accept_pin_change"] = serde_json::json!(rev);
+            }
+            if let Some(token) = accept_no_way_in {
+                body["accept_no_way_in"] = serde_json::json!(token);
+            }
+            body
         }
         JobRequest::Rollback { to } => serde_json::json!({"kind": "rollback", "to": to}),
         JobRequest::RestoreState => serde_json::json!({"kind": "restore_state"}),
@@ -376,12 +421,24 @@ async fn create_job_in(
     // the on-disk lock already names -- but checking a crossing value at the
     // boundary costs one line and turns a job that silently refuses into a
     // 400 the operator can read.
-    if let JobRequest::Apply { accept_pin_change: Some(rev) } = &req {
-        if !is_full_revision(rev) {
+    if let JobRequest::Apply { accept_pin_change, accept_no_way_in } = &req {
+        if accept_pin_change.as_deref().is_some_and(|rev| !is_full_revision(rev)) {
             audit_job("denied", &format!("kind={kind} acceptPinChange is not a revision"));
             return (
                 StatusCode::BAD_REQUEST,
                 "acceptPinChange must be a full 40-character lowercase hex revision",
+            )
+                .into_response();
+        }
+        // ROAD-TO-PUBLIC 26, same discipline: a string an authenticated
+        // operator supplies that becomes a field in the request file has
+        // its shape checked before it crosses.
+        if accept_no_way_in.as_deref().is_some_and(|token| !is_way_in_token(token)) {
+            audit_job("denied", &format!("kind={kind} acceptNoWayIn is not a lockout token"));
+            return (
+                StatusCode::BAD_REQUEST,
+                "acceptNoWayIn must be the lockout token the refusal named, of lowercase \
+                 letters, digits, '-' and '+'",
             )
                 .into_response();
         }
@@ -1183,7 +1240,7 @@ mod tests {
         // own #[serde(tag = "kind", rename_all = "snake_case")] enum accepts;
         // its own tests assert the parse side.
         assert_eq!(request_body(&JobRequest::Preflight).to_string(), r#"{"kind":"preflight"}"#);
-        assert_eq!(request_body(&JobRequest::Apply { accept_pin_change: None }).to_string(), r#"{"kind":"apply"}"#);
+        assert_eq!(request_body(&JobRequest::Apply { accept_pin_change: None, accept_no_way_in: None }).to_string(), r#"{"kind":"apply"}"#);
         assert_eq!(
             request_body(&JobRequest::Rollback { to: 42 }).to_string(),
             r#"{"kind":"rollback","to":42}"#
@@ -1531,7 +1588,7 @@ mod tests {
                 requests.path(),
                 Err(anyhow::anyhow!("unused")),
                 shared.clone(),
-                JobRequest::Apply { accept_pin_change: None },
+                JobRequest::Apply { accept_pin_change: None, accept_no_way_in: None },
             )
             .await;
             assert_eq!(
@@ -1579,7 +1636,7 @@ mod tests {
                 requests.path(),
                 Err(anyhow::anyhow!("unused")),
                 shared.clone(),
-                JobRequest::Apply { accept_pin_change: None },
+                JobRequest::Apply { accept_pin_change: None, accept_no_way_in: None },
             )
             .await;
             assert_ne!(
@@ -1605,7 +1662,7 @@ mod tests {
             let (_status, _body, written) = dispatch(
                 requests.path(),
                 Err(anyhow::anyhow!("unused")),
-                JobRequest::Apply { accept_pin_change: Some(rev.clone()) },
+                JobRequest::Apply { accept_pin_change: Some(rev.clone()), accept_no_way_in: None },
             )
             .await;
             // The D-Bus start fails here (no system bus), and that path
@@ -1614,7 +1671,7 @@ mod tests {
             // the rollback case.
             assert!(written.is_empty() || written.len() == 1);
             let body =
-                request_body(&JobRequest::Apply { accept_pin_change: Some(rev.clone()) });
+                request_body(&JobRequest::Apply { accept_pin_change: Some(rev.clone()), accept_no_way_in: None });
             assert_eq!(body["kind"], "apply");
             assert_eq!(body["accept_pin_change"], rev);
 
@@ -1622,8 +1679,98 @@ mod tests {
             // byte-identical document every ferrum before R8 wrote, so
             // `request_kind_in` -- which reads this file back to decide who
             // holds the interlock -- sees no change at all.
-            let plain = request_body(&JobRequest::Apply { accept_pin_change: None });
+            let plain = request_body(&JobRequest::Apply { accept_pin_change: None, accept_no_way_in: None });
             assert_eq!(plain.to_string(), r#"{"kind":"apply"}"#);
+        }
+
+        /// ROAD-TO-PUBLIC 26: an acknowledged lockout crosses the
+        /// boundary as the token it named, and an apply with nothing to
+        /// acknowledge still crosses as the byte-identical document every
+        /// ferrum before this wrote -- which matters because
+        /// `request_kind_in` reads that file back to decide who holds the
+        /// single-job interlock.
+        #[test]
+        fn an_acknowledged_lockout_crosses_the_boundary_as_the_token_it_named() {
+            let body = request_body(&JobRequest::Apply {
+                accept_pin_change: None,
+                accept_no_way_in: Some("console-locked+ssh-disabled".to_string()),
+            });
+            assert_eq!(body["kind"], "apply");
+            assert_eq!(body["accept_no_way_in"], "console-locked+ssh-disabled");
+            assert!(body.get("accept_pin_change").is_none());
+
+            // Both at once, because the two gates are independent and an
+            // operator can meet them on the same apply.
+            let both = request_body(&JobRequest::Apply {
+                accept_pin_change: Some("2".repeat(40)),
+                accept_no_way_in: Some("console-locked+ssh-firewalled".to_string()),
+            });
+            assert_eq!(both["accept_pin_change"], "2".repeat(40));
+            assert_eq!(both["accept_no_way_in"], "console-locked+ssh-firewalled");
+
+            let plain = request_body(&JobRequest::Apply {
+                accept_pin_change: None,
+                accept_no_way_in: None,
+            });
+            assert_eq!(plain.to_string(), r#"{"kind":"apply"}"#);
+        }
+
+        /// A lockout acknowledgement that is not a token is refused at the
+        /// boundary, before it reaches the request file at all.
+        #[tokio::test]
+        async fn a_lockout_acknowledgement_that_is_not_a_token_is_refused_before_it_crosses() {
+            for bad in [
+                "",
+                "console locked",                        // a space
+                "console-locked; rm -rf /",              // shell metacharacters
+                "../../etc/ferrum",                      // a path
+                "CONSOLE-LOCKED",                        // upper case
+                "console-locked\n+ssh-disabled",         // a newline
+                &"a".repeat(65),                         // unbounded
+            ] {
+                let requests = tempfile::tempdir().unwrap();
+                let (status, body, written) = dispatch(
+                    requests.path(),
+                    Err(anyhow::anyhow!("unused")),
+                    JobRequest::Apply {
+                        accept_pin_change: None,
+                        accept_no_way_in: Some(bad.to_string()),
+                    },
+                )
+                .await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{bad:?} was not refused: {body}");
+                assert!(body.contains("acceptNoWayIn"), "{bad:?}: {body}");
+                assert!(
+                    written.is_empty(),
+                    "{bad:?} must not reach the request file at all, got {written:?}"
+                );
+            }
+        }
+
+        /// The anti-vacuity half: every token `way_in` can actually issue
+        /// passes the shape check. Without this, a guard that rejected
+        /// everything would pass the test above and silently make the gate
+        /// impassable -- which is strictly worse than not having it.
+        #[tokio::test]
+        async fn every_real_lockout_token_passes_the_shape_check() {
+            for good in [
+                "console-locked+ssh-disabled",
+                "console-locked+ssh-firewalled",
+                "console-locked+ssh-no-credential",
+            ] {
+                assert!(is_way_in_token(good), "{good} is a token ferrum-apply issues");
+                let requests = tempfile::tempdir().unwrap();
+                let (status, body, _) = dispatch(
+                    requests.path(),
+                    Err(anyhow::anyhow!("unused")),
+                    JobRequest::Apply {
+                        accept_pin_change: None,
+                        accept_no_way_in: Some(good.to_string()),
+                    },
+                )
+                .await;
+                assert_ne!(status, StatusCode::BAD_REQUEST, "{good} must pass: {body}");
+            }
         }
 
         /// A value that is not a revision is refused at the boundary, with
@@ -1643,7 +1790,7 @@ mod tests {
                 let (status, body, written) = dispatch(
                     requests.path(),
                     Err(anyhow::anyhow!("unused")),
-                    JobRequest::Apply { accept_pin_change: Some(bad.to_string()) },
+                    JobRequest::Apply { accept_pin_change: Some(bad.to_string()), accept_no_way_in: None },
                 )
                 .await;
                 assert_eq!(status, StatusCode::BAD_REQUEST, "{bad:?} was not refused: {body}");
@@ -1664,7 +1811,10 @@ mod tests {
             let (status, body, _) = dispatch(
                 requests.path(),
                 Err(anyhow::anyhow!("unused")),
-                JobRequest::Apply { accept_pin_change: Some("0a9f3b2".to_string() + &"c".repeat(33)) },
+                JobRequest::Apply {
+                    accept_pin_change: Some("0a9f3b2".to_string() + &"c".repeat(33)),
+                    accept_no_way_in: None,
+                },
             )
             .await;
             assert_ne!(status, StatusCode::BAD_REQUEST, "a real revision must pass: {body}");
@@ -1853,7 +2003,7 @@ mod tests {
 
             let cases = [
                 (JobRequest::Preflight, true),
-                (JobRequest::Apply { accept_pin_change: None }, true),
+                (JobRequest::Apply { accept_pin_change: None, accept_no_way_in: None }, true),
                 (JobRequest::Rollback { to: 3 }, true),
                 (JobRequest::RestoreState, true),
                 (JobRequest::Gc, true),
