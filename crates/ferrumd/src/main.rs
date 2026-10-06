@@ -150,12 +150,7 @@ async fn login_handler(
     };
     match outcome {
         Ok(auth::LoginOutcome::Success(result)) => {
-            let mut cookie = Cookie::new(SESSION_COOKIE, result.session_token);
-            cookie.set_http_only(true);
-            cookie.set_same_site(tower_cookies::cookie::SameSite::Strict);
-            cookie.set_path("/");
-            cookie.set_secure(true);
-            cookies.add(cookie);
+            cookies.add(session_cookie(result.session_token));
             audit::record("login", "success", &username, &client, "");
             (StatusCode::OK, Json(LoginResponse { csrf_token: result.csrf_token })).into_response()
         }
@@ -182,6 +177,38 @@ async fn login_handler(
             (StatusCode::INTERNAL_SERVER_ERROR, "login failed").into_response()
         }
     }
+}
+
+/// The session cookie, built once for every route that issues one.
+///
+/// M-01. There are two such routes -- `login_handler` and `sso.rs`'s
+/// `sso_handler` -- and until this function existed each built the cookie
+/// itself, with a byte-identical attribute set and no mechanism holding the
+/// two spellings together. `auth::create_session` was extracted for exactly
+/// this duplication risk on the database-row side; the cookie side was
+/// missed.
+///
+/// Every attribute here is a security control and all of them are explained
+/// on [`SESSION_COOKIE`]: the `__Host-` prefix is only a prefix if the
+/// cookie is also `Secure` with `Path=/` and no `Domain`, and a browser that
+/// refuses the cookie refuses it silently -- the response is still a `200`.
+/// `the_sso_session_cookie_carries_the_same_attributes_as_the_login_one` and
+/// `the_session_cookie_is_host_prefixed_secure_and_carries_no_domain` assert
+/// the result on the wire for both routes, because a shared builder nobody
+/// is obliged to call is not itself a guarantee.
+///
+/// # Arguments
+/// * `token` - the session token the cookie carries.
+///
+/// # Returns
+/// The cookie, ready to hand to `tower_cookies::Cookies::add`.
+fn session_cookie(token: String) -> Cookie<'static> {
+    let mut cookie = Cookie::new(SESSION_COOKIE, token);
+    cookie.set_http_only(true);
+    cookie.set_secure(true);
+    cookie.set_same_site(tower_cookies::cookie::SameSite::Strict);
+    cookie.set_path("/");
+    cookie
 }
 
 /// The cookie `logout_handler` hands to `tower_cookies::Cookies::remove`.
@@ -471,6 +498,26 @@ async fn require_session(
     // at Authelia would leave this session usable for the rest of its idle
     // window -- the exact thing R5's own edge case names -- and a change of
     // Authelia identity would leave the previous one's session in place.
+    //
+    // L-02. "Every request" is the literal truth and NOT the whole bound, and
+    // the difference is worth stating rather than leaving a reader to infer
+    // the stronger claim. `GET /api/jobs/:id/stream` is ONE request that then
+    // lives for the duration of an apply: this middleware authorises it when
+    // the SSE connection opens, and `jobs::stream_job` yields from there on
+    // without re-entering anything here. So an Authelia logout does not end
+    // an ALREADY-OPEN progress stream; it takes effect on the next request,
+    // including every reconnect of that same stream.
+    //
+    // Left as it is rather than re-verified inside the stream loop, on two
+    // grounds. What survives is apply-progress text for a job the operator
+    // had already been authorised to watch -- no mutation is reachable from
+    // the stream, and every mutating route goes through this function again.
+    // And a periodic re-verify inside the loop would contradict the
+    // `Unavailable`-is-503 reasoning four paragraphs down: it would hand an
+    // Authelia that restarts mid-apply the power to cut the operator's view
+    // of that apply, which is the precise failure this file already refuses
+    // to build. The bound is "one apply", not "forever", because the stream
+    // ends when the job does.
     //
     // A password session never reaches this branch. That is what keeps the
     // SSH-tunnel recovery route independent of the proxy it exists to survive:
@@ -1257,6 +1304,174 @@ mod tests {
             auth::SessionOrigin::Authelia,
             "the session must record that Authelia is what vouched for it, or require_session \
              will never re-check it and an Authelia logout leaves it live"
+        );
+    }
+
+    /// M-01. The SAME assertions
+    /// `the_session_cookie_is_host_prefixed_secure_and_carries_no_domain`
+    /// makes about `/api/login`, made about `/api/sso`.
+    ///
+    /// Both routes mint the same session cookie, and until this test existed
+    /// only one of them had its attributes pinned by anything: every other
+    /// SSO test reads the cookie through `session_cookie_of`, which keeps the
+    /// value and throws the attributes away. Dropping `Secure` or
+    /// `SameSite=Strict` from `sso_handler` alone was measured to leave the
+    /// whole 993-test suite green -- so the shared builder those two handlers
+    /// now call is only half the fix, and this is the half that fails when
+    /// somebody stops calling it.
+    ///
+    /// Asserted on the wire for the reason the login test gives: these are
+    /// attributes the BROWSER enforces, and a `__Host-` cookie missing
+    /// `Secure` is not a weaker cookie but a cookie that is never stored --
+    /// which, on this route, silently ends single sign-on.
+    #[tokio::test]
+    async fn the_sso_session_cookie_carries_the_same_attributes_as_the_login_one() {
+        let (_dir, state, _fake) = with_sso(sso::testing::authenticated_as("admin"));
+        let response =
+            post_sso(state.clone(), &[("Cookie", "ferrum_control_session=opaque")]).await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let set_cookie = response
+            .headers()
+            .get(axum::http::header::SET_COOKIE)
+            .expect("a successful SSO exchange must set the session cookie")
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        assert!(
+            set_cookie.starts_with(&format!("{SESSION_COOKIE}=")),
+            "the SSO session cookie must be the __Host- prefixed name: {set_cookie}"
+        );
+        assert!(set_cookie.contains("Secure"), "__Host- requires Secure: {set_cookie}");
+        assert!(set_cookie.contains("HttpOnly"), "{set_cookie}");
+        assert!(set_cookie.contains("SameSite=Strict"), "{set_cookie}");
+        assert!(set_cookie.contains("Path=/"), "__Host- requires Path=/: {set_cookie}");
+        assert!(
+            !set_cookie.to_ascii_lowercase().contains("domain="),
+            "a __Host- cookie carrying Domain is refused by every browser, which \
+             would make SSO appear to succeed and log nobody in: {set_cookie}"
+        );
+    }
+
+    /// M-02. With every exchange slot occupied, a further `/api/sso` call is
+    /// SHED rather than queued -- and shed before Authelia is touched.
+    ///
+    /// The fake here answers `200` for everybody, so there is exactly one way
+    /// this assertion can hold: the handler refused before it ever asked. An
+    /// unbounded handler returns `200` and a session cookie, which is what
+    /// the finding describes -- `/api/sso` is unauthenticated, sits under
+    /// nginx's generic `/api/` location with no `limit_req`, and opens a
+    /// fresh socket to Authelia per call.
+    ///
+    /// The second half is the anti-vacuity half: once the slots are released
+    /// the IDENTICAL request succeeds, so the test cannot pass by the route
+    /// being broken, by SSO being unconfigured, or by the fixture refusing
+    /// everyone.
+    #[tokio::test]
+    async fn an_sso_exchange_is_shed_when_every_bulkhead_slot_is_busy() {
+        let (_dir, state, _fake) = with_sso(sso::testing::authenticated_as("admin"));
+        let held = state.sso.as_ref().unwrap().hold_exchange_slots(sso::SSO_MAX_IN_FLIGHT);
+
+        let shed = post_sso(state.clone(), &[("Cookie", "ferrum_control_session=opaque")]).await;
+        assert_eq!(
+            shed.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a saturated /api/sso must shed, not queue and not serve"
+        );
+        assert!(
+            session_cookie_of(&shed).is_none(),
+            "a shed exchange must not mint a session -- if it did, the bulkhead was decorative"
+        );
+
+        drop(held);
+        let served = post_sso(state.clone(), &[("Cookie", "ferrum_control_session=opaque")]).await;
+        assert_eq!(
+            served.status(),
+            StatusCode::OK,
+            "the same request must succeed once a slot frees, or this test proves nothing"
+        );
+        assert!(session_cookie_of(&served).is_some());
+    }
+
+    /// The bound is [`sso::SSO_MAX_IN_FLIGHT`], not one.
+    ///
+    /// Without this, a bulkhead accidentally sized at a single permit would
+    /// satisfy the test above exactly as well while serialising every
+    /// operator's sign-in behind every other one's five-second Authelia
+    /// timeout. Holds one fewer slot than the limit and requires the next
+    /// exchange to be served.
+    #[tokio::test]
+    async fn the_sso_bulkhead_admits_up_to_its_stated_limit() {
+        // A const block rather than a runtime assert, because the operand is
+        // a constant and clippy is right that checking it at runtime is
+        // theatre. It is also strictly stronger: resizing the bulkhead to one
+        // now fails the BUILD rather than one test.
+        const { assert!(sso::SSO_MAX_IN_FLIGHT > 1, "a bulkhead of one is a lock, not a bulkhead") };
+        let (_dir, state, _fake) = with_sso(sso::testing::authenticated_as("admin"));
+        let _held = state.sso.as_ref().unwrap().hold_exchange_slots(sso::SSO_MAX_IN_FLIGHT - 1);
+
+        let response =
+            post_sso(state.clone(), &[("Cookie", "ferrum_control_session=opaque")]).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "the last free slot must still be served: the limit is a ceiling on concurrency, \
+             not a ration on sign-ins"
+        );
+    }
+
+    /// A slot is given back when the exchange finishes, so the bulkhead
+    /// bounds CONCURRENCY and not a lifetime total.
+    ///
+    /// The sharpest way for M-02's fix to be worse than the finding: a
+    /// permit held past the response turns the bound into a quota, and after
+    /// [`sso::SSO_MAX_IN_FLIGHT`] successful sign-ins single sign-on stops
+    /// working on that host until ferrumd is restarted -- a self-inflicted
+    /// outage on the exact path the fix was protecting. Nothing else here
+    /// would catch it: every other test performs at most one exchange.
+    ///
+    /// Sequential on purpose. Concurrency is not the question; release is.
+    #[tokio::test]
+    async fn a_finished_sso_exchange_gives_its_bulkhead_slot_back() {
+        let (_dir, state, _fake) = with_sso(sso::testing::authenticated_as("admin"));
+        for attempt in 1..=(sso::SSO_MAX_IN_FLIGHT + 1) {
+            let response =
+                post_sso(state.clone(), &[("Cookie", "ferrum_control_session=opaque")]).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "exchange {attempt} must be served: a permit that is never released turns a \
+                 concurrency bound into a one-way quota"
+            );
+            assert!(session_cookie_of(&response).is_some(), "exchange {attempt} set no cookie");
+        }
+    }
+
+    /// A shed is not an Authelia outage, and the operator must be able to
+    /// tell them apart.
+    ///
+    /// Both answer `503` on purpose -- the remedy is the same -- but a `503`
+    /// whose body blamed Authelia for ferrumd's own backpressure would send
+    /// an operator to debug a service that was working. The audit line
+    /// carries the same distinction (`denied` with a `shed:` detail, against
+    /// `error` with Authelia's reason).
+    #[tokio::test]
+    async fn a_shed_exchange_does_not_report_itself_as_an_authelia_outage() {
+        let (_dir, state, _fake) = with_sso(sso::testing::authenticated_as("admin"));
+        let _held = state.sso.as_ref().unwrap().hold_exchange_slots(sso::SSO_MAX_IN_FLIGHT);
+
+        let response = post_sso(state.clone(), &[("Cookie", "ferrum_control_session=opaque")]).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+        let body = String::from_utf8_lossy(&body).to_string();
+        assert!(
+            body.contains("too many"),
+            "the shed body must name backpressure: {body}"
+        );
+        assert!(
+            !body.contains("could not reach"),
+            "a shed must not be reported as an unreachable Authelia: {body}"
         );
     }
 
