@@ -266,16 +266,31 @@ Spec: `docs/superpowers/specs/2026-10-05-field-defects-design.md`, approved by t
 2026-10-05, to be done **in spec order**. Every one was invisible to the test suite: four cannot
 be reproduced in a Nix sandbox or a tempdir, and the fifth was contradicted by its own comments.
 
-- [~] **F2. A multi-address WireGuard config must work.** IN FLIGHT. `service.nix:125` hands the
+- [x] **F2. A multi-address WireGuard config must work.** DONE 2026-10-05, merged.
+      Parsed into one entry per line and applied in a loop; fixture is the owner's REAL provider
+      output with keys replaced, because the defect is in what providers issue. **IPv6 skipped
+      deliberately** — the namespace is routed v4-only (default route, veth, kill-switch fallback
+      and masquerade all v4), every skipped entry is named in the journal, and an IPv6-ONLY config
+      is refused rather than silently producing an empty namespace. `AllowedIPs` checked and not
+      on the same defect. Two mutations caught, including one that kept the parser's file, name,
+      flags and call site and changed only its behaviour.
+      ~~Previously:~~ `service.nix:125` hands the
       whole `Address` value to `ip addr add`; Proton issues `10.2.0.2/32, 2a07:b944::2:2/128` and
       it is refused. **Every Proton config fails as issued.** Worked around on the host by deleting
       the IPv6 address by hand.
-- [~] **F4. A data disk ferrum did not format must still work.** IN FLIGHT. `/mnt/ferrum-disk-1`
+- [x] **F4. A data disk ferrum did not format must still work.** DONE 2026-10-05, merged.
+      **Split on whether the owning UID resolves:** an orphan UID carries no intent anyone could be
+      respecting and the only remedy is a chown, so ferrum normalises it; a real local account is
+      somebody's deliberate arrangement, so ferrum refuses and names the path, user, UID and exact
+      command. The normalise arm runs precisely the command the refuse arm prints. Four mutations
+      caught; the third found a real hole mid-build — a non-zero exit cannot distinguish a refusal
+      from a failed chown, **and that difference is the decision**.
+      ~~Previously:~~ `/mnt/ferrum-disk-1`
       was owned by UID 1001 — a user that does not exist on the host — and `systemd-tmpfiles`
       refused the ownership transition, failing `ferrum-media-tree.service` with `CANTCREAT`.
       **Not a regression from that unit:** the previous rules met the same condition and failed
       silently at boot. Worked around with `chown root:ferrum-media`.
-- [ ] **F1. DDNS must detect the host's public address.** The one that cost a night. The updater
+- [~] **F1. DDNS must detect the host's public address.** IN FLIGHT. The one that cost a night. The updater
       republishes a **static** address from `settings.json`; **nothing in `crates/` queries a
       public address at all**, while three separate comments claim it corrects records against the
       host's current one. The owner's IP moved and seven records silently went stale.
