@@ -268,6 +268,10 @@ fn storage_from_env() -> apply::StorageConfig {
         root_password_file: std::env::var("FERRUM_ROOT_PASSWORD_FILE")
             .unwrap_or_else(|_| secrets::DEFAULT_ROOT_PASSWORD_FILE.to_string())
             .into(),
+        // False here and set by `run_update` alone, so the one shared
+        // config this function exists to provide stays shared: an ordinary
+        // apply must never mark its snapshot as an update's way back.
+        update_pre_image: false,
     }
 }
 
@@ -981,7 +985,12 @@ fn undo_pin(job: &UpdateJob, previous: &[u8], why: String) -> String {
 fn run_update() -> i32 {
     let mut progress = progress::Progress::open();
     let job = UpdateJob::from_env();
-    let storage = storage_from_env();
+    // The one deliberate difference from an ordinary apply's configuration,
+    // and it changes nothing about what gets built: the snapshot this apply
+    // takes is the host as it was BEFORE the pin moved, so it is the way
+    // back from a bad update and `gc` must not prune it on the tenth
+    // subsequent apply. Cleared again by `confirm-update`.
+    let storage = apply::StorageConfig { update_pre_image: true, ..storage_from_env() };
     run_update_job(
         &job,
         &update_check::RealRunner,

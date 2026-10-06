@@ -179,6 +179,8 @@ mod tests {
             taken_at: "2026-09-15 12:00:00".to_string(),
             quiesced: true,
             built_pin: None,
+            built_toplevel: None,
+            update_pre_image: false,
         }
     }
 

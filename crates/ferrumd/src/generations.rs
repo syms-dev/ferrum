@@ -282,6 +282,8 @@ mod tests {
                 taken_at: unix_ts.to_string(),
                 quiesced: true,
                 built_pin: None,
+                built_toplevel: None,
+                update_pre_image: false,
             },
         )
         .unwrap();
@@ -743,12 +745,39 @@ mod tests {
         snap.sort_unstable();
         assert_eq!(
             snap,
-            vec!["built_pin", "generation", "quiesced", "snapshot", "taken_at", "toplevel"],
-            "the nested JournalEntry's six fields are part of this endpoint's contract"
+            vec![
+                "built_pin",
+                "built_toplevel",
+                "generation",
+                "quiesced",
+                "snapshot",
+                "taken_at",
+                "toplevel",
+                "update_pre_image"
+            ],
+            "the nested JournalEntry's eight fields are part of this endpoint's contract"
         );
         assert_eq!(two["snapshot"]["snapshot"], serde_json::json!("1770000000-gen2"));
         assert!(two["snapshot"]["quiesced"].is_boolean());
         assert!(two["snapshot"]["taken_at"].is_string());
+        // The three provenance fields are present even when unknown, for the
+        // same reason `reason` and `snapshot` are: a client reads them
+        // without an existence check, and an omitted key would make "this
+        // ferrum does not record it" indistinguishable from "this apply
+        // could not".
+        assert!(
+            two["snapshot"]["built_pin"].is_null(),
+            "an unrecorded pin serialises as null, not omitted"
+        );
+        assert!(
+            two["snapshot"]["built_toplevel"].is_null(),
+            "an unrecorded built toplevel serialises as null, not omitted"
+        );
+        assert_eq!(
+            two["snapshot"]["update_pre_image"],
+            serde_json::json!(false),
+            "`update_pre_image` is a bare boolean the Generations view branches on, never null"
+        );
 
         // `current: null` serialises as an explicit null, not an absent key.
         let off = dir.path().join("off");

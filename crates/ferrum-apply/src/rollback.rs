@@ -201,6 +201,8 @@ mod tests {
                 taken_at: "2026-08-20T00:00:00Z".to_string(),
                 quiesced: true,
                 built_pin: None,
+                built_toplevel: None,
+                update_pre_image: false,
             },
         )
         .unwrap();
