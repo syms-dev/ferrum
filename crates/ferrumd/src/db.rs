@@ -120,6 +120,27 @@ impl Db {
     pub fn conn(&self) -> MutexGuard<'_, Connection> {
         self.conn.lock().expect("ferrumd database mutex was poisoned by a prior panic")
     }
+
+    /// The same connection, but `None` instead of a panic when the mutex is
+    /// poisoned by a prior panic.
+    ///
+    /// Every ordinary caller uses `conn()` and SHOULD panic there: a request
+    /// handler can do nothing sensible with a poisoned database, and
+    /// `run_blocking` turns the panic into a 500 rather than taking the
+    /// daemon down. The readiness probe in `health.rs` is the single
+    /// exception, and the reason is its whole job. It exists to REPORT that
+    /// ferrumd is broken; a probe that panicked would abort the connection
+    /// instead of answering, and a monitor reading a reset connection learns
+    /// only "something" -- which is exactly the diagnosis the endpoint was
+    /// added to replace. `None` is reported as a failed database check, which
+    /// is the honest reading: a poisoned mutex means every other request on
+    /// this daemon is already panicking.
+    ///
+    /// # Returns
+    /// The locked connection, or `None` if the mutex is poisoned.
+    pub fn conn_if_usable(&self) -> Option<MutexGuard<'_, Connection>> {
+        self.conn.lock().ok()
+    }
 }
 
 #[cfg(test)]

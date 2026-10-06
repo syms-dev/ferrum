@@ -5,6 +5,7 @@ mod client_addr;
 mod db;
 mod dbus;
 mod generations;
+mod health;
 mod jobs;
 mod secrets_api;
 mod settings;
@@ -696,6 +697,24 @@ fn build_router(state: Arc<AppState>) -> Router {
         // that fails if somebody moves this alone, live in
         // `logout_is_still_unguarded_and_the_ui_still_depends_on_that`.
         .route("/api/logout", post(logout_handler))
+        // Unauthenticated ON PURPOSE, and the only two /api/ routes that are
+        // unauthenticated because a MACHINE reads them rather than because
+        // the caller has no session yet. A health endpoint a monitor cannot
+        // reach is not a health endpoint, and putting these behind the
+        // session (or behind Authelia at the edge) would leave the box with
+        // no steady-state way to be asked whether it is well.
+        //
+        // health.rs's header carries the whole argument, and it must be read
+        // before either route is changed: what each one may disclose to an
+        // anonymous caller, why a degraded answer is 200 and not 503, what
+        // readiness deliberately does NOT check, and why no watchdog and no
+        // `Restart=` policy may ever be pointed at /api/ready.
+        //
+        // `the_unauthenticated_api_routes_are_exactly_these` pins this set
+        // against the real router, so a later route added out here fails
+        // loudly instead of quietly joining the exemption.
+        .route("/api/health", axum::routing::get(health::health_handler))
+        .route("/api/ready", axum::routing::get(health::ready_handler))
         .merge(protected)
         .layer(CookieManagerLayer::new())
         .with_state(state)
@@ -1846,6 +1865,224 @@ mod tests {
         }
     }
 
+    /// The `/api/` routes that really are reachable with NO session, named
+    /// one by one.
+    ///
+    /// The exemption has to be a LIST, not a count and not a prose note,
+    /// because the whole risk of adding an unauthenticated route is that the
+    /// next one looks exactly like it. Three of these predate the health
+    /// endpoints and are unauthenticated because the caller cannot have a
+    /// session yet; the two health routes are unauthenticated because the
+    /// caller is a monitor that will never have one.
+    const UNAUTHENTICATED_API_ROUTES: &[&str] =
+        &["/api/health", "/api/login", "/api/logout", "/api/ready", "/api/sso"];
+
+    /// Every `/api/` route is behind `require_session` EXCEPT the five named
+    /// above -- asserted from both ends, against the real router.
+    ///
+    /// This is the guard the health endpoints needed to exist. Before them,
+    /// "unauthenticated" and "no session yet" were the same category, and
+    /// nothing in this crate enumerated it: a route added outside `protected`
+    /// by accident -- a one-line misplacement, which is all it takes -- would
+    /// have been served to the internet with every existing test still green.
+    ///
+    /// Both halves matter and neither is sufficient:
+    ///
+    ///   * the SOURCE half re-derives the exempt set from `build_router`'s own
+    ///     text, so a sixth unauthenticated route fails here even if it is
+    ///     never requested by any other test;
+    ///   * the BEHAVIOURAL half drives every route in `API_ROUTES` with no
+    ///     cookie and demands a 401 from everything not on the list, so a
+    ///     route that is inside `protected` in the source but reachable
+    ///     anyway -- a dropped `route_layer`, a merge order mistake -- fails
+    ///     too.
+    #[tokio::test]
+    async fn the_unauthenticated_api_routes_are_exactly_these() {
+        let source = include_str!("main.rs");
+        let body = source
+            .split_once("fn build_router(")
+            .expect("build_router must exist")
+            .1
+            .split_once("\n}\n")
+            .expect("build_router must end")
+            .0;
+        // `.route_layer(` is where `protected` closes, so everything after it
+        // is the outer router -- the part with no session middleware on it.
+        let outer = body
+            .split_once(".route_layer(")
+            .expect("the protected router must still be closed by a route_layer")
+            .1;
+        let mut declared: Vec<String> = outer
+            .lines()
+            .filter_map(|line| line.split_once(".route(\""))
+            .map(|(_, rest)| rest.split_once('"').expect("a route path is quoted").0.to_string())
+            .collect();
+        declared.sort();
+        let expected: Vec<String> =
+            UNAUTHENTICATED_API_ROUTES.iter().map(|path| (*path).to_string()).collect();
+        assert_eq!(
+            declared, expected,
+            "the set of routes registered OUTSIDE the session-gated router has changed. \
+             Every route here is served to anyone who can reach ferrumd. If that is \
+             deliberate, add it to UNAUTHENTICATED_API_ROUTES and say in its own comment \
+             what an anonymous caller learns from it"
+        );
+
+        // And the same claim made by asking the real router, with no cookie.
+        let (_dir, state, _session, _csrf) = logged_in();
+        for (method, pattern, uri) in cors_is_absent::API_ROUTES {
+            let request = Request::builder()
+                .method(Method::from_bytes(method.as_bytes()).unwrap())
+                .uri(*uri)
+                .header("Content-Type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap();
+            let status = build_router(state.clone()).oneshot(request).await.unwrap().status();
+            if UNAUTHENTICATED_API_ROUTES.contains(pattern) {
+                assert_ne!(
+                    status,
+                    StatusCode::UNAUTHORIZED,
+                    "{method} {pattern} is listed as unauthenticated but answered 401, so \
+                     the list no longer describes the router"
+                );
+            } else {
+                assert_eq!(
+                    status,
+                    StatusCode::UNAUTHORIZED,
+                    "{method} {pattern} answered a caller with no session cookie"
+                );
+            }
+        }
+    }
+
+    /// Liveness answers even when every dependency underneath it is broken.
+    ///
+    /// The point of a dependency-free liveness probe is that it separates
+    /// "the process is gone" from "the process is unwell", and the only way
+    /// to show it really does that is to make it answer on a daemon that is
+    /// genuinely unwell. The same request against `/api/ready` on the same
+    /// state is driven below and comes back 503, which is what makes this a
+    /// measurement of two different endpoints rather than of one.
+    #[tokio::test]
+    async fn liveness_answers_on_a_daemon_whose_database_is_destroyed() {
+        let (_dir, state, _session, _csrf) = logged_in();
+        state
+            .db
+            .conn()
+            .execute_batch("PRAGMA foreign_keys = OFF; DROP TABLE sessions; DROP TABLE users;")
+            .unwrap();
+
+        let response = build_router(state)
+            .oneshot(
+                Request::builder().method(Method::GET).uri("/api/health").body(Body::empty()).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "liveness must answer 200 as long as the server is up -- it is what tells a \
+             watcher the process is alive and the DEPENDENCY is what is broken"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+            serde_json::json!({ "status": "alive" })
+        );
+    }
+
+    /// Readiness on the same destroyed database: 503, and `unready`.
+    #[tokio::test]
+    async fn readiness_reports_unready_when_the_database_is_destroyed() {
+        let (_dir, state, _session, _csrf) = logged_in();
+        state
+            .db
+            .conn()
+            .execute_batch("PRAGMA foreign_keys = OFF; DROP TABLE sessions; DROP TABLE users;")
+            .unwrap();
+
+        let (status, body) = get_ready(state).await;
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a daemon that cannot read its own users table can serve nothing, which is \
+             the one state 503 is reserved for"
+        );
+        assert_eq!(body["status"], "unready");
+        assert_eq!(body["checks"]["database"]["ok"], false);
+        assert_eq!(body["checks"]["database"]["reason"], "unavailable");
+        assert!(body["job"].is_null(), "only an applying answer names a job");
+    }
+
+    /// The same daemon with a WORKING database answers 200 and never
+    /// `unready` -- so the test above is measuring the broken database and
+    /// not merely the endpoint's only possible answer.
+    #[tokio::test]
+    async fn readiness_is_two_hundred_and_never_unready_on_an_intact_database() {
+        let (_dir, state, _session, _csrf) = logged_in();
+        let (status, body) = get_ready(state).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "an intact database must not produce a 503; a degraded dependency is 200 \
+             with the degradation named in the body"
+        );
+        assert_ne!(body["status"], "unready");
+        assert_eq!(body["checks"]["database"]["ok"], true);
+        assert!(
+            body["checks"]["database"]["reason"].is_null(),
+            "a passing check carries no reason"
+        );
+    }
+
+    /// An apply in flight is reported as its own status, carrying the job id,
+    /// and NOT as a failure.
+    ///
+    /// This is the thing ferrum can report that Silo cannot (see
+    /// docs/competitive/silo.md), and it is driven here through the real
+    /// interlock rather than a second flag: `AppState.interlock` is the same
+    /// value `jobs::create_job` sets, so a future change that stopped
+    /// recording the claimant's identity there fails here as well.
+    #[tokio::test]
+    async fn readiness_reports_applying_with_the_job_id_while_the_interlock_is_held() {
+        let (_dir, state, _session, _csrf) = logged_in();
+        let job = "6f1c6d4e-9b2a-4f88-8a33-2c7e5d1b0a94";
+
+        let (_, before) = get_ready(state.clone()).await;
+        assert_ne!(
+            before["status"], "applying",
+            "the interlock is free, so nothing may report an apply in flight"
+        );
+
+        *state.interlock.lock().unwrap() = Some(job.to_string());
+        let (status, body) = get_ready(state.clone()).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "mid-apply must be 200: a 503 here is what a restart policy would act on, \
+             and restarting ferrumd mid-apply is the failure main.rs already records"
+        );
+        assert_eq!(body["status"], "applying");
+        assert_eq!(
+            body["job"], job,
+            "the applying answer must name the job that owns the system, which is what \
+             lets a watcher tell mid-switch from broken without reading the logs"
+        );
+    }
+
+    /// `GET /api/ready` through the real router, with its body parsed.
+    async fn get_ready(state: Arc<AppState>) -> (StatusCode, serde_json::Value) {
+        let response = build_router(state)
+            .oneshot(
+                Request::builder().method(Method::GET).uri("/api/ready").body(Body::empty()).unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        (status, serde_json::from_slice(&body).expect("readiness must answer JSON"))
+    }
+
     /// L-01 is knowingly OPEN, and this test is the tripwire for closing it.
     ///
     /// `POST /api/logout` still takes no CSRF token, so a same-site sibling
@@ -2805,6 +3042,7 @@ mod tests {
         ("db.rs", include_str!("db.rs")),
         ("dbus.rs", include_str!("dbus.rs")),
         ("generations.rs", include_str!("generations.rs")),
+        ("health.rs", include_str!("health.rs")),
         ("jobs.rs", include_str!("jobs.rs")),
         ("secrets_api.rs", include_str!("secrets_api.rs")),
         ("settings.rs", include_str!("settings.rs")),
@@ -3442,6 +3680,13 @@ mod tests {
             ("GET", "/api/jobs/:id", "/api/jobs/not-a-uuid"),
             ("GET", "/api/jobs/:id/stream", "/api/jobs/not-a-uuid/stream"),
             ("POST", "/api/password", "/api/password"),
+            // The two health routes. Unauthenticated by design (health.rs),
+            // which changes nothing about the absence this matrix proves: a
+            // route reachable without a session is MORE exposed to a
+            // same-site sibling, not less, so a CORS header on either would
+            // be a worse finding than on any route above.
+            ("GET", "/api/health", "/api/health"),
+            ("GET", "/api/ready", "/api/ready"),
         ];
 
         /// Fails on ANY `access-control-*` response header, not only
