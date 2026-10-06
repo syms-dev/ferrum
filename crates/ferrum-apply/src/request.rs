@@ -12,7 +12,27 @@ use std::path::Path;
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Request {
     Preflight,
-    Apply,
+    /// The ordinary rebuild.
+    ///
+    /// `accept_pin_change` is the one field on this enum that is neither a
+    /// generation number nor absent, and it is worth being precise about why
+    /// it is not the "arbitrary content" this file's header forbids: it is
+    /// compared for EQUALITY against the revision `/etc/ferrum/flake.lock`
+    /// already names, and used for nothing else (`pin_gate::decide`). It
+    /// cannot choose a repository, a reference, or a revision to fetch --
+    /// a value that matches nothing simply leaves the gate closed. What it
+    /// carries is the operator's acknowledgement that this rebuild also
+    /// moves the host to a different ferrum revision (R8), which has to
+    /// name that revision or it would survive the revision changing under
+    /// it.
+    ///
+    /// `#[serde(default)]` so `{"kind":"apply"}` -- what every ferrumd
+    /// before this wrote, and what the common case still writes -- keeps
+    /// parsing.
+    Apply {
+        #[serde(default)]
+        accept_pin_change: Option<String>,
+    },
     Rollback { to: u32 },
     RestoreState,
     Gc,
@@ -47,7 +67,7 @@ impl Request {
     pub fn kind(&self) -> &'static str {
         match self {
             Request::Preflight => "preflight",
-            Request::Apply => "apply",
+            Request::Apply { .. } => "apply",
             Request::Rollback { .. } => "rollback",
             Request::RestoreState => "restore_state",
             Request::Gc => "gc",
@@ -96,12 +116,38 @@ mod tests {
         }
     }
 
+    /// The fieldless form -- what every ferrumd before R8 wrote, and what
+    /// an ordinary apply still writes -- parses, and parses as "nothing
+    /// acknowledged" rather than failing on the absent field.
     #[test]
     fn parses_apply_request() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("req.json");
         std::fs::write(&path, r#"{"kind":"apply"}"#).unwrap();
-        assert!(matches!(read_request(&path).unwrap(), Request::Apply));
+        match read_request(&path).unwrap() {
+            Request::Apply { accept_pin_change } => assert_eq!(accept_pin_change, None),
+            other => panic!("expected Apply, got {other:?}"),
+        }
+    }
+
+    /// And the acknowledged form carries the revision through verbatim --
+    /// the half without which the test above would pass against a variant
+    /// that dropped the field on the floor.
+    #[test]
+    fn parses_an_apply_that_acknowledges_a_pin_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("req.json");
+        std::fs::write(
+            &path,
+            r#"{"kind":"apply","accept_pin_change":"2222222222222222222222222222222222222222"}"#,
+        )
+        .unwrap();
+        match read_request(&path).unwrap() {
+            Request::Apply { accept_pin_change } => {
+                assert_eq!(accept_pin_change.as_deref(), Some("2".repeat(40).as_str()));
+            }
+            other => panic!("expected Apply, got {other:?}"),
+        }
     }
 
     #[test]

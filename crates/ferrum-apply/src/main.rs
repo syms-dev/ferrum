@@ -5,6 +5,7 @@ mod apply;
 mod dns_reconcile;
 mod gc;
 mod pin;
+mod pin_gate;
 mod preflight;
 mod progress;
 mod put_secret;
@@ -29,7 +30,17 @@ enum Command {
     /// Check free space and that the snapshot directory is a real subvolume.
     Preflight,
     /// Build, snapshot state, switch, health-check, classify.
-    Apply,
+    Apply {
+        /// Acknowledge that this rebuild also moves the host to a different
+        /// ferrum revision, naming that revision exactly.
+        ///
+        /// Only consulted when the on-disk pin and the pin the running
+        /// generation was built from actually disagree (R8); on every other
+        /// host it changes nothing. See `pin_gate` for why the gate is
+        /// passable rather than a wall.
+        #[arg(long, value_name = "REV")]
+        accept_pin_change: Option<String>,
+    },
     /// Schedule a reboot into an earlier generation with its matching state.
     Rollback {
         #[arg(long)]
@@ -288,8 +299,118 @@ fn flake_ref_from_env() -> String {
         .unwrap_or_else(|_| "/etc/ferrum#nixosConfigurations.default.config.system.build.toplevel".to_string())
 }
 
-fn run_apply() -> i32 {
-    handle_apply_result(apply::run(&flake_ref_from_env(), &storage_from_env()))
+/// The journal directory, from the environment.
+///
+/// # Returns
+/// `$FERRUM_JOURNAL_DIR`, or the compiled-in default. One reader, because
+/// three call sites already resolved it independently and a fourth that
+/// disagreed would read a different host's rollback bookkeeping.
+fn journal_dir_from_env() -> std::path::PathBuf {
+    std::env::var("FERRUM_JOURNAL_DIR")
+        .unwrap_or_else(|_| "/var/lib/ferrum/journal".to_string())
+        .into()
+}
+
+/// How the pin on disk stands against the pin the running generation was
+/// built from, as the three real reads answer it.
+///
+/// Split from `run_apply` so the decision itself stays testable: everything
+/// this touches is a file or a symlink, and everything `pin_gate` does with
+/// the result is pure.
+///
+/// # Arguments
+/// * `flake_ref` - the reference the apply would build, e.g.
+///   `/etc/ferrum#nixosConfigurations...`.
+/// * `journal_dir` - ferrum's snapshot journal.
+///
+/// # Returns
+/// The comparison. Every read that fails contributes `None` rather than an
+/// error, so an unreadable lock or an unreadable journal degrades to
+/// "unknown" -- which `pin_gate::decide` lets through. Failing an apply
+/// because a bookkeeping file could not be read would be a far worse
+/// outcome than the provenance going unrecorded.
+fn pin_state_for_apply(flake_ref: &str, journal_dir: &std::path::Path) -> pin_gate::PinState {
+    let (flake_dir, _) = update_check::split_flake_ref(flake_ref);
+    let on_disk = pin::read(
+        &std::path::Path::new(&flake_dir).join("flake.lock"),
+        update_candidate::FERRUM_INPUT,
+    );
+    // The running closure, not the profile's own pointer -- `apply::run`
+    // distrusts that pointer for the same reason (a partially-failed apply
+    // can leave it naming a generation that was never activated), and the
+    // two must agree about what "running" means or the gate would compare
+    // the pin of a generation the host is not on.
+    let running = std::fs::read_link("/run/current-system").ok();
+    let recorded = running.and_then(|toplevel| {
+        let entries = ferrum_state::journal::list(journal_dir).ok()?;
+        ferrum_state::generations::built_pin_of(&toplevel.to_string_lossy(), &entries)
+    });
+    pin_gate::classify(on_disk, recorded)
+}
+
+/// `ferrum-apply apply`, gated on R8's pin comparison.
+///
+/// # Arguments
+/// * `accept_pin_change` - the revision the operator acknowledged, if any.
+///
+/// # Returns
+/// The process exit code: 1 when the gate refuses (before anything is built
+/// or stopped), otherwise whatever the apply itself produced.
+fn run_apply(accept_pin_change: Option<&str>) -> i32 {
+    let flake_ref = flake_ref_from_env();
+    let state = pin_state_for_apply(&flake_ref, &journal_dir_from_env());
+    // The running generation's NUMBER is only needed to name it in the
+    // refusal, so a host whose profile cannot be read is still gated -- it
+    // just cannot say which generation. Nothing about the decision depends
+    // on it.
+    let generation = apply::current_generation().map(|(g, _)| g).unwrap_or(0);
+    run_apply_gated(
+        &state,
+        generation,
+        accept_pin_change,
+        &mut progress::Progress::open(),
+        || handle_apply_result(apply::run(&flake_ref, &storage_from_env())),
+    )
+}
+
+/// The gate itself: refuse, or hand off to the apply.
+///
+/// Separated from `run_apply` for the reason `run_request` is separated
+/// from `main`: the thing worth pinning is that a refused apply NEVER
+/// reaches the builder, and that is only observable if the builder is a
+/// value a test can hand in.
+///
+/// # Arguments
+/// * `state` - the pin comparison.
+/// * `generation` - the running generation, for the message.
+/// * `accepted` - the revision the operator acknowledged, if any.
+/// * `progress` - the job's progress file.
+/// * `run` - the real apply. Called only when the gate lets it through, and
+///   its exit code is returned unchanged.
+///
+/// # Returns
+/// 1 on a refusal -- before anything is built, stopped, or snapshotted --
+/// otherwise whatever `run` returned.
+fn run_apply_gated(
+    state: &pin_gate::PinState,
+    generation: u32,
+    accepted: Option<&str>,
+    progress: &mut progress::Progress,
+    run: impl FnOnce() -> i32,
+) -> i32 {
+    let pin_gate::Decision::Refuse(refusal) = pin_gate::decide(state, generation, accepted) else {
+        return run();
+    };
+    // One event, two audiences, split on the FIRST ": " -- the same shape
+    // `progress::complete` already writes and the same split the UI already
+    // performs on it (`splitCompletion` in ui/app.js). The revision comes
+    // first because the UI needs it verbatim to build the acknowledged
+    // retry; the prose follows because the operator needs that and nothing
+    // else.
+    progress.event("pin-gate", &format!("{}: {}", refusal.accept_rev, refusal.message));
+    progress.complete("failed", &refusal.message);
+    eprintln!("apply refused: {}", refusal.message);
+    1
 }
 
 fn run_rollback(to: u32) -> i32 {
@@ -1196,7 +1317,7 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let exit_code = match cli.command {
         Command::Preflight => run_preflight(),
-        Command::Apply => run_apply(),
+        Command::Apply { accept_pin_change } => run_apply(accept_pin_change.as_deref()),
         Command::Rollback { to } => run_rollback(to),
         Command::RestoreState => run_restore_state(),
         Command::Gc => run_gc(),
@@ -1208,7 +1329,9 @@ fn main() -> anyhow::Result<()> {
         Command::RunRequest { path } => match request::read_request(&path) {
             Ok(req) => run_request(req, &mut progress::Progress::open(), |req| match req {
                 request::Request::Preflight => run_preflight(),
-                request::Request::Apply => run_apply(),
+                request::Request::Apply { accept_pin_change } => {
+                    run_apply(accept_pin_change.as_deref())
+                }
                 request::Request::Rollback { to } => run_rollback(to),
                 request::Request::RestoreState => run_restore_state(),
                 request::Request::Gc => run_gc(),
@@ -1479,7 +1602,107 @@ mod tests {
     fn run_request_returns_the_runners_exit_code() {
         let dir = tempfile::tempdir().unwrap();
         let mut progress = progress::Progress::to_path(&dir.path().join("j.jsonl"));
-        assert_eq!(run_request(request::Request::Apply, &mut progress, |_| 3), 3);
+        assert_eq!(run_request(request::Request::Apply { accept_pin_change: None }, &mut progress, |_| 3), 3);
+    }
+
+    /// A refused apply never reaches the builder, and says so in the job's
+    /// own progress file in the shape the Apply view reads.
+    #[test]
+    fn a_gated_apply_never_builds_and_names_the_revision_the_retry_must_accept() {
+        use ferrum_state::journal::Pin;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("j.jsonl");
+        let mut progress = progress::Progress::to_path(&path);
+
+        let state = pin_gate::classify(
+            Some(Pin { rev: "2".repeat(40), nar_hash: "h2".into() }),
+            Some(Pin { rev: "1".repeat(40), nar_hash: "h1".into() }),
+        );
+        let code = run_apply_gated(&state, 7, None, &mut progress, || {
+            panic!("the builder must not run for a gated apply")
+        });
+        assert_eq!(code, 1);
+
+        let lines = std::fs::read_to_string(&path).unwrap();
+        let events: Vec<serde_json::Value> =
+            lines.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        let gate = events
+            .iter()
+            .find(|e| e["event"] == "pin-gate")
+            .expect("the refusal must be its own event, not only the terminal line");
+        let detail = gate["detail"].as_str().unwrap();
+        let (rev, message) = detail.split_once(": ").expect("`<rev>: <prose>` is the shape the UI splits");
+        assert_eq!(rev, "2".repeat(40), "the UI hands this back verbatim as the acknowledgement");
+        assert!(message.contains("1111111"), "{message}");
+        assert_eq!(events.last().unwrap()["event"], "complete");
+        assert!(events.last().unwrap()["detail"].as_str().unwrap().starts_with("failed: "));
+    }
+
+    /// The anti-vacuity half: every state that is not an unacknowledged
+    /// difference reaches the builder and returns ITS exit code, so the
+    /// gate above cannot be satisfied by refusing everything.
+    #[test]
+    fn an_ungated_apply_reaches_the_builder_and_returns_its_exit_code() {
+        use ferrum_state::journal::Pin;
+        let old = Pin { rev: "1".repeat(40), nar_hash: "h1".into() };
+        let new = Pin { rev: "2".repeat(40), nar_hash: "h2".into() };
+        for (label, state, accepted) in [
+            ("matching pins", pin_gate::classify(Some(old.clone()), Some(old.clone())), None),
+            ("a pin-unknown generation", pin_gate::classify(Some(new.clone()), None), None),
+            ("no lock to read", pin_gate::classify(None, Some(old.clone())), None),
+            (
+                "an acknowledged difference",
+                pin_gate::classify(Some(new.clone()), Some(old.clone())),
+                Some("2".repeat(40)),
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut progress = progress::Progress::to_path(&dir.path().join("j.jsonl"));
+            assert_eq!(
+                run_apply_gated(&state, 7, accepted.as_deref(), &mut progress, || 3),
+                3,
+                "{label} must reach the builder and surface its own exit code"
+            );
+        }
+    }
+
+    /// The gate's three real reads, wired together.
+    ///
+    /// Asserts only the shapes that do not depend on the machine running
+    /// the test: `/run/current-system` exists on a NixOS host and not in a
+    /// build sandbox or on a developer's Mac, but the journal handed in
+    /// here is empty either way, so the running side is unknown in all
+    /// three environments. That is the point being pinned -- an unreadable
+    /// or silent side degrades to unknown, which `pin_gate::decide` lets
+    /// through, rather than to an error that would fail the apply over
+    /// bookkeeping.
+    #[test]
+    fn the_pin_state_degrades_to_unknown_rather_than_failing_the_apply() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = dir.path().join("journal");
+        let flake_ref = format!("{}#nixosConfigurations.default", dir.path().display());
+
+        // No lock beside the flake, and nothing in the journal.
+        assert_eq!(
+            pin_state_for_apply(&flake_ref, &journal),
+            pin_gate::PinState::Unknown(pin_gate::UnknownSide::Both)
+        );
+
+        // A readable lock moves exactly one side, which is also the proof
+        // that the on-disk read is really wired to the flake reference it
+        // was given rather than returning None unconditionally.
+        std::fs::write(
+            dir.path().join("flake.lock"),
+            r#"{"nodes":{"root":{"inputs":{"ferrum":"ferrum"}},
+                "ferrum":{"locked":{"rev":"4444444444444444444444444444444444444444",
+                                    "narHash":"sha256-GATE="}}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            pin_state_for_apply(&flake_ref, &journal),
+            pin_gate::PinState::Unknown(pin_gate::UnknownSide::Running),
+            "an empty journal leaves the running generation's pin unknown, never disagreeing"
+        );
     }
 
     #[test]

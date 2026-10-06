@@ -191,6 +191,43 @@ async function applyView() {
       : "No staged changes.",
   });
   const error = el("p", { class: "error" });
+  // Where a refused apply explains itself. Empty on every ordinary apply:
+  // the gate below fires only when this host's on-disk pin disagrees with
+  // the pin the running generation was built from, which is the state a
+  // rollback leaves behind and nothing else does.
+  const gate = el("section", { role: "status", "aria-live": "polite" });
+
+  /// Paint the pin gate's refusal, with the one control that passes it.
+  ///
+  /// @param {string} rev - The on-disk revision, full 40-hex, exactly as the
+  ///   job reported it. Handed straight back as the acknowledgement, so the
+  ///   operator can only ever accept the revision they were shown.
+  /// @param {string} message - The job's own sentence. Not recomposed here:
+  ///   only ferrum-apply can see which of the two cases this is (a moved
+  ///   revision, or a moved tree under an unchanged one).
+  /// @returns {void}
+  function renderGate(rev, message) {
+    gate.replaceChildren(
+      el("h3", { text: "This is not only a settings change" }),
+      el("p", { text: message }),
+      el("p", {}, [el("code", { class: "rev", text: rev })]),
+      el("p", {
+        class: "hint",
+        text:
+          "This usually means you rolled back and the pin did not come with you — rolling back " +
+          "reverts the system, never /etc/ferrum/flake.lock. The gate is here to make the " +
+          "decision visible, not to prevent it: if you do want that revision, take it.",
+      }),
+      el("div", { class: "row" }, [
+        el("button", {
+          type: "button",
+          class: "danger",
+          text: `Apply anyway, moving ferrum to ${rev.slice(0, 7)}`,
+          onclick: () => startApply(rev),
+        }),
+      ]),
+    );
+  }
 
   function attach(id) {
     log.textContent = "";
@@ -198,9 +235,42 @@ async function applyView() {
       onEvent: (e) => {
         log.textContent += `${e.event}: ${e.detail}\n`;
         log.scrollTop = log.scrollHeight;
+        // The job writes this one event as `<rev>: <prose>` -- the same
+        // shape `progress::complete` writes and `splitCompletion` already
+        // parses -- so the revision arrives verbatim rather than being
+        // scraped out of a sentence this page would then be depending on.
+        if (e.event === "pin-gate") {
+          const { result: rev, message } = splitCompletion(e.detail);
+          renderGate(rev, message);
+        }
       },
       onDone: () => setStatus("Job finished.", "ok"),
     });
+  }
+
+  /// Start an apply, optionally acknowledging a ferrum revision change.
+  ///
+  /// @param {string|null} acceptPinChange - The full revision the operator
+  ///   accepted, or null for an ordinary apply. Sent only when present, so
+  ///   the common case posts exactly the body it always has.
+  /// @returns {Promise<void>}
+  async function startApply(acceptPinChange = null) {
+    error.textContent = "";
+    gate.replaceChildren();
+    try {
+      const { id } = await api.startJob("apply", acceptPinChange ? { acceptPinChange } : {});
+      setStatus(`Apply started (${id}).`);
+      attach(id);
+    } catch (err) {
+      if (err.status === 409) {
+        const running = (await api.jobs(5)).jobs.find((j) => j.status === "running");
+        error.textContent = running
+          ? `A ${running.kind || "job"} started at ${localTime(running.started_at)} is still running (${running.id}). Wait for it to finish.`
+          : "A job is already running.";
+      } else {
+        error.textContent = err.message;
+      }
+    }
   }
 
   const save = el("button", {
@@ -225,23 +295,7 @@ async function applyView() {
     type: "button",
     class: "danger",
     text: "Apply now (rebuild the system)",
-    onclick: async () => {
-      error.textContent = "";
-      try {
-        const { id } = await api.startJob("apply");
-        setStatus(`Apply started (${id}).`);
-        attach(id);
-      } catch (err) {
-        if (err.status === 409) {
-          const running = (await api.jobs(5)).jobs.find((j) => j.status === "running");
-          error.textContent = running
-            ? `A ${running.kind || "job"} started at ${localTime(running.started_at)} is still running (${running.id}). Wait for it to finish.`
-            : "A job is already running.";
-        } else {
-          error.textContent = err.message;
-        }
-      }
-    },
+    onclick: () => startApply(),
   });
 
   view().replaceChildren(
@@ -254,6 +308,7 @@ async function applyView() {
       diff,
       el("div", { class: "row" }, [save, apply]),
       error,
+      gate,
       log,
     ]),
   );
@@ -901,13 +956,17 @@ function confirmUpdate(candidate) {
   });
 }
 
-/// Split a job's terminal `complete` detail into its result and its message.
+/// Split a `"<token>: <sentence>"` job detail into its two halves.
 ///
 /// `progress::complete` writes `"<result>: <detail>"` into one `detail`
 /// field, so the result the job reached and the sentence explaining it
 /// arrive as one string. Parsed on the FIRST separator only: an update's own
 /// message contains colons of its own, and splitting on all of them would
 /// truncate the sentence the operator is meant to read.
+///
+/// The Apply view's `pin-gate` event deliberately writes the same shape,
+/// with the revision in the token position, so the one value that must
+/// arrive verbatim is read rather than scraped out of prose.
 ///
 /// @param {string} detail - The `complete` event's detail.
 /// @returns {{result: string, message: string}} The job's result word and
