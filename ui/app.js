@@ -229,6 +229,39 @@ async function applyView() {
     );
   }
 
+  /// Paint the way-in gate's refusal, with the one control that passes it.
+  ///
+  /// @param {string} token - The lockout token, exactly as the job reported
+  ///   it. Handed straight back as the acknowledgement, so the operator can
+  ///   only ever accept the lockout they were shown — an acknowledgement
+  ///   given for "SSH is off" cannot pass a later, different lockout.
+  /// @param {string} message - The job's own sentence, naming both closed
+  ///   routes and what would reopen each. Not recomposed here: only
+  ///   ferrum-apply can see which routes it found shut.
+  /// @returns {void}
+  function renderWayInGate(token, message) {
+    gate.replaceChildren(
+      el("h3", { text: "This would leave no way back into this machine" }),
+      el("p", { text: message }),
+      el("p", {}, [el("code", { class: "rev", text: token })]),
+      el("p", {
+        class: "hint",
+        text:
+          "Nothing has been built and nothing has changed — this host is still running the " +
+          "generation it was. The gate is here to make the decision visible, not to prevent " +
+          "it: if you have another way in that ferrum cannot see, take it.",
+      }),
+      el("div", { class: "row" }, [
+        el("button", {
+          type: "button",
+          class: "danger",
+          text: "Apply anyway, with no way back in",
+          onclick: () => startApply(null, token),
+        }),
+      ]),
+    );
+  }
+
   function attach(id) {
     log.textContent = "";
     state.stream = api.streamJob(id, {
@@ -243,22 +276,34 @@ async function applyView() {
           const { result: rev, message } = splitCompletion(e.detail);
           renderGate(rev, message);
         }
+        // Same `<token>: <prose>` shape, same reason: the token the retry
+        // must carry arrives verbatim rather than being scraped out of a
+        // sentence this page would then depend on.
+        if (e.event === "way-in-gate") {
+          const { result: token, message } = splitCompletion(e.detail);
+          renderWayInGate(token, message);
+        }
       },
       onDone: () => setStatus("Job finished.", "ok"),
     });
   }
 
-  /// Start an apply, optionally acknowledging a ferrum revision change.
+  /// Start an apply, optionally acknowledging one of the two gates.
   ///
   /// @param {string|null} acceptPinChange - The full revision the operator
   ///   accepted, or null for an ordinary apply. Sent only when present, so
   ///   the common case posts exactly the body it always has.
+  /// @param {string|null} acceptNoWayIn - The lockout token the operator
+  ///   accepted, or null. Sent only when present, for the same reason.
   /// @returns {Promise<void>}
-  async function startApply(acceptPinChange = null) {
+  async function startApply(acceptPinChange = null, acceptNoWayIn = null) {
     error.textContent = "";
     gate.replaceChildren();
     try {
-      const { id } = await api.startJob("apply", acceptPinChange ? { acceptPinChange } : {});
+      const { id } = await api.startJob("apply", {
+        ...(acceptPinChange ? { acceptPinChange } : {}),
+        ...(acceptNoWayIn ? { acceptNoWayIn } : {}),
+      });
       setStatus(`Apply started (${id}).`);
       attach(id);
     } catch (err) {
