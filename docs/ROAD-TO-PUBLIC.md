@@ -346,8 +346,24 @@ be reproduced in a Nix sandbox or a tempdir, and the fifth was contradicted by i
         keep the original zero-occurrence rule, and the thirteenth may name one on exactly one line.
       - Login arithmetic, re-examined as the risk acceptance asked: two before, two after, and the
         dashboard's remaining one is now the Authelia the operator already uses.
-      - Verified on the merged tree: 993 tests pass (exit 0, up from 969), clippy 0 findings, all 46
-        flake checks named in `.github/workflows/ci.yml` build.
+      - **Security-reviewed, and it came back BLOCKED the first time.** The cookie-scope isolation
+        itself was confirmed sound three independent ways — including a run against a real Authelia
+        4.39.19 binary — and the hand-rolled HTTP client in `sso.rs` was traced clean: no path from
+        a parse failure, truncation or malformed input to a false success. But two Mediums were
+        real and are fixed in `6cc150e`:
+        - The SSO cookie's attributes were pinned by nothing. Proved by mutation, not argued:
+          deleting `set_secure(true)` from the SSO path alone left the whole suite green, because
+          the only attribute test drives `/api/login`. One shared builder now, plus a test on
+          `/api/sso`'s real wire `Set-Cookie`.
+        - `/api/sso` had no bound at all while `/api/login` has two. A semaphore of 4 now sheds
+          before the cookie is read and before any socket opens — not shared with the password
+          lockout, which is the way in when the proxy is broken.
+        - A comment claimed every route re-checks Authelia; the SSE job stream authorises once at
+          open. The comment was corrected rather than the code, because re-verifying inside that
+          loop would let a blip cut an operator's view of an apply.
+      - Verified on the merged tree at `6cc150e`: **998 tests pass** (exit 0, up from 969), clippy
+        0 lines, and **all 46 flake checks build, exit 0, zero error lines** — run by hand because
+        the re-validation pass flagged honestly that it had not re-run them itself.
 
 ## Phase 5 — The pre-public cleanup (your four steps)
 
