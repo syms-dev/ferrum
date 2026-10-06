@@ -160,6 +160,14 @@ step "run the installer end to end (sonarr + sabnzbd, SSO on)"
 # answers.rs:485 instead when detection offers no candidate to accept.
 # Regenerate this list with a grep for io.ask, io.ask_secret and ask_valid
 # across answers.rs, sso.rs and confirm.rs.
+#
+# A TWELFTH prompt exists on a path this fixture deliberately does not take:
+# F3/R3's Plex claim token (answers.rs:753), asked when `plex` is among the
+# apps AND a base domain is set. The app list below is sonarr + sabnzbd, so
+# it is never reached and the count stays at eleven. Add plex to that line
+# and an answer must be added here too, after the serial's predecessor and
+# BEFORE the serial -- it is collected by answers::collect, which runs
+# before confirm::confirm.
 # The token is a placeholder and is checked for real: A5 sends it to the
 # stand-in API above, which requires a bearer token and would refuse an
 # empty one. ACME itself is not exercised here, but the secret must exist

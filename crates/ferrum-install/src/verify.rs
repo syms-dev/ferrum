@@ -308,6 +308,55 @@ pub fn read_credential_command(path: &str) -> String {
     format!("cat {}", crate::collect::sh_quote(path))
 }
 
+/// Where Plex records the account it belongs to, on a ferrum host.
+///
+/// `ferrum.apps.plex.stateDir` defaults to `<storage.stateDir>/plex`
+/// (`modules/lib/app-submodule.nix`) and Plex puts its preferences under a
+/// directory whose name contains spaces. Named as a literal here for the
+/// same reason the credential paths above are: this binary runs on the
+/// operator's machine and links no code from the module tree.
+/// `modules/core/reconciler.nix` builds the identical path.
+pub const PLEX_PREFERENCES_PATH: &str =
+    "/var/lib/ferrum/state/plex/Plex Media Server/Preferences.xml";
+
+/// Builds the command that asks whether Plex is claimed (F3/R3).
+///
+/// **Claimed-ness is read from Plex's own preferences, not from Plex's
+/// API**, which is the same decision `crates/ferrum-reconcile` made and for
+/// the same reason: an unclaimed Plex answers perfectly well on localhost,
+/// so reachability proves nothing. The presence of a non-empty
+/// `PlexOnlineToken` is the fact.
+///
+/// Three outcomes, never two, for the reason
+/// [`hardware_config_command`] gives at length: a two-outcome shell test
+/// reports the absent-file case as one of the two real answers, and here
+/// the absent file is a genuinely different state -- Plex has not written
+/// its preferences yet. None of the three words is a substring of another,
+/// because [`Check::expect`] matches with `contains`.
+///
+/// # Arguments
+/// * `path` - the preferences file on the target. Quoted: it contains
+///   spaces, so an unquoted path word-splits and `test -f` sees three
+///   arguments.
+///
+/// # Returns
+/// A command printing exactly one of `CLAIMED`, `NOCLAIM` or `NOPREFS`.
+/// `NOCLAIM` rather than the obvious `UNCLAIMED`, because `CLAIMED` is a
+/// substring of that one -- harmless for today's reader, which compares the
+/// trimmed output for equality, and a live bug the moment anybody wires
+/// this into a [`Check`], whose `expect` matches with `contains`.
+#[must_use]
+pub fn plex_claim_command(path: &str) -> String {
+    let path = crate::collect::sh_quote(path);
+    // `PlexOnlineToken=""` is what an unclaimed server with a written
+    // preferences file carries, so the pattern requires at least one
+    // character inside the quotes -- matching plex_account_token's own
+    // emptiness check in crates/ferrum-reconcile/src/main.rs.
+    format!(
+        "test -f {path} && {{ grep -q 'PlexOnlineToken=\"[^\"]' {path} \
+         && echo CLAIMED || echo NOCLAIM; }} || echo NOPREFS"
+    )
+}
 
 /// R1 A8's reachability proof: is the address ferrum published the address
 /// the internet actually delivers to this host?
@@ -840,6 +889,85 @@ pub fn credential_paths(sso_enabled: bool) -> Vec<(&'static str, &'static str)> 
 
 #[cfg(test)]
 mod tests {
+    /// F3/R3. Executes the real claim probe against real files, for the
+    /// same reason the hardware-config test below does: the bug being
+    /// guarded is SHELL semantics, and no amount of reading the string
+    /// catches `grep -q ... && A || B` printing B for an absent file.
+    ///
+    /// The path deliberately contains spaces, because the real one does --
+    /// Plex writes under "Plex Media Server". Unquoted, `test -f` sees
+    /// three arguments and the probe answers NOPREFS for a claimed host.
+    ///
+    /// Mutation check: match `PlexOnlineToken="` without requiring a
+    /// character inside the quotes and the empty-token case answers
+    /// CLAIMED; drop `sh_quote` and the whole thing answers NOPREFS.
+    #[test]
+    fn the_plex_claim_probe_distinguishes_claimed_unclaimed_and_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let prefs = dir.path().join("Plex Media Server").join("Preferences.xml");
+        std::fs::create_dir_all(prefs.parent().unwrap()).unwrap();
+        let run = || {
+            let out = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(super::plex_claim_command(prefs.to_str().unwrap()))
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+
+        // Absent: Plex has not written preferences yet.
+        assert_eq!(run(), "NOPREFS");
+
+        // Written, with no token in it -- what an unclaimed server carries.
+        std::fs::write(
+            &prefs,
+            r#"<?xml version="1.0"?><Preferences MachineIdentifier="x"/>"#,
+        )
+        .unwrap();
+        assert_eq!(run(), "NOCLAIM");
+
+        // The empty-attribute form, which is NOT a claim. This is the case
+        // a `PlexOnlineToken="` substring match gets wrong, and it matches
+        // plex_account_token's own emptiness check in ferrum-reconcile.
+        std::fs::write(
+            &prefs,
+            r#"<Preferences PlexOnlineToken="" MachineIdentifier="x"/>"#,
+        )
+        .unwrap();
+        assert_eq!(run(), "NOCLAIM");
+
+        // Claimed.
+        std::fs::write(&prefs, r#"<Preferences PlexOnlineToken="abc123" />"#).unwrap();
+        assert_eq!(run(), "CLAIMED");
+
+        // No word is a substring of another, which is why the middle one is
+        // NOCLAIM rather than the obvious UNCLAIMED. Today's only reader
+        // compares for equality, so this is latent -- but it is one `Check`
+        // away from live, and that is exactly how the hardware-config
+        // probe's own three-outcome bug got in.
+        for (a, b) in [
+            ("CLAIMED", "NOCLAIM"),
+            ("CLAIMED", "NOPREFS"),
+            ("NOCLAIM", "CLAIMED"),
+            ("NOCLAIM", "NOPREFS"),
+            ("NOPREFS", "CLAIMED"),
+            ("NOPREFS", "NOCLAIM"),
+        ] {
+            assert!(!b.contains(a), "{a} is a substring of {b}");
+        }
+    }
+
+    /// The constant has to name the path the module tree really builds:
+    /// `ferrum.apps.plex.stateDir` defaults to `<storage.stateDir>/plex`
+    /// and modules/core/reconciler.nix appends Plex's own subdirectory.
+    #[test]
+    fn the_preferences_path_matches_the_module_trees_own() {
+        assert_eq!(
+            super::PLEX_PREFERENCES_PATH,
+            "/var/lib/ferrum/state/plex/Plex Media Server/Preferences.xml"
+        );
+    }
+
     /// SEC-L-N5. Executes the real command against real files, because the
     /// bug being guarded is a SHELL semantics bug -- `grep -q ... && A ||
     /// B` prints B when the file is absent -- and no amount of reading the

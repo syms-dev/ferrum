@@ -140,6 +140,21 @@ pub struct Answers {
     /// `ferrum.proxy.dns.enable` implies a base domain and a declared
     /// credential, so there is nothing to ask about without both.
     pub dns: Option<DnsDecision>,
+    /// F3/R3: the plex.tv claim token, held in memory only.
+    ///
+    /// A [`Secret`] rather than a `String` for the same reason the
+    /// Cloudflare token is: it associates this server with somebody's Plex
+    /// account, and `settings.json` is world-readable by design -- the UI
+    /// renders it. It reaches the host as a sops secret through
+    /// `ferrum-apply put-secret plex-claim` and is never written to a file
+    /// on the operator's own machine.
+    ///
+    /// `None` means the operator skipped the question, or was never asked
+    /// (see [`plex_claim_wanted`]), or this is a resumed run -- a resume
+    /// recovers everything except the credentials, which were deliberately
+    /// never written anywhere. Skipping is reported in the closing summary
+    /// as an unfinished step, never silently.
+    pub plex_claim: Option<Secret>,
 }
 
 /// A hostname must be a DNS label: it becomes `networking.hostName` and
@@ -616,6 +631,147 @@ pub fn decide_dns(
     })
 }
 
+/// The name of the sops secret the claim token lands in.
+///
+/// Named once here and consumed by `stage2::commands`, `render::settings`
+/// and the closing report, because three spellings of it is three ways for
+/// the declaration, the file and the module to drift apart.
+/// `modules/apps/plex/service.nix` and `modules/core/reconciler.nix` name
+/// the same string on the host side.
+pub const PLEX_CLAIM_SECRET: &str = "plex-claim";
+
+/// Whether this install should ask for a Plex claim token (F3/R3 A1).
+///
+/// Both terms are the requirement's own. `plex` among the apps is obvious;
+/// the base domain less so, and it is there because an unclaimed Plex is
+/// only a problem for a server somebody intends to reach. A host with no
+/// domain publishes nothing through the proxy, so the question would be
+/// asking for a credential before there is anything to use it for -- the
+/// same reasoning that keeps the Cloudflare token unasked on such a host.
+///
+/// # Arguments
+/// * `apps` - the catalog apps the operator selected.
+/// * `base_domain` - `ferrum.proxy.baseDomain`, or `None`.
+///
+/// # Returns
+/// `true` when the question should be asked.
+#[must_use]
+pub fn plex_claim_wanted(apps: &[String], base_domain: Option<&str>) -> bool {
+    base_domain.is_some() && apps.iter().any(|a| a == "plex")
+}
+
+/// Validates a plex.tv claim token before it can become a secret.
+///
+/// Deliberately **not** a format check on the `claim-` prefix. plex.tv
+/// issues tokens in that shape today, and a token that does not have it is
+/// far more likely to be a paste error than a Plex redesign -- but refusing
+/// it outright would let a future change at plex.tv block every ferrum
+/// install, for a value that is skippable and whose failure is already
+/// reported rather than fatal. So the prefix is *said*, and the charset is
+/// *enforced*: a claim token reaches `ureq`'s `?token=` query parameter in
+/// `crates/ferrum-reconcile/src/main.rs`, and the characters that are not in
+/// this set are exactly the ones a bad paste carries -- a trailing `%` from
+/// zsh, a stray space, or a whole URL copied instead of the token in it.
+///
+/// # Arguments
+/// * `raw` - what the operator pasted.
+///
+/// # Returns
+/// The trimmed token.
+///
+/// # Errors
+/// When it is empty, or carries a character a claim token cannot contain --
+/// naming the character, since the usual culprit is invisible.
+pub fn validate_plex_claim_token(raw: &str) -> anyhow::Result<String> {
+    let token = raw.trim();
+    if token.is_empty() {
+        anyhow::bail!("a claim token cannot be empty; press enter to skip instead");
+    }
+    if let Some(bad) = token
+        .chars()
+        .find(|c| !(c.is_ascii_alphanumeric() || *c == '_' || *c == '-'))
+    {
+        anyhow::bail!(
+            "that claim token contains {bad:?} ({:#06x}), which a plex.tv \
+             claim token never does -- it is letters, digits, underscores \
+             and hyphens only.\n\n\
+             If you copied it from a terminal, check for a trailing \"%\" \
+             (zsh's marker for output with no final newline) or a stray \
+             space. If you copied the whole page, the token is the \
+             \"claim-...\" value alone.",
+            bad as u32
+        );
+    }
+    Ok(token.to_string())
+}
+
+/// Asks for the plex.tv claim token (F3/R3 A1, A2, A3).
+///
+/// **The expiry is stated because the alternative is an error that lies.**
+/// A claim token is valid for four minutes after plex.tv issues it, and a
+/// stale one is refused by Plex in a way that is indistinguishable from a
+/// wrong one. An operator who fetched a token before starting the installer
+/// and answers here will meet that, so the question says so rather than
+/// letting them find out from the closing report.
+///
+/// It also says what happens when the token has expired *by the time Plex
+/// starts*, which on a first install is the likely case rather than the
+/// unlucky one: the stage-2 apply builds the whole system on the target and
+/// the claim happens after that switch. That is not something this prompt
+/// can beat -- the secret has to exist before the build, because sops-nix
+/// resolves every `sopsFile` at evaluation time -- so it is disclosed, the
+/// closing report states the measured outcome, and the one command that
+/// finishes the job is printed there.
+///
+/// Skipping is one keystroke, by requirement: an operator with no Plex
+/// account must not have to invent an answer to get past this.
+///
+/// # Arguments
+/// * `io` - the question-and-answer channel with the operator.
+///
+/// # Returns
+/// The token, or `None` when the operator pressed enter.
+///
+/// # Errors
+/// An input failure, or an answer that fails validation three times.
+fn ask_plex_claim(io: &mut impl PromptIo) -> anyhow::Result<Option<Secret>> {
+    io.say(
+        "\nPlex will not serve anybody but localhost until the server is claimed by a \
+         Plex\naccount, and ferrum opens no port for you to claim it from the LAN. So \
+         it claims\nthe server for you, with a token from:\n\n  \
+         https://plex.tv/claim\n\n\
+         That token expires FOUR MINUTES after plex.tv issues it, and an expired one \
+         is\nrefused exactly like a wrong one -- so fetch it now rather than \
+         beforehand.\n\n\
+         The install still has a system to build after this, which usually takes \
+         longer\nthan four minutes. If the token has expired by the time Plex starts, \
+         Plex comes\nup unclaimed, the closing report says so, and it names the one \
+         command that\nfinishes the job. Press enter to skip and do it that way \
+         deliberately.",
+    );
+    for attempt in 0..3 {
+        let raw = io.ask_secret("Plex claim token (enter to skip):")?;
+        if raw.trim().is_empty() {
+            return Ok(None);
+        }
+        match validate_plex_claim_token(&raw) {
+            Ok(token) => {
+                if !token.starts_with("claim-") {
+                    // Said, not refused. See validate_plex_claim_token.
+                    io.say(
+                        "  Note: plex.tv's claim tokens begin with \"claim-\". Using \
+                         what you\n  entered as given.",
+                    );
+                }
+                return Ok(Some(Secret::new(token)));
+            }
+            Err(e) if attempt < 2 => io.say(&format!("  {e}")),
+            Err(e) => return Err(e),
+        }
+    }
+    unreachable!("the loop returns or errors on its last attempt")
+}
+
 /// Collects every operator answer.
 ///
 /// # Arguments
@@ -701,6 +857,16 @@ pub fn collect(
         _ => None,
     };
 
+    // Last, because it is the one answer with a clock on it: four minutes
+    // from plex.tv issuing it. Every question before this one is the
+    // operator reading and deciding, and putting the timed answer behind
+    // them spends none of that budget.
+    let plex_claim = if plex_claim_wanted(&apps, base_domain.as_deref()) {
+        ask_plex_claim(io)?
+    } else {
+        None
+    };
+
     Ok(Answers {
         hostname,
         base_domain,
@@ -709,6 +875,7 @@ pub fn collect(
         apps,
         cloudflare_token,
         dns,
+        plex_claim,
     })
 }
 
@@ -1079,6 +1246,14 @@ pub fn from_stage2(body: &str, hostname: &str) -> anyhow::Result<Answers> {
         },
         apps,
         cloudflare_token: None,
+        // Never recovered, for the same reason the Cloudflare token is not:
+        // it was deliberately written nowhere on this machine. Unlike that
+        // one it is also not re-asked -- it is skippable, so a resume that
+        // asked again would be demanding a credential to finish a step the
+        // closing report can simply name as outstanding. What a resume DOES
+        // have to do is keep the settings document and the host's secrets
+        // directory in step; `render::set_plex_claim_secret` is that.
+        plex_claim: None,
         dns: dns_from_settings(&doc)?,
     })
 }
@@ -1357,8 +1532,9 @@ mod tests {
             "", // SSO: default yes
             "admin@thesyms.ca",
             "cftokenvalue1234567890abcdefghijklmnopqr",
-            "", // record target: default 'a'
-            "", // updater: default yes -- and so no address is asked for
+            "",                     // record target: default 'a'
+            "",                     // updater: default yes -- so no address is asked for
+            "claim-abcdefghij1234", // plex is among the apps, so this is asked
         ]);
         let fake = healthy_cloudflare();
         let a = collect(&mut io, &verifying_against(&fake), &mut no_detection()).unwrap();
@@ -1376,6 +1552,10 @@ mod tests {
                 target: RecordTarget::A(None),
                 ddns_updater: true,
             })
+        );
+        assert_eq!(
+            a.plex_claim.as_ref().map(Secret::expose),
+            Some("claim-abcdefghij1234")
         );
     }
 
@@ -1491,6 +1671,194 @@ mod tests {
             "a@b.co",
             token,
         ]
+    }
+
+    /// The answers a plex install gives, up to and including the DNS
+    /// questions, so each R3 test says only what it is about.
+    fn upto_plex_claim() -> Vec<&'static str> {
+        vec![
+            "saltbox",
+            "thesyms.ca",
+            "me@thesyms.ca",
+            "plex",
+            "", // SSO: default yes
+            "a@b.co",
+            GOOD_TOKEN,
+            "a", // record target
+            "y", // updater on, so no address question
+        ]
+    }
+
+    /// F3/R3 A1 and A2. An install that enables Plex is asked for a claim
+    /// token, with the URL to fetch it from and the four-minute expiry
+    /// stated -- the expiry because an operator who fetches it early and
+    /// answers late meets a failure indistinguishable from a bad token.
+    ///
+    /// Mutation check: drop the `plex.tv/claim` URL from the question and
+    /// the first assertion fails; drop the expiry sentence and the second
+    /// does; route it through `io.ask` instead of `io.ask_secret` and the
+    /// third does, with the token then sitting in the operator's scrollback.
+    #[test]
+    fn a_plex_install_is_asked_for_a_claim_token() {
+        let fake = healthy_cloudflare();
+        let mut script = upto_plex_claim();
+        script.push("claim-abcdefghij1234");
+        let mut io = Scripted::new(&script);
+        let a = collect(&mut io, &verifying_against(&fake), &mut no_detection()).unwrap();
+
+        let t = io.transcript();
+        assert!(
+            t.contains("https://plex.tv/claim"),
+            "the question has to say where to get one: {t}"
+        );
+        assert!(
+            t.contains("FOUR MINUTES"),
+            "and that it expires, because an expired token is refused \
+             exactly like a wrong one: {t}"
+        );
+        assert!(
+            io.secret_asks
+                .iter()
+                .any(|q| q.contains("Plex claim token")),
+            "it is a credential, so it must not be echoed: {:?}",
+            io.secret_asks
+        );
+        assert_eq!(
+            a.plex_claim.as_ref().map(Secret::expose),
+            Some("claim-abcdefghij1234")
+        );
+    }
+
+    /// F3/R3 A3. Skipping is one keystroke -- an operator with no Plex
+    /// account must not have to invent an answer to get past the question.
+    ///
+    /// Mutation check: make the empty answer fall into
+    /// `validate_plex_claim_token` and the run fails instead of skipping.
+    #[test]
+    fn skipping_the_claim_token_is_one_keystroke() {
+        let fake = healthy_cloudflare();
+        let mut script = upto_plex_claim();
+        script.push("");
+        let mut io = Scripted::new(&script);
+        let a = collect(&mut io, &verifying_against(&fake), &mut no_detection()).unwrap();
+        assert_eq!(a.plex_claim, None);
+        // ...and nothing is delivered for a token that does not exist.
+        assert!(
+            !crate::stage2::commands(&a)
+                .iter()
+                .any(|c| c.contains(PLEX_CLAIM_SECRET)),
+            "{:#?}",
+            crate::stage2::commands(&a)
+        );
+    }
+
+    /// F3/R3 A1's two conditions, both of them. The question is asked only
+    /// when Plex is among the apps AND a base domain is set: a host that
+    /// publishes nothing has nothing to reach an unclaimed Plex for, and
+    /// asking anyway would collect a credential before there is a use for
+    /// it -- the same rule that keeps the Cloudflare token unasked there.
+    #[test]
+    fn the_claim_question_is_asked_only_when_both_conditions_hold() {
+        let plex = vec!["plex".to_string()];
+        let other = vec!["sonarr".to_string()];
+        assert!(plex_claim_wanted(&plex, Some("thesyms.ca")));
+        assert!(!plex_claim_wanted(&plex, None));
+        assert!(!plex_claim_wanted(&other, Some("thesyms.ca")));
+        assert!(!plex_claim_wanted(&[], Some("thesyms.ca")));
+
+        // And the predicate is really what gates the prompt, rather than
+        // being a function nothing calls: a sonarr-only run never sees it.
+        let fake = healthy_cloudflare();
+        let mut io = Scripted::new(&[
+            "saltbox",
+            "thesyms.ca",
+            "a@b.co",
+            "sonarr",
+            "",
+            "a@b.co",
+            GOOD_TOKEN,
+            "a",
+            "y",
+        ]);
+        collect(&mut io, &verifying_against(&fake), &mut no_detection()).unwrap();
+        let t = io.transcript();
+        assert!(!t.contains("plex.tv/claim"), "should not have asked: {t}");
+    }
+
+    /// The paste errors that reach a claim token, and the one that does not
+    /// get refused.
+    ///
+    /// The charset is enforced because the token becomes a `?token=` query
+    /// parameter in `crates/ferrum-reconcile`; the `claim-` prefix is only
+    /// *said*, because plex.tv owns that format and refusing an unfamiliar
+    /// one would let a change there block every ferrum install for an
+    /// answer that is skippable anyway.
+    #[test]
+    fn a_claim_token_carrying_a_shell_artifact_is_refused_with_the_reason() {
+        let err = validate_plex_claim_token("claim-abcdefghij1234%")
+            .expect_err("a trailing % is not part of any claim token");
+        let msg = err.to_string();
+        assert!(msg.contains("zsh"), "the cause has to be named: {msg}");
+
+        // A whole URL pasted instead of the token in it.
+        assert!(validate_plex_claim_token("https://plex.tv/claim?x=1").is_err());
+        // Interior whitespace.
+        assert!(validate_plex_claim_token("claim-abc defghij").is_err());
+        // Empty, which the prompt turns into a skip rather than an error.
+        assert!(validate_plex_claim_token("   ").is_err());
+
+        // Trimmed rather than refused, like every other pasted credential.
+        assert_eq!(
+            validate_plex_claim_token("  claim-abcdefghij1234 \n").unwrap(),
+            "claim-abcdefghij1234"
+        );
+        // An unfamiliar shape is ACCEPTED, and the prompt says so. This is
+        // the half a stricter validator would have broken.
+        assert_eq!(
+            validate_plex_claim_token("xyzzy-1234567890").unwrap(),
+            "xyzzy-1234567890"
+        );
+    }
+
+    /// A rejected paste is retried rather than fatal, and the operator is
+    /// told why -- the same three tries `ask_valid` gives every answer.
+    #[test]
+    fn a_rejected_claim_token_can_be_retyped() {
+        let mut io = Scripted::new(&["claim abc", "claim-abcdefghij1234"]);
+        let token = ask_plex_claim(&mut io).unwrap();
+        assert_eq!(
+            token.as_ref().map(Secret::expose),
+            Some("claim-abcdefghij1234")
+        );
+        assert!(
+            io.transcript().contains("stray space"),
+            "the reason has to reach the operator: {}",
+            io.transcript()
+        );
+    }
+
+    /// An unfamiliar shape is accepted and NAMED, so an operator who pasted
+    /// the wrong thing finds out here rather than from the closing report.
+    #[test]
+    fn a_token_without_the_claim_prefix_is_accepted_and_flagged() {
+        let mut io = Scripted::new(&["xyzzy-1234567890"]);
+        let token = ask_plex_claim(&mut io).unwrap();
+        assert_eq!(token.as_ref().map(Secret::expose), Some("xyzzy-1234567890"));
+        assert!(
+            io.transcript().contains("begin with \"claim-\""),
+            "{}",
+            io.transcript()
+        );
+
+        // ...and the note is NOT printed for a normal token, or it would be
+        // noise on every install rather than a signal on an odd one.
+        let mut io = Scripted::new(&["claim-abcdefghij1234"]);
+        ask_plex_claim(&mut io).unwrap();
+        assert!(
+            !io.transcript().contains("begin with \"claim-\""),
+            "{}",
+            io.transcript()
+        );
     }
 
     /// Runs a full collect whose DNS answers are `extra`.

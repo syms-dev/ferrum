@@ -951,6 +951,7 @@ mod tests {
                 target: RecordTarget::A(Some(HOST)),
                 ddns_updater: true,
             }),
+            plex_claim: None,
         }
     }
 
