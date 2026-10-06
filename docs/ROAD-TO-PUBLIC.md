@@ -531,6 +531,55 @@ be reproduced in a Nix sandbox or a tempdir, and the fifth was contradicted by i
 
 ---
 
+## Phase 6 — Competitive position, and what reading a rival surfaced about us
+
+Analyses live in `docs/competitive/`. They exist so the positioning survives a dead session and so
+a public claim can be checked before someone else checks it for us.
+
+- [x] **21. Silo.** DONE 2026-10-06 — `docs/competitive/silo.md`. **Verdict: no threat.** Silo is a
+      media server, the Plex/Jellyfin slot *inside* a ferrum stack. Its own docs name Authelia and
+      mergerfs as prerequisites the operator supplies by hand, and its "connect securely" page is
+      install-Caddy-and-edit-a-Caddyfile. ~24 manual steps for one app. Its own release policy
+      "does not guarantee downgrade or in-place rollback compatibility between releases" and
+      recovery is a lossy backup restore — which is the best external validation of our thesis
+      available, and belongs in the README.
+
+Four work items that analysis surfaced about **ferrum**, not about Silo:
+
+- [ ] **22. ferrumd has no health or readiness endpoint.** Thirteen routes, none of them health; the
+      only health logic in the project lives inside `apply.rs` and ceases to exist when the apply
+      ends. There is no steady-state way to ask the box whether it is well. Two handlers and a
+      struct. **Degraded must be 200, not 503** — a watcher's reflex on 503 is to restart, which is
+      the wrong move for a degraded dependency — and `AppState.interlock` already holds the applying
+      job's UUID, so ferrum can report `"status":"applying"` honestly where Silo makes the operator
+      infer it from logs. **Point no watchdog at readiness:** `main.rs` already records "a ferrumd
+      restarted mid-apply by its own generation switch".
+- [ ] **23. Staleness is not a reading.** A mergerfs branch that drops out must render *unavailable*
+      or *last measured N days ago*, never as free space. "qBittorrent is in the tunnel" is a
+      last-known assertion and needs a timestamp — a kill switch last verified before the last reboot
+      is not a verified kill switch. We have caught this bug's sibling twice already (an empty
+      `systemctl list-dependencies` reading as health; `sonarr/meta.nix` probing `/ping` rather than
+      trusting `is-active`). It is a data-model choice — `Option<T>` + timestamp + reason, not a bare
+      number — so it is nearly free now and expensive once the health view exists.
+- [ ] **24. We disclose nothing about what leaves the machine.** Self-hosters self-host for exactly
+      this reason. The table writes itself: Cloudflare API, Let's Encrypt, plex.tv, the update check,
+      and each app's own egress — marked by whether the call is ferrum's or the app's. State plainly
+      whether there is any telemetry. Highest trust-per-byte document the project could publish.
+- [ ] **25. We leak the stack into Certificate Transparency and warn nobody.** `acme.nix` issues
+      "one `security.acme.certs` entry per public vhost", so `sonarr.`, `radarr.`, `qbittorrent.`
+      land in public, permanently searchable CT logs advertising exactly what runs at that domain.
+      Because we use DNS-01 rather than HTTP-01 we have an option others do not: a single wildcard
+      `*.<baseDomain>` puts only the base domain in CT. **Right now this is a design decision made by
+      accident.** Make it on purpose and document it either way.
+- [ ] **26. The SSO lockout path is undocumented.** The dashboard is behind Authelia as of F5. The
+      console password and the SSH tunnel both exist, and `POST /api/sso` correctly 404s on
+      tunnel-only hosts — but none of it is written down, and it is the highest-severity
+      undocumented failure mode in the product. Better still, and uniquely available to a
+      declarative system: **`preflight` should hard-fail an apply whose resulting generation leaves
+      no reachable authentication path**, with rollback still available and nothing yet changed.
+
+---
+
 ## Carried costs — recorded, owned, not blocking
 
 Each was accepted with a revisit trigger rather than forgotten.
