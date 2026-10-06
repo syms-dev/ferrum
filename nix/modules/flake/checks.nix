@@ -795,6 +795,9 @@
           daemonName = "${daemonSub}.example.test";
           vhosts = published.config.services.nginx.virtualHosts;
           daemonV = vhosts.${daemonName} or null;
+          # R5/SEC-M02. The control plane's own Authelia portal, which the
+          # daemon vhost's 401 redirect now points at.
+          controlPortalV = vhosts."auth.${daemonName}" or null;
           # `or { }` rather than `or null` so a missing location degrades to an
           # empty config string and produces a specific "directive missing"
           # problem, instead of throwing before any of them are reported.
@@ -1360,8 +1363,41 @@
             # D8, leg 3. A browser navigation should redirect to Authelia; an
             # XHR must not, or the SPA cannot tell an expired session from a
             # dead daemon.
-            ++ lib.optional (!(hasIn "error_page 401 =302 https://auth.example.test" rootLoc))
-              "the daemon vhost's / does not redirect an unauthenticated navigation to Authelia (A2)"
+            # R5/SEC-M02 moved the target. The dashboard now has an Authelia
+            # cookie scope of its own, and Authelia refuses to issue a cookie
+            # for a scope from a portal outside it -- so a redirect to
+            # auth.example.test lands the operator on a portal that
+            # authenticates them for the APPS and sends them back to a
+            # dashboard that is still unauthenticated. An infinite redirect
+            # loop on the control plane, reported by nothing.
+            #
+            # Asserted on the full `auth.ferrum.example.test` rather than a
+            # substring of it, because "auth.example.test" IS a substring of
+            # "auth.ferrum.example.test" in neither direction -- but
+            # `https://auth.` is in both, and a laxer match here would pass on
+            # exactly the regression this names.
+            ++ lib.optional
+              (!(hasIn "error_page 401 =302 https://auth.${daemonName}" rootLoc))
+              "the daemon vhost's / does not redirect an unauthenticated navigation to the control plane's own Authelia portal (A2/SEC-M02). It must be auth.${daemonName}: a redirect to auth.example.test authenticates the caller for the apps' cookie scope, which is not the dashboard's, so the browser comes back with no cookie Authelia will accept here and loops"
+            # And the portal it redirects to must exist, on a real
+            # certificate, and must NOT be behind forward-auth itself -- a
+            # login page gated by the thing it exists to log you into is the
+            # same unopenable-dashboard failure the Authelia rule above
+            # prevents, one hostname over.
+            ++ lib.optional (controlPortalV == null)
+              "the daemon vhost redirects to auth.${daemonName} and no vhost is generated for it: the control plane's login page is a name with nothing behind it (SEC-M02)"
+            ++ lib.optional
+              (controlPortalV != null
+                && (controlPortalV.locations."/".proxyPass or "") != "http://127.0.0.1:9091")
+              "the control plane's Authelia portal does not proxy to Authelia (SEC-M02)"
+            ++ lib.optional
+              (controlPortalV != null
+                && hasIn "auth_request" ((controlPortalV.locations."/".extraConfig or "")
+                  + (controlPortalV.extraConfig or "")))
+              "the control plane's Authelia portal is itself behind forward-auth, so logging in requires already being logged in (SEC-M02)"
+            ++ lib.optional
+              (controlPortalV != null && (controlPortalV.useACMEHost or null) != "auth.${daemonName}")
+              "the control plane's Authelia portal has no real certificate of its own: the very first redirect out of the dashboard lands on a certificate the browser refuses, which is SSO unusable on the configuration R5 exists to make work (SEC-M02)"
             ++ lib.optional (hasIn "=302" apiLoc)
               "the daemon vhost's /api/ redirects a 401 instead of returning it, so the SPA sees an opaque cross-origin redirect (D8)"
             ++ lib.optional (!(hasIn "error_page 401 = @ferrum_api_401" apiLoc))
@@ -1546,6 +1582,194 @@
           dashboardCertNames = builtins.attrNames dashboardCerts;
           daemonCertDnsProvider = if daemonCert == null then "<no entry>" else daemonCert.dnsProvider;
         };
+
+      # SEC-M02, closed. The dashboard's Authelia cookie is not the apps'.
+      #
+      # Until this check existed, modules/proxy/authelia.nix set
+      # `session.domain = <baseDomain>`, so ONE cookie covered every
+      # published name on the host -- including ferrum.<baseDomain>, the
+      # control plane. Several catalog apps deliberately carry
+      # unauthenticated bypass locations, so a cookie obtained in one app's
+      # context was presentable at the control plane's edge gate. That was
+      # accepted as a Medium only because ferrumd's own
+      # `__Host-ferrumd_session` sat underneath it as a compensating
+      # control, and that control is exactly what R5 spends.
+      #
+      # Authelia 4.38+ fixes it with a multi-domain `session.cookies` list.
+      # Three properties of that list are load-bearing and NONE of them is
+      # obvious from the configuration, which is why this check runs
+      # Authelia's own validator rather than reading the attrset:
+      #
+      #   1. `authelia_url` must sit INSIDE its own entry's cookie scope.
+      #      Measured against authelia 4.39.19: a `ferrum.example.test`
+      #      entry pointing at `https://auth.example.test` is refused with
+      #      "option 'authelia_url' does not share a cookie scope with
+      #      domain 'ferrum.example.test'". That single rule is why the
+      #      control plane needs a portal hostname of its own
+      #      (auth.ferrum.<baseDomain>) rather than reusing the apps' one,
+      #      and therefore why it needs its own certificate and its own DNS
+      #      record. A design that skipped them would be refused by Authelia
+      #      at startup, on a host whose apply reported success.
+      #
+      #   2. The MORE SPECIFIC domain must come FIRST. Measured: listing
+      #      example.test before ferrum.example.test is refused with
+      #      "option 'domain' shares the same cookie domain scope as another
+      #      configured session domain", while the reverse order validates.
+      #      Nix attribute/list order is otherwise invisible, so nothing
+      #      else in this repository would have noticed an edit that
+      #      reordered them.
+      #
+      #   3. The two entries must have DIFFERENT cookie NAMES, and Authelia
+      #      does NOT enforce this -- measured: two entries sharing the name
+      #      `authelia_session` validate cleanly. They are both sent to
+      #      ferrum.<baseDomain> by the browser (one by domain match, one by
+      #      subdomain match) under one name, and RFC 6265 leaves it
+      #      unspecified which a server reads. That is the SEC-M02 ambiguity
+      #      reintroduced through the fix for it, so ferrum asserts the
+      #      distinctness Authelia is content to leave open.
+      #
+      # The validator is run on the config file the REAL unit names, with
+      # the real binary the REAL unit names -- the same discipline
+      # nginxConfigParses uses, and for the same reason: an attrset that
+      # looks right is one layer short of the thing that actually refuses to
+      # start.
+      autheliaCookieScope =
+        let
+          mkCookieHost = { publish }: ferrumLib.mkHost {
+            inherit system;
+            settings = {
+              schemaVersion = realMigrations.currentVersion;
+              proxy = {
+                enable = true;
+                baseDomain = "example.test";
+                acme.email = "a@example.test";
+              };
+              auth = { enable = true; adminEmail = "a@example.test"; };
+              apps.sonarr.enable = true;
+              daemon = { inherit publish; };
+            };
+            modules = [ ../../../examples/hosts/minimal/configuration.nix ];
+          };
+          # The ordinary host: dashboard published, so the control plane
+          # needs a cookie scope of its own.
+          published = (mkCookieHost { publish = true; }).config;
+          # The control. ferrum.daemon.publish = false is the installer's
+          # stage-1 shape and the tunnel-only host: there is no
+          # ferrum.<baseDomain> vhost, so a second cookie scope would be an
+          # entry for a name nothing serves. It also proves the published
+          # fixture's extra entry comes from publication rather than from
+          # this check simply always finding two.
+          unpublished = (mkCookieHost { publish = false; }).config;
+          unitOf = cfg: cfg.systemd.units."authelia-main.service".unit;
+        in
+        pkgs.runCommand "ferrum-check-authelia-cookie-scope"
+          { nativeBuildInputs = [ pkgs.yq-go ]; }
+          ''
+            set -eu
+
+            fail() {
+              echo "authelia-cookie-scope: $1" >&2
+              exit 1
+            }
+
+            # The three secrets the real unit supplies from /run/secrets.
+            # Stand-ins, because this check is about the cookie list and not
+            # about secret material; every one is long enough to satisfy
+            # Authelia's own minimum-length rules.
+            printf '%s' aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa > jwt.key
+            printf '%s' bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb > session.key
+            printf '%s' cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc > storage.key
+            export AUTHELIA_IDENTITY_VALIDATION_RESET_PASSWORD_JWT_SECRET_FILE=$PWD/jwt.key
+            export AUTHELIA_SESSION_SECRET_FILE=$PWD/session.key
+            export AUTHELIA_STORAGE_ENCRYPTION_KEY_FILE=$PWD/storage.key
+
+            # Both halves come out of the unit, so this validates the exact
+            # file systemd will hand the exact binary it will exec, rather
+            # than a reconstruction that could drift from either.
+            read_unit() {
+              unit="$1/authelia-main.service"
+              execstart=$(grep -m1 '^ExecStart=' "$unit" | cut -d= -f2-)
+              bin=$(printf '%s' "$execstart" | cut -d' ' -f1)
+              cfg=$(printf '%s' "$execstart" | sed -n 's/.* --config \([^ ]*\).*/\1/p')
+              case "$bin" in
+                /nix/store/*/bin/authelia) ;;
+                *) fail "authelia-main.service's ExecStart does not name an authelia binary ($bin) -- this check no longer knows what it is testing" ;;
+              esac
+              case "$cfg" in
+                /nix/store/*) ;;
+                *) fail "authelia-main.service's ExecStart passes no store config path (--config '$cfg'), so there is nothing for this check to read" ;;
+              esac
+            }
+
+            # --- the published host -------------------------------------
+            read_unit ${unitOf published}
+            pub_bin=$bin
+            pub_cfg=$cfg
+
+            # Anti-vacuity, before any assertion about the list: a config
+            # with no cookies key at all would make every `yq` query below
+            # return `null`, and a comparison against `null` is not a
+            # finding. This is also the assertion that fails on the
+            # pre-R5 tree, where the key is `session.domain`.
+            yq -e '.session | has("cookies")' "$pub_cfg" > /dev/null \
+              || fail "the generated Authelia config has no session.cookies list at all, so the control plane shares one cookie with every published app (SEC-M02). Start at modules/proxy/authelia.nix."
+
+            count=$(yq '.session.cookies | length' "$pub_cfg")
+            [ "$count" = "2" ] \
+              || fail "the published host's session.cookies has $count entries, expected 2 (the control plane's own scope, then the apps')"
+
+            first_domain=$(yq -r '.session.cookies[0].domain' "$pub_cfg")
+            second_domain=$(yq -r '.session.cookies[1].domain' "$pub_cfg")
+            first_name=$(yq -r '.session.cookies[0].name' "$pub_cfg")
+            second_name=$(yq -r '.session.cookies[1].name' "$pub_cfg")
+            first_url=$(yq -r '.session.cookies[0].authelia_url' "$pub_cfg")
+
+            # Property 2. Authelia itself refuses the other order, so this
+            # assertion is belt to its braces -- but it names the control
+            # plane specifically, which the validator's message does not.
+            [ "$first_domain" = "ferrum.example.test" ] \
+              || fail "session.cookies[0].domain is \"$first_domain\", expected the control plane's own hostname. Authelia requires the more specific scope first and refuses the reverse with \"shares the same cookie domain scope\"."
+            [ "$second_domain" = "example.test" ] \
+              || fail "session.cookies[1].domain is \"$second_domain\", expected the base domain the catalog apps share"
+
+            # Property 3, the one Authelia does not check. Two cookies of
+            # the same name are BOTH sent to ferrum.example.test and RFC
+            # 6265 does not say which the server reads -- which is SEC-M02
+            # rebuilt inside its own fix.
+            [ "$first_name" != "$second_name" ] \
+              || fail "both session cookies are named \"$first_name\". The browser sends both to ferrum.example.test and RFC 6265 leaves it unspecified which Authelia reads, so a cookie obtained in an app's context can still be presented at the control plane -- which is SEC-M02 itself (Authelia's own validator accepts this; only this check does not)."
+            [ -n "$first_name" ] && [ "$first_name" != "null" ] \
+              || fail "the control plane's cookie entry has no name, so this check compared two absences"
+
+            # Property 1, named rather than left to the validator, because
+            # the validator's message does not say what it costs: a portal
+            # hostname outside the scope means the control plane needs its
+            # own certificate and DNS record, and those live in two other
+            # files.
+            case "$first_url" in
+              https://*.ferrum.example.test|https://ferrum.example.test) ;;
+              *) fail "the control plane's authelia_url is \"$first_url\", which is outside the cookie scope \"ferrum.example.test\". Authelia refuses this outright; see modules/proxy/nginx.nix's control-plane portal vhost, modules/proxy/acme.nix and modules/proxy/dns.nix, which must all name the same hostname." ;;
+            esac
+
+            # --- the control: an unpublished dashboard ------------------
+            read_unit ${unitOf unpublished}
+            unpub_cfg=$cfg
+            yq -e '.session | has("cookies")' "$unpub_cfg" > /dev/null \
+              || fail "the unpublished host's config has no session.cookies list, so comparing its length against the published host's proves nothing"
+            unpub_count=$(yq '.session.cookies | length' "$unpub_cfg")
+            [ "$unpub_count" = "1" ] \
+              || fail "ferrum.daemon.publish = false produced $unpub_count cookie scopes, expected 1. Nothing serves ferrum.example.test on that host, so a cookie scope for it is a portal URL pointing at a name with no vhost, no certificate and no record."
+
+            # --- and now Authelia's own opinion of both -----------------
+            for cfg_path in "$pub_cfg" "$unpub_cfg"; do
+              if ! "$pub_bin" validate-config --config "$cfg_path" > validate.log 2>&1; then
+                cat validate.log >&2
+                fail "authelia's own validator refuses the config this host generates (above). It refuses to START on it, so the apply succeeds and every published app on the box loses its login. Start at modules/proxy/authelia.nix's session.cookies."
+              fi
+            done
+
+            echo ok > $out
+          '';
 
       # The one check in this file that asks nginx, rather than asking Nix
       # what it told nginx.
@@ -2203,6 +2427,35 @@
             "$with_auth" > /dev/null \
             || fail "the daemon record is missing (owner ruling H-01, option C)"
 
+          # R5/SEC-M02. The control plane's own Authelia portal.
+          #
+          # The dashboard has a session cookie scope of its own now, and
+          # Authelia refuses to serve a scope from a portal outside it, so the
+          # dashboard's 401 redirect goes to auth.ferrum.<baseDomain> rather
+          # than auth.<baseDomain>. modules/proxy/acme.nix orders a
+          # certificate for that name on the same condition. Without the
+          # record, that is a valid certificate on a name that does not
+          # resolve and a dashboard nobody can log in to -- the
+          # auth.thesyms.ca incident exactly, one hostname over, which is why
+          # this assertion sits beside the one that encodes it.
+          ${pkgs.jq}/bin/jq -e '.records[] | select(.source == "auth-control") | select(.name == "auth.ferrum.example.invalid")' \
+            "$with_auth" > /dev/null \
+            || fail "auth.ferrum.example.invalid has no record, while modules/proxy/acme.nix issues its certificate and the dashboard's 401 redirect points at it -- nobody can log in to the control plane"
+
+          ${pkgs.jq}/bin/jq -e '.records[] | select(.source == "auth-control") | select(.name == "auth.ferrum.example.invalid")' \
+            "$dashboard_only" > /dev/null \
+            || fail "the dashboard-only host has no record for the dashboard's own Authelia portal, which is the one host where that portal is the only way in"
+
+          # And the three hosts that must NOT have it. Each has its own
+          # anti-vacuity partner above: $without_auth is asserted to be a
+          # generated document by the auth-record assertion, $publish_off and
+          # $record_excluded by their radarr assertions below, and $proxy_off
+          # by its baseDomain assertion. Without those, "no auth-control
+          # record" would be satisfied by an empty file.
+          ${pkgs.jq}/bin/jq -e '[.records[] | select(.source == "auth-control")] | length == 0' \
+            "$without_auth" > /dev/null \
+            || fail "a control-plane Authelia portal record was created on a host with SSO off, where no Authelia runs at all"
+
           # The dashboard-only host. Its auth certificate is issued
           # (acme.nix gates that on publicApps != { } || daemonPublished),
           # so without the matching record Authelia redirects the browser to
@@ -2252,6 +2505,10 @@
             "$proxy_off" > /dev/null \
             || fail "a host with ferrum.proxy.enable = false got a daemon record -- nginx never runs on it, so the name resolves to a box serving nothing at all (A7)"
 
+          ${pkgs.jq}/bin/jq -e '[.records[] | select(.source == "auth-control")] | length == 0' \
+            "$proxy_off" > /dev/null \
+            || fail "a host with ferrum.proxy.enable = false got a control-plane Authelia portal record -- nginx never runs on it (A7/SEC-M02)"
+
           # ferrum.daemon.dns.includeRecord = false, the only behaviour that
           # option has. The radarr assertion first, for the same reason as
           # above: it proves this document has records at all.
@@ -2263,12 +2520,25 @@
             "$record_excluded" > /dev/null \
             || fail "ferrum.daemon.dns.includeRecord = false still produced a daemon record -- the documented one-line way to opt out of the H-01 ruling does nothing"
 
+          # The portal record follows the dashboard's own record out, not the
+          # apps' auth record: the name exists only because the dashboard is
+          # published, so an operator managing the dashboard's record by hand
+          # manages its login page's record with it. Leaving one behind would
+          # hand them half a pair with no way to tell.
+          ${pkgs.jq}/bin/jq -e '[.records[] | select(.source == "auth-control")] | length == 0' \
+            "$record_excluded" > /dev/null \
+            || fail "ferrum.daemon.dns.includeRecord = false took the dashboard's record out and left its Authelia portal's behind"
+
           # ferrum.daemon.publish = false. radarr first, same anti-vacuity
           # reason as above, and it is also the positive half of the claim:
           # unpublishing the DASHBOARD must not unpublish the APPS.
           ${pkgs.jq}/bin/jq -e '.records[] | select(.source == "app:radarr")' \
             "$publish_off" > /dev/null \
             || fail "the publish = false document has no app records at all -- either it is not the generated config, so finding no daemon record in it proves nothing, or unpublishing the dashboard has unpublished the apps too"
+
+          ${pkgs.jq}/bin/jq -e '[.records[] | select(.source == "auth-control")] | length == 0' \
+            "$publish_off" > /dev/null \
+            || fail "ferrum.daemon.publish = false still produced a control-plane Authelia portal record. The dashboard is deliberately tunnel-only on that host, so nginx builds no vhost for either name"
 
           ${pkgs.jq}/bin/jq -e '[.records[] | select(.source == "daemon")] | length == 0' \
             "$publish_off" > /dev/null \
@@ -4457,6 +4727,7 @@
         auth-model-enforced = mkAssertionCheck "auth-model-enforced" authModelEnforced;
         daemon-vhost-enforced = mkAssertionCheck "daemon-vhost-enforced" daemonVhostEnforced;
         daemon-unpublished-but-running = daemonUnpublishedButRunning;
+        authelia-cookie-scope = autheliaCookieScope;
         nginx-config-parses = nginxConfigParses;
         reserved-subdomain-collision =
           mkAssertionCheck "reserved-subdomain-collision" reservedSubdomainCollision;

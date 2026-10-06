@@ -191,12 +191,24 @@ That is expected behaviour, not a bug, and the fix is to use the loopback addres
 
 ### What Authelia does and does not defend
 
-Authelia's session cookie is issued for the whole base domain (`session.domain = ferrum.proxy.baseDomain`, `modules/proxy/authelia.nix`). That is what makes single sign-on single: log in once at `auth.<baseDomain>` and every app under that domain accepts you.
+Authelia issues **two** session cookies on a host that publishes the dashboard (`session.cookies`, `modules/proxy/authelia.nix`):
 
-The consequence is worth stating plainly, because the natural assumption is the opposite one. **Authelia defends the control plane against the unauthenticated stranger from the internet, and against nothing else.** A *compromised app already behind the same SSO* — a sonarr with a remote-code-execution bug, say — makes requests to `ferrum.<baseDomain>` that carry that same domain-wide cookie, so they pass nginx's `auth_request` exactly as a legitimate browser's would. Authelia is not a boundary between two apps on one base domain; it never was.
+| Cookie | Scope | Issued at | Covers |
+|--------|-------|-----------|--------|
+| `authelia_session` | `<baseDomain>` | `auth.<baseDomain>` | every published catalog app |
+| `ferrum_control_session` | `ferrum.<baseDomain>` | `auth.ferrum.<baseDomain>` | the control plane, and nothing else |
 
-Two things, and only these two, stand between a compromised sibling app and this host's settings, secrets and system generations:
+The first is what makes single sign-on single across the apps: log in once at `auth.<baseDomain>` and every app under that domain accepts you. The second is deliberately **not** part of that: it is a separate scope with a separate cookie name and a portal hostname of its own, so a cookie obtained in an app's context is not a cookie for the dashboard.
 
+That separation is the fix for `SEC-M02` (`docs/security/SEC-M02_authelia-cookie-scope.md`), and it costs a second interactive login at the control plane — which is exactly what the risk acceptance said it would cost, and why it was deferred until something needed it.
+
+Its price is also structural rather than optional. Authelia refuses an `authelia_url` that sits outside the cookie scope it serves, so the control plane's portal cannot be `auth.<baseDomain>`; it needs its own vhost (`modules/proxy/nginx.nix`), its own certificate (`modules/proxy/acme.nix`) and its own DNS record (`modules/proxy/dns.nix`). All four files are held in agreement by the `authelia-cookie-scope`, `daemon-vhost-enforced` and `dns-record-set` checks.
+
+The consequence for the **apps** is worth stating plainly, because the natural assumption is the opposite one. **Within the base domain's own scope, Authelia defends against the unauthenticated stranger from the internet, and against nothing else.** A *compromised app already behind the same SSO* — a sonarr with a remote-code-execution bug, say — holds a cookie every other app under that domain accepts. Authelia is not a boundary between two apps on one base domain; it never was. What it is now is a boundary between the apps and the control plane.
+
+Three things stand between a compromised sibling app and this host's settings, secrets and system generations:
+
+- **The dashboard's Authelia cookie scope is not the apps'.** A sibling app's `authelia_session` is not a `ferrum_control_session`, so it does not clear the control plane's edge gate at all. This is the newest of the three and the only one of them that stops the request at nginx.
 - **ferrumd serves no CORS headers at all.** No `Access-Control-Allow-Origin` means a script running on `sonarr.<baseDomain>` cannot *read* any response it provokes from `ferrum.<baseDomain>`. This is enforced by a test that fails if such a header ever appears, rather than by the fact that nobody has added one.
 - **The session cookie is `__Host-ferrumd_session`, with `Secure`, `HttpOnly`, `SameSite=Strict` and `Path=/`.** `SameSite=Strict` stops a sibling origin's requests from carrying it; `HttpOnly` stops script from reading it; and the `__Host-` prefix makes browsers reject any version of that cookie sent with a `Domain` attribute — which is what stops a compromised sibling from *planting* a session cookie for the whole base domain and having ferrumd honour it.
 

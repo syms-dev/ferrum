@@ -180,6 +180,26 @@ lib.mkIf proxyEnabled {
         "https://acme-staging-v02.api.letsencrypt.org/directory";
     };
   }
+  // lib.optionalAttrs (ferrum.auth.enable && daemonPublished) {
+    # R5/SEC-M02. The control plane's own Authelia portal, which exists
+    # because Authelia refuses an `authelia_url` outside the cookie scope it
+    # serves (see modules/proxy/lib.nix's autheliaPortalFor). Same shape,
+    # same provider, same token as every entry above; keyed by the vhost name
+    # modules/proxy/nginx.nix references through useACMEHost.
+    #
+    # Gated on daemonPublished rather than realCertsNeeded, and the
+    # difference is not cosmetic: realCertsNeeded is also true on a host with
+    # a public app and NO published dashboard, and ordering a certificate
+    # there would name a hostname nginx builds no vhost for -- the
+    # auth.thesyms.ca defect this directory has already met twice.
+    "${proxyLib.autheliaPortalFor daemonVhostNameValue}" = {
+      dnsProvider = ferrum.proxy.acme.dnsProvider;
+      environmentFile = config.sops.secrets."${credentialSecret}".path;
+      group = nginxGroup;
+      server = lib.mkIf ferrum.proxy.acme.staging
+        "https://acme-staging-v02.api.letsencrypt.org/directory";
+    };
+  }
   // lib.optionalAttrs (ferrum.auth.enable && realCertsNeeded) {
     "auth.${ferrum.proxy.baseDomain}" = {
       dnsProvider = ferrum.proxy.acme.dnsProvider;

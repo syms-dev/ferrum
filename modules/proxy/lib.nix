@@ -1,8 +1,13 @@
 # Shared helpers for every modules/proxy/*.nix file. Plain pure functions of
 # `ferrum` (config.ferrum), not a NixOS module -- imported directly, the same
 # way modules/lib/catalog.nix is, never added to any imports list.
+#
+# `rec` rather than a plain set: autheliaPortalFor and
+# controlPlaneCookieDomain below are defined in terms of vhostNameFor and
+# daemonApp, and the whole reason this file exists is that a second copy of a
+# derivation drifts from the first.
 { lib }:
-{
+rec {
   vhostNameFor = ferrum: app: "${app.subdomain}.${ferrum.proxy.baseDomain}";
   exposedApps = ferrum: lib.filterAttrs
     (_: app: app.enable && app.exposure != "local")
@@ -102,4 +107,33 @@
     && ferrum.daemon.publish
     && ferrum.proxy.enable
     && ferrum.proxy.baseDomain != "";
+
+  # The cookie scope the control plane keeps to itself (SEC-M02, R5).
+  #
+  # Exactly the dashboard's own vhost name, so a session cookie issued in a
+  # catalog app's context -- which is scoped to the base domain, and which
+  # several apps' deliberately unauthenticated bypass locations make
+  # obtainable -- is not a cookie for this scope at all. Derived from
+  # vhostNameFor rather than spelled out, so moving the dashboard with
+  # ferrum.daemon.subdomain moves its cookie scope with it.
+  controlPlaneCookieDomain = ferrum: vhostNameFor ferrum (daemonApp ferrum);
+
+  # The Authelia portal hostname that serves a given cookie scope.
+  #
+  # One function rather than two literals because Authelia 4.38+ refuses an
+  # `authelia_url` that sits outside its own entry's cookie scope: for the
+  # base-domain scope the portal is auth.<baseDomain>, and for the control
+  # plane's own scope it has to be auth.<dashboard hostname>. Measured
+  # against authelia 4.39.19 -- a control-plane entry pointing at
+  # auth.<baseDomain> is rejected with "option 'authelia_url' does not share
+  # a cookie scope with domain '<dashboard hostname>'", and Authelia then
+  # refuses to start at all. nix/modules/flake/checks.nix's
+  # authelia-cookie-scope holds that, with Authelia's own validator.
+  #
+  # Four files have to agree on this name -- authelia.nix writes it into the
+  # cookie entry, nginx.nix serves a vhost for it and redirects to it,
+  # acme.nix orders its certificate and dns.nix publishes its record -- and
+  # a disagreement between any two of them is a login page on a name that
+  # does not resolve, or a certificate for a name nothing serves.
+  autheliaPortalFor = scopeDomain: "auth.${scopeDomain}";
 }
