@@ -1,5 +1,6 @@
 use clap::{Parser, Subcommand};
 
+mod address_history;
 mod apply;
 mod dns_reconcile;
 mod gc;
@@ -664,14 +665,15 @@ fn run_put_secret(name: &str, replace: bool) -> i32 {
 /// from the path the document names, inside `dns_reconcile`, so nothing
 /// about it passes through argv or this function.
 fn run_reconcile_dns(config: &std::path::Path) -> i32 {
-    let marker = std::path::PathBuf::from(
+    let state_dir = std::path::PathBuf::from(
         std::env::var("FERRUM_STATE_DIR").unwrap_or_else(|_| "/var/lib/ferrum/state".to_string()),
-    )
-    .join("dns-updater-last-success");
+    );
+    let marker = state_dir.join("dns-updater-last-success");
     let outcome = dns_reconcile::run(
         config,
         &dns_reconcile::cloudflare_client,
         &dns_reconcile::authoritative_verifier,
+        &dns_reconcile::production_address_policy(&state_dir),
     );
     reconcile_dns_exit(outcome, &marker, std::time::SystemTime::now())
 }
@@ -681,7 +683,15 @@ fn run_reconcile_dns(config: &std::path::Path) -> i32 {
 /// Exit codes follow `handle_apply_result`'s convention so a unit or future
 /// automation can tell the cases apart without parsing text: **0** clean,
 /// **3** reconciled but something is wrong, **1** could not reconcile at
-/// all.
+/// all, **4** this host's public address was discovered and deliberately
+/// REFUSED.
+///
+/// 4 is its own code rather than another 1, and F1/R1 asks for exactly that.
+/// "Ferrum could not reach the internet" and "the internet disagreed with
+/// itself about where this host is" send an operator to two different
+/// places, and both must be distinguishable from exit 0, which here means
+/// "looked, and there was nothing to change". The defect this closes is the
+/// three of them having been indistinguishable -- silence -- for six weeks.
 ///
 /// The last-success marker is written only on a clean cycle, and a cycle
 /// with nothing to do counts as clean. Its *age* is the signal A8 asks for:
@@ -709,7 +719,11 @@ fn reconcile_dns_exit(
         }
         Err(e) => {
             eprintln!("reconcile-dns: {e}");
-            return 1;
+            // The marker is deliberately NOT written on either branch: a
+            // refusal is not a clean cycle, and letting its age keep
+            // advancing would hide a host that has been refusing to publish
+            // since its ISP put it behind CGNAT.
+            return if e.is_discovery_refusal() { 4 } else { 1 };
         }
     };
 
@@ -927,6 +941,47 @@ mod tests {
                 !marker.exists(),
                 "a host that reconciles nothing has not proved anything about its records"
             );
+        }
+
+        /// F1/R1. Refusing an address and failing to find one are different
+        /// facts that send an operator to different places, and both must be
+        /// distinguishable from exit 0's "nothing to change". The defect
+        /// this closes is all three having been the same silence.
+        #[test]
+        fn a_refused_address_exits_four_and_a_failed_lookup_exits_one() {
+            use ferrum_dns::public_ip::DiscoveryError;
+            let dir = tempfile::tempdir().unwrap();
+            let marker = dir.path().join("dns-updater-last-success");
+
+            let refused = reconcile_dns_exit(
+                Err(ReconcileError::Discovery(DiscoveryError::Disagreement {
+                    answers: vec![
+                        ("alpha".to_string(), "142.180.179.64".parse().unwrap()),
+                        ("beta".to_string(), "184.148.39.165".parse().unwrap()),
+                    ],
+                })),
+                &marker,
+                std::time::SystemTime::now(),
+            );
+            assert_eq!(refused, 4, "a refusal has its own exit code");
+            assert!(
+                !marker.exists(),
+                "a refusal is not a clean cycle -- letting the marker age on \
+                 would hide a host that has refused to publish for weeks"
+            );
+
+            let unreachable = reconcile_dns_exit(
+                Err(ReconcileError::Discovery(
+                    DiscoveryError::NotEnoughOperators {
+                        answered: Vec::new(),
+                        failures: vec!["alpha: timed out".to_string()],
+                    },
+                )),
+                &marker,
+                std::time::SystemTime::now(),
+            );
+            assert_eq!(unreachable, 1, "not finding out is the ordinary failure");
+            assert!(!marker.exists());
         }
     }
     use clap::Parser;

@@ -90,6 +90,14 @@ let
   # A2: the record target is a decision the operator makes once (the
   # installer collects it), never a guess. One target for every record --
   # they all point at the same box.
+  #
+  # F1/R1 qualified that in one direction only. With ddnsUpdater.enable this
+  # value stops being the published address and becomes a cross-check:
+  # crates/ferrum-apply/src/dns_reconcile.rs publishes the address three
+  # independent services agreed on, and warns -- naming both -- when
+  # staticAddress disagrees with what it measured. With the updater off,
+  # which is the default, this is still the whole truth: what is written
+  # here is what gets published, unchanged.
   target =
     if dns.recordMode == "cname"
     then { mode = "cname"; hostname = dns.cnameTarget; }
@@ -183,12 +191,29 @@ in
       '';
     }
     {
-      assertion = !dnsEnabled || dns.recordMode != "a" || dns.staticAddress != "";
+      # The `|| ddnsEnabled` term is F1/R1 arriving. The original reasoning
+      # -- "guessing the address would publish every app at somewhere that is
+      # not this server" -- is still exactly right, and it is why this
+      # assertion stays for every host that does NOT run the updater. What
+      # changed is that with the updater on, ferrum no longer guesses: it
+      # asks three independent services and refuses to act unless at least
+      # two run by different parties agree (crates/ferrum-dns/src/public_ip.rs).
+      # That is a better answer than a literal an operator typed once and has
+      # no reason to revisit -- which is the literal that left seven records
+      # pointing at 184.148.39.165 for an evening.
+      #
+      # staticAddress remains legal alongside the updater, and is then
+      # advisory: crates/ferrum-apply/src/dns_reconcile.rs publishes what it
+      # measured and warns, naming both values, when the two disagree.
+      assertion = !dnsEnabled || dns.recordMode != "a"
+        || dns.staticAddress != "" || ddnsEnabled;
       message = ''
         ferrum.proxy.dns.recordMode is "a" but ferrum.proxy.dns.staticAddress
-        is empty. Guessing the address would publish every app at somewhere
-        that is not this server; set the host's real public IPv4 address, or
-        use recordMode = "cname".
+        is empty and ferrum.proxy.dns.ddnsUpdater.enable is false, so nothing
+        on this host knows where to point the records. Guessing would publish
+        every app at somewhere that is not this server. Either set the host's
+        real public IPv4 address, or turn the updater on and let ferrum
+        discover it, or use recordMode = "cname".
       '';
     }
     {
@@ -234,10 +259,11 @@ in
       assertion = !ddnsEnabled || dns.recordMode == "a";
       message = ''
         ferrum.proxy.dns.ddnsUpdater.enable is true but
-        ferrum.proxy.dns.recordMode is "cname". The updater exists to correct
-        an A record when this host's public address changes; a CNAME already
-        delegates that job to whatever owns the target name, so the updater
-        would have nothing to do.
+        ferrum.proxy.dns.recordMode is "cname". The updater discovers this
+        host's public IPv4 address and writes it into the A records ferrum
+        owns; a CNAME has no address in it to correct, and already delegates
+        the job to whatever owns the target name. Use recordMode = "a", or
+        turn the updater off.
       '';
     }
   ];
@@ -251,18 +277,49 @@ in
   # with no systemd Environment= plumbing to keep in sync.
   environment.etc."ferrum-dns-config.json".source = dnsConfigFile;
 
-  # A8's optional updater: re-check the host's real public address on a
-  # schedule and correct the records ferrum owns when it has moved. Opt-in,
+  # A8's optional updater: discover this host's real public IPv4 address on
+  # a schedule and correct the records ferrum owns when it has moved. Opt-in,
   # but recommended, because the failure it prevents is invisible from the
   # host -- a stale A record leaves every app unreachable from outside while
   # the box is healthy and its certificates are valid.
+  #
+  # THIS COMMENT WAS FALSE UNTIL F1/R1, and that is worth leaving on the
+  # record rather than quietly fixing. It said "re-check the host's real
+  # public address" from the day the unit shipped, as did the unit
+  # description below and the recordMode assertion above. No code anywhere in
+  # crates/ queried a public address; the timer re-published
+  # ferrum.proxy.dns.staticAddress on a schedule and nothing else. Three
+  # security reviews and a 32-finding bug hunt read these three sentences and
+  # took them as a description of the code. The owner's address then moved
+  # from 184.148.39.165 to 142.180.179.64, seven records kept pointing at the
+  # old one, every published app became unreachable from outside, and the
+  # host reported itself healthy throughout.
+  #
+  # What it does now, for real:
+  #
+  #   * crates/ferrum-dns/src/public_ip.rs asks three address-echo services
+  #     run by three different parties (Cloudflare, Amazon, ipify). At least
+  #     two DISTINCT operators must answer and every answer that arrives must
+  #     agree, or nothing is published -- a wrong address republishes every
+  #     one of the operator's hostnames at somebody else's server, with
+  #     certificates ferrum obtained itself, which is strictly worse than a
+  #     stale record.
+  #   * a private, loopback, CGNAT-shared or otherwise reserved answer is
+  #     refused outright rather than written.
+  #   * a discovery failure exits non-zero (1 could not find out, 4 found out
+  #     and refused), so it can never read as "nothing to do" -- which is
+  #     exactly how the original defect stayed invisible.
+  #   * crates/ferrum-apply/src/address_history.rs caps published changes at
+  #     3 per rolling 24 hours, so a flapping link cannot spend the
+  #     Cloudflare quota rewriting every hostname every hour. A held change
+  #     is disclosed with both addresses named, never silently dropped.
   #
   # Deliberately NOT wantedBy ferrum-apps.target: that target's members are
   # what crates/ferrum-apply/src/apply.rs's all_managed_units_active() polls,
   # and a timer-driven oneshot that is legitimately inactive between runs
   # would be read there as a failed apply.
   systemd.services.ferrum-dns-updater = lib.mkIf ddnsEnabled {
-    description = "Correct the DNS records ferrum owns against this host's current public address";
+    description = "Discover this host's public IPv4 address and correct the DNS records ferrum owns";
     after = [ "network-online.target" ];
     wants = [ "network-online.target" ];
     serviceConfig = {
@@ -284,11 +341,23 @@ in
       # internet-facing API, and holds a Zone:Read + DNS:Edit credential for
       # the operator's real domain while it does.
       ProtectSystem = "strict";
-      # The ONE path this unit writes, and the reason it must stay writable:
-      # crates/ferrum-apply/src/main.rs's run_reconcile_dns records a
-      # last-success timestamp at <stateDir>/dns-updater-last-success after
-      # every clean cycle, and the AGE of that file is the whole of A8's
-      # staleness signal -- a timer that has been erroring for six weeks is
+      # The only directory this unit writes, and the reason it must stay
+      # writable. Two files live in it, and both are signals rather than
+      # caches:
+      #
+      #   * <stateDir>/dns-updater-last-success -- written by
+      #     crates/ferrum-apply/src/main.rs's run_reconcile_dns after every
+      #     clean cycle. Its AGE is the whole of A8's staleness signal.
+      #   * <stateDir>/dns-public-address.json -- F1/R1's published-address
+      #     history, read and written by
+      #     crates/ferrum-apply/src/address_history.rs. It is what makes "the
+      #     address moved from X to Y" a fact rather than a guess, and it
+      #     carries the flap budget that stops an oscillating link spending
+      #     the Cloudflare quota. Losing it costs at most one extra permitted
+      #     change, which is why its own failures are disclosed rather than
+      #     fatal.
+      #
+      # A timer that has been erroring for six weeks is
       # otherwise indistinguishable from one that has never had anything to
       # do. ProtectSystem = "strict" makes the entire hierarchy read-only,
       # so removing this line does not tidy anything up: it silently turns
@@ -317,7 +386,9 @@ in
       # capability is dropped, so this is one capability away from the empty
       # set rather than a weaker posture than the house pattern.
       CapabilityBoundingSet = [ "CAP_DAC_OVERRIDE" ];
-      # AF_INET/AF_INET6 for the Cloudflare HTTPS calls and for the `dig`
+      # AF_INET/AF_INET6 for the Cloudflare HTTPS calls, for the three
+      # address-echo HTTPS calls F1/R1 added
+      # (crates/ferrum-dns/src/public_ip.rs), and for the `dig`
       # queries crates/ferrum-dns/src/dns_query.rs makes against the zone's
       # authoritative nameservers; AF_UNIX for nsswitch/NSS lookups on the
       # way there. Deliberately no AF_NETLINK and no AF_PACKET, matching

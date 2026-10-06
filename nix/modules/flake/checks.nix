@@ -2291,6 +2291,106 @@
           echo ok > $out
         '';
 
+      # F1/R1. `ferrum.proxy.dns.ddnsUpdater` shipped as a timer that
+      # re-published `ferrum.proxy.dns.staticAddress` on a schedule.
+      # modules/proxy/dns.nix said three separate times that it re-checked
+      # this host's real public address; no code in crates/ ever queried one.
+      # The owner's address moved from 184.148.39.165 to 142.180.179.64,
+      # seven records kept pointing at the old one, every published app
+      # became unreachable from outside, and the host reported itself healthy
+      # throughout.
+      #
+      # The Rust half of the fix -- the three-source quorum, the refusal on
+      # disagreement, the flap budget -- is proved in
+      # crates/ferrum-dns/src/public_ip.rs and
+      # crates/ferrum-apply/src/dns_reconcile.rs, which is where behaviour
+      # belongs. What only Nix can prove is the part of the fix that lives in
+      # the option surface: a host that has turned the updater on must no
+      # longer be required to write an address down by hand, because the
+      # hand-written address is exactly what went stale. That is the first
+      # probe below.
+      #
+      # The other two are its anti-vacuity half, and they are not decoration:
+      # a probe reporting "no staticAddress assertion fired" would pass
+      # identically if the assertion had simply been deleted, or if the
+      # message scoping were wrong and the probe could never see any failure
+      # at all. So the same probe, on the same example host, must still
+      # REJECT the two configurations that remain genuinely unusable -- the
+      # updater off with no address, and the updater on with a CNAME it has
+      # no address to correct inside.
+      #
+      # Same builtins.tryEval + message-scoping idiom as journalDirCollision
+      # above, and scoped for the same measured reason: the example host
+      # carries other failing assertions (its committed placeholder secrets
+      # have no *-apikey-raw.sops counterparts), so an unscoped probe reports
+      # every configuration as rejected and would pass with this whole
+      # requirement reverted.
+      ddnsUpdaterNeedsNoStaticAddress =
+        let
+          hostWith = { updater, recordMode ? "a", staticAddress ? "", cnameTarget ? "" }:
+            ferrumLib.mkHost {
+              inherit system;
+              settings = {
+                schemaVersion = realMigrations.currentVersion;
+                proxy = {
+                  enable = true;
+                  baseDomain = "example.invalid";
+                  acme.email = "admin@example.invalid";
+                  dns = {
+                    enable = true;
+                    inherit recordMode staticAddress cnameTarget;
+                    ddnsUpdater.enable = updater;
+                  };
+                };
+                apps.radarr.enable = true;
+              };
+              modules = [ ../../../examples/hosts/minimal/configuration.nix ];
+            };
+
+          failuresMatching = infix: args:
+            let
+              probe = builtins.tryEval (
+                builtins.filter (m: lib.hasInfix infix m)
+                  (map (a: a.message)
+                    (builtins.filter (a: !a.assertion) (hostWith args).config.assertions))
+              );
+            in
+            if probe.success then probe.value else [ "evaluation threw" ];
+
+          # 1. The requirement itself: the updater on, nothing written down.
+          updaterNoAddress =
+            failuresMatching "ferrum.proxy.dns.staticAddress" { updater = true; };
+
+          # 2. Anti-vacuity: the identical configuration with the updater OFF
+          #    is still refused, because then nothing on the host knows where
+          #    to point the records.
+          noUpdaterNoAddress =
+            failuresMatching "ferrum.proxy.dns.staticAddress" { updater = false; };
+
+          # 3. Anti-vacuity: the updater on with recordMode = "cname" is
+          #    still refused -- a CNAME carries no address to correct.
+          updaterWithCname = failuresMatching "ferrum.proxy.dns.ddnsUpdater.enable" {
+            updater = true;
+            recordMode = "cname";
+            cnameTarget = "box.dyn.example.net";
+          };
+
+          # 4. Evaluating is not the same as working: the relaxed
+          #    configuration must still build the unit and the timer that do
+          #    the discovering.
+          relaxed = (hostWith { updater = true; }).config.systemd;
+          unitExists = relaxed.services ? ferrum-dns-updater;
+          timerExists = relaxed.timers ? ferrum-dns-updater;
+        in
+        {
+          ok = updaterNoAddress == [ ]
+            && noUpdaterNoAddress != [ ]
+            && updaterWithCname != [ ]
+            && unitExists
+            && timerExists;
+          inherit updaterNoAddress noUpdaterNoAddress updaterWithCname unitExists timerExists;
+        };
+
       # The other half of the two-layer control, and the half nothing in the
       # repo pinned until now.
       #
@@ -4367,6 +4467,8 @@
         root-folders-reach-the-apps = rootFoldersReachTheApps;
         wireguard-config-with-many-addresses = wireguardConfigWithManyAddresses;
         dns-record-set = dnsRecordSet;
+        ddns-updater-needs-no-static-address =
+          mkAssertionCheck "ddns-updater-needs-no-static-address" ddnsUpdaterNeedsNoStaticAddress;
         catalog-consistency = mkAssertionCheck "catalog-consistency" catalogConsistency;
         schema-uniformity = mkAssertionCheck "schema-uniformity" schemaUniformity;
         ui-renders-every-schema-type =

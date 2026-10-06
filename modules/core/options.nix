@@ -329,6 +329,13 @@ in
             own machine can easily be a VPN or office egress, not the
             server's.
 
+            With ddnsUpdater.enable this stops being the published address
+            and becomes a cross-check: ferrum publishes the address it
+            discovers and warns, naming both values, if this one disagrees.
+            It may then be left empty, which is the recommended shape for a
+            host whose address is not contractually static -- there is no
+            second place for the truth to go stale.
+
             IPv4 only: ferrum publishes no AAAA record today.
           '';
         };
@@ -389,8 +396,8 @@ in
             type = types.bool;
             default = false;
             description = ''
-              Whether a timer re-checks this host's real public address on a
-              schedule and corrects the records ferrum owns when it has
+              Whether a timer discovers this host's real public IPv4 address
+              on a schedule and corrects the records ferrum owns when it has
               moved. Opt-in, but RECOMMENDED on any host whose address is
               not contractually static.
 
@@ -400,6 +407,23 @@ in
               certificates are valid, with no error anywhere. It only ever
               touches records ferrum created; a record it does not own is
               reported, never rewritten.
+
+              Discovery asks three address-echo services run by three
+              different parties. At least two of those parties must answer,
+              and every answer that arrives must agree, or nothing is
+              published and the run fails: a wrong address republishes every
+              hostname ferrum manages at a server that is not this one, which
+              is worse than a record that is merely out of date. A private or
+              otherwise reserved answer is refused outright, and published
+              changes are capped at three per rolling day so a flapping link
+              cannot spend the Cloudflare quota.
+
+              ferrum cannot tell whether inbound connections to the address
+              it discovers actually reach this host. Carrier-grade NAT and a
+              router with no port forward both produce correct records in
+              front of an unreachable server, so a change is published with
+              that caveat stated rather than with a reachability claim ferrum
+              is in no position to make.
             '';
           };
 
@@ -407,11 +431,11 @@ in
             type = types.int;
             default = 60;
             description = ''
-              How often the updater re-checks the public address. Hourly is
-              a deliberate compromise: an address change is rare and costs
+              How often the updater re-discovers the public address. Hourly
+              is a deliberate compromise: an address change is rare and costs
               at most this long of outside-world downtime, while a shorter
-              interval spends API calls and an address-echo lookup on a
-              value that almost never changes.
+              interval spends three address-echo lookups, and sometimes a
+              Cloudflare write pass, on a value that almost never changes.
             '';
           };
         };
