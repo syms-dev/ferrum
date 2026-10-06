@@ -71,13 +71,26 @@ impl std::fmt::Debug for Secret {
 /// that is not this one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RecordTarget {
-    /// `A` records to a stated public IPv4 address.
+    /// `A` records to a public IPv4 address, when one is stated.
     ///
-    /// Held as an [`std::net::Ipv4Addr`] rather than a `String` so that a
-    /// value which got this far cannot be anything else: it is parsed once,
-    /// at the prompt where a human can fix it, and no later reader has to
-    /// ask the question again.
-    A(std::net::Ipv4Addr),
+    /// `Some` is held as an [`std::net::Ipv4Addr`] rather than a `String` so
+    /// that a value which got this far cannot be anything else: it is parsed
+    /// once, at the prompt where a human can fix it, and no later reader has
+    /// to ask the question again.
+    ///
+    /// `None` means **the host finds its own address**, and is legal only
+    /// alongside `ddns_updater`. F1/R1 gave `ferrum.proxy.dns.ddnsUpdater`
+    /// real discovery -- three address-echo services, two distinct operators
+    /// required to agree -- and `modules/proxy/dns.nix`'s `recordMode = "a"`
+    /// assertion was relaxed to accept an empty `staticAddress` once the
+    /// updater is on. An operator who runs the updater therefore has nothing
+    /// to type here, and writing a literal anyway would create a second
+    /// place for the truth to go stale: `crates/ferrum-apply`'s
+    /// `dns_reconcile.rs` warns, naming both values, when a persisted
+    /// `staticAddress` disagrees with what it measured, so a literal written
+    /// at install time turns every later address change into a warning about
+    /// a value nobody asked for.
+    A(Option<std::net::Ipv4Addr>),
     /// `CNAME` records following a stated hostname -- typically a
     /// dynamic-DNS name maintained outside ferrum.
     Cname(String),
@@ -127,6 +140,21 @@ pub struct Answers {
     /// `ferrum.proxy.dns.enable` implies a base domain and a declared
     /// credential, so there is nothing to ask about without both.
     pub dns: Option<DnsDecision>,
+    /// F3/R3: the plex.tv claim token, held in memory only.
+    ///
+    /// A [`Secret`] rather than a `String` for the same reason the
+    /// Cloudflare token is: it associates this server with somebody's Plex
+    /// account, and `settings.json` is world-readable by design -- the UI
+    /// renders it. It reaches the host as a sops secret through
+    /// `ferrum-apply put-secret plex-claim` and is never written to a file
+    /// on the operator's own machine.
+    ///
+    /// `None` means the operator skipped the question, or was never asked
+    /// (see [`plex_claim_wanted`]), or this is a resumed run -- a resume
+    /// recovers everything except the credentials, which were deliberately
+    /// never written anywhere. Skipping is reported in the closing summary
+    /// as an unfinished step, never silently.
+    pub plex_claim: Option<Secret>,
 }
 
 /// A hostname must be a DNS label: it becomes `networking.hostName` and
@@ -485,13 +513,25 @@ fn ask_a_record_address(
 /// running and its certificates stay valid, with no error logged anywhere.
 /// That is why the updater's default is on rather than off.
 ///
+/// **The updater question comes first in `A` mode**, because its answer
+/// decides whether there is an address question at all. ferrum's install is
+/// meant to finish with a working system and no manual follow-up, and an
+/// operator who turns the updater on has nothing further to supply: F1/R1
+/// taught the host to discover its own public address, and
+/// `modules/proxy/dns.nix` was relaxed in the same change to accept an empty
+/// `staticAddress` on exactly that condition. Asking for one anyway would
+/// put a literal into `settings.json` that nothing consults and that
+/// `crates/ferrum-apply/src/dns_reconcile.rs` will later warn about every
+/// time the real address moves away from it.
+///
 /// # Arguments
 /// * `domain` - `ferrum.proxy.baseDomain`, used only to make the question
 ///   concrete about which names are at stake.
 /// * `io` - the question-and-answer channel with the operator.
 /// * `detect` - A8's address detection, described on [`Detector`]. Used
-///   only in `A` mode: a CNAME follows a name, so there is no address to
-///   find.
+///   only in `A` mode with the updater off: a CNAME follows a name and an
+///   updater host finds its own address, so in neither case is there an
+///   address for the installer to find.
 ///
 /// # Returns
 /// The decision, ready to be rendered into `ferrum.proxy.dns`.
@@ -519,7 +559,46 @@ pub fn decide_dns(
         parse_record_mode(if raw.trim().is_empty() { "a" } else { raw })
     })?;
 
+    // Asked BEFORE the address, and that order is the requirement rather
+    // than a preference. An operator who runs the updater has no address to
+    // state -- the host discovers its own, hourly -- so asking for one first
+    // and then offering to make it irrelevant collects an answer the install
+    // is about to stop using, and persists it where
+    // `crates/ferrum-apply/src/dns_reconcile.rs` will later warn that it
+    // disagrees with reality. Not offered at all in CNAME mode:
+    // `modules/proxy/dns.nix` asserts the updater and CNAME are
+    // incompatible, so an operator who said yes there would meet that
+    // assertion instead of an install.
+    let ddns_updater = match mode {
+        RecordMode::Cname => false,
+        RecordMode::A => {
+            io.say(
+                "\nIf this server's public address ever changes, those A records go \
+                 stale and every\napp becomes unreachable from outside -- while the host \
+                 stays healthy, the services\nkeep running and the certificates stay \
+                 valid, with nothing anywhere reporting an\nerror. An hourly check on \
+                 the host finds its real public address and corrects them,\nand only \
+                 ever touches records ferrum created. Say yes and there is nothing \
+                 to\ntype: no address to look up now, and none to come back and change \
+                 later.\nRecommended unless this address is contractually static.",
+            );
+            let answer = io.ask("Keep the records up to date automatically? [Y/n]")?;
+            !matches!(answer.to_lowercase().as_str(), "n" | "no")
+        }
+    };
+
     let target = match mode {
+        // The whole point of the question above: with the updater on there
+        // is no address to ask for and none to write down.
+        RecordMode::A if ddns_updater => {
+            io.say(&format!(
+                "\n  A records for every app under {domain} will point at whatever \
+                 public address\n  this host finds for itself -- checked hourly, and \
+                 again five minutes after\n  every boot. Nothing is written into \
+                 settings.json for you to keep in step."
+            ));
+            RecordTarget::A(None)
+        }
         RecordMode::A => {
             let (address, source) = ask_a_record_address(io, detect)?;
             // A8: shown before it is used, every time, with its provenance.
@@ -537,7 +616,7 @@ pub fn decide_dns(
                      unreachable from the\n  internet. Continuing with it, as you asked."
                 ));
             }
-            RecordTarget::A(address)
+            RecordTarget::A(Some(address))
         }
         RecordMode::Cname => RecordTarget::Cname(ask_valid(
             io,
@@ -546,29 +625,151 @@ pub fn decide_dns(
         )?),
     };
 
-    let ddns_updater = match &target {
-        // Not offered, rather than merely defaulted off: modules/proxy/dns.nix
-        // asserts the updater and CNAME mode are incompatible, so an operator
-        // who said yes here would meet that assertion instead of an install.
-        RecordTarget::Cname(_) => false,
-        RecordTarget::A(_) => {
-            io.say(
-                "\nIf this server's public address ever changes, those A records go \
-                 stale and every\napp becomes unreachable from outside -- while the host \
-                 stays healthy, the services\nkeep running and the certificates stay \
-                 valid, with nothing anywhere reporting an\nerror. An hourly check \
-                 corrects them, and only ever touches records ferrum\ncreated. \
-                 Recommended unless this address is contractually static.",
-            );
-            let answer = io.ask("Keep the records up to date automatically? [Y/n]")?;
-            !matches!(answer.to_lowercase().as_str(), "n" | "no")
-        }
-    };
-
     Ok(DnsDecision {
         target,
         ddns_updater,
     })
+}
+
+/// The name of the sops secret the claim token lands in.
+///
+/// Named once here and consumed by `stage2::commands`, `render::settings`
+/// and the closing report, because three spellings of it is three ways for
+/// the declaration, the file and the module to drift apart.
+/// `modules/apps/plex/service.nix` and `modules/core/reconciler.nix` name
+/// the same string on the host side.
+pub const PLEX_CLAIM_SECRET: &str = "plex-claim";
+
+/// Whether this install should ask for a Plex claim token (F3/R3 A1).
+///
+/// Both terms are the requirement's own. `plex` among the apps is obvious;
+/// the base domain less so, and it is there because an unclaimed Plex is
+/// only a problem for a server somebody intends to reach. A host with no
+/// domain publishes nothing through the proxy, so the question would be
+/// asking for a credential before there is anything to use it for -- the
+/// same reasoning that keeps the Cloudflare token unasked on such a host.
+///
+/// # Arguments
+/// * `apps` - the catalog apps the operator selected.
+/// * `base_domain` - `ferrum.proxy.baseDomain`, or `None`.
+///
+/// # Returns
+/// `true` when the question should be asked.
+#[must_use]
+pub fn plex_claim_wanted(apps: &[String], base_domain: Option<&str>) -> bool {
+    base_domain.is_some() && apps.iter().any(|a| a == "plex")
+}
+
+/// Validates a plex.tv claim token before it can become a secret.
+///
+/// Deliberately **not** a format check on the `claim-` prefix. plex.tv
+/// issues tokens in that shape today, and a token that does not have it is
+/// far more likely to be a paste error than a Plex redesign -- but refusing
+/// it outright would let a future change at plex.tv block every ferrum
+/// install, for a value that is skippable and whose failure is already
+/// reported rather than fatal. So the prefix is *said*, and the charset is
+/// *enforced*: a claim token reaches `ureq`'s `?token=` query parameter in
+/// `crates/ferrum-reconcile/src/main.rs`, and the characters that are not in
+/// this set are exactly the ones a bad paste carries -- a trailing `%` from
+/// zsh, a stray space, or a whole URL copied instead of the token in it.
+///
+/// # Arguments
+/// * `raw` - what the operator pasted.
+///
+/// # Returns
+/// The trimmed token.
+///
+/// # Errors
+/// When it is empty, or carries a character a claim token cannot contain --
+/// naming the character, since the usual culprit is invisible.
+pub fn validate_plex_claim_token(raw: &str) -> anyhow::Result<String> {
+    let token = raw.trim();
+    if token.is_empty() {
+        anyhow::bail!("a claim token cannot be empty; press enter to skip instead");
+    }
+    if let Some(bad) = token
+        .chars()
+        .find(|c| !(c.is_ascii_alphanumeric() || *c == '_' || *c == '-'))
+    {
+        anyhow::bail!(
+            "that claim token contains {bad:?} ({:#06x}), which a plex.tv \
+             claim token never does -- it is letters, digits, underscores \
+             and hyphens only.\n\n\
+             If you copied it from a terminal, check for a trailing \"%\" \
+             (zsh's marker for output with no final newline) or a stray \
+             space. If you copied the whole page, the token is the \
+             \"claim-...\" value alone.",
+            bad as u32
+        );
+    }
+    Ok(token.to_string())
+}
+
+/// Asks for the plex.tv claim token (F3/R3 A1, A2, A3).
+///
+/// **The expiry is stated because the alternative is an error that lies.**
+/// A claim token is valid for four minutes after plex.tv issues it, and a
+/// stale one is refused by Plex in a way that is indistinguishable from a
+/// wrong one. An operator who fetched a token before starting the installer
+/// and answers here will meet that, so the question says so rather than
+/// letting them find out from the closing report.
+///
+/// It also says what happens when the token has expired *by the time Plex
+/// starts*, which on a first install is the likely case rather than the
+/// unlucky one: the stage-2 apply builds the whole system on the target and
+/// the claim happens after that switch. That is not something this prompt
+/// can beat -- the secret has to exist before the build, because sops-nix
+/// resolves every `sopsFile` at evaluation time -- so it is disclosed, the
+/// closing report states the measured outcome, and the one command that
+/// finishes the job is printed there.
+///
+/// Skipping is one keystroke, by requirement: an operator with no Plex
+/// account must not have to invent an answer to get past this.
+///
+/// # Arguments
+/// * `io` - the question-and-answer channel with the operator.
+///
+/// # Returns
+/// The token, or `None` when the operator pressed enter.
+///
+/// # Errors
+/// An input failure, or an answer that fails validation three times.
+fn ask_plex_claim(io: &mut impl PromptIo) -> anyhow::Result<Option<Secret>> {
+    io.say(
+        "\nPlex will not serve anybody but localhost until the server is claimed by a \
+         Plex\naccount, and ferrum opens no port for you to claim it from the LAN. So \
+         it claims\nthe server for you, with a token from:\n\n  \
+         https://plex.tv/claim\n\n\
+         That token expires FOUR MINUTES after plex.tv issues it, and an expired one \
+         is\nrefused exactly like a wrong one -- so fetch it now rather than \
+         beforehand.\n\n\
+         The install still has a system to build after this, which usually takes \
+         longer\nthan four minutes. If the token has expired by the time Plex starts, \
+         Plex comes\nup unclaimed, the closing report says so, and it names the one \
+         command that\nfinishes the job. Press enter to skip and do it that way \
+         deliberately.",
+    );
+    for attempt in 0..3 {
+        let raw = io.ask_secret("Plex claim token (enter to skip):")?;
+        if raw.trim().is_empty() {
+            return Ok(None);
+        }
+        match validate_plex_claim_token(&raw) {
+            Ok(token) => {
+                if !token.starts_with("claim-") {
+                    // Said, not refused. See validate_plex_claim_token.
+                    io.say(
+                        "  Note: plex.tv's claim tokens begin with \"claim-\". Using \
+                         what you\n  entered as given.",
+                    );
+                }
+                return Ok(Some(Secret::new(token)));
+            }
+            Err(e) if attempt < 2 => io.say(&format!("  {e}")),
+            Err(e) => return Err(e),
+        }
+    }
+    unreachable!("the loop returns or errors on its last attempt")
 }
 
 /// Collects every operator answer.
@@ -656,6 +857,16 @@ pub fn collect(
         _ => None,
     };
 
+    // Last, because it is the one answer with a clock on it: four minutes
+    // from plex.tv issuing it. Every question before this one is the
+    // operator reading and deciding, and putting the timed answer behind
+    // them spends none of that budget.
+    let plex_claim = if plex_claim_wanted(&apps, base_domain.as_deref()) {
+        ask_plex_claim(io)?
+    } else {
+        None
+    };
+
     Ok(Answers {
         hostname,
         base_domain,
@@ -664,6 +875,7 @@ pub fn collect(
         apps,
         cloudflare_token,
         dns,
+        plex_claim,
     })
 }
 
@@ -1034,6 +1246,14 @@ pub fn from_stage2(body: &str, hostname: &str) -> anyhow::Result<Answers> {
         },
         apps,
         cloudflare_token: None,
+        // Never recovered, for the same reason the Cloudflare token is not:
+        // it was deliberately written nowhere on this machine. Unlike that
+        // one it is also not re-asked -- it is skippable, so a resume that
+        // asked again would be demanding a credential to finish a step the
+        // closing report can simply name as outstanding. What a resume DOES
+        // have to do is keep the settings document and the host's secrets
+        // directory in step; `render::set_plex_claim_secret` is that.
+        plex_claim: None,
         dns: dns_from_settings(&doc)?,
     })
 }
@@ -1058,7 +1278,10 @@ pub fn from_stage2(body: &str, hostname: &str) -> anyhow::Result<Answers> {
 /// # Errors
 /// A record mode that is neither `a` nor `cname`, a target that fails the
 /// same validation the prompt applies, or the updater enabled alongside
-/// CNAME mode -- the one combination `modules/proxy/dns.nix` rejects.
+/// CNAME mode -- the one combination `modules/proxy/dns.nix` rejects. An
+/// **absent** `staticAddress` in `a` mode is an error only with the updater
+/// off, mirroring that module's own `recordMode = "a"` assertion: with the
+/// updater on there is deliberately no address to recover.
 fn dns_from_settings(doc: &serde_json::Value) -> anyhow::Result<Option<DnsDecision>> {
     let Some(dns) = doc.pointer("/proxy/dns") else {
         return Ok(None);
@@ -1071,16 +1294,32 @@ fn dns_from_settings(doc: &serde_json::Value) -> anyhow::Result<Option<DnsDecisi
         return Ok(None);
     }
 
+    let ddns_updater = dns
+        .pointer("/ddnsUpdater/enable")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+
     let target = match parse_record_mode(
         dns.get("recordMode")
             .and_then(serde_json::Value::as_str)
             .unwrap_or("a"),
     )? {
-        RecordMode::A => RecordTarget::A(validate_public_ipv4(
-            dns.get("staticAddress")
+        RecordMode::A => {
+            let raw = dns
+                .get("staticAddress")
                 .and_then(serde_json::Value::as_str)
-                .unwrap_or_default(),
-        )?),
+                .unwrap_or_default();
+            // An absent address is the NORMAL shape for an updater host --
+            // `decide_dns` writes none, and modules/proxy/dns.nix's
+            // recordMode = "a" assertion accepts that exact combination.
+            // With the updater off it is still the error it always was, and
+            // the message below is the one that assertion gives.
+            if raw.trim().is_empty() && ddns_updater {
+                RecordTarget::A(None)
+            } else {
+                RecordTarget::A(Some(validate_public_ipv4(raw)?))
+            }
+        }
         RecordMode::Cname => RecordTarget::Cname(validate_cname_target(
             dns.get("cnameTarget")
                 .and_then(serde_json::Value::as_str)
@@ -1088,10 +1327,6 @@ fn dns_from_settings(doc: &serde_json::Value) -> anyhow::Result<Option<DnsDecisi
         )?),
     };
 
-    let ddns_updater = dns
-        .pointer("/ddnsUpdater/enable")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
     if ddns_updater && matches!(target, RecordTarget::Cname(_)) {
         anyhow::bail!(
             "the recovered settings enable ferrum.proxy.dns.ddnsUpdater with \
@@ -1297,9 +1532,9 @@ mod tests {
             "", // SSO: default yes
             "admin@thesyms.ca",
             "cftokenvalue1234567890abcdefghijklmnopqr",
-            "",             // record target: default 'a'
-            "203.0.113.10", // this server's public address
-            "",             // updater: default yes
+            "",                     // record target: default 'a'
+            "",                     // updater: default yes -- so no address is asked for
+            "claim-abcdefghij1234", // plex is among the apps, so this is asked
         ]);
         let fake = healthy_cloudflare();
         let a = collect(&mut io, &verifying_against(&fake), &mut no_detection()).unwrap();
@@ -1314,9 +1549,13 @@ mod tests {
         assert_eq!(
             a.dns,
             Some(DnsDecision {
-                target: RecordTarget::A("203.0.113.10".parse().unwrap()),
+                target: RecordTarget::A(None),
                 ddns_updater: true,
             })
+        );
+        assert_eq!(
+            a.plex_claim.as_ref().map(Secret::expose),
+            Some("claim-abcdefghij1234")
         );
     }
 
@@ -1434,6 +1673,194 @@ mod tests {
         ]
     }
 
+    /// The answers a plex install gives, up to and including the DNS
+    /// questions, so each R3 test says only what it is about.
+    fn upto_plex_claim() -> Vec<&'static str> {
+        vec![
+            "saltbox",
+            "thesyms.ca",
+            "me@thesyms.ca",
+            "plex",
+            "", // SSO: default yes
+            "a@b.co",
+            GOOD_TOKEN,
+            "a", // record target
+            "y", // updater on, so no address question
+        ]
+    }
+
+    /// F3/R3 A1 and A2. An install that enables Plex is asked for a claim
+    /// token, with the URL to fetch it from and the four-minute expiry
+    /// stated -- the expiry because an operator who fetches it early and
+    /// answers late meets a failure indistinguishable from a bad token.
+    ///
+    /// Mutation check: drop the `plex.tv/claim` URL from the question and
+    /// the first assertion fails; drop the expiry sentence and the second
+    /// does; route it through `io.ask` instead of `io.ask_secret` and the
+    /// third does, with the token then sitting in the operator's scrollback.
+    #[test]
+    fn a_plex_install_is_asked_for_a_claim_token() {
+        let fake = healthy_cloudflare();
+        let mut script = upto_plex_claim();
+        script.push("claim-abcdefghij1234");
+        let mut io = Scripted::new(&script);
+        let a = collect(&mut io, &verifying_against(&fake), &mut no_detection()).unwrap();
+
+        let t = io.transcript();
+        assert!(
+            t.contains("https://plex.tv/claim"),
+            "the question has to say where to get one: {t}"
+        );
+        assert!(
+            t.contains("FOUR MINUTES"),
+            "and that it expires, because an expired token is refused \
+             exactly like a wrong one: {t}"
+        );
+        assert!(
+            io.secret_asks
+                .iter()
+                .any(|q| q.contains("Plex claim token")),
+            "it is a credential, so it must not be echoed: {:?}",
+            io.secret_asks
+        );
+        assert_eq!(
+            a.plex_claim.as_ref().map(Secret::expose),
+            Some("claim-abcdefghij1234")
+        );
+    }
+
+    /// F3/R3 A3. Skipping is one keystroke -- an operator with no Plex
+    /// account must not have to invent an answer to get past the question.
+    ///
+    /// Mutation check: make the empty answer fall into
+    /// `validate_plex_claim_token` and the run fails instead of skipping.
+    #[test]
+    fn skipping_the_claim_token_is_one_keystroke() {
+        let fake = healthy_cloudflare();
+        let mut script = upto_plex_claim();
+        script.push("");
+        let mut io = Scripted::new(&script);
+        let a = collect(&mut io, &verifying_against(&fake), &mut no_detection()).unwrap();
+        assert_eq!(a.plex_claim, None);
+        // ...and nothing is delivered for a token that does not exist.
+        assert!(
+            !crate::stage2::commands(&a)
+                .iter()
+                .any(|c| c.contains(PLEX_CLAIM_SECRET)),
+            "{:#?}",
+            crate::stage2::commands(&a)
+        );
+    }
+
+    /// F3/R3 A1's two conditions, both of them. The question is asked only
+    /// when Plex is among the apps AND a base domain is set: a host that
+    /// publishes nothing has nothing to reach an unclaimed Plex for, and
+    /// asking anyway would collect a credential before there is a use for
+    /// it -- the same rule that keeps the Cloudflare token unasked there.
+    #[test]
+    fn the_claim_question_is_asked_only_when_both_conditions_hold() {
+        let plex = vec!["plex".to_string()];
+        let other = vec!["sonarr".to_string()];
+        assert!(plex_claim_wanted(&plex, Some("thesyms.ca")));
+        assert!(!plex_claim_wanted(&plex, None));
+        assert!(!plex_claim_wanted(&other, Some("thesyms.ca")));
+        assert!(!plex_claim_wanted(&[], Some("thesyms.ca")));
+
+        // And the predicate is really what gates the prompt, rather than
+        // being a function nothing calls: a sonarr-only run never sees it.
+        let fake = healthy_cloudflare();
+        let mut io = Scripted::new(&[
+            "saltbox",
+            "thesyms.ca",
+            "a@b.co",
+            "sonarr",
+            "",
+            "a@b.co",
+            GOOD_TOKEN,
+            "a",
+            "y",
+        ]);
+        collect(&mut io, &verifying_against(&fake), &mut no_detection()).unwrap();
+        let t = io.transcript();
+        assert!(!t.contains("plex.tv/claim"), "should not have asked: {t}");
+    }
+
+    /// The paste errors that reach a claim token, and the one that does not
+    /// get refused.
+    ///
+    /// The charset is enforced because the token becomes a `?token=` query
+    /// parameter in `crates/ferrum-reconcile`; the `claim-` prefix is only
+    /// *said*, because plex.tv owns that format and refusing an unfamiliar
+    /// one would let a change there block every ferrum install for an
+    /// answer that is skippable anyway.
+    #[test]
+    fn a_claim_token_carrying_a_shell_artifact_is_refused_with_the_reason() {
+        let err = validate_plex_claim_token("claim-abcdefghij1234%")
+            .expect_err("a trailing % is not part of any claim token");
+        let msg = err.to_string();
+        assert!(msg.contains("zsh"), "the cause has to be named: {msg}");
+
+        // A whole URL pasted instead of the token in it.
+        assert!(validate_plex_claim_token("https://plex.tv/claim?x=1").is_err());
+        // Interior whitespace.
+        assert!(validate_plex_claim_token("claim-abc defghij").is_err());
+        // Empty, which the prompt turns into a skip rather than an error.
+        assert!(validate_plex_claim_token("   ").is_err());
+
+        // Trimmed rather than refused, like every other pasted credential.
+        assert_eq!(
+            validate_plex_claim_token("  claim-abcdefghij1234 \n").unwrap(),
+            "claim-abcdefghij1234"
+        );
+        // An unfamiliar shape is ACCEPTED, and the prompt says so. This is
+        // the half a stricter validator would have broken.
+        assert_eq!(
+            validate_plex_claim_token("xyzzy-1234567890").unwrap(),
+            "xyzzy-1234567890"
+        );
+    }
+
+    /// A rejected paste is retried rather than fatal, and the operator is
+    /// told why -- the same three tries `ask_valid` gives every answer.
+    #[test]
+    fn a_rejected_claim_token_can_be_retyped() {
+        let mut io = Scripted::new(&["claim abc", "claim-abcdefghij1234"]);
+        let token = ask_plex_claim(&mut io).unwrap();
+        assert_eq!(
+            token.as_ref().map(Secret::expose),
+            Some("claim-abcdefghij1234")
+        );
+        assert!(
+            io.transcript().contains("stray space"),
+            "the reason has to reach the operator: {}",
+            io.transcript()
+        );
+    }
+
+    /// An unfamiliar shape is accepted and NAMED, so an operator who pasted
+    /// the wrong thing finds out here rather than from the closing report.
+    #[test]
+    fn a_token_without_the_claim_prefix_is_accepted_and_flagged() {
+        let mut io = Scripted::new(&["xyzzy-1234567890"]);
+        let token = ask_plex_claim(&mut io).unwrap();
+        assert_eq!(token.as_ref().map(Secret::expose), Some("xyzzy-1234567890"));
+        assert!(
+            io.transcript().contains("begin with \"claim-\""),
+            "{}",
+            io.transcript()
+        );
+
+        // ...and the note is NOT printed for a normal token, or it would be
+        // noise on every install rather than a signal on an odd one.
+        let mut io = Scripted::new(&["claim-abcdefghij1234"]);
+        ask_plex_claim(&mut io).unwrap();
+        assert!(
+            !io.transcript().contains("begin with \"claim-\""),
+            "{}",
+            io.transcript()
+        );
+    }
+
     /// Runs a full collect whose DNS answers are `extra`.
     fn collect_with_dns(fake: &FakeCloudflare, extra: &[&'static str]) -> anyhow::Result<Answers> {
         let mut script = upto_token(GOOD_TOKEN);
@@ -1448,11 +1875,11 @@ mod tests {
     #[test]
     fn both_record_shapes_are_collected() {
         let fake = healthy_cloudflare();
-        let a = collect_with_dns(&fake, &["a", "203.0.113.10", "n"]).unwrap();
+        let a = collect_with_dns(&fake, &["a", "n", "203.0.113.10"]).unwrap();
         assert_eq!(
             a.dns,
             Some(DnsDecision {
-                target: RecordTarget::A("203.0.113.10".parse().unwrap()),
+                target: RecordTarget::A(Some("203.0.113.10".parse().unwrap())),
                 ddns_updater: false,
             })
         );
@@ -1476,7 +1903,7 @@ mod tests {
     fn the_updater_defaults_to_on_and_says_why() {
         let fake = healthy_cloudflare();
         let mut script = upto_token(GOOD_TOKEN);
-        script.extend_from_slice(&["a", "203.0.113.10", ""]);
+        script.extend_from_slice(&["a", ""]);
         let mut io = Scripted::new(&script);
         let a = collect(&mut io, &verifying_against(&fake), &mut no_detection()).unwrap();
         assert_eq!(
@@ -1492,8 +1919,66 @@ mod tests {
 
         // ...and 'n' is still honoured. It is a recommendation, not a gate.
         script_healthy_zone(&fake);
-        let off = collect_with_dns(&fake, &["a", "203.0.113.10", "no"]).unwrap();
+        let off = collect_with_dns(&fake, &["a", "no", "203.0.113.10"]).unwrap();
         assert_eq!(off.dns.map(|d| d.ddns_updater), Some(false));
+    }
+
+    /// F3/R3b. An operator who turns the updater on is asked for nothing
+    /// else: the host discovers its own address, so there is no literal to
+    /// look up now and none to come back and correct later. This is the
+    /// hands-off requirement -- an install must finish with a working
+    /// system and no manual follow-up -- arriving at the one question that
+    /// was still contradicting it.
+    ///
+    /// Mutation check: ask for the address before the updater question (the
+    /// order this replaced) and the first assertion fails, naming the
+    /// question that was asked. Write `staticAddress` anyway and
+    /// `render::tests::an_updater_host_persists_no_static_address` fails.
+    #[test]
+    fn an_updater_host_is_never_asked_for_a_static_address() {
+        let mut io = Scripted::new(&["a", "y"]);
+        // Fails loudly if the address path runs at all: an updater host has
+        // no reason to reach the target for an address it will not use.
+        let mut detect = || panic!("detection must not run once the updater is on");
+        let d = decide_dns("thesyms.ca", &mut io, &mut detect).unwrap();
+        assert_eq!(
+            d,
+            DnsDecision {
+                target: RecordTarget::A(None),
+                ddns_updater: true,
+            }
+        );
+        assert!(
+            !io.asked.iter().any(|q| q.contains("IPv4 address")),
+            "asked for an address the updater makes unnecessary: {:?}",
+            io.asked
+        );
+        // And the operator is told why nothing was asked, rather than left
+        // wondering which address their records point at.
+        let t = io.transcript();
+        assert!(
+            t.contains("this host finds for itself"),
+            "the absent question has to be explained: {t}"
+        );
+
+        // Anti-vacuity: declining the updater still asks, and still
+        // records what was typed. The assertion above is about the
+        // updater's branch, not about the question having been deleted.
+        let mut io = Scripted::new(&["a", "n", "203.0.113.10"]);
+        let d = decide_dns("thesyms.ca", &mut io, &mut no_detection()).unwrap();
+        assert_eq!(
+            d,
+            DnsDecision {
+                target: RecordTarget::A(Some("203.0.113.10".parse().unwrap())),
+                ddns_updater: false,
+            }
+        );
+        assert!(
+            io.asked.iter().any(|q| q.contains("IPv4 address")),
+            "with the updater off the address is still the operator's to \
+             state: {:?}",
+            io.asked
+        );
     }
 
     /// R1 A8 / modules/proxy/dns.nix's own assertion: the updater exists to
@@ -1569,12 +2054,12 @@ mod tests {
         let mut script = upto_token(GOOD_TOKEN);
         // 100.64/10 -- carrier-grade NAT, the case a residential connection
         // hits when the ISP hands out no real address.
-        script.extend_from_slice(&["a", "100.64.1.5", "n"]);
+        script.extend_from_slice(&["a", "n", "100.64.1.5"]);
         let mut io = Scripted::new(&script);
         let a = collect(&mut io, &verifying_against(&fake), &mut no_detection()).unwrap();
         assert_eq!(
             a.dns.map(|d| d.target),
-            Some(RecordTarget::A("100.64.1.5".parse().unwrap())),
+            Some(RecordTarget::A(Some("100.64.1.5".parse().unwrap()))),
             "the answer is the operator's"
         );
         assert!(
@@ -1617,10 +2102,10 @@ mod tests {
     #[test]
     fn a_detected_public_address_is_shown_then_taken_by_pressing_enter() {
         let fake = healthy_cloudflare();
-        let (a, io) = collect_detecting(&fake, "203.0.113.10\n", &["a", "", "n"]);
+        let (a, io) = collect_detecting(&fake, "203.0.113.10\n", &["a", "n", ""]);
         assert_eq!(
             a.dns.map(|d| d.target),
-            Some(RecordTarget::A("203.0.113.10".parse().unwrap()))
+            Some(RecordTarget::A(Some("203.0.113.10".parse().unwrap())))
         );
         let t = io.transcript();
         assert!(
@@ -1646,10 +2131,10 @@ mod tests {
     #[test]
     fn an_override_is_honoured_labelled_and_still_validated() {
         let fake = healthy_cloudflare();
-        let (a, io) = collect_detecting(&fake, "203.0.113.10", &["a", "198.51.100.7", "n"]);
+        let (a, io) = collect_detecting(&fake, "203.0.113.10", &["a", "n", "198.51.100.7"]);
         assert_eq!(
             a.dns.map(|d| d.target),
-            Some(RecordTarget::A("198.51.100.7".parse().unwrap())),
+            Some(RecordTarget::A(Some("198.51.100.7".parse().unwrap()))),
             "the operator's answer wins over the detected one"
         );
         assert!(
@@ -1665,11 +2150,11 @@ mod tests {
         let (b, _) = collect_detecting(
             &fake,
             "203.0.113.10",
-            &["a", "not-an-address", "198.51.100.8", "n"],
+            &["a", "n", "not-an-address", "198.51.100.8"],
         );
         assert_eq!(
             b.dns.map(|d| d.target),
-            Some(RecordTarget::A("198.51.100.8".parse().unwrap()))
+            Some(RecordTarget::A(Some("198.51.100.8".parse().unwrap())))
         );
     }
 
@@ -1678,7 +2163,7 @@ mod tests {
     fn the_operator_can_ask_it_to_look_again() {
         let fake = healthy_cloudflare();
         let mut script = upto_token(GOOD_TOKEN);
-        script.extend_from_slice(&["a", "r", "", "n"]);
+        script.extend_from_slice(&["a", "n", "r", ""]);
         let mut io = Scripted::new(&script);
         let mut looks = 0usize;
         let a = collect(&mut io, &verifying_against(&fake), &mut || {
@@ -1689,7 +2174,7 @@ mod tests {
         assert_eq!(looks, 2, "'r' must run detection again, not parse as input");
         assert_eq!(
             a.dns.map(|d| d.target),
-            Some(RecordTarget::A("203.0.113.10".parse().unwrap()))
+            Some(RecordTarget::A(Some("203.0.113.10".parse().unwrap())))
         );
     }
 
@@ -1702,10 +2187,10 @@ mod tests {
     #[test]
     fn a_detected_cgnat_address_is_reported_never_offered() {
         let fake = healthy_cloudflare();
-        let (a, io) = collect_detecting(&fake, "100.64.1.5", &["a", "203.0.113.10", "n"]);
+        let (a, io) = collect_detecting(&fake, "100.64.1.5", &["a", "n", "203.0.113.10"]);
         assert_eq!(
             a.dns.map(|d| d.target),
-            Some(RecordTarget::A("203.0.113.10".parse().unwrap())),
+            Some(RecordTarget::A(Some("203.0.113.10".parse().unwrap()))),
             "the CGNAT address must not have become the record's value"
         );
         let t = io.transcript();
@@ -1733,10 +2218,10 @@ mod tests {
     #[test]
     fn a_detected_ipv6_address_never_becomes_an_a_record() {
         let fake = healthy_cloudflare();
-        let (a, io) = collect_detecting(&fake, "2001:db8::1", &["a", "203.0.113.10", "n"]);
+        let (a, io) = collect_detecting(&fake, "2001:db8::1", &["a", "n", "203.0.113.10"]);
         assert_eq!(
             a.dns.map(|d| d.target),
-            Some(RecordTarget::A("203.0.113.10".parse().unwrap()))
+            Some(RecordTarget::A(Some("203.0.113.10".parse().unwrap())))
         );
         let t = io.transcript();
         assert!(t.contains("2001:db8::1"), "it must be shown: {t}");
@@ -1768,10 +2253,10 @@ mod tests {
     #[test]
     fn detection_that_finds_nothing_states_it_and_asks() {
         let fake = healthy_cloudflare();
-        let (a, io) = collect_detecting(&fake, "", &["a", "203.0.113.10", "n"]);
+        let (a, io) = collect_detecting(&fake, "", &["a", "n", "203.0.113.10"]);
         assert_eq!(
             a.dns.map(|d| d.target),
-            Some(RecordTarget::A("203.0.113.10".parse().unwrap())),
+            Some(RecordTarget::A(Some("203.0.113.10".parse().unwrap()))),
             "an empty detection must not degrade into a default address"
         );
         let t = io.transcript();
@@ -1784,7 +2269,7 @@ mod tests {
         // And a detection that could not run at all behaves the same way.
         script_healthy_zone(&fake);
         let mut script = upto_token(GOOD_TOKEN);
-        script.extend_from_slice(&["a", "203.0.113.10", "n"]);
+        script.extend_from_slice(&["a", "n", "203.0.113.10"]);
         let mut io = Scripted::new(&script);
         let b = collect(&mut io, &verifying_against(&fake), &mut || {
             address::detect(|_| anyhow::bail!("ssh target failed: no route to host"))
@@ -1792,7 +2277,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             b.dns.map(|d| d.target),
-            Some(RecordTarget::A("203.0.113.10".parse().unwrap()))
+            Some(RecordTarget::A(Some("203.0.113.10".parse().unwrap())))
         );
         assert!(
             io.transcript().contains("no route to host"),
@@ -1829,18 +2314,18 @@ mod tests {
     #[test]
     fn a8_prompts_read_correctly_to_an_operator() {
         for (case, detected, extra) in [
-            ("detected and usable", "203.0.113.10", &["a", "", "n"][..]),
+            ("detected and usable", "203.0.113.10", &["a", "n", ""][..]),
             (
                 "detected but CGNAT",
                 "100.64.1.5",
-                &["a", "203.0.113.10", "n"][..],
+                &["a", "n", "203.0.113.10"][..],
             ),
             (
                 "detected IPv6",
                 "2001:db8::1",
-                &["a", "203.0.113.10", "n"][..],
+                &["a", "n", "203.0.113.10"][..],
             ),
-            ("detection failed", "", &["a", "203.0.113.10", "n"][..]),
+            ("detection failed", "", &["a", "n", "203.0.113.10"][..]),
         ] {
             let fake = healthy_cloudflare();
             let (_, io) = collect_detecting(&fake, detected, extra);
@@ -1929,20 +2414,52 @@ mod tests {
         assert_eq!(
             a.dns,
             Some(DnsDecision {
-                target: RecordTarget::A("203.0.113.10".parse().unwrap()),
+                target: RecordTarget::A(Some("203.0.113.10".parse().unwrap())),
                 ddns_updater: true,
             })
         );
 
-        // A hand-blanked address is the exact shape of D-11(b)'s failure:
-        // an empty value that reads as "nothing to do".
-        let blanked = from_stage2(
-            &doc(serde_json::json!({ "enable": true, "recordMode": "a", "staticAddress": "" })),
+        // F3/R3b: the settings an updater install actually writes. No
+        // staticAddress at all, which modules/proxy/dns.nix's own
+        // `recordMode = "a"` assertion accepts on exactly this condition --
+        // so a resume must accept it too, rather than refusing the
+        // documents this installer now produces.
+        let discovered = from_stage2(
+            &doc(serde_json::json!({
+                "enable": true,
+                "recordMode": "a",
+                "ddnsUpdater": { "enable": true },
+            })),
             "saltbox",
         )
-        .unwrap_err()
-        .to_string();
-        assert!(blanked.contains("staticAddress"), "{blanked}");
+        .unwrap();
+        assert_eq!(
+            discovered.dns,
+            Some(DnsDecision {
+                target: RecordTarget::A(None),
+                ddns_updater: true,
+            })
+        );
+
+        // With the updater OFF a hand-blanked address is still the exact
+        // shape of D-11(b)'s failure: an empty value that reads as "nothing
+        // to do". The relaxation above is scoped to the updater and nothing
+        // else -- which is also what makes it a check rather than a hole.
+        for blank in [
+            serde_json::json!({ "enable": true, "recordMode": "a", "staticAddress": "" }),
+            serde_json::json!({ "enable": true, "recordMode": "a" }),
+            serde_json::json!({
+                "enable": true,
+                "recordMode": "a",
+                "staticAddress": "",
+                "ddnsUpdater": { "enable": false },
+            }),
+        ] {
+            let blanked = from_stage2(&doc(blank.clone()), "saltbox")
+                .unwrap_err()
+                .to_string();
+            assert!(blanked.contains("staticAddress"), "{blank}: {blanked}");
+        }
 
         // The one combination dns.nix rejects, caught here instead.
         let impossible = from_stage2(

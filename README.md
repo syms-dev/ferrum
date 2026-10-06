@@ -78,6 +78,25 @@ token is the one you will need; the installer handles it for you.
 
 **Sonarr, Radarr and Prowlarr's API keys are fully automatic.** `ferrum-apply` generates and encrypts a random key for each enabled app on first apply; there is nothing an operator needs to do.
 
+### Plex's claim token
+
+Plex will not serve anybody but localhost until the server is claimed by a Plex account, and ferrum opens no port you could claim it from on the LAN — so ferrum claims it for you. If you enable Plex and set a base domain, the installer asks for a token from [plex.tv/claim](https://plex.tv/claim) and sends it to the host as the `plex-claim` secret; `ferrum-reconcile` uses it on the next apply and is a no-op on a server that is already claimed. It is a secret and not a `settings.json` value on purpose: it associates the server with somebody's Plex account, and `settings.json` is world-readable by design.
+
+That token expires **four minutes** after plex.tv issues it, and the system build between the question and the claim usually takes longer — so coming up unclaimed is the ordinary outcome rather than a fault. The closing report asks the host whether Plex is actually claimed and says so plainly when it is not, with the commands that finish the job:
+
+```bash
+ferrum-apply put-secret plex-claim --replace   # paste a fresh token on stdin
+ferrum-apply apply
+```
+
+Skipping the question is one keystroke, and is reported the same way rather than silently — but the recovery is one step longer, because nothing declared the secret. Add it to `secrets` in `/etc/ferrum/settings.json` first:
+
+```json
+"plex-claim": { "description": "plex.tv claim token" }
+```
+
+then `ferrum-apply put-secret plex-claim` (no `--replace`, there is nothing there yet) and `ferrum-apply apply`. The declaration is what `modules/apps/plex/service.nix` and `modules/core/reconciler.nix` both key on; without it the secret is written and never read.
+
 ### qBittorrent VPN kill switch
 
 qBittorrent's VPN kill-switch config is operator-provided, since it's your own WireGuard peer's config, not something ferrum can generate. To enable it:

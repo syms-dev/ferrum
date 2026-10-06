@@ -136,6 +136,25 @@ pub fn commands(answers: &Answers) -> Vec<String> {
         cmds.push("ferrum-apply put-secret acme-dns".into());
     }
 
+    // F3/R3 A4: the claim token is a credential, so it travels as a sops
+    // secret and never through settings.json, which is world-readable by
+    // design. Before the tar and the apply, not after, because sops-nix
+    // resolves `sops.secrets.plex-claim.sopsFile` to a Nix path that must
+    // physically exist when the stage-2 build is EVALUATED -- the same
+    // constraint this whole module exists for.
+    //
+    // No `--replace`, deliberately, and that is R3's "re-running an apply
+    // on an already-claimed server must not re-claim or disturb it" in one
+    // flag: `ferrum-apply put-secret` leaves an existing file alone without
+    // it, so a second run through this path cannot overwrite the token a
+    // working server was claimed with.
+    if answers.plex_claim.is_some() {
+        cmds.push(format!(
+            "ferrum-apply put-secret {}",
+            crate::answers::PLEX_CLAIM_SECRET
+        ));
+    }
+
     // Neither the copy nor the commit happens on the target any more.
     //
     // A ferrum host has no git -- a real install failed here with "bash:
@@ -158,6 +177,26 @@ pub fn commands(answers: &Answers) -> Vec<String> {
 /// The stdin payload for `put-secret acme-dns`.
 pub fn acme_payload(token: &str) -> String {
     format!("CLOUDFLARE_DNS_API_TOKEN={token}")
+}
+
+/// The stdin payload for `put-secret plex-claim`.
+///
+/// The BARE token, unlike [`acme_payload`]'s `KEY=value` line, and the
+/// difference is in the consumers rather than in taste. ACME's secret is
+/// handed to systemd as an `EnvironmentFile=`, which only understands
+/// assignments; this one is read as a whole file by
+/// `crates/ferrum-reconcile/src/main.rs`'s `claim_plex`, which trims it and
+/// posts it to Plex's `/myplex/claim`. A `KEY=` prefix there would be sent
+/// to plex.tv as part of the token.
+///
+/// # Arguments
+/// * `token` - the claim token the operator pasted.
+///
+/// # Returns
+/// Exactly the token, with nothing added.
+#[must_use]
+pub fn plex_claim_payload(token: &str) -> String {
+    token.to_string()
 }
 
 /// What `ferrum-apply apply` reported, as the installer needs to act on it.
@@ -269,6 +308,7 @@ mod tests {
             // Nothing in this module reads the DNS decision; it reaches the
             // host through settings.json, which render.rs owns and tests.
             dns: None,
+            plex_claim: None,
         }
     }
 
@@ -427,6 +467,61 @@ mod tests {
             put < apply,
             "the .sops file must exist before the build evaluates"
         );
+    }
+
+    /// F3/R3 A4. The claim token is delivered as a sops secret, before the
+    /// build that will evaluate its `sopsFile`, and without `--replace` --
+    /// which is R3's "a re-run must not disturb an already-claimed server"
+    /// in one flag, because `ferrum-apply put-secret` leaves an existing
+    /// file alone without it.
+    ///
+    /// Mutation check: move the push after `extract_into_etc_ferrum` and
+    /// the ordering assertion fails; add `--replace` and the last one does.
+    #[test]
+    fn the_claim_token_is_delivered_before_the_apply_and_never_replaces() {
+        let mut a = answers(&["plex"], true);
+        a.plex_claim = Some(crate::answers::Secret::new("claim-abcdefghij1234".into()));
+        let c = commands(&a);
+        let put = c
+            .iter()
+            .position(|x| x.contains("put-secret plex-claim"))
+            .expect("the claim token has to be delivered");
+        let apply = c
+            .iter()
+            .position(|x| x.contains("ferrum-apply apply"))
+            .unwrap();
+        assert!(
+            put < apply,
+            "the .sops file must exist before the build evaluates: {c:#?}"
+        );
+        assert!(
+            !c[put].contains("--replace"),
+            "replacing would overwrite the token a working server was \
+             claimed with: {}",
+            c[put]
+        );
+
+        // Anti-vacuity: no token, no command. The assertion above is about
+        // the shape of the delivery, not about a command that is always
+        // there.
+        a.plex_claim = None;
+        assert!(
+            !commands(&a).iter().any(|x| x.contains("plex-claim")),
+            "{:#?}",
+            commands(&a)
+        );
+    }
+
+    /// The claim token is a bare file, not an `EnvironmentFile` line: it is
+    /// read whole by `crates/ferrum-reconcile`'s `claim_plex` and posted to
+    /// plex.tv, so a `KEY=` prefix would be sent as part of the token.
+    #[test]
+    fn the_claim_payload_is_the_bare_token() {
+        assert_eq!(plex_claim_payload("claim-abc"), "claim-abc");
+        assert!(!plex_claim_payload("claim-abc").contains('='));
+        // ...and the ACME payload is still the other shape, so "bare" is a
+        // decision about this secret rather than about all of them.
+        assert!(acme_payload("tok").starts_with("CLOUDFLARE_DNS_API_TOKEN="));
     }
 
     #[test]

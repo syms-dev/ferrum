@@ -557,10 +557,22 @@ fn dns_settings(decision: &DnsDecision, adoption: &Adoption) -> serde_json::Valu
     match &decision.target {
         RecordTarget::A(address) => {
             dns.insert("recordMode".into(), serde_json::json!("a"));
-            dns.insert(
-                "staticAddress".into(),
-                serde_json::json!(address.to_string()),
-            );
+            // Written only when the operator actually stated one. An
+            // updater host has no address to state, and persisting a
+            // literal there would be a second copy of a fact the host
+            // re-measures hourly: `crates/ferrum-apply/src/dns_reconcile.rs`
+            // publishes what it measured and warns, naming both values,
+            // whenever `staticAddress` disagrees -- so a literal written
+            // here turns every genuine address change into a warning about
+            // a value nobody asked for. modules/proxy/dns.nix's
+            // `recordMode = "a"` assertion accepts the empty case on
+            // exactly this condition.
+            if let Some(address) = address {
+                dns.insert(
+                    "staticAddress".into(),
+                    serde_json::json!(address.to_string()),
+                );
+            }
         }
         RecordTarget::Cname(hostname) => {
             dns.insert("recordMode".into(), serde_json::json!("cname"));
@@ -718,13 +730,33 @@ fn settings(
             // Declaring the name is required on its own: acme.nix checks
             // `ferrum.secrets ? acme-dns` as well as the .sops file's
             // existence, so a token delivered without this still fails.
+            // Same for plex-claim: modules/apps/plex/service.nix declares
+            // its `sops.secrets` entry inside
+            // `lib.mkIf (ferrum.secrets ? "plex-claim")`, and
+            // modules/core/reconciler.nix reads the same attribute to
+            // decide whether ferrum-reconcile has a token path to claim
+            // with at all.
+            let mut secrets = serde_json::Map::new();
             if answers.cloudflare_token.is_some() {
-                root.insert(
-                    "secrets".into(),
-                    serde_json::json!({
-                        "acme-dns": { "description": "Cloudflare DNS-01 API token" }
-                    }),
+                secrets.insert(
+                    "acme-dns".into(),
+                    serde_json::json!({ "description": "Cloudflare DNS-01 API token" }),
                 );
+            }
+            // Written only when a token is actually in hand. The name
+            // declared without the file is a build that fails at evaluation
+            // on a `.sops` path the operator has never heard of -- so the
+            // declaration follows the delivery rather than the intention.
+            // `set_plex_claim_secret` keeps the two in step on a resume,
+            // where the token is gone but the file may already be there.
+            if answers.plex_claim.is_some() {
+                secrets.insert(
+                    crate::answers::PLEX_CLAIM_SECRET.into(),
+                    serde_json::json!({ "description": "plex.tv claim token" }),
+                );
+            }
+            if !secrets.is_empty() {
+                root.insert("secrets".into(), serde_json::Value::Object(secrets));
             }
         }
     }
@@ -735,6 +767,73 @@ fn settings(
 pub enum Stage {
     One,
     Two,
+}
+
+/// Brings a stage-2 settings document's `plex-claim` declaration into step
+/// with what will actually be on the host (F3/R3).
+///
+/// **This exists because a declaration without its file is an evaluation
+/// failure, and a resume can produce exactly that.** `settings.stage2.json`
+/// is written before the disk is erased, carrying the declaration when a
+/// token was collected. If the run then dies between that write and
+/// `put-secret`, the file on disk names a secret the host does not have --
+/// and a resume cannot re-derive the token, because it was deliberately
+/// written nowhere. The stage-2 build would then fail resolving
+/// `sops.secrets.plex-claim.sopsFile`, which is a Nix path that must exist
+/// at evaluation time, with an error naming a `.sops` file rather than the
+/// question it came from.
+///
+/// So the document is made to state one rule, every run, fresh or resumed:
+/// **declare the secret exactly when the host will have it** -- because a
+/// token is about to be delivered, or because an earlier attempt already
+/// delivered one. On a first run that is what [`settings`] already wrote
+/// and this changes nothing; on a resume it is the repair.
+///
+/// # Arguments
+/// * `doc` - the parsed stage-2 settings document, modified in place.
+/// * `declared` - whether the host will have `plex-claim.sops`: a token is
+///   in hand now, or the encrypted file is already on the target.
+///
+/// # Returns
+/// `true` when the document was changed, so the caller can say so rather
+/// than silently rewriting the operator's settings.
+pub fn set_plex_claim_secret(doc: &mut serde_json::Value, declared: bool) -> bool {
+    let name = crate::answers::PLEX_CLAIM_SECRET;
+    let present = doc.pointer(&format!("/secrets/{name}")).is_some();
+    if present == declared {
+        return false;
+    }
+    if declared {
+        let Some(root) = doc.as_object_mut() else {
+            return false;
+        };
+        root.entry("secrets")
+            .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+        if let Some(secrets) = root.get_mut("secrets").and_then(|s| s.as_object_mut()) {
+            secrets.insert(
+                name.into(),
+                serde_json::json!({ "description": "plex.tv claim token" }),
+            );
+            return true;
+        }
+        return false;
+    }
+    let Some(secrets) = doc
+        .get_mut("secrets")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return false;
+    };
+    secrets.remove(name);
+    // An empty `secrets` object is legal but is one more thing in a file
+    // the operator reads; removing it leaves the document in the shape a
+    // run that never collected a secret would have produced.
+    if secrets.is_empty() {
+        if let Some(root) = doc.as_object_mut() {
+            root.remove("secrets");
+        }
+    }
+    true
 }
 
 /// Renders the whole host repository for a run that adopted nothing.
@@ -1275,9 +1374,10 @@ mod tests {
             apps: vec!["sonarr".into(), "plex".into()],
             cloudflare_token: Some(crate::answers::Secret::new("tok".into())),
             dns: Some(DnsDecision {
-                target: RecordTarget::A("203.0.113.10".parse().expect("a literal address")),
+                target: RecordTarget::A(Some("203.0.113.10".parse().expect("a literal address"))),
                 ddns_updater: true,
             }),
+            plex_claim: None,
         }
     }
 
@@ -1875,6 +1975,135 @@ mod tests {
         // The interval keeps its module default rather than freezing
         // today's value into this host forever.
         assert!(dns.pointer("/ddnsUpdater/intervalMinutes").is_none(), "{s}");
+    }
+
+    /// F3/R3 A4. The claim token is a credential: it is DECLARED in the
+    /// settings and its value appears in no generated file at all.
+    ///
+    /// `settings.json` is world-readable by design -- the UI renders it --
+    /// and `meta.nix`'s `settingsSchema.claimToken` is the wrong home for
+    /// this for exactly that reason. The whole repository is swept rather
+    /// than only the settings document, because a credential that leaked
+    /// into disko.nix or a flake would be no less leaked.
+    ///
+    /// Mutation check: write the token as `apps.plex.settings.claimToken`
+    /// (the shape the module tree still accepts) and the sweep fails,
+    /// naming the file.
+    #[test]
+    fn the_plex_claim_token_is_declared_and_its_value_written_nowhere() {
+        const TOKEN: &str = "claim-abcdefghij1234";
+        let mut a = answers();
+        a.plex_claim = Some(crate::answers::Secret::new(TOKEN.into()));
+        let f = render(&a, &approved(Firmware::Uefi), &keys(), "abc1234").unwrap();
+
+        let s: serde_json::Value = serde_json::from_str(&f["settings.stage2.json"]).unwrap();
+        assert!(
+            s["secrets"]["plex-claim"].is_object(),
+            "service.nix declares its sops.secrets entry inside \
+             `lib.mkIf (ferrum.secrets ? \"plex-claim\")`, so the name has \
+             to be here or the token is delivered and never read: {s}"
+        );
+        // ...alongside, not instead of, the Cloudflare declaration.
+        assert!(s["secrets"]["acme-dns"].is_object(), "{s}");
+
+        for (name, body) in &f {
+            assert!(
+                !body.contains(TOKEN),
+                "the claim token's VALUE reached {name}"
+            );
+        }
+
+        // Anti-vacuity: the sweep above passes trivially for a run that
+        // collected no token, so prove the declaration tracks the answer.
+        a.plex_claim = None;
+        let f = render(&a, &approved(Firmware::Uefi), &keys(), "abc1234").unwrap();
+        let s: serde_json::Value = serde_json::from_str(&f["settings.stage2.json"]).unwrap();
+        assert!(
+            s["secrets"].get("plex-claim").is_none(),
+            "a name declared without its file fails the build at \
+             evaluation, on a .sops path nobody asked for: {s}"
+        );
+        assert!(s["secrets"]["acme-dns"].is_object(), "{s}");
+    }
+
+    /// F3/R3. The resume repair: the document declares `plex-claim` exactly
+    /// when the host will have the file.
+    ///
+    /// The state this exists for is a run that died between writing
+    /// `settings.stage2.json` and running `put-secret` -- the declaration
+    /// is on disk, the token was deliberately written nowhere, and the
+    /// stage-2 build would fail resolving a `sopsFile` that does not exist.
+    ///
+    /// Mutation check: make it a one-way function that only ever adds, and
+    /// the removal half fails; make it ignore `declared` and both do.
+    #[test]
+    fn the_claim_declaration_is_brought_into_step_with_the_host() {
+        let base =
+            || serde_json::json!({ "schemaVersion": 1, "apps": { "plex": { "enable": true } } });
+
+        // Nothing on the host and no token: the stale declaration goes.
+        let mut doc = base();
+        doc["secrets"] = serde_json::json!({ "plex-claim": { "description": "x" } });
+        assert!(set_plex_claim_secret(&mut doc, false));
+        assert!(doc.get("secrets").is_none(), "{doc}");
+
+        // ...and a sibling secret is left alone, so the repair cannot take
+        // the Cloudflare credential with it.
+        let mut doc = base();
+        doc["secrets"] = serde_json::json!({
+            "plex-claim": { "description": "x" },
+            "acme-dns": { "description": "y" },
+        });
+        assert!(set_plex_claim_secret(&mut doc, false));
+        assert!(doc["secrets"]["acme-dns"].is_object(), "{doc}");
+        assert!(doc["secrets"].get("plex-claim").is_none(), "{doc}");
+
+        // The file is on the host but the document forgot: declare it.
+        let mut doc = base();
+        assert!(set_plex_claim_secret(&mut doc, true));
+        assert!(doc["secrets"]["plex-claim"].is_object(), "{doc}");
+
+        // Already in step, either way: no write, so the operator's settings
+        // are not rewritten for nothing.
+        assert!(!set_plex_claim_secret(&mut doc, true));
+        let mut empty = base();
+        assert!(!set_plex_claim_secret(&mut empty, false));
+    }
+
+    /// F3/R3b. The settings an updater install produces: `recordMode = "a"`
+    /// with the updater on and **no `staticAddress` key at all**.
+    ///
+    /// Writing one would be a second copy of a fact the host re-measures
+    /// hourly, and `crates/ferrum-apply/src/dns_reconcile.rs` warns -- naming
+    /// both values -- whenever the two disagree. So a literal written here
+    /// would turn every genuine address change into a warning about a value
+    /// nobody asked for, which is the opposite of what the updater is for.
+    ///
+    /// Mutation check: render `staticAddress` unconditionally (the shape
+    /// this replaced) and the key assertion fails. Delete the updater key
+    /// and the host no longer evaluates at all -- `modules/proxy/dns.nix`
+    /// accepts an empty address only on that condition -- which the
+    /// `ddnsUpdater` assertion below holds.
+    #[test]
+    fn an_updater_host_persists_no_static_address() {
+        let mut a = answers();
+        a.dns = Some(DnsDecision {
+            target: RecordTarget::A(None),
+            ddns_updater: true,
+        });
+        let f = render(&a, &approved(Firmware::Uefi), &keys(), "abc1234").unwrap();
+        let s: serde_json::Value = serde_json::from_str(&f["settings.stage2.json"]).unwrap();
+        let dns = &s["proxy"]["dns"];
+        assert_eq!(dns["enable"], true, "{s}");
+        assert_eq!(dns["recordMode"], "a", "{s}");
+        assert!(
+            dns.get("staticAddress").is_none(),
+            "an address the host discovers for itself must not be frozen \
+             into settings.json: {s}"
+        );
+        assert!(dns.get("cnameTarget").is_none(), "{s}");
+        // The term that makes the absent address legal at evaluation time.
+        assert_eq!(dns["ddnsUpdater"]["enable"], true, "{s}");
     }
 
     /// R1 A2 and A8. CNAME mode is the mirror image, and the updater must

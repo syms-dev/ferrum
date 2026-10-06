@@ -298,6 +298,28 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
         let stage2_path = pre.host_dir.join("settings.stage2.json");
         let stage1_path = pre.host_dir.join("settings.stage1.json");
         let live = pre.host_dir.join("settings.json");
+
+        // F3/R3. The stage-2 document declares `plex-claim` exactly when
+        // the host will have the encrypted file -- because one is about to
+        // be delivered, or because an earlier attempt already delivered
+        // one. On a first run this changes nothing; on a resume it is what
+        // stops a declaration left behind by an interrupted run from
+        // failing the build on a `.sops` path. See
+        // `render::set_plex_claim_secret`.
+        if stage2_path.exists() {
+            let mut doc: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&stage2_path)?)?;
+            let declared = answers.plex_claim.is_some() || plex_secret_present(&pre)?;
+            if render::set_plex_claim_secret(&mut doc, declared) {
+                println!(
+                    "  (the Plex claim secret is {} the settings this host will run, \
+                     to match what is on it)",
+                    if declared { "added to" } else { "removed from" }
+                );
+                std::fs::write(&stage2_path, serde_json::to_string_pretty(&doc)? + "\n")?;
+            }
+        }
+
         if stage2_path.exists() {
             if !stage1_path.exists() {
                 std::fs::rename(&live, &stage1_path)?;
@@ -318,6 +340,22 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
             if command == install::extract_into_etc_ferrum() {
                 let payload = install::tar_payload(&pre.host_dir, &[".git", "settings.json"])?;
                 collect::run_with_stdin(&pre.target, &pre.ssh_auth, &command, &payload)?;
+            } else if command.contains(answers::PLEX_CLAIM_SECRET) {
+                // Matched BEFORE the generic put-secret arm below, which
+                // would otherwise send this command the Cloudflare token's
+                // EnvironmentFile line. The two payloads have different
+                // shapes on purpose -- see stage2::plex_claim_payload.
+                let token = answers
+                    .plex_claim
+                    .as_ref()
+                    .map(answers::Secret::expose)
+                    .unwrap_or_default();
+                collect::run_with_stdin(
+                    &pre.target,
+                    &pre.ssh_auth,
+                    &command,
+                    &stage2::plex_claim_payload(token),
+                )?;
             } else if command.contains("put-secret") {
                 let token = answers
                     .cloudflare_token
@@ -929,6 +967,200 @@ fn interpret_acme_probe(outcome: anyhow::Result<String>) -> anyhow::Result<bool>
     }
 }
 
+/// Asks the target whether `plex-claim.sops` is already there.
+///
+/// # Errors
+/// When the target cannot be asked. Same shape, and same reasoning, as
+/// [`acme_secret_present`].
+fn plex_secret_present(pre: &preconditions::Preconditions) -> anyhow::Result<bool> {
+    interpret_plex_secret_probe(collect::run(
+        &pre.target,
+        &pre.ssh_auth,
+        &format!(
+            "test -f /etc/ferrum/secrets/{}.sops && echo yes || echo no",
+            answers::PLEX_CLAIM_SECRET
+        ),
+    ))
+}
+
+/// Turns the plex-claim secret probe's outcome into an answer.
+///
+/// Refuses to guess for the same reason [`interpret_acme_probe`] does, but
+/// the consequence of a wrong guess is the other way round here. A false
+/// "present" declares a secret the host does not have, and the stage-2
+/// build then fails at evaluation on a `.sops` path; a false "absent"
+/// strips a declaration from a host that is already claimed, and the next
+/// apply stops handing ferrum-reconcile a token path. Neither is a thing to
+/// decide from an SSH timeout.
+///
+/// # Arguments
+/// * `outcome` - what `collect::run` returned for the probe command.
+///
+/// # Returns
+/// `true` for `yes`, `false` for `no`.
+///
+/// # Errors
+/// When the command failed, or answered anything else.
+fn interpret_plex_secret_probe(outcome: anyhow::Result<String>) -> anyhow::Result<bool> {
+    let output = outcome.map_err(|e| {
+        anyhow::anyhow!(
+            "could not ask the target whether the Plex claim secret is \
+             already installed: {e}. Refusing to assume either way -- \
+             declaring a secret the host does not have fails the build at \
+             evaluation, and removing one it does have un-claims a working \
+             server. Re-run once the target answers SSH."
+        )
+    })?;
+    match output.trim() {
+        "yes" => Ok(true),
+        "no" => Ok(false),
+        other => anyhow::bail!(
+            "the target answered {other:?} when asked whether the Plex claim \
+             secret is installed, which is neither \"yes\" nor \"no\". \
+             Refusing to guess."
+        ),
+    }
+}
+
+/// What the finished host says about Plex's claim (F3/R3).
+///
+/// Four states rather than a boolean, because the closing report has to
+/// tell an operator *which* of them they are in, and "I could not find
+/// out" is not the same sentence as "it is not claimed".
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PlexClaim {
+    /// Plex's own preferences carry a `PlexOnlineToken`.
+    Claimed,
+    /// Plex has written its preferences and there is no token in them.
+    Unclaimed,
+    /// Plex has not written preferences yet. Treated as unclaimed in the
+    /// report -- it cannot be claimed without them -- but named separately
+    /// so a reader can tell the two apart.
+    NoPreferences,
+    /// The question could not be asked. Never reported as "not claimed":
+    /// that is the conflation this enum exists to prevent.
+    Unknown(String),
+}
+
+/// Reads the claim probe's output.
+///
+/// # Arguments
+/// * `outcome` - what `collect::run` returned for
+///   [`verify::plex_claim_command`].
+///
+/// # Returns
+/// The state. An unreachable target, or an answer that is none of the three
+/// words the command can print, is [`PlexClaim::Unknown`] carrying the
+/// reason -- never an invented verdict.
+fn interpret_plex_claim_probe(outcome: anyhow::Result<String>) -> PlexClaim {
+    match outcome {
+        Err(e) => PlexClaim::Unknown(e.to_string()),
+        Ok(output) => match output.trim() {
+            "CLAIMED" => PlexClaim::Claimed,
+            "NOCLAIM" => PlexClaim::Unclaimed,
+            "NOPREFS" => PlexClaim::NoPreferences,
+            other => PlexClaim::Unknown(format!("the target answered {other:?}")),
+        },
+    }
+}
+
+/// The closing report's Plex block (F3/R3 A3).
+///
+/// **An install that enabled Plex must end with Plex claimed, or say
+/// plainly that it did not and why.** This is the second half of that, and
+/// it reports a MEASURED state rather than what the installer intended: a
+/// claim token expires four minutes after plex.tv issues it and the
+/// stage-2 build takes longer than that, so "we sent a token" and "the
+/// server is claimed" are genuinely different facts and only one of them
+/// is worth printing.
+///
+/// **The recovery it prints differs between the two cases, and that is the
+/// point of taking `token_supplied` at all.** `put-secret` alone is enough
+/// only when the secret is already DECLARED: `modules/apps/plex/service.nix`
+/// wraps its `sops.secrets` entry in `lib.mkIf (ferrum.secrets ?
+/// "plex-claim")`, and `modules/core/reconciler.nix` reads the same
+/// attribute to decide whether ferrum-reconcile is handed a token path. A
+/// run that delivered a token declared it; a run that skipped did not, so
+/// telling that operator to run `put-secret` and re-apply would send them
+/// through two commands that correctly do nothing.
+///
+/// # Arguments
+/// * `state` - what the probe found on the host.
+/// * `token_supplied` - whether this run delivered a claim token at all.
+///   Separates "you skipped it" from "it did not take", and with it the
+///   declaration that makes the shorter recovery sufficient.
+///
+/// # Returns
+/// The lines to print, or none at all when Plex is claimed -- a finished
+/// step is not news.
+fn plex_report(state: &PlexClaim, token_supplied: bool) -> Vec<String> {
+    let name = answers::PLEX_CLAIM_SECRET;
+    let redo = if token_supplied {
+        format!(
+            "  Get a fresh token from https://plex.tv/claim (valid 4 minutes), then on \
+             the host:\n    ferrum-apply put-secret {name} --replace\n    ferrum-apply apply"
+        )
+    } else {
+        format!(
+            "  You skipped the token, so the secret is not declared yet and \
+             put-secret\n  alone would do nothing. Add it to \"secrets\" in \
+             /etc/ferrum/settings.json:\n\n      \
+             \"{name}\": {{ \"description\": \"plex.tv claim token\" }}\n\n  \
+             then get a token from https://plex.tv/claim (valid 4 minutes) and, on the \
+             host:\n    ferrum-apply put-secret {name}\n    ferrum-apply apply"
+        )
+    };
+    match state {
+        PlexClaim::Claimed => Vec::new(),
+        PlexClaim::Unknown(why) => vec![
+            "\nplex: COULD NOT CHECK whether the server is claimed.".to_string(),
+            format!("  {why}"),
+            "  Check it yourself before assuming the install finished that step.".to_string(),
+        ],
+        PlexClaim::Unclaimed | PlexClaim::NoPreferences => {
+            let mut lines = vec!["\nplex: NOT CLAIMED -- one step is unfinished.".to_string()];
+            lines.push(if token_supplied {
+                "  A claim token was delivered and Plex did not take it. Claim tokens \
+                 expire\n  four minutes after plex.tv issues them and the system build \
+                 after that\n  question takes longer, so this is the ordinary outcome \
+                 rather than a fault."
+                    .to_string()
+            } else {
+                "  No claim token was supplied, which is what you chose.".to_string()
+            });
+            lines.push(
+                "  Until it is claimed, Plex answers \"You do not have access to this \
+                 server\"\n  to everything but localhost, and ferrum opens no port you \
+                 could claim it from."
+                    .to_string(),
+            );
+            lines.push(redo);
+            lines
+        }
+    }
+}
+
+/// The headline's count of unfinished steps.
+///
+/// Split out so the sentence can be exercised without an SSH connection. It
+/// says "one thing" or "two things" rather than listing them, because each
+/// has its own block further down the report and the headline's job is only
+/// to stop an operator reading "is installed" as "is finished".
+///
+/// # Arguments
+/// * `degraded_apply` - the apply switched but reported a problem.
+/// * `plex_unfinished` - Plex is enabled and is not claimed.
+///
+/// # Returns
+/// The phrase that completes "<host> is installed, with ...".
+fn unfinished_count(degraded_apply: bool, plex_unfinished: bool) -> &'static str {
+    if degraded_apply && plex_unfinished {
+        "two things unfinished"
+    } else {
+        "one thing unfinished"
+    }
+}
+
 /// Re-asks for the Cloudflare token on a resumed run, and checks it the
 /// same way the first run does.
 ///
@@ -1158,14 +1390,41 @@ fn final_report(
     zone_not_serving_yet: Option<&str>,
     degraded_apply: bool,
 ) -> anyhow::Result<()> {
+    // F3/R3 A3. Asked of the host rather than inferred from what this run
+    // sent, because a delivered token and a claimed server are different
+    // facts: the token expires four minutes after it is issued and the
+    // build between the question and the claim takes longer than that. A
+    // report that said "claimed" because it posted a token would be the
+    // false-success shape this project keeps finding.
+    //
+    // Measured BEFORE the headline, not beside its own block further down,
+    // because the headline is the line an operator actually reads. "is
+    // installed" over a Plex nobody can reach is the same false success a
+    // degraded apply was already given a headline for.
+    let plex = answers.apps.iter().any(|a| a == "plex").then(|| {
+        interpret_plex_claim_probe(collect::run(
+            &pre.target,
+            &pre.ssh_auth,
+            &verify::plex_claim_command(verify::PLEX_PREFERENCES_PATH),
+        ))
+    });
+    let plex_lines = plex
+        .as_ref()
+        .map(|state| plex_report(state, answers.plex_claim.is_some()))
+        .unwrap_or_default();
+
     println!("\n{}", "=".repeat(64));
     // The headline tells the truth about which of the two endings this was.
     // "is installed" over a degraded apply is the false-success shape this
     // project keeps finding: a host that looks finished and has published
     // nothing, with the one line that could have said so spent on
     // congratulation.
-    if degraded_apply {
-        println!("{} is installed, with one thing unfinished.", answers.hostname);
+    if degraded_apply || !plex_lines.is_empty() {
+        println!(
+            "{} is installed, with {}.",
+            answers.hostname,
+            unfinished_count(degraded_apply, !plex_lines.is_empty())
+        );
     } else {
         println!("{} is installed.", answers.hostname);
     }
@@ -1184,6 +1443,10 @@ fn final_report(
     }
 
     for line in url_report(answers, adoption, zone_not_serving_yet) {
+        println!("{line}");
+    }
+
+    for line in &plex_lines {
         println!("{line}");
     }
 
@@ -1227,6 +1490,120 @@ mod tests {
             err.contains("timed out"),
             "and carry the underlying cause: {err}"
         );
+    }
+
+    /// F3/R3. "I could not ask" is never "it is not claimed".
+    ///
+    /// The two lead to opposite reports -- one tells the operator to go and
+    /// claim a server that may already be claimed, the other tells them to
+    /// check for themselves -- and an SSH blip must not choose between
+    /// them.
+    ///
+    /// Mutation check: collapse `Unknown` into `Unclaimed` and the first
+    /// assertion fails; accept any output as CLAIMED and the last does.
+    #[test]
+    fn an_unreachable_target_is_not_an_unclaimed_plex() {
+        let unknown = interpret_plex_claim_probe(Err(anyhow::anyhow!("ssh: connect: timed out")));
+        match &unknown {
+            PlexClaim::Unknown(why) => assert!(why.contains("timed out"), "{why}"),
+            other => panic!("an unreachable target must not be a verdict: {other:?}"),
+        }
+        // The three real answers are read as themselves...
+        assert_eq!(
+            interpret_plex_claim_probe(Ok("CLAIMED\n".into())),
+            PlexClaim::Claimed
+        );
+        assert_eq!(
+            interpret_plex_claim_probe(Ok("NOCLAIM\n".into())),
+            PlexClaim::Unclaimed
+        );
+        assert_eq!(
+            interpret_plex_claim_probe(Ok("NOPREFS\n".into())),
+            PlexClaim::NoPreferences
+        );
+        // ...and nothing else is guessed at.
+        for other in ["", "Permission denied", "yes"] {
+            assert!(
+                matches!(
+                    interpret_plex_claim_probe(Ok(other.into())),
+                    PlexClaim::Unknown(_)
+                ),
+                "{other:?} was read as a verdict"
+            );
+        }
+    }
+
+    /// F3/R3 A3. The closing report states the MEASURED outcome, names why,
+    /// and carries the command that finishes the job -- and it says a
+    /// different thing for "you skipped it" than for "it did not take".
+    ///
+    /// Mutation check: report from `answers.plex_claim.is_some()` instead
+    /// of from the probe and the first case reports success for an
+    /// unclaimed server; drop the `--replace` from the recovery command and
+    /// an operator following it meets "already exists, left unchanged".
+    #[test]
+    fn an_unclaimed_plex_is_reported_with_the_command_that_finishes_it() {
+        let delivered = super::plex_report(&PlexClaim::Unclaimed, true).join("\n");
+        assert!(delivered.contains("NOT CLAIMED"), "{delivered}");
+        assert!(
+            delivered.contains("did not take it"),
+            "a delivered-but-expired token is not a skipped one: {delivered}"
+        );
+        assert!(delivered.contains("expire"), "{delivered}");
+        assert!(delivered.contains("https://plex.tv/claim"), "{delivered}");
+        assert!(
+            delivered.contains("put-secret plex-claim --replace"),
+            "without --replace the operator's fix is a no-op: {delivered}"
+        );
+        assert!(delivered.contains("ferrum-apply apply"), "{delivered}");
+
+        // Skipped says so instead, rather than implying something failed --
+        // and gives a DIFFERENT recovery, because the secret is not
+        // declared on that host and put-secret alone would correctly do
+        // nothing. modules/apps/plex/service.nix declares its sops entry
+        // inside `lib.mkIf (ferrum.secrets ? "plex-claim")`.
+        let skipped = super::plex_report(&PlexClaim::Unclaimed, false).join("\n");
+        assert!(skipped.contains("what you chose"), "{skipped}");
+        assert!(!skipped.contains("did not take it"), "{skipped}");
+        assert!(
+            skipped.contains("settings.json"),
+            "the declaration step is what makes the rest work: {skipped}"
+        );
+        assert!(
+            skipped.contains("\"secrets\"") && skipped.contains("\"plex-claim\""),
+            "and it has to name the key to add: {skipped}"
+        );
+        assert!(
+            !skipped.contains("--replace"),
+            "there is nothing on the host to replace: {skipped}"
+        );
+
+        // No preferences is the same unfinished step, not a third report.
+        assert!(super::plex_report(&PlexClaim::NoPreferences, true)
+            .join("\n")
+            .contains("NOT CLAIMED"));
+
+        // A claimed server is not news, so nothing is printed...
+        assert!(super::plex_report(&PlexClaim::Claimed, true).is_empty());
+        assert!(super::plex_report(&PlexClaim::Claimed, false).is_empty());
+
+        // ...and a probe that could not run says exactly that, rather than
+        // either verdict.
+        let unknown =
+            super::plex_report(&PlexClaim::Unknown("ssh timed out".into()), true).join("\n");
+        assert!(unknown.contains("COULD NOT CHECK"), "{unknown}");
+        assert!(unknown.contains("ssh timed out"), "{unknown}");
+        assert!(!unknown.contains("NOT CLAIMED"), "{unknown}");
+    }
+
+    /// The headline is the line an operator actually reads, so it has to
+    /// count the unfinished steps rather than leaving them to a block
+    /// further down.
+    #[test]
+    fn the_headline_counts_every_unfinished_step() {
+        assert_eq!(super::unfinished_count(true, false), "one thing unfinished");
+        assert_eq!(super::unfinished_count(false, true), "one thing unfinished");
+        assert_eq!(super::unfinished_count(true, true), "two things unfinished");
     }
 
     /// The two answers the probe can actually give still work, so refusing
@@ -1778,9 +2155,10 @@ mod tests {
             // `answers::validate_and_verify_cloudflare_token`.
             cloudflare_token: None,
             dns: Some(answers::DnsDecision {
-                target: answers::RecordTarget::A("203.0.113.10".parse().expect("a literal")),
+                target: answers::RecordTarget::A(Some("203.0.113.10".parse().expect("a literal"))),
                 ddns_updater: true,
             }),
+            plex_claim: None,
         }
     }
 
