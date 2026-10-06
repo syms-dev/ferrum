@@ -1079,9 +1079,41 @@ async function route() {
   }
 }
 
+/// Gets a ferrumd session without a password, if the edge already knows who we
+/// are -- R5.
+///
+/// Tried once, at boot, and only after /api/session has already said 401. Every
+/// failure path here is ordinary and ends the same way: return false, and the
+/// caller shows the password form. A host with no single sign-on answers 404; a
+/// browser not signed in to Authelia gets 401; an Authelia identity with no
+/// ferrum account gets 403; Authelia being down gets 503. None of them is an
+/// error worth interrupting the operator with, because the password form is
+/// right there and still works.
+async function trySingleSignOn() {
+  try {
+    await api.sso();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async function boot() {
   try {
-    const me = await api.session();
+    let me;
+    try {
+      // signalExpiry: false -- a 401 here is the expected answer before the
+      // SSO attempt below, and dropping to the login view first would paint
+      // the password form for a frame on a host that does not need it.
+      me = await api.session({ signalExpiry: false });
+    } catch (err) {
+      if (err.status !== 401) throw err;
+      if (!(await trySingleSignOn())) {
+        loginView();
+        return;
+      }
+      me = await api.session();
+    }
     state.username = me.username;
     [state.catalog, state.settings] = await Promise.all([api.catalog(), api.settings()]);
   } catch (err) {

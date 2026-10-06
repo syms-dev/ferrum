@@ -1771,6 +1771,195 @@
             echo ok > $out
           '';
 
+      # R5, the join between its two halves -- and the only check here that
+      # runs a REAL Authelia rather than reading what Nix told one.
+      #
+      # `crates/ferrumd/src/sso.rs` rests its entire security argument on a
+      # claim about somebody else's software: that an `authelia_session`
+      # cookie obtained in a catalog app's context is refused when presented
+      # at the control plane's URL. If that claim is false, ferrumd's SSO
+      # exchange hands a session to any app that can reach loopback -- and
+      # every Rust test in the crate would still pass, because they drive a
+      # FAKE Authelia that answers whatever they scripted.
+      #
+      # So the claim is measured, on the configuration this repository
+      # actually generates, with the binary this repository actually ships.
+      # The five rows below are the ones sso.rs's own module header states;
+      # this is what keeps that header from becoming the kind of comment F1
+      # was about -- a feature described in prose and absent in fact.
+      #
+      # Row (b) is the load-bearing one: it is precisely what R5's first half
+      # buys its second, and it is why shipping the second alone would have
+      # been a regression. Row (d) is its control -- the same apps cookie
+      # succeeding at an app's own URL, so (b) is a finding about scope rather
+      # than about a cookie that was never valid. Row (e) is revocation at the
+      # source, which is what `require_session`'s re-check relies on.
+      #
+      # The config comes from the generated unit; only the paths a build
+      # sandbox cannot provide are overridden, through Authelia's own
+      # environment-variable mechanism, so `session.cookies` and
+      # `access_control` reach the running process exactly as
+      # modules/proxy/authelia.nix wrote them.
+      autheliaAssertsOnlyItsOwnScope =
+        let
+          host = ferrumLib.mkHost {
+            inherit system;
+            settings = {
+              schemaVersion = realMigrations.currentVersion;
+              proxy = {
+                enable = true;
+                baseDomain = "example.test";
+                acme.email = "a@example.test";
+              };
+              auth = { enable = true; adminEmail = "a@example.test"; };
+              apps.sonarr.enable = true;
+            };
+            modules = [ ../../../examples/hosts/minimal/configuration.nix ];
+          };
+          unit = host.config.systemd.units."authelia-main.service".unit;
+          daemonHost = "${host.config.ferrum.daemon.subdomain}.example.test";
+          appHost = "${host.config.ferrum.apps.sonarr.subdomain}.example.test";
+        in
+        pkgs.runCommand "ferrum-check-authelia-asserts-only-its-own-scope"
+          { nativeBuildInputs = [ pkgs.curl ]; }
+          ''
+            set -eu
+
+            fail() {
+              echo "authelia-asserts-only-its-own-scope: $1" >&2
+              [ -f authelia.log ] && tail -40 authelia.log >&2
+              exit 1
+            }
+
+            execstart=$(grep -m1 '^ExecStart=' ${unit}/authelia-main.service | cut -d= -f2-)
+            bin=$(printf '%s' "$execstart" | cut -d' ' -f1)
+            cfg=$(printf '%s' "$execstart" | sed -n 's/.* --config \([^ ]*\).*/\1/p')
+            case "$bin" in
+              /nix/store/*/bin/authelia) ;;
+              *) fail "authelia-main.service's ExecStart does not name an authelia binary ($bin)" ;;
+            esac
+
+            # Anti-vacuity, before anything is started: this check is about
+            # the two cookie scopes and the two access_control rules that make
+            # them observable. Without any one of them the probes below would
+            # all answer 401 and the check would pass having proved nothing.
+            grep -q 'ferrum_control_session' "$cfg" \
+              || fail "the generated config has no control-plane session cookie, so every probe below is about one scope"
+            grep -q "${daemonHost}" "$cfg" \
+              || fail "the generated config never mentions ${daemonHost}, so it is not the config for this host"
+            grep -q "${appHost}" "$cfg" \
+              || fail "the generated config has no rule for ${appHost}, so the control probe (d) cannot distinguish a scope refusal from a policy refusal"
+
+            printf '%s' aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa > jwt.key
+            printf '%s' bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb > session.key
+            printf '%s' cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc > storage.key
+            export AUTHELIA_IDENTITY_VALIDATION_RESET_PASSWORD_JWT_SECRET_FILE=$PWD/jwt.key
+            export AUTHELIA_SESSION_SECRET_FILE=$PWD/session.key
+            export AUTHELIA_STORAGE_ENCRYPTION_KEY_FILE=$PWD/storage.key
+            # The paths a build sandbox cannot provide, and ONLY those. Each
+            # one is state, not policy: nothing here touches session.cookies
+            # or access_control, which are what this check exists to exercise.
+            export AUTHELIA_AUTHENTICATION_BACKEND_FILE_PATH=$PWD/users.yml
+            export AUTHELIA_STORAGE_LOCAL_PATH=$PWD/db.sqlite3
+            export AUTHELIA_NOTIFIER_FILESYSTEM_FILENAME=$PWD/notifications.txt
+            export AUTHELIA_SERVER_ADDRESS=tcp://127.0.0.1:9091
+            export AUTHELIA_LOG_FILE_PATH=$PWD/authelia.log
+            export HOME=$PWD
+
+            password='correct horse battery staple'
+            hash=$("$bin" crypto hash generate argon2 --password "$password" --no-confirm 2>/dev/null \
+                     | sed -n 's/^Digest: //p')
+            [ -n "$hash" ] || fail "could not generate a password hash with authelia's own hasher"
+            cat > users.yml <<YAML
+            users:
+              admin:
+                disabled: false
+                displayname: admin
+                password: "$hash"
+                email: a@example.test
+                groups: []
+            YAML
+            # The heredoc above is indented to match this file; Authelia's YAML
+            # parser is not, so strip the common prefix back off.
+            sed -i 's/^            //' users.yml
+
+            "$bin" --config "$cfg" &
+            authelia_pid=$!
+            trap 'kill $authelia_pid 2>/dev/null || true' EXIT
+            up=no
+            for _ in $(seq 1 60); do
+              if curl -fsS -o /dev/null http://127.0.0.1:9091/api/health; then up=yes; break; fi
+              sleep 1
+            done
+            [ "$up" = yes ] || fail "the generated config did not produce an Authelia that starts"
+
+            login() {
+              curl -sS -o "$2" -D "$2.h" -X POST http://127.0.0.1:9091/api/firstfactor \
+                -H "Host: $1" -H 'Content-Type: application/json' \
+                -H 'X-Forwarded-Proto: https' -H "X-Forwarded-Host: $1" \
+                -d "{\"username\":\"admin\",\"password\":\"$password\",\"keepMeLoggedIn\":false}"
+              sed -n 's/.*[Ss]et-[Cc]ookie: \([^;]*\);.*/\1/p' "$2.h" | head -1
+            }
+
+            control_cookie=$(login ${daemonHost} ctl.json)
+            app_cookie=$(login ${appHost} app.json)
+            # Only the cookie NAMES are ever printed. The values are real
+            # session identifiers for this throwaway instance and there is no
+            # reason to put one in a build log.
+            case "$control_cookie" in
+              ferrum_control_session=*) ;;
+              *) fail "logging in at ${daemonHost} did not issue a ferrum_control_session cookie (got \"''${control_cookie%%=*}\"), so the two scopes are not separate" ;;
+            esac
+            case "$app_cookie" in
+              authelia_session=*) ;;
+              *) fail "logging in at ${appHost} did not issue an authelia_session cookie (got \"''${app_cookie%%=*}\")" ;;
+            esac
+
+            # Returns the HTTP status of one verify, and writes the headers to
+            # $PWD/v.h so the identity can be read on a 200.
+            verify() {
+              if [ -n "$2" ]; then
+                curl -sS -o /dev/null -D v.h -w '%{http_code}' http://127.0.0.1:9091/api/verify \
+                  -H "X-Original-URL: $1" -H "Cookie: $2"
+              else
+                curl -sS -o /dev/null -D v.h -w '%{http_code}' http://127.0.0.1:9091/api/verify \
+                  -H "X-Original-URL: $1"
+              fi
+            }
+
+            # (a) the dashboard's own cookie, at the dashboard's URL.
+            status=$(verify "https://${daemonHost}/" "$control_cookie")
+            [ "$status" = 200 ] \
+              || fail "(a) the control plane's own session cookie was refused at https://${daemonHost}/ with $status -- POST /api/sso could never succeed, so the dashboard has no single sign-on at all"
+            grep -qi '^remote-user: *admin' v.h \
+              || fail "(a) Authelia allowed the request but named no identity, so crates/ferrumd/src/sso.rs has nothing to exchange for a session"
+
+            # (b) THE ROW R5's ORDERING EXISTS FOR.
+            status=$(verify "https://${daemonHost}/" "$app_cookie")
+            [ "$status" = 401 ] \
+              || fail "(b) a session cookie obtained in ${appHost}'s context was ACCEPTED at https://${daemonHost}/ with $status. This is SEC-M02, live: crates/ferrumd/src/sso.rs would exchange it for a control-plane session, so any catalog app that can reach loopback owns apply, rollback, settings and the secrets API"
+
+            # (c) nothing at all.
+            status=$(verify "https://${daemonHost}/" "")
+            [ "$status" = 401 ] \
+              || fail "(c) an anonymous verify at https://${daemonHost}/ answered $status"
+
+            # (d) the control for (b): the same apps cookie, at an app's URL.
+            status=$(verify "https://${appHost}/" "$app_cookie")
+            [ "$status" = 200 ] \
+              || fail "(d) the apps cookie was refused at its OWN url (https://${appHost}/) with $status, so (b) above proves nothing about scope -- that cookie may simply never have been valid"
+
+            # (e) revocation at the source, which is what require_session's
+            # per-request re-check in crates/ferrumd/src/main.rs relies on.
+            curl -sS -o /dev/null -X POST http://127.0.0.1:9091/api/logout \
+              -H "Host: ${daemonHost}" -H "Cookie: $control_cookie"
+            status=$(verify "https://${daemonHost}/" "$control_cookie")
+            [ "$status" = 401 ] \
+              || fail "(e) a cookie logged out at Authelia still verified at https://${daemonHost}/ with $status, so logging out of single sign-on leaves the ferrumd session it vouched for alive"
+
+            echo ok > $out
+          '';
+
       # The one check in this file that asks nginx, rather than asking Nix
       # what it told nginx.
       #
@@ -4728,6 +4917,7 @@
         daemon-vhost-enforced = mkAssertionCheck "daemon-vhost-enforced" daemonVhostEnforced;
         daemon-unpublished-but-running = daemonUnpublishedButRunning;
         authelia-cookie-scope = autheliaCookieScope;
+        authelia-asserts-only-its-own-scope = autheliaAssertsOnlyItsOwnScope;
         nginx-config-parses = nginxConfigParses;
         reserved-subdomain-collision =
           mkAssertionCheck "reserved-subdomain-collision" reservedSubdomainCollision;

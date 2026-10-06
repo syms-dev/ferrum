@@ -95,6 +95,33 @@ gate.** A compromised sibling app holds an `authelia_session`, and that is not a
 It does not change the apps' own situation. Every catalog app still shares one cookie with every
 other catalog app, which was explicitly not what this finding was about.
 
+## What R5's second half then did with it
+
+The compensating control is spent, deliberately and in the open. `POST /api/sso`
+(`crates/ferrumd/src/sso.rs`) exchanges an Authelia identity for a ferrumd session, so the dashboard
+takes one login instead of two.
+
+It does not spend the control by trusting a header. ferrumd reads **no** forward-auth header off any
+request it receives; it takes the cookie the caller presented and asks Authelia, over loopback, who
+it belongs to. The thing a forger must produce is therefore not a header but a valid
+`ferrum_control_session` — a cookie this fix makes unobtainable from a catalog app's context. That
+is why the two halves are one feature and why they shipped in this order.
+
+The dependency is measured, not argued. `authelia-asserts-only-its-own-scope` starts the real
+Authelia on the real generated configuration and proves, on every build, that an `authelia_session`
+obtained at `sonarr.example.test` is **refused** at `https://ferrum.example.test/` while the
+dashboard's own cookie is accepted there — with the same apps cookie still working at the app's own
+URL, so the refusal is about scope rather than a cookie that was never valid. Reverting this fix
+fails that check with the message *"the generated config has no control-plane session cookie"*, and
+making the dashboard's Authelia rule a bypass fails it with *"a session cookie obtained in
+sonarr.example.test's context was ACCEPTED"* — both measured.
+
+`no_source_file_reads_a_forward_auth_header` was replaced, not relaxed, by
+`a_forward_auth_header_is_named_only_where_authelia_is_asked`: twelve of ferrumd's thirteen sources
+are held to the original zero-occurrence rule, and the thirteenth may name one on exactly one line —
+its `IDENTITY_HEADER` declaration. A `headers.get(IDENTITY_HEADER)` on a request, which the old scan
+could never have seen because it names no literal, fails the new one.
+
 ## The cost, re-examined
 
 The 2026-09 acceptance named the cost as "a second login at the control plane", and that is what
@@ -103,14 +130,18 @@ has now arrived. Counted honestly, for an operator who uses both the apps and th
 - **Before:** one Authelia login (apps + dashboard, shared cookie) + one ferrumd password = **2**.
 - **After this change alone:** one Authelia login for the apps + one for the dashboard + one
   ferrumd password = **3**.
-- **After R5's second half** (ferrumd accepting the Authelia-asserted identity, which is what this
-  change exists to make safe): one Authelia login for the apps + one for the dashboard = **2**.
+- **After R5's second half** (landed): one Authelia login for the apps + one for the dashboard =
+  **2**, and the ferrum password is no longer typed in the ordinary case.
 
-So the first half alone is a net cost of one login, and the pair is net neutral while isolating the
-control plane. That is the trade the owner was told about, and it is the reason R5's two halves are
-sequenced rather than independent. Shipping only the second half would have been a regression; the
-first half alone is a security improvement that the operator pays for in one extra login until the
-second lands.
+So the first half alone would have cost one extra login; the pair is net neutral on count while
+isolating the control plane, and it moves the dashboard's remaining login from a ferrum-specific
+password to the same Authelia the operator already uses. That is the trade the owner was told about,
+and it is the reason R5's two halves are sequenced rather than independent: shipping only the second
+would have been a regression wearing a feature's clothes.
+
+The honest residual cost is that the dashboard is no longer behind a credential ferrum controls
+alone. An operator who wants the old two-gate behaviour back gets it by not signing in to Authelia
+at the dashboard's portal: `POST /api/sso` then answers 401 and the password form is still there.
 
 ## Residual
 

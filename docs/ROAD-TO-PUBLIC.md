@@ -327,11 +327,27 @@ be reproduced in a Nix sandbox or a tempdir, and the fifth was contradicted by i
       Verified on the merged tree: 969 tests pass (exit 0, up from 951), clippy 0 lines.
       **Not verified locally, and will first run on CI:** `tests/stage2/run.sh` — still eleven
       prompts, 9 and 10 swapped — because it needs real KVM and a QEMU guest.
-- [ ] **F5. Dashboard single sign-on — AS A PAIR, in order.** The dashboard needs two logins
-      because ferrumd refuses forward-auth headers, enforced by
-      `no_source_file_reads_a_forward_auth_header`. **That refusal is the compensating control for
-      the accepted risk SEC-M02.** Scope Authelia's cookie first, *then* trust the headers —
-      doing the second alone deletes the control and turns an accepted Medium into a live one.
+- [x] **F5. Dashboard single sign-on — AS A PAIR, in order.** DONE 2026-10-06, as two commits so
+      the first is revertible on its own.
+      - **First: SEC-M02 closed.** Authelia now issues two cookies —
+        `ferrum_control_session` on `ferrum.<baseDomain>` and `authelia_session` on `<baseDomain>` —
+        so a cookie obtained in an app's context is not a cookie for the dashboard.
+        `docs/security/SEC-M02_authelia-cookie-scope.md` records the close; **the ledger transition
+        is the owner's to make.** The price was not obvious and was measured, not guessed: Authelia
+        refuses an `authelia_url` outside the scope it serves, so the control plane needs a portal
+        hostname of its own (`auth.ferrum.<baseDomain>`) and therefore its own vhost, certificate
+        and DNS record.
+      - **Then: `POST /api/sso`.** ferrumd still reads no forward-auth header off any request. It
+        asks Authelia, over loopback, who the caller's cookie belongs to — so the first half is
+        literally what makes the second safe, and `authelia-asserts-only-its-own-scope` measures
+        that on a real Authelia every build.
+      - `no_source_file_reads_a_forward_auth_header` was **replaced, not relaxed**, by
+        `a_forward_auth_header_is_named_only_where_authelia_is_asked`: twelve of thirteen sources
+        keep the original zero-occurrence rule, and the thirteenth may name one on exactly one line.
+      - Login arithmetic, re-examined as the risk acceptance asked: two before, two after, and the
+        dashboard's remaining one is now the Authelia the operator already uses.
+      - Verified on the merged tree: 993 tests pass (exit 0, up from 969), clippy 0 findings, all 46
+        flake checks named in `.github/workflows/ci.yml` build.
 
 ## Phase 5 — The pre-public cleanup (your four steps)
 

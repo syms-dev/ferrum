@@ -12,6 +12,15 @@ let
   ferrum = config.ferrum;
 
   listenAddress = ferrum.daemon.listenAddress;
+
+  # R5. Single sign-on exists only where the dashboard is published AND
+  # Authelia is on -- the same `daemonPublished` predicate every other
+  # consumer reads (modules/proxy/lib.nix), so the vhost, the Authelia cookie
+  # scope, the certificate, the DNS record and this all appear and disappear
+  # together. One definition rather than a sixth re-spelling of the condition.
+  ssoEnabled =
+    (import ../proxy/lib.nix { inherit lib; }).daemonPublished ferrum
+    && ferrum.auth.enable;
   # 127.0.0.0/8 by its first octet, plus the two other spellings of the
   # same thing. Split rather than prefix-matched so that "127.0.0.1.example"
   # -- a string that starts with "127." and is not an address at all -- is
@@ -259,6 +268,35 @@ lib.mkIf ferrum.daemon.enable {
       FERRUM_PROFILES_DIR = "/nix/var/nix/profiles";
       FERRUM_JOURNAL_DIR = ferrum.storage.journalDir;
       FERRUM_UI_DIR = "${pkgs.ferrum-ui}/share/ferrum/ui";
+    }
+    # R5. The two variables that turn single sign-on on, and the condition
+    # that decides whether it exists at all.
+    #
+    # `ssoEnabled` is `daemonPublished && ferrum.auth.enable`, and both terms
+    # are load-bearing:
+    #
+    #  * Without publication there is no ferrum.<baseDomain> vhost, so there is
+    #    no cookie scope for it (modules/proxy/authelia.nix emits the control
+    #    plane's session.cookies entry on the same predicate) and nothing for
+    #    Authelia to decide about. That host is reached over the SSH tunnel
+    #    modules/core/daemon.nix's A5 assertion protects, and R5's own
+    #    acceptance criterion is that the tunnel must not become dependent on
+    #    the proxy it exists to survive. Leaving these unset is what guarantees
+    #    it: crates/ferrumd/src/sso.rs builds no verifier, POST /api/sso
+    #    answers 404, and the password login is untouched.
+    #  * Without Authelia there is nobody to ask.
+    #
+    # FERRUMD_SSO_ORIGIN is the dashboard's own published origin and is what
+    # ferrumd sends as X-Original-URL, so Authelia decides against the control
+    # plane's cookie scope and no other. It is derived here, from the host's
+    # own configuration, precisely so that it can never come from a request.
+    // lib.optionalAttrs ssoEnabled {
+      FERRUMD_SSO_ORIGIN = "https://${ferrum.daemon.subdomain}.${ferrum.proxy.baseDomain}";
+      # The same loopback address modules/proxy/nginx.nix writes into every
+      # /authelia subrequest location. Set explicitly rather than left to
+      # sso.rs's default so the two places that name Authelia's port are both
+      # greppable.
+      FERRUMD_AUTHELIA_ADDRESS = "127.0.0.1:9091";
     };
     serviceConfig = {
       Type = "simple";

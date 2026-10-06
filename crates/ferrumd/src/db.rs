@@ -34,7 +34,8 @@ impl Db {
                 csrf_token TEXT NOT NULL,
                 created_at INTEGER NOT NULL,
                 expires_at INTEGER NOT NULL,
-                last_seen_at INTEGER NOT NULL DEFAULT 0
+                last_seen_at INTEGER NOT NULL DEFAULT 0,
+                origin TEXT NOT NULL DEFAULT 'password'
             );
             CREATE TABLE IF NOT EXISTS login_attempts (
                 username TEXT NOT NULL,
@@ -61,6 +62,14 @@ impl Db {
         // real one.
         Self::add_column_if_missing(&conn, "login_attempts", "peer", "TEXT NOT NULL DEFAULT ''")?;
         Self::add_column_if_missing(&conn, "sessions", "last_seen_at", "INTEGER NOT NULL DEFAULT 0")?;
+        // R5. How a session was obtained, because `require_session` treats the
+        // two differently: a session ferrumd's own password login issued stands
+        // on its own, and a session an Authelia identity produced is re-checked
+        // against Authelia on every request so that logging out there does not
+        // leave a usable session here. The default of 'password' is the correct
+        // reading of every row written before this column existed -- it was the
+        // only way to get one.
+        Self::add_column_if_missing(&conn, "sessions", "origin", "TEXT NOT NULL DEFAULT 'password'")?;
         // A session that predates the idle timeout has no last_seen_at, and
         // the column default of 0 would read as "idle since 1970" -- logging
         // every existing operator out the moment they upgrade. Seeding from
@@ -130,6 +139,43 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 3);
+    }
+
+    /// R5's migration, on the shape a host provisioned before it really has.
+    ///
+    /// `CREATE TABLE IF NOT EXISTS` does nothing to an existing table, so
+    /// without the `ALTER` the first `SELECT ... origin` on an upgraded host
+    /// fails and nobody can log in at all. Built by hand rather than by
+    /// opening an old binary, so the fixture states the old shape explicitly.
+    #[test]
+    fn an_existing_sessions_table_gains_the_origin_column_defaulting_to_password() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE sessions (
+                     token TEXT PRIMARY KEY,
+                     user_id INTEGER NOT NULL,
+                     csrf_token TEXT NOT NULL,
+                     created_at INTEGER NOT NULL,
+                     expires_at INTEGER NOT NULL,
+                     last_seen_at INTEGER NOT NULL DEFAULT 0
+                 );
+                 INSERT INTO sessions VALUES ('t', 1, 'c', 100, 200, 100);",
+            )
+            .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        let origin: String = db
+            .conn()
+            .query_row("SELECT origin FROM sessions WHERE token = 't'", [], |row| row.get(0))
+            .expect("the pre-R5 row must survive the migration and be readable");
+        assert_eq!(
+            origin, "password",
+            "a session that predates SSO was obtained with a password, and must not be \
+             re-checked against an Authelia it never involved"
+        );
     }
 
     #[test]

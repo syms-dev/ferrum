@@ -8,6 +8,7 @@ mod generations;
 mod jobs;
 mod secrets_api;
 mod settings;
+mod sso;
 mod static_files;
 mod updates;
 
@@ -50,6 +51,16 @@ pub struct AppState {
     /// JobRemoved signal, below) and, on the failure paths, by create_job
     /// itself.
     pub interlock: Mutex<Option<String>>,
+    /// How to ask Authelia who a cookie belongs to -- R5, and `None` on every
+    /// host that has no single sign-on.
+    ///
+    /// `None` is the ordinary state of a tunnel-only recovery host and of any
+    /// host with `ferrum.auth.enable` off: `POST /api/sso` answers 404 and
+    /// nothing in `sso.rs` runs, so the password login that the SSH tunnel
+    /// reaches is untouched by Authelia's health. It is also what
+    /// `require_session` refuses an Authelia-origin session against, because a
+    /// session that cannot be re-checked cannot be honoured.
+    pub sso: Option<sso::AutheliaVerifier>,
 }
 
 #[derive(Deserialize)]
@@ -454,6 +465,50 @@ async fn require_session(
             _ => return Err(StatusCode::UNAUTHORIZED),
         };
 
+    // R5, the revocation half. A session ferrumd issued from an Authelia
+    // identity is a cached restatement of somebody else's claim, so it is
+    // re-checked against Authelia on every request. Without this, logging out
+    // at Authelia would leave this session usable for the rest of its idle
+    // window -- the exact thing R5's own edge case names -- and a change of
+    // Authelia identity would leave the previous one's session in place.
+    //
+    // A password session never reaches this branch. That is what keeps the
+    // SSH-tunnel recovery route independent of the proxy it exists to survive:
+    // on a host whose nginx or Authelia is broken, the operator forwards a port
+    // to ferrumd, logs in with their ferrum password, and nothing here runs.
+    //
+    // The three outcomes are deliberately three. `Unavailable` is a 503, NOT a
+    // 401: an Authelia restarted mid-apply must not log the operator out of the
+    // dashboard they are watching the apply through.
+    //
+    // What this deliberately does NOT do is delete the session row. A local
+    // process that learned a session token could otherwise call any route with
+    // no Authelia cookie and have the operator's session destroyed for them --
+    // a denial of service handed out for nothing, since a session Authelia will
+    // not vouch for is already refused on every request and is pruned at
+    // expiry. One rule, and no primitive worth stealing.
+    if session.origin == auth::SessionOrigin::Authelia {
+        let Some(verifier) = state.sso.as_ref() else {
+            // SSO was turned off (or the dashboard unpublished) while this
+            // session was alive. It cannot be re-checked, so it is refused.
+            return Err(StatusCode::UNAUTHORIZED);
+        };
+        let cookie = headers
+            .get(axum::http::header::COOKIE)
+            .and_then(|value| value.to_str().ok());
+        match verifier.verify(cookie).await {
+            // The name is compared, not merely the fact of a login: logging
+            // out at Authelia and back in as somebody else must not resume
+            // the previous operator's session here.
+            sso::Assertion::Identified { username }
+                if Some(&username) == session.username.as_ref() => {}
+            sso::Assertion::Identified { .. } | sso::Assertion::Anonymous => {
+                return Err(StatusCode::UNAUTHORIZED)
+            }
+            sso::Assertion::Unavailable(_) => return Err(StatusCode::SERVICE_UNAVAILABLE),
+        }
+    }
+
     if method_is_mutating(request.method()) {
         let provided = request
             .headers()
@@ -578,6 +633,14 @@ fn build_router(state: Arc<AppState>) -> Router {
         // page you log in on would be circular. See static_files.rs's header.
         .fallback(static_files::serve)
         .route("/api/login", post(login_handler))
+        // R5. Unauthenticated by ferrumd's own session, exactly as
+        // /api/login is: it is the call you make when you do not have one. It
+        // is not unauthenticated -- the caller must present a cookie Authelia
+        // accepts in the control plane's own scope, and sso.rs asks Authelia
+        // directly rather than believing anything on the request. Outside
+        // `protected` also means no CSRF header is demanded, by the identical
+        // reasoning: there is no session yet to have a token.
+        .route("/api/sso", post(sso::sso_handler))
         // L-01 is knowingly still open here: this is the one mutating route
         // with no CSRF check. Moving it into `protected` is a one-line fix
         // that breaks the real UI, which sends no token on logout and then
@@ -1003,7 +1066,14 @@ async fn main() -> anyhow::Result<()> {
     // directions, from within the subscription, and it recovers the
     // claimant's identity from /run/ferrum/requests rather than from
     // memory, because memory is precisely what this restart destroyed.
-    let state = Arc::new(AppState { db, interlock: Mutex::new(None) });
+    // R5. `Err` here is a misconfigured host rather than a host without SSO:
+    // `from_env` returns `Ok(None)` for the latter. Refusing to start on a
+    // malformed FERRUMD_SSO_ORIGIN is deliberate -- the alternative is a
+    // dashboard that silently never offers single sign-on and an operator with
+    // nothing to read.
+    let sso = sso::AutheliaVerifier::from_env()
+        .map_err(|e| anyhow::anyhow!("ferrumd: single sign-on is configured but unusable: {e}"))?;
+    let state = Arc::new(AppState { db, interlock: Mutex::new(None), sso });
 
     // Independently confirms job completion via systemd's own JobRemoved
     // D-Bus signal, so the interlock is cleared even if ferrum-apply
@@ -1122,8 +1192,319 @@ mod tests {
         auth::ensure_first_user(&db, dir.path()).unwrap();
         let password = std::fs::read_to_string(dir.path().join("ferrumd-setup-password")).unwrap();
         let result = auth::login(&db, "admin", password.trim(), &test_client()).unwrap().session().unwrap();
-        let state = Arc::new(AppState { db, interlock: Mutex::new(None) });
+        let state = Arc::new(AppState { db, interlock: Mutex::new(None), sso: None });
         (dir, state, result.session_token, result.csrf_token)
+    }
+
+    /// R5. A host that HAS single sign-on, pointed at a fake Authelia.
+    ///
+    /// Returns the state and the running fake, because several tests have to
+    /// assert on what ferrumd actually asked as well as on what it concluded.
+    /// The fake must outlive the state: dropping it closes the listener and
+    /// every subsequent verify becomes `Unavailable`, which would turn a 401
+    /// assertion into a 503 for an environmental reason.
+    fn with_sso(response: String) -> (tempfile::TempDir, Arc<AppState>, sso::testing::FakeAuthelia) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = db::Db::open(&dir.path().join("test.db")).unwrap();
+        auth::ensure_first_user(&db, dir.path()).unwrap();
+        let fake = sso::testing::FakeAuthelia::serving(response);
+        let verifier = sso::AutheliaVerifier::new(
+            fake.address.clone(),
+            "https://ferrum.example.test".to_string(),
+        )
+        .unwrap();
+        let state =
+            Arc::new(AppState { db, interlock: Mutex::new(None), sso: Some(verifier) });
+        (dir, state, fake)
+    }
+
+    /// Drives `POST /api/sso` through the REAL router, with whatever extra
+    /// headers the test wants to put on the request.
+    async fn post_sso(
+        state: Arc<AppState>,
+        headers: &[(&str, &str)],
+    ) -> axum::response::Response {
+        let mut builder = Request::builder().method(Method::POST).uri("/api/sso");
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        build_router(state).oneshot(builder.body(Body::empty()).unwrap()).await.unwrap()
+    }
+
+    /// The session cookie a response set, if it set one.
+    fn session_cookie_of(response: &axum::response::Response) -> Option<String> {
+        response
+            .headers()
+            .get(axum::http::header::SET_COOKIE)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix(&format!("{SESSION_COOKIE}=")))
+            .map(|v| v.split(';').next().unwrap_or_default().to_string())
+    }
+
+    /// R5's happy path: an Authelia identity ferrum has an account for becomes
+    /// a ferrumd session, with no password typed.
+    #[tokio::test]
+    async fn an_authelia_identity_ferrum_knows_becomes_a_session() {
+        let (_dir, state, _fake) = with_sso(sso::testing::authenticated_as("admin"));
+        let response =
+            post_sso(state.clone(), &[("Cookie", "ferrum_control_session=opaque")]).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let token = session_cookie_of(&response).expect("a session cookie must be set");
+        let session = auth::validate_session(&state.db, &token).unwrap().expect("a real session");
+        assert_eq!(session.username.as_deref(), Some("admin"));
+        assert_eq!(
+            session.origin,
+            auth::SessionOrigin::Authelia,
+            "the session must record that Authelia is what vouched for it, or require_session \
+             will never re-check it and an Authelia logout leaves it live"
+        );
+    }
+
+    /// The forged-header question, asked of the one route that exists to turn
+    /// an assertion into a session. `forged_forward_auth_headers_authenticate_nobody`
+    /// covers the protected routes; this covers the unprotected one R5 added,
+    /// which is where a header would be believed if it were believed anywhere.
+    ///
+    /// The fake answers 401 for everyone, so the ONLY way this could succeed
+    /// is by reading the identity off the request -- which is the defect.
+    #[tokio::test]
+    async fn an_sso_exchange_refuses_a_forged_identity_header() {
+        for header in FORWARD_AUTH_HEADERS {
+            let (_dir, state, _fake) = with_sso(
+                "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n".to_string(),
+            );
+            let response = post_sso(state, &[(header, "admin")]).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{header} must not produce a session when Authelia recognises nobody"
+            );
+        }
+    }
+
+    /// The other half, and the sharper one: even when Authelia DOES vouch for
+    /// somebody, the identity must be Authelia's and not the caller's. A
+    /// daemon that preferred the header would hand a local process a session
+    /// for any account it named, while Authelia's own answer sat unread.
+    #[tokio::test]
+    async fn an_sso_exchange_ignores_a_forged_identity_header() {
+        let (_dir, state, _fake) = with_sso(sso::testing::authenticated_as("admin"));
+        // A second ferrumd account, so "root" is a name that really exists
+        // here: if the header were believed, this test would observe a
+        // genuine root session rather than a 403 for an absent user, and the
+        // assertion would be about the wrong thing.
+        state
+            .db
+            .conn()
+            .execute(
+                "INSERT INTO users (username, password_hash, created_at) VALUES ('root', 'x', 0)",
+                [],
+            )
+            .unwrap();
+
+        let mut headers: Vec<(&str, &str)> = vec![("Cookie", "ferrum_control_session=opaque")];
+        for header in FORWARD_AUTH_HEADERS {
+            headers.push((header, "root"));
+        }
+        let response = post_sso(state.clone(), &headers).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let token = session_cookie_of(&response).unwrap();
+        let session = auth::validate_session(&state.db, &token).unwrap().unwrap();
+        assert_eq!(
+            session.username.as_deref(),
+            Some("admin"),
+            "the identity must come from Authelia's answer, never from a header on the request"
+        );
+    }
+
+    /// R5's edge case, decided: refuse, never provision. An Authelia identity
+    /// with no ferrumd account must not create one.
+    #[tokio::test]
+    async fn an_authelia_identity_ferrum_does_not_know_is_refused_rather_than_provisioned() {
+        let (_dir, state, _fake) = with_sso(sso::testing::authenticated_as("someone-else"));
+        let response =
+            post_sso(state.clone(), &[("Cookie", "ferrum_control_session=opaque")]).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "403, not 401: the caller IS authenticated, and telling them to log in again would \
+             not help"
+        );
+        assert!(session_cookie_of(&response).is_none(), "no session may be issued");
+        let users: i64 = state
+            .db
+            .conn()
+            .query_row("SELECT count(*) FROM users", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            users, 1,
+            "no account may be created from an Authelia identity -- that would make Authelia's \
+             user database ferrumd's authorization source"
+        );
+    }
+
+    /// A host with no SSO answers 404 rather than failing some other way, so
+    /// the UI can tell "there is no single sign-on here" from "it did not
+    /// work". This is the tunnel-only recovery host.
+    #[tokio::test]
+    async fn a_host_without_sso_has_no_sso_endpoint() {
+        let (_dir, state, _session, _csrf) = logged_in();
+        let response = post_sso(state, &[("Cookie", "anything=1")]).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// A host whose SSO verifier points at a port nothing is listening on --
+    /// which is what a stopped `authelia-main.service` presents.
+    ///
+    /// Built by binding and immediately releasing a port rather than by
+    /// dropping a `FakeAuthelia`: the fake's listener is owned by its serving
+    /// thread, so dropping the handle leaves it accepting. That exact mistake
+    /// made the first version of the test below pass with a 200.
+    fn with_authelia_down() -> (tempfile::TempDir, Arc<AppState>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        drop(listener);
+        let dir = tempfile::tempdir().unwrap();
+        let db = db::Db::open(&dir.path().join("test.db")).unwrap();
+        auth::ensure_first_user(&db, dir.path()).unwrap();
+        let verifier =
+            sso::AutheliaVerifier::new(address, "https://ferrum.example.test".to_string()).unwrap();
+        (dir, Arc::new(AppState { db, interlock: Mutex::new(None), sso: Some(verifier) }))
+    }
+
+    /// R5's edge case: Authelia down must not take the dashboard with it, and
+    /// must not be reported as "you are nobody".
+    #[tokio::test]
+    async fn an_unreachable_authelia_is_a_503_rather_than_a_401() {
+        let (_dir, state) = with_authelia_down();
+        let response = post_sso(state, &[("Cookie", "ferrum_control_session=opaque")]).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a 401 here would tell the operator their login failed, which is false and sends \
+             them to re-enter a password that was never wrong"
+        );
+    }
+
+    /// The SSH-tunnel recovery route, held as a test rather than as a claim.
+    ///
+    /// R5's own acceptance criterion: the tunnel must not become dependent on
+    /// the thing it exists to survive. A password session is `require_session`'s
+    /// other branch and must never consult Authelia -- so this drives a real
+    /// protected route on a host whose SSO verifier points at a listener that
+    /// is gone, and it must succeed anyway.
+    #[tokio::test]
+    async fn a_password_session_keeps_working_with_authelia_gone() {
+        let (dir, state) = with_authelia_down();
+        let password =
+            std::fs::read_to_string(dir.path().join("ferrumd-setup-password")).unwrap();
+        let result = auth::login(&state.db, "admin", password.trim(), &test_client())
+            .unwrap()
+            .session()
+            .unwrap();
+
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/api/session")
+            .header("Cookie", format!("{SESSION_COOKIE}={}", result.session_token))
+            .body(Body::empty())
+            .unwrap();
+        let response = build_router(state).oneshot(request).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "the password login is the way in when the proxy is broken; it must not ask the \
+             proxy's authenticator for permission"
+        );
+    }
+
+    /// R5's revocation edge case. Logging out at Authelia must not leave a
+    /// ferrumd session that still works.
+    #[tokio::test]
+    async fn an_authelia_logout_stops_the_session_it_vouched_for() {
+        let (_dir, state, _fake) = with_sso(sso::testing::authenticated_as("admin"));
+        let response =
+            post_sso(state.clone(), &[("Cookie", "ferrum_control_session=opaque")]).await;
+        let token = session_cookie_of(&response).unwrap();
+
+        // The session works while Authelia still vouches for it. Asserted
+        // first, so the refusal below is a change of behaviour rather than a
+        // session that never worked.
+        let live = Request::builder()
+            .method(Method::GET)
+            .uri("/api/session")
+            .header("Cookie", format!("{SESSION_COOKIE}={token}"))
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            build_router(state.clone()).oneshot(live).await.unwrap().status(),
+            StatusCode::OK
+        );
+
+        // Now Authelia says nobody -- which is exactly what it answers after a
+        // logout, measured against the real thing.
+        let logged_out = sso::testing::FakeAuthelia::serving(
+            "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n".to_string(),
+        );
+        let after = Arc::new(AppState {
+            db: db::Db::open(&_dir.path().join("test.db")).unwrap(),
+            interlock: Mutex::new(None),
+            sso: Some(
+                sso::AutheliaVerifier::new(
+                    logged_out.address.clone(),
+                    "https://ferrum.example.test".to_string(),
+                )
+                .unwrap(),
+            ),
+        });
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/api/session")
+            .header("Cookie", format!("{SESSION_COOKIE}={token}"))
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            build_router(after).oneshot(request).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED,
+            "a session Authelia no longer vouches for must authenticate nothing"
+        );
+    }
+
+    /// And the sharper half of revocation: logging out at Authelia and back in
+    /// as a DIFFERENT person must not resume the previous operator's session.
+    /// A check that only asked "is anybody logged in?" would pass this while
+    /// handing the second person the first one's session.
+    #[tokio::test]
+    async fn a_different_authelia_identity_does_not_inherit_the_session() {
+        let (dir, state, _fake) = with_sso(sso::testing::authenticated_as("admin"));
+        let response =
+            post_sso(state.clone(), &[("Cookie", "ferrum_control_session=opaque")]).await;
+        let token = session_cookie_of(&response).unwrap();
+
+        let someone_else = sso::testing::FakeAuthelia::serving(
+            sso::testing::authenticated_as("someone-else"),
+        );
+        let after = Arc::new(AppState {
+            db: db::Db::open(&dir.path().join("test.db")).unwrap(),
+            interlock: Mutex::new(None),
+            sso: Some(
+                sso::AutheliaVerifier::new(
+                    someone_else.address.clone(),
+                    "https://ferrum.example.test".to_string(),
+                )
+                .unwrap(),
+            ),
+        });
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/api/session")
+            .header("Cookie", format!("{SESSION_COOKIE}={token}"))
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            build_router(after).oneshot(request).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
     }
 
     /// The real `require_session` middleware in front of a handler that
@@ -2212,29 +2593,104 @@ mod tests {
         ("jobs.rs", include_str!("jobs.rs")),
         ("secrets_api.rs", include_str!("secrets_api.rs")),
         ("settings.rs", include_str!("settings.rs")),
+        ("sso.rs", include_str!("sso.rs")),
         ("static_files.rs", include_str!("static_files.rs")),
         ("updates.rs", include_str!("updates.rs")),
     ];
 
-    /// The behavioural tests above prove the routes they drive ignore a
-    /// forged header. This proves the stronger thing they cannot: no code
-    /// path anywhere in the crate so much as NAMES one, including paths no
-    /// test reaches. D4's promise is an absence, and an absence is only
-    /// really held by a check that reads everything.
+    /// The file that is allowed to name a forward-auth header, and the ONE
+    /// line of it that may.
+    ///
+    /// R5 replaced the crate-wide absence this scan used to assert, because
+    /// `sso.rs` genuinely has to name the header Authelia answers in. What it
+    /// did NOT do is relax the rule -- see
+    /// `a_forward_auth_header_is_named_only_where_authelia_is_asked` for the
+    /// argument that the replacement is strictly stronger.
+    const SSO_SOURCE: &str = "sso.rs";
+
+    /// The exact line `sso.rs` is permitted to name a forward-auth header on.
+    ///
+    /// Matched as a whole trimmed line, not as a substring: a looser match
+    /// would be satisfied by `headers.get(IDENTITY_HEADER)` on a REQUEST,
+    /// which is the single edit this guard exists to catch.
+    ///
+    /// Split across a concatenation so that this line is not itself an
+    /// occurrence of the thing it describes -- the scan reads main.rs too, and
+    /// the first version of this constant failed its own check.
+    fn permitted_identity_declaration() -> String {
+        format!("const IDENTITY_HEADER: &str = \"{}\";", "remote-".to_string() + "user")
+    }
+
+    /// The replacement for `no_source_file_reads_a_forward_auth_header`, and
+    /// the reason it is a replacement rather than a relaxation.
+    ///
+    /// The old guard asserted an absence across the whole crate: no source
+    /// file so much as NAMED a forward-auth header. R5's second half makes
+    /// ferrumd read one by design -- but off **Authelia's answer to a question
+    /// ferrumd asked**, not off a request it received. An absence proof cannot
+    /// express that distinction, so this asserts the narrower, stronger thing:
+    ///
+    ///  1. Every file **except** `sso.rs` is held to the ORIGINAL rule,
+    ///     unchanged -- zero occurrences, including in paths no test reaches.
+    ///     Twelve of the crate's thirteen sources are exactly as locked down as
+    ///     they were.
+    ///  2. `sso.rs` may name one on **exactly one line**, and that line must be
+    ///     the `IDENTITY_HEADER` declaration. Not a `headers.get(...)`, not a
+    ///     match arm, not a fixture -- the declaration, verbatim.
+    ///
+    /// Why that is stronger rather than weaker. Under the old guard, the way
+    /// to start trusting a request header was to write one line in any file,
+    /// and the guard caught it. Under this one, the same edit is still caught
+    /// everywhere, AND the one file that may name the header cannot use it
+    /// twice -- so `headers.get(IDENTITY_HEADER)` in `sso.rs`, which the old
+    /// guard would never have seen because it names no header literal at all,
+    /// fails here. The old scan's blind spot was a constant; this closes it.
+    ///
+    /// The behavioural half is `main.rs`'s own
+    /// `forged_forward_auth_headers_authenticate_nobody` (unchanged) and
+    /// `an_sso_exchange_ignores_a_forged_identity_header`: together they say
+    /// the header is named in one place and believed from one source.
     #[test]
-    fn no_source_file_reads_a_forward_auth_header() {
-        let mut found = Vec::new();
+    fn a_forward_auth_header_is_named_only_where_authelia_is_asked() {
+        let permitted = permitted_identity_declaration();
+        let mut elsewhere = Vec::new();
+        let mut in_sso = Vec::new();
         for (name, source) in CRATE_SOURCES {
             for (number, line) in source.lines().enumerate() {
-                if let Some(header) = forward_auth_header_named_on(line) {
-                    found.push(format!("{name}:{}: {header}: {}", number + 1, line.trim()));
+                let Some(header) = forward_auth_header_named_on(line) else { continue };
+                let found = format!("{name}:{}: {header}: {}", number + 1, line.trim());
+                if *name == SSO_SOURCE {
+                    in_sso.push((line.trim().to_string(), found));
+                } else {
+                    elsewhere.push(found);
                 }
             }
         }
+
         assert!(
-            found.is_empty(),
-            "ferrumd must never trust a forward-auth identity header (D4); found:\n{}",
-            found.join("\n")
+            elsewhere.is_empty(),
+            "only sso.rs may name a forward-auth identity header, and only to declare the one \
+             it reads off AUTHELIA'S ANSWER (R5/D4); found elsewhere:\n{}",
+            elsewhere.join("\n")
+        );
+
+        // Anti-vacuity, and the half that catches the regression this guard
+        // exists for. `in_sso` being empty would mean the scan no longer sees
+        // sso.rs at all -- at which point "nothing else names one" is a claim
+        // about twelve files and the thirteenth is unwatched.
+        assert_eq!(
+            in_sso.len(),
+            1,
+            "sso.rs must name a forward-auth header on exactly one line -- the IDENTITY_HEADER \
+             declaration. {} is not one. A second occurrence is how `headers.get(IDENTITY_HEADER)` \
+             on a REQUEST would enter the crate, which is exactly the trust D4 refuses:\n{}",
+            in_sso.len(),
+            in_sso.iter().map(|(_, found)| found.as_str()).collect::<Vec<_>>().join("\n")
+        );
+        assert_eq!(
+            in_sso[0].0, permitted,
+            "sso.rs's one permitted mention of a forward-auth header must be the IDENTITY_HEADER \
+             declaration itself"
         );
     }
 
@@ -2748,6 +3204,10 @@ mod tests {
         pub(super) const API_ROUTES: &[(&str, &str, &str)] = &[
             ("POST", "/api/login", "/api/login"),
             ("POST", "/api/logout", "/api/logout"),
+            // R5. On a host with no single sign-on -- which every fixture in
+            // this module is -- this answers 404, and a 404 carrying a CORS
+            // header would be as much of a finding as a 200 carrying one.
+            ("POST", "/api/sso", "/api/sso"),
             ("GET", "/api/catalog", "/api/catalog"),
             ("GET", "/api/generations", "/api/generations"),
             // No `?job=`: the probe asks for the most recent report, the
@@ -3059,7 +3519,12 @@ mod tests {
         /// nothing above would fail.
         #[tokio::test]
         async fn every_probe_uri_really_reaches_its_route() {
-            let (dir, state, _session, _csrf) = logged_in();
+            // An SSO-configured host, pointed at an Authelia that is not
+            // listening. `logged_in()` has no SSO, where POST /api/sso
+            // legitimately answers 404 -- and a 404 is exactly what this guard
+            // reads as "the probe missed its route", so the one route it was
+            // added to cover would be the one it could not see.
+            let (dir, state) = super::with_authelia_down();
             let password = std::fs::read_to_string(dir.path().join("ferrumd-setup-password"))
                 .unwrap()
                 .trim()
@@ -3100,7 +3565,7 @@ mod tests {
             let db = db::Db::open(&dir.path().join("test.db")).unwrap();
             // The TempDir is dropped here on purpose: SQLite keeps the open
             // handle, and nothing in these tests touches the file again.
-            AppState { db, interlock: Mutex::new(None) }
+            AppState { db, interlock: Mutex::new(None), sso: None }
         }
 
         /// The half of M3 that needs no race at all.

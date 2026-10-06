@@ -1241,7 +1241,7 @@ mod tests {
         fn state() -> Arc<AppState> {
             let dir = tempfile::tempdir().unwrap();
             let db = crate::db::Db::open(&dir.path().join("test.db")).unwrap();
-            Arc::new(AppState { db, interlock: std::sync::Mutex::new(None) })
+            Arc::new(AppState { db, interlock: std::sync::Mutex::new(None), sso: None })
         }
 
         /// Drives the real handler and hands back its status, its body, and
