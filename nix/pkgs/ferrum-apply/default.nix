@@ -1,4 +1,4 @@
-{ rustPlatform, lib, makeWrapper, btrfs-progs, sops, ssh-to-age, authelia, dnsutils, shadow }:
+{ rustPlatform, lib, makeWrapper, btrfs-progs, sops, ssh-to-age, authelia, dnsutils, shadow, git }:
 rustPlatform.buildRustPackage {
   pname = "ferrum-apply";
   version = "0.1.0";
@@ -48,6 +48,21 @@ rustPlatform.buildRustPackage {
   nativeCheckInputs = [ btrfs-progs sops ssh-to-age authelia dnsutils ];
   nativeBuildInputs = [ makeWrapper ];
   postFixup = ''
-    wrapProgram $out/bin/ferrum-apply --prefix PATH : ${lib.makeBinPath [ btrfs-progs sops ssh-to-age authelia dnsutils shadow ]}
+    # git belongs here and not only in environment.systemPackages, which is
+    # where modules/core/overlays.nix put it after the first real install hit
+    # "bash: line 1: git: command not found". systemPackages is not on a
+    # systemd unit's PATH once `systemd.services.<n>.path` is set, and
+    # modules/core/daemon.nix sets ferrum-apply@'s to [ config.nix.package ] --
+    # so the operator shell has git and the unit that actually does the work
+    # does not. Confirmed on a running host: that unit's PATH is nix, coreutils,
+    # findutils, gnugrep, gnused and systemd, and nothing else.
+    #
+    # `check-update` and `update` both shell out to `git ls-remote` to resolve
+    # what revision a tracked ref points at now. A host pinned to an exact
+    # commit short-circuits before reaching it and so never noticed, which is
+    # why this survived a merged, deployed feature -- but the whole point of
+    # the update design is that a host tracks a release REF, and every such
+    # host would have failed with a bare "No such file or directory".
+    wrapProgram $out/bin/ferrum-apply --prefix PATH : ${lib.makeBinPath [ btrfs-progs sops ssh-to-age authelia dnsutils shadow git ]}
   '';
 }
