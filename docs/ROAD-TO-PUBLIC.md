@@ -312,9 +312,21 @@ be reproduced in a Nix sandbox or a tempdir, and the fifth was contradicted by i
       check exit 0.
       **Left open, now folded into F3's lane:** the installer still asks for a static address and
       never offers the updater, so discovery only helps someone who hand-edits settings.
-- [ ] **F3. The installer must obtain a Plex claim token.** `claimToken` defaults to `""`, the
-      installer never asks, so a fresh install ends with an unclaimed server — a manual step in a
-      product whose pitch is not having any.
+- [x] **F3. The installer must obtain a Plex claim token.** DONE 2026-10-06, merged `661531d`. The
+      installer now asks when Plex is enabled and a base domain is set, states the four-minute
+      expiry up front, and takes a skip in one keystroke. The token is delivered as a **sops
+      secret**; a test sweeps *every rendered file* for its value, not just `settings.json`.
+      **The expiry cannot be closed at this layer and the change does not pretend it can** —
+      sops-nix resolves every `sopsFile` at evaluation time, so the secret must exist before a
+      stage-2 build that takes far longer than four minutes. Asking later shrinks the window and
+      never shuts it. So the closing report states the **measured** outcome, read from Plex's own
+      `Preferences.xml` on the host, and the headline now reads "installed, with one thing
+      unfinished" rather than "installed".
+      **F1's leftover closed here too:** the installer offers the DNS updater *before* asking for
+      an address, and an updater host is asked for none and persists none.
+      Verified on the merged tree: 969 tests pass (exit 0, up from 951), clippy 0 lines.
+      **Not verified locally, and will first run on CI:** `tests/stage2/run.sh` — still eleven
+      prompts, 9 and 10 swapped — because it needs real KVM and a QEMU guest.
 - [ ] **F5. Dashboard single sign-on — AS A PAIR, in order.** The dashboard needs two logins
       because ferrumd refuses forward-auth headers, enforced by
       `no_source_file_reads_a_forward_auth_header`. **That refusal is the compensating control for
