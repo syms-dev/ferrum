@@ -75,9 +75,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use ferrum_dns::client::Client;
 use ferrum_dns::dns_query::Verification;
 use ferrum_dns::ownership::AdoptedNames;
+use ferrum_dns::public_ip::{self, Discovered, DiscoveryError};
 use ferrum_dns::record::{plan_with_adoptions, DesiredRecord, RecordAction};
 use ferrum_dns::{CloudflareError, RecordTarget, Secret, Zone};
 use serde::Deserialize;
+
+use crate::address_history::{self, Decision};
 
 /// The `EnvironmentFile=` key the Cloudflare token is stored under.
 ///
@@ -320,6 +323,30 @@ pub enum ReconcileError {
     /// Cloudflare refused, or could not be reached, before any record was
     /// touched -- zone resolution or the listing itself.
     Cloudflare(CloudflareError),
+    /// The updater is on and this host's public address could not be
+    /// established, or was established and refused (F1/R1).
+    ///
+    /// An error rather than a quiet fall back to `staticAddress`, and that
+    /// is the whole point: the defect this closes is a timer that published
+    /// a stale literal forever while reporting nothing. "Could not find out"
+    /// must never be indistinguishable from "nothing to do".
+    Discovery(DiscoveryError),
+}
+
+impl ReconcileError {
+    /// Whether this failure is ferrum *refusing* an answer it does not
+    /// believe, rather than failing to obtain one.
+    ///
+    /// # Returns
+    /// `true` only for a [`ReconcileError::Discovery`] carrying a refusal.
+    /// `crates/ferrum-apply/src/main.rs` turns that into its own exit code,
+    /// so an operator -- and anything watching the unit -- can tell "this
+    /// host could not reach the internet" from "the internet disagreed with
+    /// itself about where this host is".
+    #[must_use]
+    pub fn is_discovery_refusal(&self) -> bool {
+        matches!(self, ReconcileError::Discovery(inner) if inner.is_refusal())
+    }
 }
 
 impl fmt::Display for ReconcileError {
@@ -341,6 +368,7 @@ impl fmt::Display for ReconcileError {
                 write!(f, "the DNS record target is unusable: {detail}")
             }
             ReconcileError::Cloudflare(inner) => write!(f, "{inner}"),
+            ReconcileError::Discovery(inner) => write!(f, "{inner}"),
         }
     }
 }
@@ -399,6 +427,21 @@ pub enum Operation {
     /// disclosure that only one of two readers prints is the defect this
     /// variant exists to close.
     ZoneNotServing,
+    /// Not a record either: what discovery decided this host's public
+    /// address is, and which independent sources agreed (F1/R1).
+    ///
+    /// Routine rather than a disclosure, so it does not add a line to every
+    /// apply's stderr -- but it is always present in the `reconcile-dns`
+    /// breakdown the timer writes to the journal. That is the line the
+    /// original defect had nowhere to put: a host whose records were six
+    /// weeks stale had no journal entry naming any address at all.
+    PublicAddress,
+    /// Something about the public address the operator must be told, while
+    /// the run itself stays clean: a source that did not answer, a
+    /// `staticAddress` that disagrees with what was discovered, a change
+    /// held back by the flap budget, or a published change whose
+    /// reachability ferrum cannot vouch for.
+    PublicAddressWarning,
 }
 
 impl Operation {
@@ -415,6 +458,8 @@ impl Operation {
             Operation::SkipUnmodelledType => "also here (a type ferrum does not manage)",
             Operation::SkipForeignBeside => "also here (a record ferrum does not own)",
             Operation::ZoneNotServing => "NOT PUBLISHED (Cloudflare is not answering for this zone)",
+            Operation::PublicAddress => "public address",
+            Operation::PublicAddressWarning => "public address (read this)",
         }
     }
 
@@ -437,6 +482,7 @@ impl Operation {
                 | Operation::SkipForeignBeside
                 | Operation::SkipUnmodelledType
                 | Operation::ZoneNotServing
+                | Operation::PublicAddressWarning
         )
     }
 }
@@ -585,6 +631,250 @@ pub fn authoritative_verifier(
     client.verify_authoritative(zone, name, target)
 }
 
+/// How this host's public address is found. Production asks three
+/// independent services; tests pass a closure.
+pub type AddressDiscoverer<'a> = &'a dyn Fn() -> Result<Discovered, DiscoveryError>;
+
+/// Everything the address half of a reconcile needs, injected together
+/// (F1/R1).
+///
+/// One struct rather than three more parameters on three functions, because
+/// the three values are one decision: *how to find the address, what was
+/// published last, and when now is*. Tests drive all three; nothing else
+/// here needs a clock or a filesystem.
+pub struct AddressPolicy<'a> {
+    /// How to ask. [`production_discoverer`] in production.
+    pub discover: AddressDiscoverer<'a>,
+    /// Where the published-address history lives, normally
+    /// `<stateDir>/dns-public-address.json`.
+    pub history_path: PathBuf,
+    /// The current time, for the flap budget.
+    pub now: SystemTime,
+}
+
+/// The production discoverer: ask `ferrum_dns::public_ip`'s three
+/// independent sources.
+///
+/// # Returns
+/// The address they agree on.
+///
+/// # Errors
+/// [`DiscoveryError`] when fewer than two independent operators answered,
+/// when the answers disagree, or when the agreed address is one no public
+/// record may point at.
+pub fn production_discoverer() -> Result<Discovered, DiscoveryError> {
+    public_ip::discover(&public_ip::default_sources())
+}
+
+/// Builds the production policy from the environment.
+///
+/// # Arguments
+/// * `state_dir` - `ferrum.storage.stateDir`, the one path the updater unit
+///   may write to.
+#[must_use]
+pub fn production_address_policy(state_dir: &Path) -> AddressPolicy<'static> {
+    AddressPolicy {
+        discover: &production_discoverer,
+        history_path: state_dir.join(address_history::FILE_NAME),
+        now: SystemTime::now(),
+    }
+}
+
+/// Decides what address every record should point at, and what the operator
+/// has to be told about it (F1/R1).
+///
+/// With the updater **off** this is exactly what it always was:
+/// `ConfiguredTarget::resolve`, and nothing on this path is reached at all.
+/// `staticAddress` therefore keeps working unchanged, which is the
+/// acceptance criterion that protects every host already running.
+///
+/// With the updater **on**, the address comes from discovery and
+/// `staticAddress` becomes advisory: if it is set and disagrees, that is a
+/// warning naming both values, never a silent override in either direction.
+/// The operator wrote a fact down that is no longer true, and the one thing
+/// ferrum must not do is quietly pick a winner.
+///
+/// Note this runs for the in-apply reconcile too, not only the timer, and
+/// that is deliberate. If an apply used `staticAddress` while the timer used
+/// discovery, every apply would drag the records back to the stale literal
+/// and the next timer tick would drag them forward again -- two Cloudflare
+/// writes per cycle, forever, with the records wrong half the time.
+///
+/// # Arguments
+/// * `config` - the desired-record document.
+/// * `policy` - how to discover, where the history is, and what time it is.
+///
+/// # Returns
+/// The target every record will point at, and the report entries to prepend
+/// to the breakdown.
+///
+/// # Errors
+/// [`ReconcileError::Discovery`] when the updater is on and no address could
+/// be established or the established one was refused;
+/// [`ReconcileError::Target`] when the updater is off and `staticAddress` is
+/// unusable.
+fn address_target(
+    config: &DnsConfig,
+    policy: &AddressPolicy<'_>,
+) -> Result<(RecordTarget, Vec<RecordReport>), ReconcileError> {
+    if !config.ddns_updater.enable {
+        return Ok((config.target.resolve()?, Vec::new()));
+    }
+
+    // `dns.nix` asserts this combination away at evaluation, so reaching it
+    // means a document that did not come from that module. Refused rather
+    // than quietly resolved: silently turning a configured CNAME into an A
+    // record is exactly the class of unannounced substitution this whole
+    // requirement exists to stop.
+    if let ConfiguredTarget::Cname { hostname } = &config.target {
+        return Err(ReconcileError::Target {
+            detail: format!(
+                "ddnsUpdater is enabled but recordMode is \"cname\" (target {hostname:?}). A \
+                 discovered address has nowhere to go in a CNAME, and replacing the CNAME with \
+                 an A record is not a decision this binary gets to make"
+            ),
+        });
+    }
+
+    let discovered = (policy.discover)().map_err(ReconcileError::Discovery)?;
+    let mut entries = vec![note(
+        &config.base_domain,
+        Operation::PublicAddress,
+        &discovered.to_string(),
+    )];
+    if !discovered.unreachable.is_empty() {
+        entries.push(warn(
+            &config.base_domain,
+            &format!(
+                "{} of this host's address sources did not answer ({}). {} still agreed, which \
+                 is the minimum ferrum will act on -- one more outage and the records stop \
+                 being corrected at all",
+                discovered.unreachable.len(),
+                discovered.unreachable.join("; "),
+                discovered.agreed_by.len()
+            ),
+        ));
+    }
+
+    let (mut history, complaint) = address_history::load(&policy.history_path);
+    if let Some(complaint) = complaint {
+        entries.push(warn(&config.base_domain, &complaint));
+    }
+
+    let address = match address_history::decide(&history, discovered.address, policy.now) {
+        Decision::Unchanged { address } => address,
+        Decision::Change { previous, flapping } => {
+            // Recorded before the Cloudflare writes, not after, and that is
+            // safe because the history decides only which address is CHOSEN,
+            // never whether a record is already correct. If the writes below
+            // fail, the next run re-derives its plan from the live listing,
+            // finds the records still holding the old value, and corrects
+            // them with the same chosen address. Recording after a partial
+            // failure, by contrast, would re-spend a change from the flap
+            // budget on every retry.
+            history.record(discovered.address, policy.now);
+            if let Err(e) = address_history::save(&policy.history_path, &history) {
+                entries.push(warn(
+                    &config.base_domain,
+                    &format!(
+                        "the published-address history at {} could not be written ({e}), so the \
+                         flap budget will restart on the next run",
+                        policy.history_path.display()
+                    ),
+                ));
+            }
+            let movement = match previous {
+                Some(old) => format!("this host's public address moved from {old} to {}", discovered.address),
+                None => format!(
+                    "this host's public address is {} and is being published for the first time",
+                    discovered.address
+                ),
+            };
+            entries.push(warn(
+                &config.base_domain,
+                &format!(
+                    "{movement}, so every record ferrum owns is being corrected in this pass.{} \
+                     ferrum cannot tell whether connections TO {} reach this host: if this line \
+                     is behind carrier-grade NAT, or a router with no port forward, the records \
+                     are now right and the apps are still unreachable",
+                    if flapping {
+                        " This address was already published recently, so the link looks like it \
+                         is flapping rather than moving on."
+                    } else {
+                        ""
+                    },
+                    discovered.address
+                ),
+            ));
+            discovered.address
+        }
+        Decision::RateLimited {
+            keep,
+            discovered: found,
+            changes_in_window,
+            flapping,
+            retry_in_seconds,
+        } => {
+            entries.push(warn(
+                &config.base_domain,
+                &format!(
+                    "this host's public address now reads {found}, but {changes_in_window} \
+                     changes have already been published in the last {} hours, so the records \
+                     were left pointing at {keep}.{} ferrum will publish {found} in about {} \
+                     minutes if it is still the address then -- the budget exists so a flapping \
+                     link cannot spend the Cloudflare quota rewriting every hostname every hour",
+                    address_history::WINDOW.as_secs() / 3600,
+                    if flapping {
+                        " This address has been published before within that history, so the \
+                         link is oscillating rather than moving."
+                    } else {
+                        ""
+                    },
+                    retry_in_seconds / 60
+                ),
+            ));
+            keep
+        }
+    };
+
+    // The criterion is a WARNING naming both, in both directions: ferrum
+    // does not get to decide that the operator's written-down fact was a
+    // mistake, and it does not get to publish a literal it has live evidence
+    // against either. It publishes what it measured and says what it saw.
+    if let ConfiguredTarget::A { address: configured } = &config.target {
+        let configured = configured.trim();
+        if !configured.is_empty() && configured != address.to_string() {
+            entries.push(warn(
+                &config.base_domain,
+                &format!(
+                    "ferrum.proxy.dns.staticAddress in settings.json is {configured}, but the \
+                     updater is on and this host's address is {address}. {address} is what was \
+                     published. Clear staticAddress, or set it to {address}, so the two cannot \
+                     disagree again"
+                ),
+            ));
+        }
+    }
+
+    Ok((RecordTarget::A(address), entries))
+}
+
+/// A clean, informational report entry about something that is not a record.
+fn note(name: &str, operation: Operation, detail: &str) -> RecordReport {
+    RecordReport {
+        name: name.to_string(),
+        operation,
+        failure: None,
+        note: Some(detail.to_string()),
+    }
+}
+
+/// A clean report entry the operator must nonetheless read
+/// ([`Operation::is_disclosure`]).
+fn warn(name: &str, detail: &str) -> RecordReport {
+    note(name, Operation::PublicAddressWarning, detail)
+}
+
 /// Reads the Cloudflare token out of its systemd `EnvironmentFile` (decision
 /// D-11).
 ///
@@ -676,8 +966,9 @@ pub fn reconcile_with(
     config: &DnsConfig,
     client: &Client,
     verify: Verifier<'_>,
+    address: &AddressPolicy<'_>,
 ) -> Result<ReconcileReport, ReconcileError> {
-    let target = config.target.resolve()?;
+    let (target, address_entries) = address_target(config, address)?;
     let desired: Vec<DesiredRecord> = config
         .records
         .iter()
@@ -702,6 +993,12 @@ pub fn reconcile_with(
         .into_iter()
         .map(|action| execute(client, zone, verify, action))
         .collect();
+
+    // Before the per-record lines, because every one of them is a
+    // consequence of the address decided above: an operator reading
+    // "plex.example.com (update): was A, now B" needs to have already read
+    // where B came from and who agreed on it.
+    records.splice(0..0, address_entries);
 
     // First, not last. Every line below it describes a write that will
     // succeed, and reading those as good news is the whole failure: the
@@ -904,6 +1201,7 @@ pub fn run(
     config_path: &Path,
     make_client: ClientFactory<'_>,
     verify: Verifier<'_>,
+    address: &AddressPolicy<'_>,
 ) -> Result<Option<ReconcileReport>, ReconcileError> {
     let config = load_config(config_path)?;
     if !config.enable {
@@ -914,7 +1212,7 @@ pub fn run(
         .as_deref()
         .ok_or(ReconcileError::NoCredentialConfigured)?;
     let client = make_client(read_token(credential_file)?);
-    reconcile_with(&config, &client, verify).map(Some)
+    reconcile_with(&config, &client, verify, address).map(Some)
 }
 
 /// Reconciles as a step inside `ferrum-apply apply` (decision D-08).
@@ -939,11 +1237,15 @@ pub fn reconcile_for_apply(
     toplevel: &str,
     progress: &mut crate::progress::Progress,
 ) -> Option<String> {
+    let state_dir = PathBuf::from(
+        std::env::var("FERRUM_STATE_DIR").unwrap_or_else(|_| "/var/lib/ferrum/state".to_string()),
+    );
     reconcile_for_apply_with(
         toplevel,
         progress,
         &cloudflare_client,
         &authoritative_verifier,
+        &production_address_policy(&state_dir),
     )
 }
 
@@ -962,6 +1264,7 @@ pub fn reconcile_for_apply(
 /// * `progress` - the job stream the operator's dashboard tails.
 /// * `make_client` - how Cloudflare is reached.
 /// * `verify` - how a written record is proved to resolve.
+/// * `address` - how this host's public address is found (F1/R1).
 ///
 /// # Returns
 /// The same as [`reconcile_for_apply`]: `Some(reason)` only when the apply
@@ -971,13 +1274,14 @@ fn reconcile_for_apply_with(
     progress: &mut crate::progress::Progress,
     make_client: ClientFactory<'_>,
     verify: Verifier<'_>,
+    address: &AddressPolicy<'_>,
 ) -> Option<String> {
     let path = Path::new(toplevel).join(CONFIG_IN_CLOSURE);
     if !path.exists() {
         return None;
     }
     progress.event("dns", "reconciling the DNS records for published apps");
-    match run(&path, make_client, verify) {
+    match run(&path, make_client, verify, address) {
         Ok(None) => None,
         Ok(Some(report)) => {
             disclose(&report, progress);
@@ -1060,13 +1364,79 @@ mod tests {
             "records": records,
             "target": { "mode": "a", "address": "203.0.113.7" },
             "credentialFile": "/run/secrets/acme-dns",
-            "ddnsUpdater": { "enable": true, "intervalMinutes": 30 },
+            // Deliberately OFF in the shared fixture. Every test in this
+            // module except the F1/R1 block below is about record planning,
+            // ownership or reporting, and all of them must keep proving that
+            // `staticAddress` publishes unchanged on a host with the updater
+            // off -- which is itself an F1 acceptance criterion. The
+            // discovery fixtures below turn it on explicitly, one test at a
+            // time.
+            "ddnsUpdater": { "enable": false, "intervalMinutes": 30 },
         })
         .to_string()
     }
 
     fn parsed(records: &[(&str, &str)]) -> DnsConfig {
         serde_json::from_str(&config_json(records, true)).expect("the document parses")
+    }
+
+    /// The same document with the updater ON and a given `staticAddress`.
+    ///
+    /// # Arguments
+    /// * `records` - the names to publish.
+    /// * `static_address` - what settings.json still says; `""` for a host
+    ///   whose operator never wrote one down, which is the shape F1 makes
+    ///   legal.
+    fn parsed_with_updater(records: &[(&str, &str)], static_address: &str) -> DnsConfig {
+        let mut value: serde_json::Value =
+            serde_json::from_str(&config_json(records, true)).expect("the document parses");
+        value["ddnsUpdater"]["enable"] = serde_json::json!(true);
+        value["target"] = serde_json::json!({ "mode": "a", "address": static_address });
+        serde_json::from_value(value).expect("the updater document parses")
+    }
+
+    /// A discoverer that always finds `address`, as if two independent
+    /// sources agreed.
+    fn finds(address: Ipv4Addr) -> impl Fn() -> Result<Discovered, DiscoveryError> {
+        move || {
+            Ok(Discovered {
+                address,
+                agreed_by: vec!["alpha".to_string(), "beta".to_string()],
+                unreachable: Vec::new(),
+            })
+        }
+    }
+
+    /// The policy a test drives: a fixed discoverer and a history file in a
+    /// tempdir.
+    fn policy<'a>(
+        discover: &'a dyn Fn() -> Result<Discovered, DiscoveryError>,
+        dir: &tempfile::TempDir,
+    ) -> AddressPolicy<'a> {
+        AddressPolicy {
+            discover,
+            history_path: dir.path().join(crate::address_history::FILE_NAME),
+            now: SystemTime::now(),
+        }
+    }
+
+    /// Discovery that panics if it is ever called.
+    ///
+    /// Every test on the `staticAddress` path uses this, so "the updater is
+    /// off, therefore nothing queries the internet" is enforced by the suite
+    /// rather than asserted in a comment.
+    fn never_discovers() -> Result<Discovered, DiscoveryError> {
+        panic!("discovery must never run with ferrum.proxy.dns.ddnsUpdater.enable = false");
+    }
+
+    /// The policy for every pre-F1 test: discovery is a programming error
+    /// and the history path does not exist.
+    fn static_policy() -> AddressPolicy<'static> {
+        AddressPolicy {
+            discover: &never_discovers,
+            history_path: PathBuf::from("/nonexistent/ferrum/dns-public-address.json"),
+            now: UNIX_EPOCH,
+        }
     }
 
     /// The same document, plus the names the operator adopted at the gate.
@@ -1199,6 +1569,7 @@ mod tests {
             &mut progress,
             &|_| client_for(&fake),
             &always_matches,
+            &static_policy(),
         );
 
         assert_eq!(
@@ -1237,6 +1608,7 @@ mod tests {
                 &mut progress,
                 &|_| client_for(&fake),
                 &always_matches,
+                &static_policy(),
             ),
             None
         );
@@ -1283,6 +1655,7 @@ mod tests {
             &mut progress,
             &|_| client_for(&fake),
             &always_matches,
+            &static_policy(),
         );
 
         assert_eq!(
@@ -1330,6 +1703,7 @@ mod tests {
             &parsed(&[("plex.example.com", "app:plex")]),
             &client_for(&fake),
             &always_matches,
+            &static_policy(),
         )
         .expect("the reconcile runs");
 
@@ -1362,8 +1736,13 @@ mod tests {
             config.credential_file.as_deref(),
             Some(Path::new("/run/secrets/acme-dns"))
         );
-        assert!(config.ddns_updater.enable);
+        assert!(!config.ddns_updater.enable);
         assert_eq!(config.target.resolve().unwrap(), RecordTarget::A(HOST));
+        // The same document with the updater on, which is the shape F1
+        // makes meaningful: the field is read, and an empty staticAddress
+        // beside it is legal.
+        let updating = parsed_with_updater(&[("auth.example.com", "auth")], "");
+        assert!(updating.ddns_updater.enable);
     }
 
     #[test]
@@ -1416,7 +1795,7 @@ mod tests {
         let path = dir.path().join("ferrum-dns-config.json");
         fs::write(&path, config_json(&[("auth.example.com", "auth")], false)).unwrap();
         let fake = FakeCloudflare::start();
-        let outcome = run(&path, &|_| client_for(&fake), &always_matches)
+        let outcome = run(&path, &|_| client_for(&fake), &always_matches, &static_policy())
             .expect("a disabled host is not an error");
         assert_eq!(outcome, None);
         assert!(
@@ -1527,7 +1906,7 @@ mod tests {
         fs::write(&config_path, document.to_string()).unwrap();
 
         let fake = fake_zone(serde_json::json!([]));
-        let err = run(&config_path, &|_| client_for(&fake), &always_matches)
+        let err = run(&config_path, &|_| client_for(&fake), &always_matches, &static_policy())
             .expect_err("an unusable credential must be an error, not an empty report");
         assert!(matches!(
             err,
@@ -1548,7 +1927,7 @@ mod tests {
         document["credentialFile"] = serde_json::Value::Null;
         fs::write(&path, document.to_string()).unwrap();
         let fake = FakeCloudflare::start();
-        let err = run(&path, &|_| client_for(&fake), &always_matches)
+        let err = run(&path, &|_| client_for(&fake), &always_matches, &static_policy())
             .expect_err("no credential is a refusal");
         assert_eq!(err, ReconcileError::NoCredentialConfigured);
     }
@@ -1566,6 +1945,7 @@ mod tests {
             &parsed(&[("auth.example.com", "auth")]),
             &client_for(&fake),
             &always_matches,
+            &static_policy(),
         )
         .expect("the run completes");
 
@@ -1601,6 +1981,7 @@ mod tests {
             &parsed(&[("plex.example.com", "app:plex")]),
             &client_for(&fake),
             &always_matches,
+            &static_policy(),
         )
         .expect("the run completes");
 
@@ -1654,6 +2035,7 @@ mod tests {
             &parsed(&[("plex.example.com", "app:plex")]),
             &client_for(&fake),
             &always_matches,
+            &static_policy(),
         )
         .expect("the run completes");
 
@@ -1701,6 +2083,7 @@ mod tests {
             &parsed(&[("plex.example.com", "app:plex")]),
             &client_for(&fake),
             &always_matches,
+            &static_policy(),
         )
         .expect("the run completes");
 
@@ -1733,7 +2116,7 @@ mod tests {
             CannedResponse::ok(serde_json::json!({ "id": "mine" })),
         );
 
-        let report = reconcile_with(&parsed(&[]), &client_for(&fake), &always_matches)
+        let report = reconcile_with(&parsed(&[]), &client_for(&fake), &always_matches, &static_policy())
             .expect("the run completes");
 
         assert_eq!(report.records.len(), 1, "only ferrum's record is acted on");
@@ -1762,6 +2145,7 @@ mod tests {
             &parsed(&[("auth.example.com", "auth")]),
             &client_for(&fake),
             &always_matches,
+            &static_policy(),
         )
         .expect("the run completes");
 
@@ -1787,6 +2171,7 @@ mod tests {
             &parsed(&[("auth.example.com", "auth")]),
             &client_for(&fake),
             &always_matches,
+            &static_policy(),
         )
         .expect("the run completes");
 
@@ -1857,12 +2242,12 @@ mod tests {
         let client = client_for(&fake);
         let config = parsed(&[("auth.example.com", "auth")]);
 
-        let first = reconcile_with(&config, &client, &always_matches).expect("round 1 completes");
+        let first = reconcile_with(&config, &client, &always_matches, &static_policy()).expect("round 1 completes");
         assert_eq!(first.records[0].operation, Operation::Create);
         let after_first = fake.requests().len();
 
         let second =
-            reconcile_with(&config, &client, &always_matches).expect("round 2 completes");
+            reconcile_with(&config, &client, &always_matches, &static_policy()).expect("round 2 completes");
         assert_eq!(
             second.records[0].operation,
             Operation::Unchanged,
@@ -1942,6 +2327,7 @@ mod tests {
             ]),
             &client_for(&fake),
             &always_matches,
+            &static_policy(),
         )
         .expect("the run completes");
 
@@ -1980,6 +2366,7 @@ mod tests {
                 &parsed(&[("auth.example.com", "auth")]),
                 &client_for(&fake),
                 verify,
+                &static_policy(),
             )
             .expect("the run completes");
             assert!(!report.is_clean(), "an unproved record is not a success");
@@ -2013,6 +2400,7 @@ mod tests {
             &parsed(&[("auth.example.com", "auth")]),
             &client_for(&fake),
             &always_matches,
+            &static_policy(),
         )
         .expect_err("a refused listing is not an empty zone");
         assert!(err.to_string().contains("9109"), "{err}");
@@ -2093,6 +2481,7 @@ mod tests {
             &parsed_with_adoptions(&[("plex.example.com", "app:plex")], &["plex.example.com"]),
             &client_for(&fake),
             &always_matches,
+            &static_policy(),
         )
         .expect("the run completes");
 
@@ -2152,6 +2541,7 @@ mod tests {
             ),
             &client_for(&fake),
             &always_matches,
+            &static_policy(),
         )
         .expect("the run completes");
 
@@ -2189,6 +2579,7 @@ mod tests {
             &parsed_with_adoptions(&[("sonarr.example.com", "app:sonarr")], &["plex.example.com"]),
             &client_for(&fake),
             &always_matches,
+            &static_policy(),
         )
         .expect("the run completes");
 
@@ -2224,6 +2615,7 @@ mod tests {
             &parsed_with_adoptions(&[], &["plex.example.com"]),
             &client_for(&fake),
             &always_matches,
+            &static_policy(),
         )
         .expect("the run completes");
 
@@ -2241,5 +2633,417 @@ mod tests {
     fn the_breakdown_says_adopt_rather_than_update() {
         assert_eq!(Operation::Adopt.label(), "adopt (was yours, you handed it over)");
         assert_ne!(Operation::Adopt.label(), Operation::Update.label());
+    }
+
+    // ---- F1/R1: the updater actually discovers the address --------------
+    //
+    // The whole block exists because `ddnsUpdater` shipped as a timer that
+    // re-published a literal from settings.json. Nothing in `crates/` ever
+    // asked what this host's address was, while three comments in
+    // `modules/proxy/dns.nix` said it did -- which is how the gap survived
+    // three security reviews and a 32-finding bug hunt.
+
+    /// The address the owner's host moved to.
+    const MOVED_TO: Ipv4Addr = Ipv4Addr::new(142, 180, 179, 64);
+    /// The one it moved from, which seven records kept pointing at.
+    const MOVED_FROM: &str = "184.148.39.165";
+
+    /// Every note on an entry with the given operation.
+    fn notes_for(report: &ReconcileReport, operation: Operation) -> Vec<String> {
+        report
+            .records
+            .iter()
+            .filter(|r| r.operation == operation)
+            .filter_map(|r| r.note.clone())
+            .collect()
+    }
+
+    /// The original RED test. The owner's address moved from 184.148.39.165
+    /// to 142.180.179.64, seven records kept pointing at the old one, every
+    /// published app became unreachable from outside, and the host reported
+    /// itself healthy throughout. With the updater on, what reaches
+    /// Cloudflare is what discovery found.
+    ///
+    /// Mutation check: make `address_target` return `config.target.resolve()`
+    /// unconditionally and this fails with `184.148.39.165`.
+    #[test]
+    fn the_updater_publishes_the_discovered_address_not_the_stale_static_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = fake_zone(serde_json::json!([]));
+        let found = finds(MOVED_TO);
+
+        let report = reconcile_with(
+            &parsed_with_updater(&[("plex.example.com", "app:plex")], MOVED_FROM),
+            &client_for(&fake),
+            &always_matches,
+            &policy(&found, &dir),
+        )
+        .expect("the run completes");
+
+        let created = fake.requests_for(&Route::post("/zones/z1/dns_records"));
+        let body = created
+            .first()
+            .expect("a record was created")
+            .json_body()
+            .expect("the create carried a JSON body");
+        assert_eq!(body["content"], "142.180.179.64", "{report:?}");
+    }
+
+    /// The acceptance criterion that protects every host already running:
+    /// with the updater OFF, `staticAddress` publishes exactly as before and
+    /// nothing queries the internet at all. `never_discovers` panics, so
+    /// this is enforced rather than asserted.
+    #[test]
+    fn with_the_updater_off_the_static_address_is_published_and_nothing_is_discovered() {
+        let fake = fake_zone(serde_json::json!([]));
+
+        let report = reconcile_with(
+            &parsed(&[("plex.example.com", "app:plex")]),
+            &client_for(&fake),
+            &always_matches,
+            &static_policy(),
+        )
+        .expect("the run completes");
+
+        let body = fake.requests_for(&Route::post("/zones/z1/dns_records"))[0]
+            .json_body()
+            .expect("the create carried a JSON body");
+        assert_eq!(body["content"], "203.0.113.7");
+        assert!(
+            notes_for(&report, Operation::PublicAddress).is_empty(),
+            "a host with the updater off has no discovery to report: {report:?}"
+        );
+    }
+
+    /// "Without the operator editing settings.json" is the criterion, so an
+    /// empty `staticAddress` must be a working configuration -- and silent,
+    /// because there is no second value to disagree with.
+    #[test]
+    fn an_updater_host_needs_no_static_address_at_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = fake_zone(serde_json::json!([]));
+        let found = finds(MOVED_TO);
+
+        let report = reconcile_with(
+            &parsed_with_updater(&[("plex.example.com", "app:plex")], ""),
+            &client_for(&fake),
+            &always_matches,
+            &policy(&found, &dir),
+        )
+        .expect("an empty staticAddress is legal once the updater is on");
+
+        let body = fake.requests_for(&Route::post("/zones/z1/dns_records"))[0]
+            .json_body()
+            .unwrap();
+        assert_eq!(body["content"], "142.180.179.64");
+        let warnings = notes_for(&report, Operation::PublicAddressWarning);
+        assert!(
+            !warnings.iter().any(|w| w.contains("staticAddress")),
+            "there is no staticAddress to conflict with: {warnings:?}"
+        );
+    }
+
+    /// A `staticAddress` that disagrees is a warning naming BOTH, never a
+    /// silent override. The operator wrote a fact down; it is now false;
+    /// ferrum says so rather than quietly choosing for them.
+    #[test]
+    fn a_static_address_that_disagrees_is_a_warning_naming_both() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = fake_zone(serde_json::json!([]));
+        fake.script(
+            Route::post("/zones/z1/dns_records"),
+            CannedResponse::ok(record_json("r1", "plex.example.com", "142.180.179.64", true)),
+        );
+        let found = finds(MOVED_TO);
+
+        let report = reconcile_with(
+            &parsed_with_updater(&[("plex.example.com", "app:plex")], MOVED_FROM),
+            &client_for(&fake),
+            &always_matches,
+            &policy(&found, &dir),
+        )
+        .expect("the run completes");
+
+        let conflict = notes_for(&report, Operation::PublicAddressWarning)
+            .into_iter()
+            .find(|w| w.contains("staticAddress"))
+            .expect("a disagreeing staticAddress must be disclosed");
+        assert!(conflict.contains(MOVED_FROM), "{conflict}");
+        assert!(conflict.contains("142.180.179.64"), "{conflict}");
+        assert!(report.is_clean(), "a disagreement is a warning, not a failure");
+        assert!(
+            report
+                .disclosures()
+                .iter()
+                .any(|d| d.note.as_deref() == Some(conflict.as_str())),
+            "the conflict must reach the apply path's disclosure stream too"
+        );
+    }
+
+    /// "A changed address updates every record ferrum owns, in one pass, and
+    /// is visible in the journal with both the old and new values named."
+    #[test]
+    fn a_changed_address_corrects_every_record_in_one_pass_naming_old_and_new() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = fake_zone(serde_json::json!([
+            record_json("r1", "plex.example.com", MOVED_FROM, true),
+            record_json("r2", "sonarr.example.com", MOVED_FROM, true),
+            record_json("r3", "auth.example.com", MOVED_FROM, true),
+        ]));
+        for (id, name) in [
+            ("r1", "plex.example.com"),
+            ("r2", "sonarr.example.com"),
+            ("r3", "auth.example.com"),
+        ] {
+            fake.script(
+                Route::put(&format!("/zones/z1/dns_records/{id}")),
+                CannedResponse::ok(record_json(id, name, "142.180.179.64", true)),
+            );
+        }
+        let found = finds(MOVED_TO);
+
+        let report = reconcile_with(
+            &parsed_with_updater(
+                &[
+                    ("auth.example.com", "auth"),
+                    ("plex.example.com", "app:plex"),
+                    ("sonarr.example.com", "app:sonarr"),
+                ],
+                "",
+            ),
+            &client_for(&fake),
+            &always_matches,
+            &policy(&found, &dir),
+        )
+        .expect("the run completes");
+
+        let updates: Vec<&RecordReport> = report
+            .records
+            .iter()
+            .filter(|r| r.operation == Operation::Update)
+            .collect();
+        assert_eq!(updates.len(), 3, "{report:?}");
+        for entry in &updates {
+            assert_eq!(
+                entry.note.as_deref(),
+                Some("was 184.148.39.165, now 142.180.179.64"),
+                "{entry:?}"
+            );
+        }
+        for id in ["r1", "r2", "r3"] {
+            assert_eq!(
+                fake.requests_for(&Route::put(&format!("/zones/z1/dns_records/{id}")))
+                    .len(),
+                1,
+                "every record ferrum owns is corrected exactly once, in one pass"
+            );
+        }
+        let announced = notes_for(&report, Operation::PublicAddress);
+        assert_eq!(announced.len(), 1, "{report:?}");
+        assert!(announced[0].contains("142.180.179.64"), "{announced:?}");
+        assert!(announced[0].contains("alpha, beta"), "{announced:?}");
+    }
+
+    /// A change the operator can act on also carries what ferrum cannot
+    /// know: a correct record in front of CGNAT or an unforwarded router is
+    /// still an unreachable app, and only they can tell.
+    #[test]
+    fn a_published_change_discloses_that_reachability_is_not_proved() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = fake_zone(serde_json::json!([]));
+        let found = finds(MOVED_TO);
+
+        let report = reconcile_with(
+            &parsed_with_updater(&[("plex.example.com", "app:plex")], ""),
+            &client_for(&fake),
+            &always_matches,
+            &policy(&found, &dir),
+        )
+        .expect("the run completes");
+
+        let warnings = notes_for(&report, Operation::PublicAddressWarning);
+        assert!(
+            warnings.iter().any(|w| w.contains("carrier-grade NAT")
+                && w.contains("port forward")
+                && w.contains("142.180.179.64")),
+            "{warnings:?}"
+        );
+    }
+
+    /// A quorum that held on two of three sources is still a quorum, and the
+    /// operator is told it is one outage away from stopping.
+    #[test]
+    fn a_source_that_did_not_answer_is_disclosed_even_though_the_quorum_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = fake_zone(serde_json::json!([]));
+        fake.script(
+            Route::post("/zones/z1/dns_records"),
+            CannedResponse::ok(record_json("r1", "plex.example.com", "142.180.179.64", true)),
+        );
+        let found = || {
+            Ok(Discovered {
+                address: MOVED_TO,
+                agreed_by: vec!["alpha".to_string(), "beta".to_string()],
+                unreachable: vec!["gamma: timed out".to_string()],
+            })
+        };
+
+        let report = reconcile_with(
+            &parsed_with_updater(&[("plex.example.com", "app:plex")], ""),
+            &client_for(&fake),
+            &always_matches,
+            &policy(&found, &dir),
+        )
+        .expect("two of three is still a quorum");
+
+        let warnings = notes_for(&report, Operation::PublicAddressWarning);
+        assert!(
+            warnings.iter().any(|w| w.contains("gamma: timed out")),
+            "{warnings:?}"
+        );
+        assert!(report.is_clean(), "a degraded quorum is not a failed run");
+    }
+
+    /// "A discovery failure is reported as a failure, never as no change."
+    /// An `Err` here, not an empty report: the two are indistinguishable
+    /// from outside, and the second one is what the shipped timer produced.
+    #[test]
+    fn a_discovery_failure_is_an_error_and_never_an_empty_report() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = fake_zone(serde_json::json!([]));
+        let found = || {
+            Err(DiscoveryError::NotEnoughOperators {
+                answered: Vec::new(),
+                failures: vec!["alpha: timed out".to_string()],
+            })
+        };
+
+        let err = reconcile_with(
+            &parsed_with_updater(&[("plex.example.com", "app:plex")], MOVED_FROM),
+            &client_for(&fake),
+            &always_matches,
+            &policy(&found, &dir),
+        )
+        .expect_err("an undiscoverable address must stop the run");
+
+        assert!(matches!(err, ReconcileError::Discovery(_)), "{err:?}");
+        assert!(
+            !err.is_discovery_refusal(),
+            "not reaching the sources is a failure to find out, not a refusal"
+        );
+        assert!(
+            fake.requests_for(&Route::post("/zones/z1/dns_records"))
+                .is_empty(),
+            "nothing is written when the address is unknown -- and the stale \
+             staticAddress is emphatically not a fallback"
+        );
+    }
+
+    /// Refusing is distinguishable from failing, which is what gives the
+    /// unit its own exit code.
+    #[test]
+    fn a_disagreement_refuses_rather_than_picking_a_winner() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = fake_zone(serde_json::json!([]));
+        let found = || {
+            Err(DiscoveryError::Disagreement {
+                answers: vec![
+                    ("alpha".to_string(), MOVED_TO),
+                    ("beta".to_string(), MOVED_FROM.parse().unwrap()),
+                ],
+            })
+        };
+
+        let err = reconcile_with(
+            &parsed_with_updater(&[("plex.example.com", "app:plex")], ""),
+            &client_for(&fake),
+            &always_matches,
+            &policy(&found, &dir),
+        )
+        .expect_err("a disputed address must not be published");
+
+        assert!(err.is_discovery_refusal(), "{err:?}");
+        assert!(err.to_string().contains("142.180.179.64"), "{err}");
+        assert!(err.to_string().contains(MOVED_FROM), "{err}");
+    }
+
+    /// `dns.nix` refuses the updater beside a CNAME at evaluation. A
+    /// document that reaches this binary with both anyway is refused here
+    /// too, rather than quietly becoming an A record: an unannounced
+    /// substitution is the shape of the defect, not the fix.
+    #[test]
+    fn the_updater_beside_a_cname_is_refused_rather_than_silently_made_an_a_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = FakeCloudflare::start();
+        let mut value: serde_json::Value =
+            serde_json::from_str(&config_json(&[("plex.example.com", "app:plex")], true)).unwrap();
+        value["ddnsUpdater"]["enable"] = serde_json::json!(true);
+        value["target"] = serde_json::json!({ "mode": "cname", "hostname": "box.dyn.example.net" });
+        let config: DnsConfig = serde_json::from_value(value).unwrap();
+        let found = finds(MOVED_TO);
+
+        let err = reconcile_with(
+            &config,
+            &client_for(&fake),
+            &always_matches,
+            &policy(&found, &dir),
+        )
+        .expect_err("a CNAME has nowhere to put a discovered address");
+
+        assert!(matches!(err, ReconcileError::Target { .. }), "{err:?}");
+        assert!(err.to_string().contains("box.dyn.example.net"), "{err}");
+        assert!(
+            fake.requests().is_empty(),
+            "nothing is touched on a document ferrum refuses to interpret"
+        );
+    }
+
+    /// The flap budget: the fourth change in a day holds the old address,
+    /// stays clean, and says what it is doing and why.
+    #[test]
+    fn a_flapping_link_is_held_at_the_last_published_address() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = SystemTime::now();
+        let mut history = crate::address_history::History::default();
+        let old: Ipv4Addr = MOVED_FROM.parse().unwrap();
+        history.record(old, now - std::time::Duration::from_secs(10 * 3600));
+        history.record(MOVED_TO, now - std::time::Duration::from_secs(6 * 3600));
+        history.record(old, now - std::time::Duration::from_secs(2 * 3600));
+        let history_path = dir.path().join(crate::address_history::FILE_NAME);
+        crate::address_history::save(&history_path, &history).unwrap();
+
+        let fake = fake_zone(serde_json::json!([]));
+        fake.script(
+            Route::post("/zones/z1/dns_records"),
+            CannedResponse::ok(record_json("r1", "plex.example.com", MOVED_FROM, true)),
+        );
+        let found = finds(MOVED_TO);
+        let report = reconcile_with(
+            &parsed_with_updater(&[("plex.example.com", "app:plex")], ""),
+            &client_for(&fake),
+            &always_matches,
+            &AddressPolicy {
+                discover: &found,
+                history_path,
+                now,
+            },
+        )
+        .expect("a held change is not a failure");
+
+        let body = fake.requests_for(&Route::post("/zones/z1/dns_records"))[0]
+            .json_body()
+            .unwrap();
+        assert_eq!(
+            body["content"], MOVED_FROM,
+            "the budget is spent, so the last published address stays"
+        );
+        let warnings = notes_for(&report, Operation::PublicAddressWarning);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("oscillating") && w.contains("142.180.179.64")),
+            "{warnings:?}"
+        );
+        assert!(report.is_clean(), "a deliberate hold is not a failure");
     }
 }

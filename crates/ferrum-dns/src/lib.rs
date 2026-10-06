@@ -1,4 +1,6 @@
-//! ferrum-dns: the one place in this workspace that talks to Cloudflare.
+//! ferrum-dns: the one place in this workspace that talks to Cloudflare --
+//! and, since F1/R1, the one place that asks what this host's public address
+//! is.
 //!
 //! R1 exists because `auth.thesyms.ca` never resolved after an install that
 //! reported success: ferrum publishes apps on a base domain but had no
@@ -31,8 +33,18 @@
 //!    call fails CI by construction. [`testing`] is the fake every test
 //!    points at instead.
 //!
+//! **The charter widened once, deliberately.** [`public_ip`] talks to three
+//! address-echo services rather than to Cloudflare, so on a strict reading it
+//! does not belong behind a Cloudflare seam. It lives here anyway because the
+//! alternative is worse: its only consumer is the DNS reconciler, its answer
+//! is the `content` of every `A` record this crate writes, and a second
+//! `ureq` dependency in `ferrum-apply` is exactly the duplication D-01 exists
+//! to prevent. One of its three sources is Cloudflare's own `/cdn-cgi/trace`,
+//! which makes the overlap literal as well as structural. Read the boundary
+//! as *"every HTTP call ferrum makes in order to publish a DNS record"*.
+//!
 //! **Where the rest of it lives.** This file holds the vocabulary -- the
-//! types the seam is expressed in. The behaviour is in four modules, each
+//! types the seam is expressed in. The behaviour is in five modules, each
 //! owning one decision:
 //!
 //! * [`client`] -- every HTTP call, with the `success`-field check,
@@ -47,6 +59,8 @@
 //!   to change, and the explicit per-name operator adoption that is the only
 //!   other way past it. The Critical guards live here.
 //! * [`record`] -- the record model and the idempotent reconcile plan.
+//! * [`public_ip`] -- what this host's public IPv4 address is, decided by a
+//!   quorum of independent sources that refuses to answer when they disagree.
 //!
 //! **One thing this crate still owes a live API.** Decision D-01 rests on
 //! Cloudflare's `comment` field persisting across reads, being returned by a
@@ -65,6 +79,7 @@ use std::net::Ipv4Addr;
 pub mod client;
 pub mod dns_query;
 pub mod ownership;
+pub mod public_ip;
 pub mod record;
 pub mod zone;
 
