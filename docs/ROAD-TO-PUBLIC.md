@@ -544,7 +544,16 @@ a public claim can be checked before someone else checks it for us.
       recovery is a lossy backup restore — which is the best external validation of our thesis
       available, and belongs in the README.
 
-Four work items that analysis surfaced about **ferrum**, not about Silo:
+- [x] **21b. Perfect Media Server.** DONE 2026-10-06 — `docs/competitive/perfect-media-server.md`.
+      **Not a competitor — documentation, and a probable ally.** The headline: its author moved his
+      own box from Proxmox to NixOS in 2024, the site now has a NixOS tech-stack page and two NixOS
+      install pages, and his public config uses **mergerfs + SnapRAID + btrfs + snapper** with
+      `nixos-anywhere` and `disko` as flake inputs. The canonical guide in our space runs our exact
+      substrate. The seam is visible and it is ours: his NixOS config handles the *substrate* and
+      contains no \*arr/Plex/Jellyfin — the apps are still Ansible-generated Docker Compose in
+      another repo.
+
+Items that analysis surfaced about **ferrum**, not about the projects analysed:
 
 - [ ] **22. ferrumd has no health or readiness endpoint.** Thirteen routes, none of them health; the
       only health logic in the project lives inside `apply.rs` and ceases to exist when the apply
@@ -571,6 +580,30 @@ Four work items that analysis surfaced about **ferrum**, not about Silo:
       Because we use DNS-01 rather than HTTP-01 we have an option others do not: a single wildcard
       `*.<baseDomain>` puts only the base domain in CT. **Right now this is a design decision made by
       accident.** Make it on purpose and document it either way.
+- [ ] **26b. We pool with mergerfs and have NO parity story.** Grep `modules/`, `crates/` and the
+      design docs for SnapRAID or parity: nothing. PMS's mergerfs page is blunt — mergerfs "has
+      nothing whatsoever to do with parity. If a drive fails, the data on that drive is gone" — and
+      the entire reason it pairs mergerfs with SnapRAID is that the pool provides no fault tolerance
+      at all. We ship the convenience half and omit the survival half, and the guide every
+      prospective user has already read says so. `services.snapraid` is a first-class NixOS module,
+      so this is cheaper on our substrate than anywhere else. **If we add it:** exclude the btrfs
+      snapshot subvolumes or parity cost explodes, and ship "parity is not backup" with it.
+- [ ] **26c. `epmfs` deserves a decision, not a default.** PMS names our policy specifically as one
+      that "can surprise users by concentrating data on single drives", and points at `pfrd` as
+      upstream's current default. `options.nix:144` offers only `epmfs | mfs` — `pfrd` is not even
+      expressible. **This is not naivety:** `storage.nix` seeds the tree on every branch precisely to
+      give `epmfs` more than one candidate, because we were bitten by that failure already. The
+      question is whether a hands-off installer should depend on a correct seeding step to avoid a
+      pathological layout when a policy exists that needs no layout at all. A reader who knows PMS
+      will notice the disagreement; have an answer better than silence.
+- [ ] **26d. No SMART monitoring, no drive temps, no burn-in, no batch-failure warning.** All four
+      are hard-won PMS knowledge a guide can only *tell* you and ferrum can *guarantee*. The burn-in
+      one is the differentiator: `badblocks` plus a SMART long test either side takes about a week
+      for an 8 TB disk, **nobody does it by hand**, and PMS reports catching a drive that died after
+      19 hours. A "prepare new disk" flow that refuses to pool an un-burned-in disk without an
+      explicit override is a feature no competitor has.
+- [ ] **26e. TRaSH Guides deserves its own analysis.** Arguably more load-bearing for our app layer
+      than PMS — it is the \*arr configuration bible and we ship \*arr apps with defaults.
 - [ ] **26. The SSO lockout path is undocumented.** The dashboard is behind Authelia as of F5. The
       console password and the SSH tunnel both exist, and `POST /api/sso` correctly 404s on
       tunnel-only hosts — but none of it is written down, and it is the highest-severity
