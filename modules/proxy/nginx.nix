@@ -377,8 +377,67 @@ let
           limit_req zone=ferrum_login burst=10 nodelay;
         '';
       };
-    };
+    } // healthLocations;
   };
+
+  # ROAD-TO-PUBLIC item 22. The two health endpoints, published and
+  # DELIBERATELY NOT behind Authelia -- the only locations on this vhost that
+  # are not.
+  #
+  # Why they bypass forward-auth. A health endpoint a monitor cannot reach is
+  # not a health endpoint. Everything else under /api/ answers a browser the
+  # operator is sitting in front of, and a 302 to the Authelia portal is the
+  # right answer for one of those. A monitor is not a browser: it would follow
+  # that redirect, receive the portal's own HTML with a 200, and report the box
+  # healthy forever -- including while ferrumd was down. Putting these behind
+  # SSO does not secure them, it converts them into a permanent false green,
+  # which is worse than having no health endpoint at all.
+  #
+  # Why published rather than tunnel-only. A monitor that lives on the box dies
+  # with the box, so the configuration that is actually worth anything is an
+  # external watcher reaching the published vhost. The alternative considered
+  # and rejected was publishing only liveness and leaving readiness behind SSO:
+  # that produces exactly the false green described above on the more
+  # interesting of the two endpoints, and an operator who verified readiness
+  # over the tunnel would have no way to know their monitor was reading a login
+  # page. On a tunnel-only host (no baseDomain, no proxy) there is no vhost at
+  # all and both endpoints remain reachable only through the SSH tunnel, which
+  # is unchanged and is still the safest configuration ferrum offers.
+  #
+  # What that discloses. Exactly what crates/ferrumd/src/health.rs permits:
+  # four status words, five check names, booleans, five reason words, and the
+  # UUID of an apply in flight. No path, no hostname, no version, no generation
+  # number, no error text. `ferrum.<baseDomain>` already serves a recognisable
+  # ferrum login page to anonymous callers, so "this host runs ferrum" is not
+  # new information; the marginal disclosure is whether an apply is running and
+  # whether a dependency is degraded.
+  #
+  # The rate limit is the price of being unauthenticated. Every readiness probe
+  # does real work -- a SQLite query, two file reads with JSON parses, and a
+  # D-Bus connect -- so without a limit this is an amplifier anyone on the
+  # internet can point at the daemon. It is set far above any real monitor's
+  # polling rate (60/min with a burst of 10 is one probe per second sustained,
+  # where a monitor asks every 15-60s) because a health check that the edge
+  # starts refusing under ordinary use would, again, be a monitoring failure
+  # dressed as an outage.
+  #
+  # Exact-match (`= /path`) rather than prefix: nginx matches `=` before any
+  # prefix location, so these shadow `/api/` for these two paths only and
+  # nothing else on the vhost changes. It also means no longer path can be
+  # accidentally captured by them -- `/api/healthz` would still hit `/api/`
+  # and still be behind Authelia.
+  healthLocations = lib.listToAttrs (map
+    (path: lib.nameValuePair "= ${path}" {
+      proxyPass = daemonUpstream;
+      # Deliberately daemonStreamConfig alone: NOT daemonApiConfig, which is
+      # the whole point of this block. The omission of daemonAuthConfig is the
+      # feature, and is asserted as such by daemon-vhost-enforced so that a
+      # reader cannot mistake it for the oversight it would otherwise resemble.
+      extraConfig = daemonStreamConfig + ''
+        limit_req zone=ferrum_health burst=10 nodelay;
+      '';
+    })
+    [ "/api/health" "/api/ready" ]);
 
   # D7/A8. virtualHosts is assembled below with `//`, so a later key silently
   # WINS -- this is the jellyfin/plex failure class the catch-all vhost's own
@@ -528,8 +587,18 @@ lib.mkMerge [
       # Returns 429 rather than nginx's default 503: the SPA can tell "you are
       # going too fast" from "the daemon fell over", and so can the operator
       # reading a log.
+      #
+      # ferrum_health is the second zone, and it is deliberately far looser
+      # than ferrum_login. Its purpose is not to slow an attacker down -- there
+      # is nothing to guess at a health endpoint -- but to put a ceiling on how
+      # much real work (a SQLite query, two JSON parses, a D-Bus connect) an
+      # unauthenticated caller can make ferrumd do, since the two health
+      # locations are the only ones on the daemon vhost that Authelia does not
+      # gate. 60r/m with a burst of 10 is one sustained probe per second,
+      # which no real monitor approaches and which bounds the amplification.
       commonHttpConfig = generalSecurityHeaders + ''
         limit_req_zone $binary_remote_addr zone=ferrum_login:1m rate=20r/m;
+        limit_req_zone $binary_remote_addr zone=ferrum_health:1m rate=60r/m;
         limit_req_status 429;
       '';
       virtualHosts = {
