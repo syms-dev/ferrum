@@ -4394,10 +4394,37 @@
             (l: lib.hasInfix "el(\"button\"" l || lib.hasInfix "onclick" l || lib.hasInfix "el(\"a\"" l)
             appRowBlock;
 
-          # Nothing on this screen may start anything but the read-only check:
-          # no commit, no apply, no rollback.
+          # This screen may start exactly two job kinds and no others.
+          #
+          # It was one until R4 landed. The earlier rule ("nothing here may
+          # start anything but the read-only check") was right for a screen
+          # that only reported; R4 requires the commit action to sit on this
+          # screen, immediately below the preview it commits to, rather than
+          # inventing a second commit shape elsewhere. The allowlist is
+          # widened by exactly one name, and stays an allowlist: `apply`,
+          # `rollback`, `gc` and `restore_state` must never be startable from
+          # here, and an unrecognised kind fails rather than passing.
+          updatesJobKinds = [ "check_update" "update" ];
           startJobLines = builtins.filter (l: lib.hasInfix "api.startJob(" l) updatesBlock;
-          foreignJobKinds = builtins.filter (l: !(lib.hasInfix "\"check_update\"" l)) startJobLines;
+          foreignJobKinds = builtins.filter
+            (l: !(builtins.any (k: lib.hasInfix ("\"" + k + "\"") l) updatesJobKinds))
+            startJobLines;
+
+          # And the commit control really is present. The allowlist above
+          # only says what MAY be started; without this, deleting the commit
+          # action entirely would leave the check green while R4's last
+          # criterion went unimplemented -- the same vacuity
+          # `startsNoCheckJob` already guards against for the check itself.
+          startsTheUpdateJob = builtins.any (l: lib.hasInfix "\"update\"" l) startJobLines;
+
+          # The commit is behind a confirmation, and the confirmation names
+          # the revision. DA-1 makes seeing and being able to refuse the
+          # exact commit the control that stands in place of signature
+          # verification, so a one-click update would remove the only thing
+          # being verified.
+          confirmsBeforeUpdating = builtins.any
+            (l: lib.hasInfix "confirmUpdate(" l && lib.hasInfix "await" l)
+            updatesBlock;
 
           # The Apply view's reattach finder is NOT kind-filtered, so an
           # unfiltered copy here would tail a rollback or gc job into this
@@ -4420,6 +4447,8 @@
             && reattachIsKindFiltered
             && startJobLines != [ ]
             && foreignJobKinds == [ ]
+            && startsTheUpdateJob
+            && confirmsBeforeUpdating
             && perAppControls == [ ]
             && absoluteUrls == [ ]
             && unbranched candidateStates candidateBranches == [ ]
@@ -4439,6 +4468,8 @@
           routeMissing = !routeWired;
           reattachNotKindFiltered = !reattachIsKindFiltered;
           startsNoCheckJob = startJobLines == [ ];
+          startsNoUpdateJob = !startsTheUpdateJob;
+          updatesWithoutConfirming = !confirmsBeforeUpdating;
           inherit foreignJobKinds perAppControls absoluteUrls;
           candidateStatesWithNoBranch = unbranched candidateStates candidateBranches;
           candidateBranchesWithNoState = orphaned candidateStates candidateBranches;
