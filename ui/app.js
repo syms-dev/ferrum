@@ -630,6 +630,22 @@ const CANDIDATE_STATES = ["up-to-date", "not-newer", "update-available", "check-
 /// It is explicitly not a claim that the app is up to date.
 const APP_STATES = ["not-checked", "up-to-date", "update-available", "excluded", "evaluation-failed"];
 
+/// The five values `pinProvenance.state` can carry (R8).
+///
+/// Same file, same flake check, same cross-check against ferrum-apply's
+/// `PinProvenanceState`. This is the answer to a question nothing else on
+/// the report asks: `candidate.currentRev` is the pin on DISK, which is
+/// where the next build starts — this says where the system you are looking
+/// at actually came from, and the two are not the same claim on a host that
+/// has been rolled back.
+///
+/// Three unknowns rather than one, deliberately. "The lock does not pin
+/// ferrum in a shape ferrum reads" and "this generation predates the field
+/// that would have recorded its pin" send an operator to different places,
+/// and the second is the ordinary state of every generation on a host that
+/// predates this feature.
+const PIN_STATES = ["matches", "differs", "on-disk-unknown", "running-unknown", "both-unknown"];
+
 /// The three keys `GET /api/updates` always answers with, and the two values
 /// its `status` can take.
 ///
@@ -697,6 +713,18 @@ const APP_STATE_TEXT = {
   "update-available": stateText("Would change", "The candidate package set carries a different version for this app. It moves with every other app, not on its own."),
   "excluded": stateText("Not shown — disabled", "This app is disabled, so nothing is running to compare against. It picks up the candidate's version if you enable it after updating."),
   "evaluation-failed": stateText("Could not evaluate", "Evaluating this app against the candidate failed. The row is kept, with the evaluator's own words, rather than dropped."),
+};
+
+// A first-class state, never an error. The two ways an operator reaches
+// "differs" are both deliberate acts: rolling back (which reverts the
+// system and not the lock) and a `git checkout` in /etc/ferrum that puts a
+// machine-written flake.lock back.
+const PIN_STATE_TEXT = {
+  "matches": stateText("The running system was built from the pin on disk", "What you are running and what the next rebuild would start from are the same revision. This is the ordinary state."),
+  "differs": stateText("Your on-disk pin is not the one the running system was built from", "The next rebuild would move this host to a different ferrum revision, whether or not you changed anything else. Usually this means you rolled back: a rollback reverts the system, never /etc/ferrum/flake.lock. Nothing happens behind your back — the Apply screen names the revision and asks before it moves you. To go the other way, `git -C /etc/ferrum checkout flake.lock` on the host puts the pin back."),
+  "on-disk-unknown": stateText("Could not read the pin on disk", "/etc/ferrum/flake.lock could not be read, or does not pin ferrum in a shape ferrum recognises. Nothing is being claimed about where the running system came from."),
+  "running-unknown": stateText("Pin unknown for the running generation", "Nothing records which revision this generation was built from. Generations applied before ferrum began recording it — and any applied outside ferrum-apply — read this way. It is an artifact of age, not a disagreement, and it is never treated as one: an apply is not gated on it."),
+  "both-unknown": stateText("Pin unknown on both sides", "Neither the lock on disk nor the running generation's provenance could be established, so there is nothing to compare."),
 };
 
 /// A value the report may legitimately not know yet, rendered as words.
@@ -820,6 +848,12 @@ function renderUpdateReport(target, report, catalogApps, jobId) {
   const candidate = report.candidate || {};
   const ferrum = report.ferrum || {};
   const migration = report.schemaMigration || {};
+  // Defaulted to the daemon's own "neither side known" value rather than to
+  // `{}`: a report from a ferrum that predates this block has, truthfully,
+  // established nothing about the pin — and an absent `state` would render
+  // as "Unrecognised state: unknown", which blames the daemon for a field
+  // it never claimed to send.
+  const provenance = report.pinProvenance || { state: "both-unknown" };
   const apps = Array.isArray(report.apps) ? report.apps : [];
   const warnings = Array.isArray(report.warnings) ? report.warnings : [];
 
@@ -928,23 +962,42 @@ function renderUpdateReport(target, report, catalogApps, jobId) {
       el("dd", { text: orUnknown(candidate.reference) }),
       // Named as the pin, not as the running revision. This value is read
       // out of /etc/ferrum/flake.lock, which is the pin the NEXT build would
-      // start from. Journal entries now record the pin each apply built from
-      // (`built_pin`), so the two ARE comparable on a host whose generations
-      // postdate that field -- but nothing on this screen reads it yet, and
-      // the gate that acts on a disagreement is a separate piece of work. So
-      // the label still says only what this value is, which stays honest:
-      // asserting the equality here was what the earlier wording got wrong,
-      // on the one field the operator is asked to read and refuse in place
-      // of a signature check.
+      // start from. What the RUNNING system was built from is a separate
+      // claim, and it now has a separate section below rather than being
+      // quietly asserted here -- asserting the equality on this line is what
+      // the earliest wording got wrong, on the one field the operator is
+      // asked to read and refuse in place of a signature check.
       el("dt", { text: "Revision pinned in /etc/ferrum/flake.lock" }),
       el("dd", {}, [el("code", { class: "rev", text: orUnknown(candidate.currentRev) })]),
       el("dt", { text: "Candidate revision" }),
       el("dd", {}, [el("code", { class: "rev", text: orUnknown(candidate.rev || ferrum.candidateRev) })]),
     ]),
-    el("p", {
-      class: "hint",
-      text: "That is the pin on disk, which is where the next build starts. ferrum now records the pin each generation was built from, but this screen does not yet compare the two — so it is not telling you the running system was built from the revision above.",
-    }),
+
+    el("h3", { text: "Where the running system came from" }),
+    stateCell(PIN_STATE_TEXT[provenance.state], provenance.state, null, PIN_STATES),
+    // Only on `differs`, where they are two facts the operator has to read.
+    // On every other state the producer sends null, and a facts list of
+    // "unknown / unknown" under a sentence that already said so would be
+    // noise.
+    provenance.state === "differs"
+      ? el("dl", { class: "facts" }, [
+          el("dt", { text: "The running system was built from" }),
+          el("dd", {}, [el("code", { class: "rev", text: orUnknown(provenance.runningRev) })]),
+          el("dt", { text: "The next build would start from" }),
+          el("dd", {}, [el("code", { class: "rev", text: orUnknown(provenance.onDiskRev) })]),
+          // Present only when the revision is NOT what moved -- a reference
+          // re-pointed at a new tree under one revision, where showing that
+          // revision twice would read as a bug rather than as the finding.
+          ...(provenance.onDiskNarHash
+            ? [
+                el("dt", { text: "…and the tree behind that one revision" }),
+                el("dd", {
+                  text: `${orUnknown(provenance.runningNarHash)} → ${orUnknown(provenance.onDiskNarHash)}`,
+                }),
+              ]
+            : []),
+        ])
+      : null,
 
     el("h3", { text: "ferrum itself" }),
     el("p", {
@@ -1375,6 +1428,24 @@ async function updatesView() {
         class: "hint",
         text:
           "ferrum cannot update one app without the others. A single nixpkgs pin supplies every app's package, so every version below moves together or not at all. There is no per-app update control here because there is no per-app update to offer.",
+      }),
+      // R7's second criterion. The honest answer to "can I hold Sonarr
+      // back?" is no — and then the one lever that does exist, named,
+      // rather than leaving an operator to go looking for a control this
+      // phase did not build. It REMOVES an app from tracking the shared pin
+      // rather than letting it move ahead of it, which is a different thing
+      // and is said as such.
+      el("p", {
+        class: "hint",
+        text:
+          "If you need one app held at a specific version, the lever is the custom/ override on the host — `services.<app>.package = ...` in your own Nix. That takes the app out of the shared pin rather than letting it move independently of it, and ferrum will then report it as unaffected by any update, because it is.",
+      }),
+      // R7's third criterion. Enabling an app is an ordinary settings
+      // change; it reaches the host through Apply, not through this screen.
+      el("p", {
+        class: "hint",
+        text:
+          "Enabling an app you have never run is not an update. It arrives with the next ordinary Apply, at whatever version the pin you already have supplies — so a newly enabled app shows a version here without that version being something this screen can move.",
       }),
       el("div", { class: "row" }, [check]),
       pending,

@@ -4252,6 +4252,8 @@
           appStates = vocabOf "the app-state vocabulary" "APP_STATES";
           candidateBranches = branchesOf "candidate-state rendering" "CANDIDATE_STATE_TEXT";
           appBranches = branchesOf "app-state rendering" "APP_STATE_TEXT";
+          pinStates = vocabOf "the pin-provenance vocabulary" "PIN_STATES";
+          pinBranches = branchesOf "pin-provenance rendering" "PIN_STATE_TEXT";
 
           unbranched = states: branches: builtins.filter (s: !(builtins.elem s branches)) states;
           orphaned = states: branches: builtins.filter (b: !(builtins.elem b states)) branches;
@@ -4307,6 +4309,7 @@
 
           daemonCandidateStates = daemonStatesOf "CandidateState";
           daemonAppStates = daemonStatesOf "AppState";
+          daemonPinStates = daemonStatesOf "PinProvenanceState";
 
           # Set equality, reported as two separate lists so a failure says
           # which side is ahead rather than just that they differ.
@@ -4455,10 +4458,14 @@
             && orphaned candidateStates candidateBranches == [ ]
             && unbranched appStates appBranches == [ ]
             && orphaned appStates appBranches == [ ]
+            && unbranched pinStates pinBranches == [ ]
+            && orphaned pinStates pinBranches == [ ]
             && daemonOnly daemonCandidateStates candidateStates == [ ]
             && uiOnly daemonCandidateStates candidateStates == [ ]
             && daemonOnly daemonAppStates appStates == [ ]
             && uiOnly daemonAppStates appStates == [ ]
+            && daemonOnly daemonPinStates pinStates == [ ]
+            && uiOnly daemonPinStates pinStates == [ ]
             && envelopeKeysDisagree == [ ]
             && daemonOnly daemonEnvelopeKeys uiEnvelopeKeys == [ ]
             && uiOnly daemonEnvelopeKeys uiEnvelopeKeys == [ ]
@@ -4475,12 +4482,17 @@
           candidateBranchesWithNoState = orphaned candidateStates candidateBranches;
           appStatesWithNoBranch = unbranched appStates appBranches;
           appBranchesWithNoState = orphaned appStates appBranches;
+          pinStatesWithNoBranch = unbranched pinStates pinBranches;
+          pinBranchesWithNoState = orphaned pinStates pinBranches;
 
           # Both sides named on every failure, so the message says what the
           # daemon actually sends as well as what the UI believes.
-          inherit daemonCandidateStates daemonAppStates;
+          inherit daemonCandidateStates daemonAppStates daemonPinStates;
           uiCandidateStates = candidateStates;
           uiAppStates = appStates;
+          uiPinStates = pinStates;
+          pinStatesTheDaemonSendsAndTheUiLacks = daemonOnly daemonPinStates pinStates;
+          pinStatesTheUiExpectsAndTheDaemonNeverSends = uiOnly daemonPinStates pinStates;
           candidateStatesTheDaemonSendsAndTheUiLacks = daemonOnly daemonCandidateStates candidateStates;
           candidateStatesTheUiExpectsAndTheDaemonNeverSends = uiOnly daemonCandidateStates candidateStates;
           appStatesTheDaemonSendsAndTheUiLacks = daemonOnly daemonAppStates appStates;

@@ -725,6 +725,12 @@ struct CheckUpdateJob {
     /// The two files the read-only guarantee is measured against.
     flake_nix: std::path::PathBuf,
     flake_lock: std::path::PathBuf,
+    /// ferrum's snapshot journal, where each apply recorded the pin it
+    /// built from (R8). Read, never written, like everything else here.
+    journal_dir: std::path::PathBuf,
+    /// The symlink naming the closure this host is RUNNING. Overridable
+    /// so the whole provenance join is exercised against real files.
+    running_system: std::path::PathBuf,
     /// Where the report document is published.
     report_dir: std::path::PathBuf,
     /// The report's file name, from `$FERRUM_JOB_ID`.
@@ -750,6 +756,10 @@ impl CheckUpdateJob {
             flake_nix: std::path::Path::new(&flake_dir).join("flake.nix"),
             flake_lock: std::path::Path::new(&flake_dir).join("flake.lock"),
             settings_path: settings_path.into(),
+            journal_dir: journal_dir_from_env(),
+            running_system: std::env::var("FERRUM_RUNNING_SYSTEM")
+                .unwrap_or_else(|_| "/run/current-system".to_string())
+                .into(),
             report_dir: update_check::report_dir(),
             report_file: update_check::report_file_name(job_id.as_deref()),
             now: std::time::SystemTime::now()
@@ -798,6 +808,8 @@ fn run_check_update_job(
         settings_path: &job.settings_path,
         flake_nix: &job.flake_nix,
         flake_lock: &job.flake_lock,
+        journal_dir: &job.journal_dir,
+        running_system: &job.running_system,
         now: job.now,
     };
     let mut report = update_check::build_report(&inputs, runner);
@@ -2180,6 +2192,11 @@ mod tests {
                     settings_path,
                     flake_nix,
                     flake_lock,
+                    // Absent on purpose: these tests are about the job's
+                    // composition, and reading the real /run/current-system
+                    // would make them agree with the host they run on.
+                    journal_dir: dir.path().join("journal-absent"),
+                    running_system: dir.path().join("current-system-absent"),
                     report_dir,
                     report_file: "job-1.update-check.json".to_string(),
                     now: 1_758_700_000,

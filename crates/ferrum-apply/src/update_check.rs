@@ -224,6 +224,102 @@ pub struct SchemaMigrationReport {
     pub error: Option<String>,
 }
 
+/// How the pin on disk stands against the pin the RUNNING generation was
+/// built from (R8's fifth criterion).
+///
+/// A first-class state and never an error. The operator reaches it two
+/// ordinary ways -- rolling back (which reverts the closure and not the
+/// lock) and a `git checkout` in `/etc/ferrum` that puts a
+/// machine-written `flake.lock` back -- and both are things a person did on
+/// purpose, not faults.
+///
+/// Three unknowns rather than one, for the same reason `CandidateState`
+/// separates `CheckFailed` from `UpToDate`: "the lock does not pin ferrum
+/// in a shape we read" and "this generation predates the field that would
+/// have recorded its pin" send an operator to completely different places.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PinProvenanceState {
+    /// The running generation was built from the pin that is on disk now.
+    Matches,
+    /// It was not. The next rebuild would start from a different ferrum.
+    Differs,
+    /// `/etc/ferrum/flake.lock` could not be read, or does not pin `ferrum`
+    /// in a shape this reader accepts.
+    OnDiskUnknown,
+    /// No journal entry claims the running closure, or the one that does
+    /// recorded no pin -- normally an entry written by a ferrum that had
+    /// neither field. An artifact of age, never a disagreement.
+    RunningUnknown,
+    /// Neither side could be established.
+    BothUnknown,
+}
+
+/// The pin-provenance block of the report.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PinProvenanceReport {
+    pub state: PinProvenanceState,
+    /// The revision `/etc/ferrum/flake.lock` pins today, full 40-hex.
+    pub on_disk_rev: Option<String>,
+    /// The revision the RUNNING generation was built from, full 40-hex.
+    /// This is the half nothing else on the report carries: `candidate`
+    /// reports the lock, which is where the next build starts, not where
+    /// this one came from.
+    pub running_rev: Option<String>,
+    /// The NAR hashes, carried only when they are what differ -- a
+    /// re-pointed reference resolving to a new tree under one revision,
+    /// where naming the revision twice would read as a bug rather than as
+    /// the finding.
+    pub on_disk_nar_hash: Option<String>,
+    pub running_nar_hash: Option<String>,
+}
+
+/// Shape the pin-provenance block from the comparison.
+///
+/// # Arguments
+/// * `state` - `pin_gate::classify` of the two pins.
+///
+/// # Returns
+/// The block. The revisions are carried ONLY on `Differs`, where they are
+/// two different facts the operator has to read. On `Matches` they are one
+/// fact the report already states: `candidate.currentRev` is the on-disk
+/// revision, and "matches" is the claim that the running generation was
+/// built from it. Repeating it here would be a second place for the same
+/// value to be rendered from, and two places is a place to drift.
+pub fn pin_provenance_report(state: &crate::pin_gate::PinState) -> PinProvenanceReport {
+    use crate::pin_gate::{PinState, UnknownSide};
+    match state {
+        PinState::Matches => PinProvenanceReport {
+            state: PinProvenanceState::Matches,
+            on_disk_rev: None,
+            running_rev: None,
+            on_disk_nar_hash: None,
+            running_nar_hash: None,
+        },
+        PinState::Differs { on_disk, recorded } => PinProvenanceReport {
+            state: PinProvenanceState::Differs,
+            on_disk_rev: Some(on_disk.rev.clone()),
+            running_rev: Some(recorded.rev.clone()),
+            // Only when the revision is NOT what moved: otherwise the two
+            // hashes are noise beside two revisions that already say it.
+            on_disk_nar_hash: (on_disk.rev == recorded.rev).then(|| on_disk.nar_hash.clone()),
+            running_nar_hash: (on_disk.rev == recorded.rev).then(|| recorded.nar_hash.clone()),
+        },
+        PinState::Unknown(side) => PinProvenanceReport {
+            state: match side {
+                UnknownSide::OnDisk => PinProvenanceState::OnDiskUnknown,
+                UnknownSide::Running => PinProvenanceState::RunningUnknown,
+                UnknownSide::Both => PinProvenanceState::BothUnknown,
+            },
+            on_disk_rev: None,
+            running_rev: None,
+            on_disk_nar_hash: None,
+            running_nar_hash: None,
+        },
+    }
+}
+
 /// The whole read-only check, as one document.
 ///
 /// One document, not a per-app flag: nixpkgs pins one package set for the
@@ -242,6 +338,10 @@ pub struct UpdateReport {
     /// the one failure that would otherwise present as "no apps".
     pub apps_error: Option<String>,
     pub schema_migration: SchemaMigrationReport,
+    /// Where the RUNNING system came from, against where the next build
+    /// would start (R8). Nothing else in the report answers the first half:
+    /// `candidate` reports the lock, which is the future, not the past.
+    pub pin_provenance: PinProvenanceReport,
     pub warnings: Vec<String>,
 }
 
@@ -260,6 +360,15 @@ pub struct CheckInputs<'a> {
     pub flake_nix: &'a Path,
     /// The host's own `flake.lock` -- what revision it runs today.
     pub flake_lock: &'a Path,
+    /// ferrum's snapshot journal, where each apply recorded the pin it
+    /// built from. Read-only here, like everything else this check touches.
+    pub journal_dir: &'a Path,
+    /// The symlink naming the closure this host is RUNNING, normally
+    /// `/run/current-system`. Not the profile's own `system` pointer, for
+    /// the reason `apply::current_generation` distrusts that pointer: a
+    /// partially-failed apply can leave it naming a generation that was
+    /// never activated.
+    pub running_system: &'a Path,
     pub now: u64,
 }
 
@@ -659,6 +768,20 @@ pub fn build_report(inputs: &CheckInputs, runner: &dyn CommandRunner) -> UpdateR
         _ => crate::update_deltas::mark_no_delta(&mut rows, candidate.state),
     }
 
+    // R8's fifth criterion. Read through `pin::parse` rather than through
+    // `update_candidate::parse_locked`, which has already read this same
+    // file a few lines above: the two readers answer different questions on
+    // purpose (see pin.rs's header), and only this one yields the WHOLE pin,
+    // which is what the journal recorded and therefore what can be compared
+    // against it.
+    let on_disk_pin = crate::pin::read(inputs.flake_lock, crate::update_candidate::FERRUM_INPUT);
+    let running_pin = std::fs::read_link(inputs.running_system).ok().and_then(|toplevel| {
+        let entries = ferrum_state::journal::list(inputs.journal_dir).ok()?;
+        ferrum_state::generations::built_pin_of(&toplevel.to_string_lossy(), &entries)
+    });
+    let pin_provenance =
+        pin_provenance_report(&crate::pin_gate::classify(on_disk_pin, running_pin));
+
     if let Some(e) = &apps_error {
         warnings.push(format!(
             "no app could be reported: the catalog app set itself did not evaluate: {e}"
@@ -673,6 +796,7 @@ pub fn build_report(inputs: &CheckInputs, runner: &dyn CommandRunner) -> UpdateR
         apps: rows,
         apps_error,
         schema_migration,
+        pin_provenance,
         warnings,
     }
 }
@@ -945,17 +1069,18 @@ mod tests {
     const INSTALLED_REV: &str = "1111111111111111111111111111111111111111";
     const CANDIDATE_REV: &str = "2222222222222222222222222222222222222222";
 
-    fn inputs<'a>(
-        settings: &'a std::path::Path,
-        flake_nix: &'a std::path::Path,
-        flake_lock: &'a std::path::Path,
-    ) -> CheckInputs<'a> {
+    /// Takes the whole fixture rather than three paths, because the
+    /// provenance join needs two more and they must live inside the same
+    /// temp directory -- which is what `Fixture` owns.
+    fn inputs(f: &Fixture) -> CheckInputs<'_> {
         CheckInputs {
             flake_dir: "/etc/ferrum",
             config_attr: "nixosConfigurations.saltbox.config",
-            settings_path: settings,
-            flake_nix,
-            flake_lock,
+            settings_path: &f.settings,
+            flake_nix: &f.flake_nix,
+            flake_lock: &f.flake_lock,
+            journal_dir: &f.journal_dir,
+            running_system: &f.running_system,
             now: 1_758_700_000,
         }
     }
@@ -988,6 +1113,14 @@ mod tests {
         settings: PathBuf,
         flake_nix: PathBuf,
         flake_lock: PathBuf,
+        /// Both deliberately point at paths that do NOT exist, so every
+        /// test that does not care about pin provenance gets the same
+        /// "neither side known" answer on any machine. Reading the real
+        /// /run/current-system instead would make these tests agree with
+        /// the host they run on -- it exists on NixOS and not in a build
+        /// sandbox.
+        journal_dir: PathBuf,
+        running_system: PathBuf,
     }
 
     fn fixture(schema_version: i64) -> Fixture {
@@ -1023,11 +1156,18 @@ mod tests {
             .to_string(),
         )
         .unwrap();
-        Fixture { _dir: dir, settings, flake_nix, flake_lock }
+        Fixture {
+            journal_dir: dir.path().join("journal-absent"),
+            running_system: dir.path().join("current-system-absent"),
+            _dir: dir,
+            settings,
+            flake_nix,
+            flake_lock,
+        }
     }
 
     fn report_for(runner: &FakeRunner, f: &Fixture) -> UpdateReport {
-        build_report(&inputs(&f.settings, &f.flake_nix, &f.flake_lock), runner)
+        build_report(&inputs(f), runner)
     }
 
     /// R1: every enabled app appears exactly once with its current version,
@@ -1279,6 +1419,96 @@ mod tests {
         assert_eq!(report.candidate.rev.as_deref(), report.ferrum.candidate_rev.as_deref());
     }
 
+    /// R8's fifth criterion, driven through the real `build_report`: "your
+    /// on-disk pin differs from the pin the running generation was built
+    /// from" is a state of the report, not an error and not a warning.
+    ///
+    /// The whole join is real -- a running-system symlink, a journal entry
+    /// claiming that closure, and a lock on disk -- because the thing worth
+    /// pinning is that the three are wired together at all.
+    #[test]
+    fn the_report_states_how_the_on_disk_pin_stands_against_the_running_one() {
+        use ferrum_state::journal::{self, JournalEntry, Pin};
+
+        let f = fixture(1);
+        let root = f.settings.parent().unwrap().to_path_buf();
+        let closure = root.join("running-closure");
+        std::fs::create_dir_all(&closure).unwrap();
+        std::os::unix::fs::symlink(&closure, &f.running_system).unwrap();
+        let entry = |rev: &str, hash: &str| JournalEntry {
+            snapshot: "1000-gen1".to_string(),
+            generation: 1,
+            toplevel: "/nix/store/pre-image".to_string(),
+            taken_at: "1000".to_string(),
+            quiesced: true,
+            built_pin: Some(Pin { rev: rev.to_string(), nar_hash: hash.to_string() }),
+            built_toplevel: Some(closure.to_string_lossy().into_owned()),
+            update_pre_image: false,
+        };
+        // The fixture's lock records INSTALLED_REV and no narHash, which is
+        // "unreadable" to `pin::parse` -- a half-pin is not a weaker
+        // identity -- so it is rewritten here with both halves.
+        let write_lock = |rev: &str, hash: &str| {
+            std::fs::write(
+                &f.flake_lock,
+                serde_json::json!({
+                    "nodes": {
+                        "root": {"inputs": {"ferrum": "ferrum"}},
+                        "ferrum": {"locked": {
+                            "rev": rev, "narHash": hash, "lastModified": 100
+                        }}
+                    },
+                    "version": 7
+                })
+                .to_string(),
+            )
+            .unwrap();
+        };
+        let runner = standard_runner();
+
+        // The host was rolled back; the lock still names the update.
+        journal::write(&f.journal_dir, &entry(INSTALLED_REV, "sha256-OLD=")).unwrap();
+        write_lock(CANDIDATE_REV, "sha256-NEW=");
+        let report = report_for(&runner, &f);
+        assert_eq!(report.pin_provenance.state, PinProvenanceState::Differs);
+        assert_eq!(report.pin_provenance.running_rev.as_deref(), Some(INSTALLED_REV));
+        assert_eq!(report.pin_provenance.on_disk_rev.as_deref(), Some(CANDIDATE_REV));
+        assert!(
+            report.warnings.iter().all(|w| !w.contains("pin")),
+            "a pin difference is a STATE of the report, not a warning about it: {:?}",
+            report.warnings
+        );
+
+        // ...and it is not a thing the report says about every host. Same
+        // journal, same everything, lock put back: nothing differs.
+        write_lock(INSTALLED_REV, "sha256-OLD=");
+        assert_eq!(report_for(&runner, &f).pin_provenance.state, PinProvenanceState::Matches);
+
+        // The tree moved under one revision: the hashes are what the
+        // operator has to read, so they are the ones carried.
+        write_lock(INSTALLED_REV, "sha256-REPOINTED=");
+        let moved = report_for(&runner, &f).pin_provenance;
+        assert_eq!(moved.state, PinProvenanceState::Differs);
+        assert_eq!(moved.on_disk_nar_hash.as_deref(), Some("sha256-REPOINTED="));
+        assert_eq!(moved.running_nar_hash.as_deref(), Some("sha256-OLD="));
+
+        // And a generation that predates `built_toplevel` -- which is every
+        // generation on the host this was built for -- is reported as
+        // "pin unknown", distinctly from both "matches" and "differs".
+        std::fs::remove_file(f.journal_dir.join("1000-gen1.json")).unwrap();
+        write_lock(CANDIDATE_REV, "sha256-NEW=");
+        let aged = report_for(&runner, &f).pin_provenance;
+        assert_eq!(aged.state, PinProvenanceState::RunningUnknown);
+        assert_eq!(aged.running_rev, None);
+
+        // Neither side: the lock becomes unreadable too.
+        std::fs::write(&f.flake_lock, "}{").unwrap();
+        assert_eq!(
+            report_for(&runner, &f).pin_provenance.state,
+            PinProvenanceState::BothUnknown
+        );
+    }
+
     /// The frozen wire contract. Two other lanes read this document, so the
     /// key set is pinned the way `/api/generations`'s is.
     #[test]
@@ -1293,9 +1523,17 @@ mod tests {
         assert_eq!(
             top,
             vec![
-                "apps", "appsError", "candidate", "checkedAt", "ferrum", "schemaMigration",
-                "schemaVersion", "warnings"
+                "apps", "appsError", "candidate", "checkedAt", "ferrum", "pinProvenance",
+                "schemaMigration", "schemaVersion", "warnings"
             ]
+        );
+
+        let mut prov: Vec<&str> =
+            value["pinProvenance"].as_object().unwrap().keys().map(|s| s.as_str()).collect();
+        prov.sort_unstable();
+        assert_eq!(
+            prov,
+            vec!["onDiskNarHash", "onDiskRev", "runningNarHash", "runningRev", "state"]
         );
 
         let mut app: Vec<&str> = value["apps"][0].as_object().unwrap().keys().map(|s| s.as_str()).collect();
