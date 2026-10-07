@@ -3717,6 +3717,36 @@
             != (timerCfg defaults "snapraid-scrub").OnUnitActiveSec or null
             && (timerCfg defaults "snapraid-sync").Unit or null == "snapraid-sync.service"
             && (timerCfg defaults "snapraid-scrub").Unit or null == "snapraid-scrub.service";
+
+          # The sync unit records WHERE ferrum-apply looks.
+          #
+          # Two files name this path independently -- `LAST_SYNC_FILE` in
+          # crates/ferrum-apply/src/parity.rs, which READS it, and
+          # modules/core/parity.nix's `parityStateDir`, whose ExecStopPost
+          # WRITES it -- and nothing else holds them together. The drift is
+          # silent in the worst direction: a host whose Nix side moved would
+          # keep syncing happily while every status surface reported "never
+          # synced" forever, because the reader is looking at a path nothing
+          # writes any more. So the path is read out of the Rust constant and
+          # asserted against the GENERATED unit and tmpfiles rules.
+          lastSyncDir =
+            let
+              src = builtins.readFile ../../../crates/ferrum-apply/src/parity.rs;
+              hits = builtins.filter builtins.isList
+                (builtins.split "pub const LAST_SYNC_FILE: &str = \"([^\"]+)\"" src);
+            in
+            if hits == [ ] then
+              throw ("crates/ferrum-apply/src/parity.rs no longer declares LAST_SYNC_FILE as a "
+                + "string literal, so parity-timers-self-heal cannot check that the unit "
+                + "writes where the reader looks")
+            else dirOf (builtins.head (builtins.head hits));
+
+          syncWritesWhereTheReaderLooks =
+            let cfg = cfgOf defaults; in
+            builtins.elem lastSyncDir
+              (cfg.systemd.services.snapraid-sync.serviceConfig.ReadWritePaths or [ ])
+            && builtins.any (r: lib.hasInfix "d ${lastSyncDir} " r) cfg.systemd.tmpfiles.rules
+            && (cfg.systemd.services.snapraid-sync.serviceConfig.ExecStopPost or null) != null;
         in
         {
           ok = selfHealing "snapraid-sync"
@@ -3736,7 +3766,8 @@
             # makes `ferrum-apply parity-sync` work there.
             && timerExists disabled "snapraid-sync"
             && !(timerExists off "snapraid-sync")
-            && !(timerExists off "snapraid-scrub");
+            && !(timerExists off "snapraid-scrub")
+            && syncWritesWhereTheReaderLooks;
           message =
             "modules/core/parity.nix's timers are not in the self-healing shape "
             + "modules/proxy/dns.nix uses, are not independently disablable, or "
@@ -3750,6 +3781,7 @@
           syncIo = ioClass defaults "snapraid-sync";
           scrubIo = ioClass defaults "snapraid-scrub";
           offHasTimers = timerExists off "snapraid-sync";
+          inherit lastSyncDir syncWritesWhereTheReaderLooks;
         };
 
       # R4. The parity view renders every state the producer can send, the
