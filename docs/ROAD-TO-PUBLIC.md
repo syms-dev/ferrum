@@ -204,10 +204,18 @@ Last updated at HEAD `288f2b3`, branch `grounding-and-install-path`. Nothing pus
 
 ## Phase 3 — The dashboard people will actually see
 
-- [ ] **8. Dashboard revamp.** Today it is a settings form. The product is a window onto the
+- [~] **8. Dashboard revamp.** Today it is a settings form. The product is a window onto the
       system: what is running, is it healthy, what updates exist, one action each to update or
       roll back. The read-only APIs and the schema renderer survive a redesign; the form as the
       primary surface does not.
+      **First slice done 2026-10-07: the app detail view** (mockup screens 4 and 5), routed at
+      `#/apps/<id>`, with the Integrations panel and the qBittorrent VPN panel. The schema renderer
+      is reused untouched, so "adding an app needs no UI change" still holds. Screens 1, 2, 3, 6
+      and 8 remain. **One gap this surfaced and did not fill:** the mockup's green "Healthy" dot has
+      no backend — ferrum has no per-app health check between applies (`health.rs` says in as many
+      words that readiness asks nothing about Sonarr, Plex or qBittorrent), so the header shows
+      enabled/disabled, which is what is actually known. A dot there would be exactly the frozen
+      gauge item 23 is about.
 
 ## Phase 4 — Prove it works, not just that it builds
 
@@ -658,11 +666,20 @@ Items that analysis surfaced about **ferrum**, not about the projects analysed:
       job records — and nothing renders it. Owner's framing: this belongs inside the dashboard
       revamp (item 8) rather than bolted onto the current screen, and **earlier Claude Design work
       exists and appears to have been implemented** — find it before designing anything new.
-- [ ] **29. Nothing tells you whether qBittorrent's VPN is actually up.** `vpnKillSwitch` exists as
-      an option but the dashboard shows no state. Two asks: **surface whether the tunnel is live**
-      (and per item 23, with a timestamp — "last verified" rather than a bare green), and **let the
-      operator paste a WireGuard config into the qBittorrent settings in the UI** instead of
-      declaring a sops secret by hand. The second is squarely the hands-off requirement.
+- [x] **29. Nothing tells you whether qBittorrent's VPN is actually up.** DONE 2026-10-07. Both asks,
+      built onto the new app detail view (screens 4 and 5 of the mockups). `GET /api/vpn` is a
+      **live reading with a `checkedAt`**, and the panel ages it on screen rather than painting a
+      dot — item 23's rule, applied. **The honest part is the limit, stated on the screen itself:**
+      the measurement is one systemd unit's state, which proves the tunnel was *set up*, not that it
+      is carrying traffic. WireGuard is connectionless, so an interface is up from the moment it is
+      configured, peer or no peer; proving otherwise needs `wg show` from inside the namespace and
+      ferrumd is unprivileged by design. Six named states, because "could not ask", "declared but
+      not applied" and "down" are three different things to do next, and collapsing them is how a
+      status ends up wrong in the reassuring direction. The paste field writes `qbittorrent-vpn`
+      through the write-only secrets API — **`no_route_can_read_a_secret_back` now fails the build
+      if any read path ever appears**, so the sentence the screen prints stays true.
+      Unit name, secret name and settings key are **catalog data** (`meta.vpn`), not hard-coded,
+      and `vpn-metadata-matches-the-unit` proves each really names what it claims to.
 - [ ] **30. Intermittent "unauthorized" at qBittorrent after signing in to Authelia.** Seen once by
       the owner, worked on retry. **Investigated 2026-10-07 and NOT reproduced**: the live config
       is correct (`AuthSubnetWhitelist=10.200.1.0/30`, nginx arrives from `10.200.1.1`, inside it)

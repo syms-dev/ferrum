@@ -13,6 +13,7 @@ mod settings;
 mod sso;
 mod static_files;
 mod updates;
+mod vpn;
 
 use axum::{
     extract::State,
@@ -666,6 +667,7 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/generations", axum::routing::get(generations::get_generations))
         .route("/api/updates", axum::routing::get(updates::get_updates))
         .route("/api/parity", axum::routing::get(parity::get_parity))
+        .route("/api/vpn", axum::routing::get(vpn::get_vpn))
         .route("/api/settings", axum::routing::get(settings::get_settings).put(settings::put_settings))
         .route("/api/secrets/:name", axum::routing::post(secrets_api::write_secret))
         .route("/api/session", axum::routing::get(session_handler))
@@ -1867,6 +1869,92 @@ mod tests {
         }
     }
 
+    /// **There is no way to read a secret back out of ferrumd, and this is
+    /// what keeps it that way.**
+    ///
+    /// The qBittorrent VPN panel tells the operator, in as many words, that
+    /// the WireGuard config they paste is *"encrypted immediately on save;
+    /// ferrumd can write this but can never read it back"*. That sentence is
+    /// true today only because `secrets_api.rs` has one handler and it is a
+    /// POST. A UI that makes a security promise over a daemon that does not
+    /// keep it is worse than a UI that says nothing, so the promise gets a
+    /// test rather than a comment.
+    ///
+    /// Both halves, because neither alone is sufficient:
+    ///
+    ///   * the SOURCE half re-derives every (method, path) pair from
+    ///     `build_router`'s own text -- the same derivation
+    ///     `the_matrix_covers_every_api_route` already guards the readability
+    ///     of -- and demands that every route touching `/api/secrets` is a
+    ///     POST. A `get(secrets_api::read_secret)` added tomorrow fails here
+    ///     even if nothing ever requests it;
+    ///   * the BEHAVIOURAL half drives GET, PUT, PATCH and DELETE at a real
+    ///     secret path with a REAL, VALID SESSION and a real CSRF token, and
+    ///     demands 405 from each. A session holder is the strongest caller
+    ///     this daemon has, and the point is that even they cannot read one
+    ///     back.
+    #[tokio::test]
+    async fn no_route_can_read_a_secret_back() {
+        let source = include_str!("main.rs");
+        let body = source
+            .split_once("fn build_router(")
+            .expect("build_router must exist")
+            .1
+            .split_once("\n}\n")
+            .expect("build_router must end")
+            .0;
+
+        let mut secret_routes: Vec<(String, String)> = Vec::new();
+        for line in body.lines() {
+            let Some((_, rest)) = line.split_once(".route(\"") else { continue };
+            let path = rest.split_once('"').expect("a route path is quoted").0;
+            if !path.starts_with("/api/secrets") {
+                continue;
+            }
+            for (needle, method) in [
+                ("get(", "GET"),
+                ("post(", "POST"),
+                ("put(", "PUT"),
+                ("patch(", "PATCH"),
+                ("delete(", "DELETE"),
+            ] {
+                if line.contains(needle) {
+                    secret_routes.push((method.to_string(), path.to_string()));
+                }
+            }
+        }
+        // Anti-vacuity. A scan that found nothing would pass while saying
+        // nothing, which is how a guard quietly stops guarding.
+        assert_eq!(
+            secret_routes,
+            vec![("POST".to_string(), "/api/secrets/:name".to_string())],
+            "the secrets API must be exactly one POST and nothing else. Anything that READS \
+             a secret back breaks the one sentence the VPN panel makes to the operator"
+        );
+
+        let (dir, state, session, csrf) = logged_in();
+        std::env::set_var("FERRUM_SETTINGS_PATH", dir.path().join("settings.json"));
+        std::env::set_var("FERRUM_SECRETS_DIR", dir.path());
+        for method in ["GET", "PUT", "PATCH", "DELETE"] {
+            let request = Request::builder()
+                .method(Method::from_bytes(method.as_bytes()).unwrap())
+                .uri("/api/secrets/qbittorrent-vpn")
+                .header("Cookie", format!("{SESSION_COOKIE}={}", session.clone()))
+                .header(CSRF_HEADER, csrf.clone())
+                .header("Content-Type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap();
+            let status = build_router(state.clone()).oneshot(request).await.unwrap().status();
+            assert_eq!(
+                status,
+                StatusCode::METHOD_NOT_ALLOWED,
+                "{method} /api/secrets/:name answered {status} to a caller holding a valid \
+                 session. The secrets API is write-only BY CONSTRUCTION, and a session is the \
+                 strongest credential this daemon issues"
+            );
+        }
+    }
+
     /// The `/api/` routes that really are reachable with NO session, named
     /// one by one.
     ///
@@ -3052,6 +3140,7 @@ mod tests {
         ("sso.rs", include_str!("sso.rs")),
         ("static_files.rs", include_str!("static_files.rs")),
         ("updates.rs", include_str!("updates.rs")),
+        ("vpn.rs", include_str!("vpn.rs")),
     ];
 
     /// The file that is allowed to name a forward-auth header, and the ONE
@@ -3675,6 +3764,11 @@ mod tests {
             // probe asks for the most recent report, which answers 200 on a
             // host that has never run a parity check rather than a 404.
             ("GET", "/api/parity", "/api/parity"),
+            // R29. Reads two documents and asks systemd for one unit's
+            // state; on a fixture host with no catalog it answers 500,
+            // and a 500 carrying a CORS header is as much of a finding as
+            // a 200 carrying one.
+            ("GET", "/api/vpn", "/api/vpn"),
             ("GET", "/api/settings", "/api/settings"),
             ("PUT", "/api/settings", "/api/settings"),
             ("POST", "/api/secrets/:name", "/api/secrets/cors-probe"),

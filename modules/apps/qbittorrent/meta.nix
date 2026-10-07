@@ -81,6 +81,40 @@
     };
   };
 
+  # The VPN kill switch, declared as CATALOG DATA rather than known
+  # separately by each consumer.
+  #
+  # Three things already had to agree about this app's tunnel and nothing
+  # held them together: service.nix names the unit and the secret, the
+  # settings schema above names the toggle, and now ferrumd's /api/vpn
+  # reports the tunnel's state and ui/app.js renders a panel for pasting a
+  # WireGuard config. Hard-coding "qbittorrent" into either of those last
+  # two would end the property this catalog exists for -- that adding an app
+  # is adding a directory -- and would put the unit name in a second place
+  # where it could silently stop matching the unit service.nix defines.
+  #
+  # So the daemon reads the unit name from here and the UI renders a VPN
+  # panel for whichever app declares this block. `vpn-metadata-matches-the-unit`
+  # (nix/modules/flake/checks.nix) asserts each field really names what it
+  # claims to: the systemd unit, the sops secret, and the settingsSchema key.
+  vpn = {
+    # The sops secret holding the WireGuard config. Write-only, through
+    # POST /api/secrets/<name> -- there is no read path, which is what lets
+    # the UI say "ferrumd can write this but can never read it back".
+    secret = "qbittorrent-vpn";
+    # The systemd unit whose completion IS the measurement. A RemainAfterExit
+    # oneshot: `active` means its script ran all the way through, so the
+    # namespace exists, wg0 was configured inside it from the operator's own
+    # config, and the routes below it were installed. It does NOT mean the
+    # tunnel is passing traffic -- WireGuard is connectionless and an
+    # interface is "up" from the moment it is configured, peer or no peer.
+    # See crates/ferrumd/src/vpn.rs for the full statement of what this can
+    # and cannot establish.
+    unit = "qbt-vpn-netns-setup.service";
+    # The key under this app's `settings` that turns the kill switch on.
+    setting = "vpnKillSwitch";
+  };
+
   docsUrl = "https://github.com/qbittorrent/qBittorrent/wiki";
   iconSlug = "qbittorrent";
 }

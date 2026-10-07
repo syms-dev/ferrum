@@ -147,6 +147,44 @@ pub async fn write_secret(
 mod tests {
     use super::*;
 
+    /// This file's opening sentence, asserted instead of asserted-in-prose.
+    ///
+    /// The header says there is "deliberately no GET handler anywhere in this
+    /// file, and never will be". `main.rs`'s `no_route_can_read_a_secret_back`
+    /// guards the ROUTER, which is the thing an attacker reaches; this guards
+    /// the MODULE, which is where the handler would be written first. A
+    /// `pub async fn read_secret` sitting here unrouted is not yet a hole, but
+    /// it is the commit before one, and it is the commit a reviewer skims.
+    ///
+    /// The exported surface is the right thing to pin rather than a keyword
+    /// denylist: every way to read a secret back out of this module has to
+    /// leave through a `pub` item, and there is exactly one.
+    ///
+    /// Anti-vacuity first. A scan that found no `pub` items at all would
+    /// agree with an empty expectation and prove nothing.
+    #[test]
+    fn this_module_exports_exactly_one_thing_and_it_writes() {
+        let source = include_str!("secrets_api.rs");
+        let exported: Vec<&str> = source
+            .lines()
+            // Column zero only, so a `pub` inside the struct literals or the
+            // test module below is not mistaken for module surface.
+            .filter(|line| line.starts_with("pub "))
+            .collect();
+        assert_eq!(
+            exported.len(),
+            1,
+            "the secrets module's exported surface changed: {exported:?}. It is write-only by \
+             construction -- that is what makes \"ferrumd can write any secret but cannot read \
+             one back\" a property of the code rather than a policy somebody remembers"
+        );
+        assert!(
+            exported[0].contains("async fn write_secret("),
+            "the one exported item is no longer the write handler: {}",
+            exported[0]
+        );
+    }
+
     /// SEC-09. Both 500 paths in this file fail on a FILE, so their errors
     /// name one -- the settings document, the host key, the destination
     /// under the secrets directory. Returning that to the caller hands them

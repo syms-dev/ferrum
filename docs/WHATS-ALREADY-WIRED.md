@@ -32,6 +32,13 @@ qBittorrent registration and nothing broken.
 **On a host with all five enabled that is eight registrations**, and they are re-asserted on every
 apply rather than only at install, so an app that forgets its configuration gets it back.
 
+**The dashboard says this per app now, too.** Each app's own page (Apps → *app*) carries an
+Integrations panel listing exactly these edges, and it **reads** them rather than re-deriving them:
+`modules/lib/integrations.nix` computes the graph once from the same `meta.nix` declarations
+`ferrum-reconcile` acts on, and stamps it into the catalog document the browser fetches. Two places
+deriving one fact from the same inputs is how `modules/proxy/nginx.nix` came to proxy an app that
+was not there; `checks.app-detail-view-is-wired` fails the build if the rule reappears in the UI.
+
 > `ferrum-reconcile` commonly **fails once per apply and succeeds on its automatic retry.** The
 > apps are not listening yet when it first runs. That is designed behaviour, not a fault — if you
 > see it in an apply's output, look at whether the retry succeeded before investigating.

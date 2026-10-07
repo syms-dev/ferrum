@@ -4069,6 +4069,374 @@
       #      case-insensitively, across the doc and every parity prose
       #      surface. Scanning for claims rather than for a word is what lets
       #      the denial and the claim be told apart.
+      # R29 + ROAD item 8's first slice. The app detail view renders every
+      # VPN state the daemon can send, reads its integration edges rather
+      # than re-deriving them, and cannot read a secret back.
+      #
+      # Four files have to agree here and, as with the Updates and Parity
+      # screens before it, nothing but this holds them together:
+      # crates/ferrumd/src/vpn.rs owns the state vocabulary and the envelope,
+      # modules/lib/integrations.nix owns the registration-kind rule,
+      # nix/modules/flake/packages.nix is what actually puts the computed
+      # edges into the document the browser reads, and ui/app.js transcribes
+      # all of it. Modelled directly on `updates-view-is-wired` and
+      # `parity-view-is-wired`, which exist because exactly that drift
+      # happened the first day their files lived apart.
+      #
+      # The INTEGRATIONS half is the sharp one. The whole reason
+      # modules/lib/integrations.nix exists is that "Prowlarr registers
+      # Sonarr as an application" was computed in one place and needed in
+      # two, and a JavaScript copy of that rule would be the second place --
+      # the defect class that produced the nginx/reconciler address split.
+      # A rule with exactly one app-specific token is cheap to guard: the
+      # token must not appear in the UI at all.
+      #
+      # Every lookup throws rather than returning an empty result. A check
+      # that grepped for a declaration, found nothing, and passed would be
+      # worse than no check -- this tree has shipped that twice.
+      appDetailViewIsWired =
+        let
+          lines = lib.splitString "\n" (builtins.readFile ../../../ui/app.js);
+          apiLines = lib.splitString "\n" (builtins.readFile ../../../ui/api.js);
+          vpnPath = "crates/ferrumd/src/vpn.rs";
+          vpnLines = lib.splitString "\n" (builtins.readFile ../../../crates/ferrumd/src/vpn.rs);
+          reconcilerSrc = builtins.readFile ../../../modules/core/reconciler.nix;
+          packagesSrc = builtins.readFile ../../../nix/modules/flake/packages.nix;
+          integrationsSrc = builtins.readFile ../../../modules/lib/integrations.nix;
+
+          # Same helpers as the two checks above. They are restated rather
+          # than shared because each one names itself in its own failure
+          # messages, and a message that names the wrong check sends the
+          # reader to the wrong file.
+          indexIn = src: file: what: infix:
+            let
+              hits = builtins.filter (e: lib.hasInfix infix e.l)
+                (lib.imap0 (i: l: { inherit i l; }) src);
+            in
+            if hits == [ ] then
+              throw (file + " no longer has a line containing '" + infix
+                + "', so app-detail-view-is-wired cannot verify " + what
+                + ". A check that cannot find what it guards must fail, not pass.")
+            else (builtins.head hits).i;
+
+          blockIn = src: file: what: startInfix: isEnd:
+            let
+              after = lib.drop ((indexIn src file what startInfix) + 1) src;
+              take = acc: rest:
+                if rest == [ ] then
+                  throw (file + " opens '" + startInfix
+                    + "' but app-detail-view-is-wired cannot find the line that closes it")
+                else if isEnd (builtins.head rest) then acc
+                else take (acc ++ [ (builtins.head rest) ]) (builtins.tail rest);
+              block = take [ ] after;
+            in
+            if block == [ ] then
+              throw (file + "'s '" + startInfix + "' block is empty, so every assertion "
+                + "app-detail-view-is-wired makes about " + what + " would be vacuously true")
+            else block;
+
+          quotedIn = re: line:
+            map builtins.head (builtins.filter builtins.isList (builtins.split re line));
+
+          # A one-line `const NAME = ["a", "b"];` in ui/app.js. The character
+          # class admits camelCase as well as kebab: the state words are
+          # kebab, the envelope keys are `checkedAt`.
+          vocabOf = what: name:
+            let
+              values = quotedIn "\"([a-zA-Z][a-zA-Z0-9-]*)\""
+                (builtins.elemAt lines (indexIn lines "ui/app.js" what "const ${name} = ["));
+            in
+            if values == [ ] then
+              throw ("ui/app.js declares " + name + " but app-detail-view-is-wired read no "
+                + "names out of it -- it is no longer a single-line array literal, and an "
+                + "empty vocabulary would make the branch-coverage assertion vacuous")
+            else values;
+
+          branchesOf = what: name:
+            let
+              keys = lib.concatMap (quotedIn "\"([a-z-]+)\":")
+                (blockIn lines "ui/app.js" what "const ${name} = {" (l: l == "};"));
+            in
+            if keys == [ ] then
+              throw ("ui/app.js declares " + name
+                + " but app-detail-view-is-wired found no \"state\": keys in it")
+            else keys;
+
+          uiStates = vocabOf "the VPN-state vocabulary" "VPN_STATES";
+          uiBranches = branchesOf "VPN-state rendering" "VPN_STATE_TEXT";
+          uiEnvelopeKeys = vocabOf "the VPN envelope keys" "VPN_ENVELOPE_KEYS";
+
+          # serde's kebab-case rule, derived rather than hand-listed -- the
+          # same derivation `updates-view-is-wired` records in full.
+          kebabOf = variant:
+            lib.toLower (builtins.concatStringsSep "-"
+              (map builtins.head
+                (builtins.filter builtins.isList (builtins.split "([A-Z][a-z0-9]*)" variant))));
+
+          # camelCase, for `#[serde(rename_all = "camelCase")]` struct
+          # fields: `checked_at` is on the wire as `checkedAt`.
+          camelOf = field:
+            let parts = lib.splitString "_" field; in
+            builtins.concatStringsSep ""
+              ([ (builtins.head parts) ] ++ map (p: lib.toUpper (builtins.substring 0 1 p)
+                + builtins.substring 1 (builtins.stringLength p) p) (builtins.tail parts));
+
+          # The unit variants of VpnState, as wire values. Same `unparsed`
+          # discipline as the other two checks: a body line this cannot read
+          # would be dropped from the daemon's set, and the resulting diff
+          # would accuse the UI of inventing a state the daemon never sends.
+          daemonStates =
+            let
+              block = blockIn vpnLines vpnPath "ferrumd's VpnState variants"
+                "pub enum VpnState {" (l: l == "}");
+              variantOf = l: builtins.match "[[:space:]]*([A-Z][A-Za-z0-9]*),[[:space:]]*" l;
+              ignorable = l:
+                builtins.match "[[:space:]]*" l != null
+                || builtins.match "[[:space:]]*(///|//|#\\[).*" l != null;
+              names = lib.concatMap (l: let m = variantOf l; in if m == null then [ ] else m) block;
+              unparsed = builtins.filter (l: variantOf l == null && !(ignorable l)) block;
+            in
+            if unparsed != [ ] then
+              throw (vpnPath + "'s VpnState has lines app-detail-view-is-wired cannot read as "
+                + "unit variants: " + builtins.toJSON unparsed + ". Silently dropping them "
+                + "would understate the daemon's vocabulary and blame the UI for the difference.")
+            else if names == [ ] then
+              throw (vpnPath + " declares VpnState but app-detail-view-is-wired parsed no "
+                + "variants out of it")
+            else map kebabOf names;
+
+          # The envelope VpnReport really serializes, by the same discipline.
+          daemonEnvelopeKeys =
+            let
+              block = blockIn vpnLines vpnPath "ferrumd's VpnReport fields"
+                "pub struct VpnReport {" (l: l == "}");
+              fieldOf = l: builtins.match "[[:space:]]*pub ([a-z_]+):.*" l;
+              ignorable = l:
+                builtins.match "[[:space:]]*" l != null
+                || builtins.match "[[:space:]]*(///|//|#\\[).*" l != null;
+              names = lib.concatMap (l: let m = fieldOf l; in if m == null then [ ] else m) block;
+              unparsed = builtins.filter (l: fieldOf l == null && !(ignorable l)) block;
+            in
+            if unparsed != [ ] then
+              throw (vpnPath + "'s VpnReport has lines app-detail-view-is-wired cannot read as "
+                + "fields: " + builtins.toJSON unparsed)
+            else if names == [ ] then
+              throw (vpnPath + " declares VpnReport but app-detail-view-is-wired parsed no "
+                + "fields out of it")
+            else map camelOf names;
+
+          daemonOnly = daemon: ui: builtins.filter (v: !(builtins.elem v ui)) daemon;
+          uiOnly = daemon: ui: builtins.filter (v: !(builtins.elem v daemon)) ui;
+          unbranched = builtins.filter (s: !(builtins.elem s uiBranches)) uiStates;
+          orphaned = builtins.filter (b: !(builtins.elem b uiStates)) uiBranches;
+
+          # The detail route exists and really dispatches the detail view.
+          # Both halves: a pattern nothing calls, or a call no pattern
+          # reaches, each leaves the screen unreachable while looking wired.
+          routePatternDeclared =
+            builtins.any (l: lib.hasInfix "const APP_DETAIL_ROUTE = " l) lines;
+          routeDispatches =
+            builtins.any (l: lib.hasInfix "appDetailView(detail[1])" l) lines;
+
+          # The detail view's own source, delimited by the banner comments
+          # this file already uses to separate ui/app.js's sections.
+          detailBlock = blockIn lines "ui/app.js" "the app detail view's own source"
+            "// --- app detail ---" (l: lib.hasPrefix "// --- " l);
+
+          # THE INTEGRATION RULE LIVES IN ONE PLACE. `prowlarr` is the only
+          # app-specific token in it, so its absence from the UI's CODE is
+          # the cheapest true statement that the UI is not the second place.
+          #
+          # Comment lines are excluded deliberately, and the distinction is
+          # the whole point rather than a loophole: the sentence explaining
+          # *why* this rule is not duplicated here names the rule, and a scan
+          # that failed on its own rationale would be removed by the next
+          # reader instead of being satisfied. `codeLines` is asserted
+          # non-empty below, so the exclusion cannot quietly swallow the
+          # entire file.
+          isComment = l:
+            let t = lib.trim l; in
+            lib.hasPrefix "//" t || lib.hasPrefix "*" t || lib.hasPrefix "/*" t;
+          codeLines = builtins.filter (l: !(isComment l)) lines;
+          integrationRuleCopiedIntoTheUi =
+            builtins.filter (l: lib.hasInfix "prowlarr" (lib.toLower l)) codeLines;
+          # ...and the UI really does read the computed edges.
+          readsComputedEdges =
+            builtins.any (l: lib.hasInfix "integrationEdges" l) detailBlock;
+          # ...and the catalog document really carries them.
+          catalogCarriesEdges = lib.hasInfix "integrations.nix" packagesSrc
+            && lib.hasInfix "annotate" packagesSrc;
+          # ...and the reconciler reads the rule rather than owning a copy.
+          reconcilerImportsTheRule =
+            lib.hasInfix "integrations.nix" reconcilerSrc
+            && !(lib.hasInfix "pairKind = consumer: provider:" reconcilerSrc);
+          ruleIsDefinedOnce = lib.hasInfix "pairKind = consumer: provider:" integrationsSrc;
+
+          # No secret may be read back. ui/api.js has one secrets call and it
+          # is the POST; the detail view starts no privileged job, because an
+          # apply belongs to the Apply screen and a screen that could start
+          # one from behind a settings form would apply edits the operator
+          # had not reviewed.
+          secretCalls = builtins.filter (l: lib.hasInfix "/api/secrets" l) apiLines;
+          secretReads = builtins.filter (l: !(lib.hasInfix "\"POST\"" l)) secretCalls;
+          jobStartsInDetail = builtins.filter (l: lib.hasInfix "api.startJob(" l) detailBlock;
+
+          # The claim the panel prints to the operator, required verbatim
+          # enough that deleting it fails rather than passing quietly. This
+          # is the sentence crates/ferrumd's `no_route_can_read_a_secret_back`
+          # keeps true; without this half, the test would go on guarding a
+          # promise the UI had stopped making.
+          panelStatesTheWriteOnlyProperty =
+            builtins.any (l: lib.hasInfix "can never read it back" l) detailBlock;
+          # And it never implies a liveness the measurement cannot support.
+          panelStatesTheLimit =
+            builtins.any (l: lib.hasInfix "whether it is carrying traffic" l) detailBlock;
+        in
+        {
+          ok = codeLines != [ ]
+            && routePatternDeclared
+            && routeDispatches
+            && readsComputedEdges
+            && catalogCarriesEdges
+            && reconcilerImportsTheRule
+            && ruleIsDefinedOnce
+            && panelStatesTheWriteOnlyProperty
+            && panelStatesTheLimit
+            && integrationRuleCopiedIntoTheUi == [ ]
+            && secretReads == [ ]
+            && secretCalls != [ ]
+            && jobStartsInDetail == [ ]
+            && unbranched == [ ]
+            && orphaned == [ ]
+            && daemonOnly daemonStates uiStates == [ ]
+            && uiOnly daemonStates uiStates == [ ]
+            && daemonOnly daemonEnvelopeKeys uiEnvelopeKeys == [ ]
+            && uiOnly daemonEnvelopeKeys uiEnvelopeKeys == [ ];
+
+          # Anti-vacuity for the comment exclusion above: if the filter ever
+          # ate the whole file, every scan over `codeLines` would agree with
+          # an empty expectation and prove nothing.
+          theCommentFilterAteTheWholeFile = codeLines == [ ];
+          detailRoutePatternMissing = !routePatternDeclared;
+          detailRouteNeverDispatched = !routeDispatches;
+          uiDoesNotReadComputedIntegrationEdges = !readsComputedEdges;
+          catalogDoesNotCarryIntegrationEdges = !catalogCarriesEdges;
+          reconcilerStillOwnsItsOwnCopyOfTheRule = !reconcilerImportsTheRule;
+          theIntegrationRuleIsDefinedNowhere = !ruleIsDefinedOnce;
+          thePanelNoLongerStatesTheWriteOnlyProperty = !panelStatesTheWriteOnlyProperty;
+          thePanelNoLongerStatesWhatItCannotMeasure = !panelStatesTheLimit;
+          theUiAlsoKnowsTheIntegrationRule = integrationRuleCopiedIntoTheUi;
+          apiJsReadsSecretsBack = secretReads;
+          apiJsNoLongerWritesSecrets = secretCalls == [ ];
+          theDetailViewStartsJobs = jobStartsInDetail;
+          vpnStatesWithNoBranch = unbranched;
+          vpnBranchesWithNoState = orphaned;
+          inherit daemonStates daemonEnvelopeKeys;
+          uiVpnStates = uiStates;
+          inherit uiEnvelopeKeys;
+          vpnStatesTheDaemonSendsAndTheUiLacks = daemonOnly daemonStates uiStates;
+          vpnStatesTheUiExpectsAndTheDaemonNeverSends = uiOnly daemonStates uiStates;
+          envelopeKeysTheDaemonSendsAndTheUiLacks = daemonOnly daemonEnvelopeKeys uiEnvelopeKeys;
+          envelopeKeysTheUiExpectsAndTheDaemonNeverSends = uiOnly daemonEnvelopeKeys uiEnvelopeKeys;
+        };
+
+      # The VPN metadata in a catalog meta.nix really names what it claims
+      # to: a systemd unit that exists, a sops secret that exists, and a key
+      # in that app's own settings schema.
+      #
+      # It exists because `/api/vpn` reads the unit name out of the CATALOG
+      # and asks systemd about it. A typo there does not fail anything --
+      # systemd answers "no such unit", and the dashboard reports the tunnel
+      # as never applied on a host where it is running perfectly. A status
+      # that is wrong in the reassuring direction is worse than no status,
+      # and this is the only thing standing between the two files.
+      #
+      # ANTI-VACUITY, four ways, because every probe here can find nothing
+      # and "found nothing" must never read as "found nothing wrong":
+      #
+      #   a. at least one catalog app must declare a `vpn` block at all;
+      #   b. the unit must be found on a host where the VPN IS declared;
+      #   c. a CONTROL host without the declaration must NOT have that unit,
+      #      which proves the probe is reading a thing the declaration
+      #      actually creates rather than something that is always there;
+      #   d. the settings-schema key must be read out of a non-empty
+      #      property set.
+      vpnMetadataMatchesTheUnit =
+        let
+          vpnApps = lib.filterAttrs (_: meta: meta ? vpn) catalog;
+
+          mkHostWith = extra: ferrumLib.mkHost {
+            inherit system;
+            settings = {
+              schemaVersion = realMigrations.currentVersion;
+              apps = lib.mapAttrs (_: _: { enable = true; }) catalog;
+            };
+            modules = [
+              ../../../examples/hosts/minimal/configuration.nix
+              { ferrum.secretsDir = toString ../../../examples/hosts/minimal/secrets; }
+            ] ++ extra;
+          };
+
+          # Declaring every VPN secret is what switches each app's tunnel
+          # machinery on -- see qbittorrent/service.nix's `vpnEnabled`.
+          declared = mkHostWith [{
+            ferrum.secrets = lib.mapAttrs' (_: meta: lib.nameValuePair meta.vpn.secret { }) vpnApps;
+          }];
+          control = mkHostWith [ ];
+
+          unitsOn = host: builtins.attrNames host.config.systemd.services;
+          secretsOn = host: builtins.attrNames host.config.sops.secrets;
+          # systemd.services is keyed WITHOUT the .service suffix.
+          unitKey = unit: lib.removeSuffix ".service" unit;
+
+          missingUnit = lib.mapAttrsToList
+            (id: meta:
+              if builtins.elem (unitKey meta.vpn.unit) (unitsOn declared) then null
+              else "modules/apps/${id}/meta.nix declares vpn.unit \"${meta.vpn.unit}\", but no "
+                + "such systemd unit exists on a host with that app enabled and its secret declared")
+            vpnApps;
+          missingSecret = lib.mapAttrsToList
+            (id: meta:
+              if builtins.elem meta.vpn.secret (secretsOn declared) then null
+              else "modules/apps/${id}/meta.nix declares vpn.secret \"${meta.vpn.secret}\", but "
+                + "declaring it in ferrum.secrets creates no sops secret by that name")
+            vpnApps;
+          missingSetting = lib.mapAttrsToList
+            (id: meta:
+              let props = meta.settingsSchema.properties or { }; in
+              if props == { } then
+                "modules/apps/${id}/meta.nix declares a vpn block but its settingsSchema has no "
+                + "properties at all, so the vpn.setting assertion would be vacuous"
+              else if props ? ${meta.vpn.setting} then null
+              else "modules/apps/${id}/meta.nix declares vpn.setting \"${meta.vpn.setting}\", "
+                + "which is not a key of its own settingsSchema.properties")
+            vpnApps;
+          # (c). The unit must be ABSENT without the declaration, or arm (b)
+          # is a branch nothing can ever take.
+          unitExistsWithoutTheDeclaration = lib.mapAttrsToList
+            (id: meta:
+              if builtins.elem (unitKey meta.vpn.unit) (unitsOn control) then
+                "modules/apps/${id}/service.nix defines ${meta.vpn.unit} even with no VPN secret "
+                + "declared, so this check's unit probe proves nothing about the declaration"
+              else null)
+            vpnApps;
+
+          real = builtins.filter (x: x != null);
+        in
+        {
+          ok = vpnApps != { }
+            && real missingUnit == [ ]
+            && real missingSecret == [ ]
+            && real missingSetting == [ ]
+            && real unitExistsWithoutTheDeclaration == [ ];
+
+          noCatalogAppDeclaresAVpn = vpnApps == { };
+          unitsThatDoNotExist = real missingUnit;
+          secretsThatDoNotExist = real missingSecret;
+          settingsKeysThatDoNotExist = real missingSetting;
+          unitsPresentWithoutTheirDeclaration = real unitExistsWithoutTheDeclaration;
+        };
+
       parityNeverClaimsToBeABackup =
         let
           doc = builtins.readFile ../../../docs/storage/parity.md;
@@ -6497,6 +6865,10 @@
           mkAssertionCheck "parity-timers-self-heal" parityTimersSelfHeal;
         parity-view-is-wired =
           mkAssertionCheck "parity-view-is-wired" parityViewIsWired;
+        app-detail-view-is-wired =
+          mkAssertionCheck "app-detail-view-is-wired" appDetailViewIsWired;
+        vpn-metadata-matches-the-unit =
+          mkAssertionCheck "vpn-metadata-matches-the-unit" vpnMetadataMatchesTheUnit;
         parity-never-claims-to-be-a-backup =
           mkAssertionCheck "parity-never-claims-to-be-a-backup" parityNeverClaimsToBeABackup;
         media-tree-waits-for-its-mounts =
