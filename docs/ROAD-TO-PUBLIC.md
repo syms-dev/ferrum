@@ -585,24 +585,9 @@ Items that analysis surfaced about **ferrum**, not about the projects analysed:
       `systemctl list-dependencies` reading as health; `sonarr/meta.nix` probing `/ping` rather than
       trusting `is-active`). It is a data-model choice — `Option<T>` + timestamp + reason, not a bare
       number — so it is nearly free now and expensive once the health view exists.
-- [ ] **24. We disclose nothing about what leaves the machine.** Self-hosters self-host for exactly
-      this reason. The table writes itself: Cloudflare API, Let's Encrypt, plex.tv, the update check,
-      and each app's own egress — marked by whether the call is ferrum's or the app's. State plainly
-      whether there is any telemetry. Highest trust-per-byte document the project could publish.
-- [ ] **25. We leak the stack into Certificate Transparency and warn nobody.** `acme.nix` issues
-      "one `security.acme.certs` entry per public vhost", so `sonarr.`, `radarr.`, `qbittorrent.`
-      land in public, permanently searchable CT logs advertising exactly what runs at that domain.
-      Because we use DNS-01 rather than HTTP-01 we have an option others do not: a single wildcard
-      `*.<baseDomain>` puts only the base domain in CT. **Right now this is a design decision made by
-      accident.** Make it on purpose and document it either way.
-- [ ] **26b. We pool with mergerfs and have NO parity story.** Grep `modules/`, `crates/` and the
-      design docs for SnapRAID or parity: nothing. PMS's mergerfs page is blunt — mergerfs "has
-      nothing whatsoever to do with parity. If a drive fails, the data on that drive is gone" — and
-      the entire reason it pairs mergerfs with SnapRAID is that the pool provides no fault tolerance
-      at all. We ship the convenience half and omit the survival half, and the guide every
-      prospective user has already read says so. `services.snapraid` is a first-class NixOS module,
-      so this is cheaper on our substrate than anywhere else. **If we add it:** exclude the btrfs
-      snapshot subvolumes or parity cost explodes, and ship "parity is not backup" with it.
+- [x] **24. What leaves the machine is now disclosed.** DONE 2026-10-07 — `docs/EGRESS.md`, 19 rows, every one traced to a `file:line` that was machine-verified, ferrum's own calls separated from an app doing its job. **Headline: no telemetry of any kind**, and the module tree declares exactly one timer (the optional DDNS updater), so nothing phones anywhere unattended. Two surprises recorded: ferrum never talks to plex.tv (the claim token goes to loopback and Plex makes the exchange itself), and three install-time calls nobody had written down, two of which run from the operator's own laptop.
+- [x] **25. The Certificate Transparency leak is disclosed, and the decision is yours.** DONE 2026-10-07 — `docs/CERTIFICATE-TRANSPARENCY.md`. Publishing an app puts its hostname in a permanent, publicly searchable log. **Nothing was implemented deliberately:** the analysis recommends offering both strategies and keeping `per-host` as the default until something watches certificate renewal, because one wildcard means a single renewal failure takes every app, the dashboard and both Authelia portals down at once — including the two things you would diagnose it with. Also: `*.<baseDomain>` does not cover `auth.ferrum.<baseDomain>`, so that name lands in CT regardless. **Open: the owner's call.**
+- [x] **26b. Parity is built.** DONE 2026-10-07, merged `0b4e856`. SnapRAID, six requirements, spec approved first. **The spike overturned an approved acceptance criterion:** a SnapRAID exclude path is relative to each data disk's own root, so the specified `${branch}/torrents/**` form matches nothing — measured on real disks, it took all 7 files into the array where the correct `/torrents/` form took exactly the 2 that belong. A host built from the spec as written would sync, report success, claim protection, and spend every pass on the data the exclusion existed to skip. R5 was **exercised**: a filesystem destroyed and restored, 7 recovered, 0 unrecoverable, every SHA-256 matching, plus a negative control proving excluded data does not come back.
 - [ ] **26c. `epmfs` deserves a decision, not a default.** PMS names our policy specifically as one
       that "can surprise users by concentrating data on single drives", and points at `pfrd` as
       upstream's current default. `options.nix:144` offers only `epmfs | mfs` — `pfrd` is not even
@@ -652,14 +637,6 @@ Items that analysis surfaced about **ferrum**, not about the projects analysed:
 
 ## Phase 7 — Found by the owner using the deployed system, 2026-10-07
 
-- [ ] **27. The Updates view says "up-to-date" when it cannot check at all.** The backend is
-      right and the UI drops it: `check-update` returns
-      `"warnings":["this host pins the ferrum input at an exact commit (2ec53b6), so no newer
-      release can be discovered until you change that pin yourself"]`, and the dashboard renders
-      "up-to-date" and discards the warning. Prowlarr really is on 2.4.0.5397 against 2.6.5
-      upstream. **Two defects, not one.** The UI must surface warnings; and "up-to-date" is the
-      wrong word when nothing *can* be discovered — that is "cannot check". **A gauge frozen at
-      green, which is item 23's failure mode arriving in a different place.**
 - [x] **27. The Updates view says "up-to-date" when it cannot check at all.** DONE 2026-10-07,
       `0a0de84`. Two defects, both fixed. `CandidateState::PinnedExactly` now exists: a host pinned
       at an exact commit resolves it to itself, so the old code returned the state it would return
