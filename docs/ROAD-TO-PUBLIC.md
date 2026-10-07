@@ -650,6 +650,41 @@ Items that analysis surfaced about **ferrum**, not about the projects analysed:
 
 ---
 
+## Phase 7 — Found by the owner using the deployed system, 2026-10-07
+
+- [ ] **27. The Updates view says "up-to-date" when it cannot check at all.** The backend is
+      right and the UI drops it: `check-update` returns
+      `"warnings":["this host pins the ferrum input at an exact commit (2ec53b6), so no newer
+      release can be discovered until you change that pin yourself"]`, and the dashboard renders
+      "up-to-date" and discards the warning. Prowlarr really is on 2.4.0.5397 against 2.6.5
+      upstream. **Two defects, not one.** The UI must surface warnings; and "up-to-date" is the
+      wrong word when nothing *can* be discovered — that is "cannot check". **A gauge frozen at
+      green, which is item 23's failure mode arriving in a different place.**
+- [ ] **28. Generations show nothing about what changed between them.** No diff, no "what did this
+      apply actually do". The data largely exists — `built_pin`, `built_toplevel`, the journal, the
+      job records — and nothing renders it. Owner's framing: this belongs inside the dashboard
+      revamp (item 8) rather than bolted onto the current screen, and **earlier Claude Design work
+      exists and appears to have been implemented** — find it before designing anything new.
+- [ ] **29. Nothing tells you whether qBittorrent's VPN is actually up.** `vpnKillSwitch` exists as
+      an option but the dashboard shows no state. Two asks: **surface whether the tunnel is live**
+      (and per item 23, with a timestamp — "last verified" rather than a bare green), and **let the
+      operator paste a WireGuard config into the qBittorrent settings in the UI** instead of
+      declaring a sops secret by hand. The second is squarely the hands-off requirement.
+- [ ] **30. Intermittent "unauthorized" at qBittorrent after signing in to Authelia.** Seen once by
+      the owner, worked on retry. **Investigated 2026-10-07 and NOT reproduced**: the live config
+      is correct (`AuthSubnetWhitelist=10.200.1.0/30`, nginx arrives from `10.200.1.1`, inside it)
+      and qBittorrent logged no 401 at all. Two untested candidates: a **stale pre-split Authelia
+      cookie** (F5 split the cookie into two scopes the same day), or the netns setup still
+      settling mid-apply. **Needs a reproduction before anyone theorises further** — the cause is
+      unknown and should be recorded as unknown.
+- [ ] **31. Document what ferrum already did for you.** The owner asked whether Prowlarr was wired
+      to Sonarr and Radarr. It was — `ferrum-reconcile` registers all of it on every apply, 8
+      registrations on this host. **Having to ask is the defect.** Write the page that says what
+      the standard setup already includes, and separately what falls outside it and needs the
+      `custom/` escape hatch.
+
+---
+
 ## Carried costs — recorded, owned, not blocking
 
 Each was accepted with a revisit trigger rather than forgotten.
