@@ -211,11 +211,19 @@ Last updated at HEAD `288f2b3`, branch `grounding-and-install-path`. Nothing pus
       **First slice done 2026-10-07: the app detail view** (mockup screens 4 and 5), routed at
       `#/apps/<id>`, with the Integrations panel and the qBittorrent VPN panel. The schema renderer
       is reused untouched, so "adding an app needs no UI change" still holds. Screens 1, 2, 3, 6
-      and 8 remain. **One gap this surfaced and did not fill:** the mockup's green "Healthy" dot has
-      no backend — ferrum has no per-app health check between applies (`health.rs` says in as many
-      words that readiness asks nothing about Sonarr, Plex or qBittorrent), so the header shows
-      enabled/disabled, which is what is actually known. A dot there would be exactly the frozen
-      gauge item 23 is about.
+      and 8 remain.
+      **Second slice done 2026-10-07: per-app health** (`GET /api/app-health`, the apps list, and
+      the detail header — mockup screens 3 and 4). This closes the gap the first slice surfaced and
+      deliberately left open: the mockup's green "Healthy" dot had no backend, because readiness
+      asks nothing about Sonarr, Plex or qBittorrent and `health.rs`'s banner forbids pointing
+      anything at it. Every app already declared `healthCheck.path` in its own `meta.nix` and
+      nothing read it; the probe is that metadata's first consumer. It is a **separate,
+      session-gated endpoint** — `/api/health` and `/api/ready` are untouched and the banner stands.
+      Built to item 23's rule throughout: every reading carries `checkedAt`, stamped after the
+      slowest probe; "never checked" is its own state; and "I could not ask" (`timed-out`,
+      `refused`, `unreachable`, `address-unknown`) is never collapsed into "it is down". No
+      credential is sent — measured, per app, against the real applications — so an app that
+      answers `401` is reported as up rather than broken.
 
 ## Phase 4 — Prove it works, not just that it builds
 

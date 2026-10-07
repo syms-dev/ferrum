@@ -32,6 +32,7 @@ const state = {
   settings: null,
   stream: null, // the live EventSource, so a view teardown can close it
   ticker: null, // the interval re-ageing an on-screen reading, same reason
+  ticks: [], // every re-ageing callback that interval drives -- see startTicker
 };
 
 function setStatus(message, kind = "") {
@@ -64,21 +65,33 @@ function closeStream() {
 /// gauge in slow motion -- it was true when it was painted and says nothing
 /// about having stopped being true.
 ///
-/// One ticker at a time, cleared by `route()` before any view is painted, so
-/// a view cannot leak a timer that goes on writing into a detached node.
+/// One INTERVAL at a time, cleared by `route()` before any view is painted, so
+/// a view cannot leak a timer that goes on writing into a detached node -- but
+/// it drives every callback registered against it, rather than only the last
+/// one. That distinction is the whole reason this function changed: the app
+/// detail screen now carries two independently-fetched readings (health and
+/// VPN), and the previous version replaced the interval on each call, so the
+/// second panel to register silently froze the first one's age line at the
+/// value it was painted with. A line that has STOPPED ageing is worse than no
+/// line, because it still looks like a live one.
 ///
 /// @param {() => void} tick - Called every minute, and never on the first
 ///   call: the caller paints the initial value itself, so the line is never
 ///   blank for a minute.
 /// @returns {void}
 function startTicker(tick) {
-  closeTicker();
-  state.ticker = setInterval(tick, 60_000);
+  state.ticks.push(tick);
+  if (state.ticker === null) {
+    state.ticker = setInterval(() => {
+      for (const each of state.ticks) each();
+    }, 60_000);
+  }
 }
 
 function closeTicker() {
   if (state.ticker !== null) clearInterval(state.ticker);
   state.ticker = null;
+  state.ticks = [];
 }
 
 // --- login ---------------------------------------------------------------
@@ -123,14 +136,24 @@ function appsView() {
   const ids = Object.keys(apps).sort();
 
   const list = el("div", { class: "cards" });
+  // One health cell per card, filled in by the single request below rather
+  // than by a fetch per card. Held by id so the answer can find its cell
+  // whatever order the probes finished in.
+  const healthCells = new Map();
   for (const id of ids) {
     const meta = apps[id];
     const enabled = state.settings?.apps?.[id]?.enable === true;
+    // "Checking..." rather than a blank or a neutral dot. An empty cell on a
+    // list of app names reads as "nothing wrong", which is the one thing it
+    // must not say before anybody has asked.
+    const health = el("p", { class: "pill", text: "Checking…" });
+    healthCells.set(id, health);
     list.appendChild(
       el("article", { class: "card" }, [
         el("h3", { text: meta.displayName || id }),
         el("p", { class: "hint", text: meta.summary || "" }),
         el("p", { class: enabled ? "pill on" : "pill", text: enabled ? "Enabled" : "Disabled" }),
+        health,
         // A real link, not a button that calls a function. The detail view has
         // its own route, so this one is middle-clickable, bookmarkable, and
         // survives a reload -- which a hand-dispatched render never did.
@@ -139,13 +162,21 @@ function appsView() {
     );
   }
 
+  // One line for the whole list, aged in place while the page sits open. Each
+  // card's word is only as good as this timestamp, so it is stated once,
+  // prominently, rather than implied per card.
+  const age = el("p", { class: "checked-at" });
+
   view().replaceChildren(
     el("section", {}, [
       el("h2", { text: "Apps" }),
       el("p", { class: "hint", text: "Every app is rendered from the same schema. Adding one to the catalog needs no UI change." }),
+      age,
       list,
     ]),
   );
+
+  fillAppHealth(healthCells, age);
 }
 
 // --- app detail ----------------------------------------------------------
@@ -491,11 +522,14 @@ function appDetailView(id) {
     el("section", {}, [
       el("p", { class: "crumb" }, [el("a", { href: "#/apps", text: "\u2190 Apps" }), ` / ${meta.displayName || id}`]),
       el("h2", { text: meta.displayName || id }),
-      // What is actually KNOWN about this app, and nothing more. The mockup
-      // puts a green "Healthy" dot here; ferrum has no per-app health check
-      // between applies -- health.rs says in as many words that readiness
-      // asks nothing about Sonarr, Plex or qBittorrent -- so a dot here would
-      // be exactly the frozen gauge this release is trying to stop shipping.
+      // What is actually KNOWN about this app, and nothing more. This line
+      // used to carry a comment explaining why the mockup's green "Healthy"
+      // dot was NOT drawn: ferrum had no per-app health check between applies,
+      // so a dot would have been the frozen gauge this release exists to stop
+      // shipping. The measurement exists now (`appHealthPanel` below, over
+      // GET /api/app-health), so the status is reported -- in words, with the
+      // time it was taken, and with the limits of what it proves stated on the
+      // panel itself rather than implied by a colour.
       el("p", {}, [
         el("span", { class: enabled ? "pill on" : "pill", text: enabled ? "Enabled" : "Disabled" }),
         " ",
@@ -503,6 +537,8 @@ function appDetailView(id) {
       ]),
       host ? el("p", { class: "hint", text: `Published at ${host}.` }) : null,
       actions,
+
+      appHealthPanel(id),
 
       primary.node,
 
@@ -550,6 +586,232 @@ function appDetailView(id) {
       ]),
     ]),
   );
+}
+
+// --- app health ----------------------------------------------------------
+
+/// What `GET /api/app-health` can establish, rendered as WORDS.
+///
+/// The mockup's screens 3 and 4 put a green "Healthy" dot here, and until this
+/// section existed the detail view deliberately refused to draw one: nothing
+/// measured anything, so the dot would have been the frozen gauge ROAD-TO-PUBLIC
+/// item 23 exists to stop shipping. The dot is earned now, and these are the
+/// terms it is earned on.
+///
+/// One entry per line, one distinct sentence per state, and every sentence
+/// names a DIFFERENT thing to do next -- the same test a state had to pass to
+/// exist in the daemon's own vocabulary. The three that matter most:
+///
+///   * `unauthenticated` is NOT a fault. The app answered 401 or 403, which
+///     means it accepted the connection, read the request and applied its own
+///     auth policy. ferrum holds no credential for it on purpose, because the
+///     alternative is putting a key in a URL.
+///   * `timed-out` is NOT `refused`. One is a wedged app, the other a stopped
+///     one, and starting the unit only fixes the second.
+///   * `address-unknown` is NOT `unreachable`. Nothing was dialled at all.
+///
+/// Cross-checked against crates/ferrumd/src/app_health.rs's own `HealthState`
+/// variants by checks.app-health-view-is-wired, so a state the daemon can send
+/// with no branch here fails the build rather than rendering as a blank cell.
+// Kept on ONE line on purpose -- the check reads the quoted names out of it.
+const HEALTH_STATES = ["not-enabled", "not-measurable", "address-unknown", "healthy", "unauthenticated", "unhealthy", "refused", "unreachable", "timed-out"];
+
+/// The two keys `GET /api/app-health` always answers with. Same cross-check.
+const HEALTH_ENVELOPE_KEYS = ["checkedAt", "apps"];
+
+const HEALTH_STATE_TEXT = {
+  "not-enabled": stateText("Not enabled", "This app is not switched on for this host, so there is nothing running to ask. Nothing was measured."),
+  "not-measurable": stateText("Not checked — nothing to ask", "This app publishes no HTTP endpoint of its own, so ferrum has nothing to dial. That is a permanent property of the app, not a fault, and it is not a statement that the app is unwell."),
+  "address-unknown": stateText("ferrum does not know where this app listens", "The app is enabled, but this host did not tell the daemon which address it binds. Nothing was dialled — ferrum declines to guess, because guessing loopback is exactly how an app that runs inside a VPN namespace gets reported as down. Rebuild this host; if it persists, it is a ferrum bug."),
+  "healthy": stateText("Answering", "The app answered on its own health endpoint with exactly the status its catalog entry declares. See the limit below — this says it is up and serving, not that everything inside it is well."),
+  "unauthenticated": stateText("Answering — and declining to say more", "The app replied that this caller may not ask, which means it is UP: it accepted the connection, read the request and applied its own auth policy. ferrum deliberately holds no key for this check, so this is the expected answer rather than a problem to fix. Nothing to do."),
+  "unhealthy": stateText("Answering with the wrong thing", "Something is listening and speaking HTTP at this address, and what it said is not what this app's catalog entry expects. The app may be starting, mid-upgrade, or broken — its own journal is the next place to look."),
+  "refused": stateText("Nothing is listening", "The connection was refused outright, so the port is closed. That usually means the app's service is not running. Check the unit, then its journal."),
+  "unreachable": stateText("Could not be reached", "The address could not be dialled, or whatever answered was not speaking HTTP. This is different from the port being closed: something about the route or the network namespace is wrong rather than simply absent. The address ferrum dialled is shown below."),
+  "timed-out": stateText("Did not answer in time", "The connection was accepted and then nothing came back inside the deadline. That is NOT the same as the app being down — a wedged app holds its socket open and says nothing, and starting it again is not the fix. Check its load, then its journal."),
+};
+
+/// The short word for a state, for the apps list, where there is no room for
+/// a sentence.
+///
+/// @param {object|undefined} reading - That app's entry in the report.
+/// @returns {string} The state's label, or the raw wire value when this page
+///   has no branch for it -- never a blank, which reads as "fine".
+function healthLabel(reading) {
+  const name = String(reading?.state ?? "");
+  return HEALTH_STATE_TEXT[name]?.label ?? `Unrecognised state "${orUnknown(name)}"`;
+}
+
+/// Whether a state is one an operator should look at.
+///
+/// Used ONLY to pick a border colour. The words carry the meaning on their
+/// own -- colour is never the only indicator here, which is the rule
+/// .claude/rules/responsive-and-accessibility.md states and the reason every
+/// pill below is labelled as well as tinted.
+///
+/// @param {object|undefined} reading - That app's entry in the report.
+/// @returns {string} A `pill` class list.
+function healthPillClass(reading) {
+  const name = String(reading?.state ?? "");
+  if (name === "healthy" || name === "unauthenticated") return "pill on";
+  if (name === "not-enabled" || name === "not-measurable") return "pill";
+  return "pill bad";
+}
+
+/// What the probe actually did, as rows an operator can act on.
+///
+/// `measuredFrom` is the load-bearing one: it is how a reader sees that
+/// qBittorrent was dialled at `10.200.1.2:8090` inside its VPN namespace
+/// rather than at a loopback address where nothing listens.
+///
+/// The declared PATH is deliberately not here, and not anywhere else on this
+/// page: the daemon never sends it, so a key in a catalog query string cannot
+/// reach a browser. See crates/ferrumd/src/app_health.rs.
+///
+/// @param {object} reading - That app's entry in the report.
+/// @returns {Array<[string, string]>} Term/detail pairs.
+function healthFacts(reading) {
+  return [
+    ["Measured from", reading.measuredFrom
+      ? `${reading.measuredFrom} — the address this host says the app binds`
+      : "nothing — no connection was made"],
+    ["It answered", reading.status === null || reading.status === undefined
+      ? "nothing"
+      : `HTTP ${reading.status}, where this app's catalog entry expects ${orUnknown(reading.expectStatus)}`],
+  ];
+}
+
+/// The health block on the app detail header -- screen 4 of the mockups.
+///
+/// Fetches its own reading, says when it was taken, keeps saying how old that
+/// is while the page sits open, and offers a re-check. Nothing here names an
+/// app: every app gets the same block, because the catalog decides what is
+/// measurable.
+///
+/// @param {string} id - The catalog app id.
+/// @returns {HTMLElement} The block, which fetches its own reading.
+function appHealthPanel(id) {
+  const status = el("div", { class: "state" });
+  const age = el("p", { class: "checked-at" });
+  const facts = el("dl", { class: "facts" });
+  const note = el("p", { class: "hint", "aria-live": "polite" });
+  const recheck = el("button", { type: "button", class: "ghost", text: "Check again" });
+
+  // The reading's own timestamp, held so the ticker can re-age it without
+  // re-fetching. Silently re-fetching would make the screen disagree with what
+  // the operator last asked for; only the AGE moves.
+  let checkedAt = null;
+
+  function paintAge() {
+    age.textContent = checkedAt
+      ? `Checked ${localTime(checkedAt)} — ${relativeAge(checkedAt)}.`
+      : "Not checked yet.";
+  }
+
+  function paint(reading) {
+    const name = String(reading?.state ?? "");
+    const text = HEALTH_STATE_TEXT[name];
+    status.replaceChildren();
+    facts.replaceChildren();
+    if (!text) {
+      status.appendChild(el("p", {
+        class: "error",
+        text: `The daemon reported health state "${orUnknown(name)}", which this page does not know how to render. It knows: ${HEALTH_STATES.join(", ")}.`,
+      }));
+      return;
+    }
+    status.appendChild(el("strong", { text: text.label }));
+    status.appendChild(el("p", { class: "hint", text: text.prose }));
+    facts.replaceChildren(...healthFacts(reading).flatMap(([term, detail]) => [
+      el("dt", { text: term }),
+      el("dd", { text: detail }),
+    ]));
+  }
+
+  async function refresh() {
+    recheck.disabled = true;
+    try {
+      const document_ = await api.appHealth();
+      const missing = HEALTH_ENVELOPE_KEYS.filter((key) => !(key in document_));
+      if (missing.length) {
+        note.textContent = `The daemon's health answer is missing ${missing.join(", ")}, so this panel cannot be trusted.`;
+        return;
+      }
+      note.textContent = "";
+      // Stamped only once a reading really arrived. Setting it before the
+      // fetch would age a measurement that never happened.
+      checkedAt = document_.checkedAt;
+      paintAge();
+      paint(document_.apps?.[id]);
+    } catch (err) {
+      note.textContent = `Could not read this app's health: ${err.message}`;
+    } finally {
+      recheck.disabled = false;
+    }
+  }
+
+  recheck.addEventListener("click", refresh);
+  startTicker(paintAge);
+  paintAge();
+  refresh();
+
+  return el("section", { class: "callout" }, [
+    el("h3", { text: "Health" }),
+    status,
+    age,
+    facts,
+    el("p", {
+      class: "hint",
+      text:
+        "What this can and cannot tell you: ferrum asks this app's own health endpoint whether " +
+        "it is answering, and reports the status code it got back. An app can answer perfectly " +
+        "and still have a corrupt database or an unmounted library, so this is a " +
+        "liveness signal, not a verdict on the app. " +
+        "ferrum also sends no password or API key with the question, " +
+        "so an app that refuses to answer is reported as up, which is what it is.",
+    }),
+    el("div", { class: "row" }, [recheck]),
+    note,
+  ]);
+}
+
+/// Fills in every card's health cell on the apps list, from ONE request.
+///
+/// One request for the whole screen rather than one per card: the daemon
+/// probes every app concurrently and answers once, so a list of seven apps
+/// costs seven sockets opened at the same time rather than seven round trips
+/// in sequence.
+///
+/// @param {Map<string, HTMLElement>} cells - Card id -> the element to fill.
+/// @param {HTMLElement} age - The one "checked ..." line for the whole list.
+/// @returns {Promise<void>}
+async function fillAppHealth(cells, age) {
+  let checkedAt = null;
+  const paintAge = () => {
+    age.textContent = checkedAt
+      ? `Health checked ${localTime(checkedAt)} — ${relativeAge(checkedAt)}.`
+      : "Health not checked yet.";
+  };
+  startTicker(paintAge);
+  paintAge();
+
+  try {
+    const document_ = await api.appHealth();
+    const missing = HEALTH_ENVELOPE_KEYS.filter((key) => !(key in document_));
+    if (missing.length) {
+      age.textContent = `The daemon's health answer is missing ${missing.join(", ")}, so these rows cannot be trusted.`;
+      return;
+    }
+    checkedAt = document_.checkedAt;
+    paintAge();
+    for (const [id, cell] of cells) {
+      const reading = document_.apps?.[id];
+      cell.className = healthPillClass(reading);
+      cell.textContent = healthLabel(reading);
+    }
+  } catch (err) {
+    age.textContent = `Could not read app health: ${err.message}`;
+  }
 }
 
 // --- apply ---------------------------------------------------------------

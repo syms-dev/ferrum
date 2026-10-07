@@ -66,4 +66,39 @@ rec {
   # The address a root-namespace caller -- nginx, the reconciler -- must
   # dial to reach app `id` on this host.
   hostFor = ferrum: id: (namespacedHosts ferrum).${id} or loopback;
+
+  # The port app `id` ACTUALLY listens on, which is not always the port the
+  # operator set.
+  #
+  # `ferrum.apps.<id>.port` is one uniform option across the catalog, and
+  # that uniformity is what lets the UI render one form rather than seven --
+  # but Plex and Jellyfin cannot honour it at any layer, which is what the
+  # catalog's `portIsFixed` mark records. modules/core/options.nix asserts a
+  # moved port on a marked app ("a port it cannot honour"), so on a host that
+  # evaluates at all the two values agree; this function is what makes the
+  # ADDRESS correct rather than merely consistent with an assertion
+  # elsewhere.
+  #
+  # It was added for ferrumd's per-app health probe, and the reason is the
+  # same defect this whole file exists for, one layer down. The measurement
+  # recorded in nix/modules/flake/checks.nix's `fixed-ports-are-enforced`:
+  # `plex.port = 9999` once rendered `proxy_pass http://127.0.0.1:9999` while
+  # Plex went on serving 32400. A health probe built on the same value would
+  # report Plex as REFUSED on a host where Plex is running perfectly -- a
+  # status wrong in the alarming direction, which sends an operator to debug
+  # an app that is fine.
+  #
+  # modules/proxy/nginx.nix still builds its upstream from `app.port`
+  # directly and is protected by the assertion alone. Pointing it here too
+  # would be the smaller statement of the same fact, and is deliberately left
+  # for whoever next touches that file: it is not this change's to make.
+  portFor = catalog: ferrum: id:
+    if catalog.${id}.portIsFixed or false
+    then catalog.${id}.defaultPort
+    else ferrum.apps.${id}.port;
+
+  # Both halves at once: the `host:port` a root-namespace caller must dial to
+  # reach app `id`. The form ferrumd's `$FERRUM_APP_ADDRESSES` carries.
+  addressFor = catalog: ferrum: id:
+    "${hostFor ferrum id}:${toString (portFor catalog ferrum id)}";
 }

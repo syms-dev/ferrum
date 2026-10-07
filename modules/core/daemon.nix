@@ -20,6 +20,38 @@ let
   # together. One definition rather than a sixth re-spelling of the condition.
   proxyLib = import ../proxy/lib.nix { inherit lib; };
   ssoEnabled = proxyLib.daemonPublished ferrum && ferrum.auth.enable;
+
+  # Where each ENABLED app actually listens, for ferrumd's per-app health
+  # probe (crates/ferrumd/src/app_health.rs).
+  #
+  # The FOURTH consumer of modules/lib/app-address.nix, and read from it for
+  # the reason that file's header gives in as many words: "a THIRD consumer
+  # that hand-copies 127.0.0.1 fails there instead of in the field". nginx was
+  # the consumer that hand-copied it, Decluttarr was the third, and a health
+  # probe is the worst possible place for a fourth -- it would report
+  # qBittorrent as DOWN on every VPN host, because the WebUI binds inside the
+  # qbt-vpn namespace and nothing answers at 127.0.0.1:8090 in the root one.
+  # A status that is wrong in the reassuring direction is bad; one that is
+  # wrong in the alarming direction sends an operator to debug a perfectly
+  # healthy app.
+  #
+  # Rendered as `host:port` rather than as a host alone, by that file's own
+  # `addressFor`, so the PORT comes from the shared source too. The port is
+  # not simply `app.port`: Plex and Jellyfin carry the catalog's
+  # `portIsFixed` mark because they cannot honour that option at any layer,
+  # and a probe built on the operator's value would report a perfectly
+  # healthy Plex as refused. See `portFor` in modules/lib/app-address.nix.
+  #
+  # Only enabled apps appear. ferrumd reports an enabled app that is absent
+  # from this table as `address-unknown` and dials nothing -- it has NO
+  # loopback fallback, deliberately, because a fallback is precisely the
+  # hand-copied 127.0.0.1 this file exists to avoid.
+  appAddress = (import ../lib/app-address.nix { inherit lib; }).addressFor
+    (import ../lib/catalog.nix { inherit lib; }) ferrum;
+  appAddresses = lib.mapAttrs
+    (id: _: appAddress id)
+    (lib.filterAttrs (_: app: app.enable) ferrum.apps);
+
   # 127.0.0.0/8 by its first octet, plus the two other spellings of the
   # same thing. Split rather than prefix-matched so that "127.0.0.1.example"
   # -- a string that starts with "127." and is not an address at all -- is
@@ -264,6 +296,11 @@ lib.mkIf ferrum.daemon.enable {
       # and, until now, consumed by nothing -- nix/modules/flake/packages.nix
       # said so in its own header comment.
       FERRUM_CATALOG = "${pkgs.ferrum-catalog}/share/ferrum/catalog.json";
+      # `{"<app id>": "<host>:<port>"}` for every enabled app, from
+      # modules/lib/app-address.nix. See `appAddresses` above for why this is
+      # derived rather than assumed, and crates/ferrumd/src/app_health.rs for
+      # what happens when an app is missing from it (nothing is dialled).
+      FERRUM_APP_ADDRESSES = builtins.toJSON appAddresses;
       FERRUM_PROFILES_DIR = "/nix/var/nix/profiles";
       FERRUM_JOURNAL_DIR = ferrum.storage.journalDir;
       FERRUM_UI_DIR = "${pkgs.ferrum-ui}/share/ferrum/ui";

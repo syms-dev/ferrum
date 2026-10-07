@@ -4340,6 +4340,292 @@
           envelopeKeysTheUiExpectsAndTheDaemonNeverSends = uiOnly daemonEnvelopeKeys uiEnvelopeKeys;
         };
 
+      # The per-app health probe really reaches the UI, really reads the
+      # SHARED address table, and really sends no credential.
+      #
+      # Modelled directly on `app-detail-view-is-wired`, which exists because
+      # exactly this drift happened before: a daemon vocabulary and the UI's
+      # rendering of it are two files that must agree and have no compiler
+      # between them. A state the daemon can send with no branch in ui/app.js
+      # renders as a blank cell, and a blank cell on a health screen reads as
+      # "nothing wrong" -- the reassuring-direction failure this whole feature
+      # exists to stop.
+      #
+      # It also guards two things the Rust tests cannot see from inside the
+      # crate:
+      #
+      #   * THE ADDRESS. modules/lib/app-address.nix's header warns that "a
+      #     THIRD consumer that hand-copies 127.0.0.1 fails there instead of in
+      #     the field". The health probe is the FOURTH. This asserts
+      #     modules/core/daemon.nix imports that file rather than spelling an
+      #     address itself, and that crates/ferrumd/src/app_health.rs contains
+      #     no loopback literal to fall back to. A probe that guessed loopback
+      #     would report qBittorrent as DOWN on every VPN host.
+      #
+      #   * THE CREDENTIAL. docs/WHATS-ALREADY-WIRED.md records, measured, that
+      #     SABnzbd takes its API key as a URL query parameter and logs the
+      #     failing URL verbatim. ferrum's own probe must therefore never put
+      #     one in a URL -- so this fails EVALUATION if any catalog app's
+      #     declared `healthCheck.path` ever grows something that looks like a
+      #     key, at the meta.nix where that edit would be made rather than
+      #     after it has shipped to a browser.
+      appHealthViewIsWired =
+        let
+          lines = lib.splitString "\n" (builtins.readFile ../../../ui/app.js);
+          apiLines = lib.splitString "\n" (builtins.readFile ../../../ui/api.js);
+          healthPath = "crates/ferrumd/src/app_health.rs";
+          healthSrc = builtins.readFile ../../../crates/ferrumd/src/app_health.rs;
+          healthLines = lib.splitString "\n" healthSrc;
+          daemonSrc = builtins.readFile ../../../modules/core/daemon.nix;
+
+          # Same helpers as the checks above. Restated rather than shared
+          # because each one names itself in its own failure messages, and a
+          # message that names the wrong check sends the reader to the wrong
+          # file.
+          indexIn = src: file: what: infix:
+            let
+              hits = builtins.filter (e: lib.hasInfix infix e.l)
+                (lib.imap0 (i: l: { inherit i l; }) src);
+            in
+            if hits == [ ] then
+              throw (file + " no longer has a line containing '" + infix
+                + "', so app-health-view-is-wired cannot verify " + what
+                + ". A check that cannot find what it guards must fail, not pass.")
+            else (builtins.head hits).i;
+
+          blockIn = src: file: what: startInfix: isEnd:
+            let
+              after = lib.drop ((indexIn src file what startInfix) + 1) src;
+              take = acc: rest:
+                if rest == [ ] then
+                  throw (file + " opens '" + startInfix
+                    + "' but app-health-view-is-wired cannot find the line that closes it")
+                else if isEnd (builtins.head rest) then acc
+                else take (acc ++ [ (builtins.head rest) ]) (builtins.tail rest);
+              block = take [ ] after;
+            in
+            if block == [ ] then
+              throw (file + "'s '" + startInfix + "' block is empty, so every assertion "
+                + "app-health-view-is-wired makes about " + what + " would be vacuously true")
+            else block;
+
+          quotedIn = re: line:
+            map builtins.head (builtins.filter builtins.isList (builtins.split re line));
+
+          vocabOf = what: name:
+            let
+              values = quotedIn "\"([a-zA-Z][a-zA-Z0-9-]*)\""
+                (builtins.elemAt lines (indexIn lines "ui/app.js" what "const ${name} = ["));
+            in
+            if values == [ ] then
+              throw ("ui/app.js declares " + name + " but app-health-view-is-wired read no "
+                + "names out of it -- it is no longer a single-line array literal, and an "
+                + "empty vocabulary would make the branch-coverage assertion vacuous")
+            else values;
+
+          branchesOf = what: name:
+            let
+              keys = lib.concatMap (quotedIn "\"([a-z-]+)\":")
+                (blockIn lines "ui/app.js" what "const ${name} = {" (l: l == "};"));
+            in
+            if keys == [ ] then
+              throw ("ui/app.js declares " + name
+                + " but app-health-view-is-wired found no \"state\": keys in it")
+            else keys;
+
+          uiStates = vocabOf "the health-state vocabulary" "HEALTH_STATES";
+          uiBranches = branchesOf "health-state rendering" "HEALTH_STATE_TEXT";
+          uiEnvelopeKeys = vocabOf "the health envelope keys" "HEALTH_ENVELOPE_KEYS";
+
+          kebabOf = variant:
+            lib.toLower (builtins.concatStringsSep "-"
+              (map builtins.head
+                (builtins.filter builtins.isList (builtins.split "([A-Z][a-z0-9]*)" variant))));
+
+          camelOf = field:
+            let parts = lib.splitString "_" field; in
+            builtins.concatStringsSep ""
+              ([ (builtins.head parts) ] ++ map (p: lib.toUpper (builtins.substring 0 1 p)
+                + builtins.substring 1 (builtins.stringLength p) p) (builtins.tail parts));
+
+          # The unit variants of HealthState, as wire values. Same `unparsed`
+          # discipline as the sibling checks: a body line this cannot read
+          # would be dropped from the daemon's set, and the resulting diff
+          # would accuse the UI of inventing a state the daemon never sends.
+          daemonStates =
+            let
+              block = blockIn healthLines healthPath "ferrumd's HealthState variants"
+                "pub enum HealthState {" (l: l == "}");
+              variantOf = l: builtins.match "[[:space:]]*([A-Z][A-Za-z0-9]*),[[:space:]]*" l;
+              ignorable = l:
+                builtins.match "[[:space:]]*" l != null
+                || builtins.match "[[:space:]]*(///|//|#\\[).*" l != null;
+              names = lib.concatMap (l: let m = variantOf l; in if m == null then [ ] else m) block;
+              unparsed = builtins.filter (l: variantOf l == null && !(ignorable l)) block;
+            in
+            if unparsed != [ ] then
+              throw (healthPath + "'s HealthState has lines app-health-view-is-wired cannot read "
+                + "as unit variants: " + builtins.toJSON unparsed + ". Silently dropping them "
+                + "would understate the daemon's vocabulary and blame the UI for the difference.")
+            else if names == [ ] then
+              throw (healthPath + " declares HealthState but app-health-view-is-wired parsed no "
+                + "variants out of it")
+            else map kebabOf names;
+
+          daemonEnvelopeKeys =
+            let
+              block = blockIn healthLines healthPath "ferrumd's HealthReport fields"
+                "pub struct HealthReport {" (l: l == "}");
+              fieldOf = l: builtins.match "[[:space:]]*pub ([a-z_]+):.*" l;
+              ignorable = l:
+                builtins.match "[[:space:]]*" l != null
+                || builtins.match "[[:space:]]*(///|//|#\\[).*" l != null;
+              names = lib.concatMap (l: let m = fieldOf l; in if m == null then [ ] else m) block;
+              unparsed = builtins.filter (l: fieldOf l == null && !(ignorable l)) block;
+            in
+            if unparsed != [ ] then
+              throw (healthPath + "'s HealthReport has lines app-health-view-is-wired cannot read "
+                + "as fields: " + builtins.toJSON unparsed)
+            else if names == [ ] then
+              throw (healthPath + " declares HealthReport but app-health-view-is-wired parsed no "
+                + "fields out of it")
+            else map camelOf names;
+
+          daemonOnly = daemon: ui: builtins.filter (v: !(builtins.elem v ui)) daemon;
+          uiOnly = daemon: ui: builtins.filter (v: !(builtins.elem v daemon)) ui;
+          unbranched = builtins.filter (s: !(builtins.elem s uiBranches)) uiStates;
+          orphaned = builtins.filter (b: !(builtins.elem b uiStates)) uiBranches;
+
+          # Both halves of the wiring: a client function nothing calls, or a
+          # call with no client function, each leaves the screen blank while
+          # looking wired.
+          clientCallDeclared =
+            builtins.any (l: lib.hasInfix "export const appHealth = " l) apiLines;
+          # ...and BOTH consumers really use it. The apps list and the detail
+          # header are the two screens the mockup puts a status on, so a
+          # version wired into only one of them is half-done, not done.
+          # In the DETAIL view's own block, not anywhere in the file: the
+          # function's own definition line contains this same text, and a scan
+          # over the whole file was therefore satisfied by the definition even
+          # with the call site deleted. Measured, by deleting it.
+          detailBlock = blockIn lines "ui/app.js" "the app detail view's own source"
+            "// --- app detail ---" (l: lib.hasPrefix "// --- " l);
+          detailReadsIt = builtins.any (l: lib.hasInfix "appHealthPanel(id)" l) detailBlock;
+          listReadsIt = builtins.any (l: lib.hasInfix "fillAppHealth(healthCells" l) lines;
+
+          # The panel states what the measurement does NOT prove, in the same
+          # shape app-detail-view-is-wired requires of the VPN panel. Without
+          # this, the limit paragraph could be deleted and the screen would go
+          # on implying a verdict it never measured.
+          healthBlock = blockIn lines "ui/app.js" "the app health section's own source"
+            "// --- app health ---" (l: lib.hasPrefix "// --- " l);
+          statesTheLimit =
+            builtins.any (l: lib.hasInfix "liveness signal, not a verdict on the app" l) healthBlock;
+          # ...and that no credential is sent, which is the reason an app that
+          # refuses the probe is rendered as UP rather than as broken.
+          statesNoCredentialIsSent =
+            builtins.any (l: lib.hasInfix "sends no password or API key with the question" l) healthBlock;
+
+          # THE ADDRESS, from the one place both other consumers read it.
+          # The real `import` EXPRESSION, on a line that is not a comment. The
+          # first version scanned the whole file for "app-address.nix" and was
+          # satisfied by the paragraph explaining why this file reads it --
+          # i.e. the rationale kept the check green with the import removed.
+          # Measured, by removing it.
+          daemonCodeLines = builtins.filter (l: !(lib.hasPrefix "#" (lib.trim l)))
+            (lib.splitString "\n" daemonSrc);
+          daemonImportsTheTable = builtins.any
+            (l: lib.hasInfix "import ../lib/app-address.nix" l) daemonCodeLines;
+          daemonExportsTheTable = lib.hasInfix "FERRUM_APP_ADDRESSES" daemonSrc
+            && lib.hasInfix "FERRUM_APP_ADDRESSES" healthSrc;
+          # ...and the probe has nothing to fall back TO. Comment lines are
+          # excluded because the paragraph explaining why there is no loopback
+          # fallback necessarily names the address it refuses to use; a scan
+          # that failed on its own rationale would be deleted by the next
+          # reader instead of being satisfied. `codeLines` is asserted
+          # non-empty below so the exclusion cannot swallow the whole file.
+          isComment = l: let t = lib.trim l; in lib.hasPrefix "//" t || lib.hasPrefix "*" t;
+          codeLines = builtins.filter (l: !(isComment l)) healthLines;
+          # The test module legitimately binds real listeners on 127.0.0.1 to
+          # drive the probe against real servers, so the scan stops where
+          # `mod tests` begins -- the production half is what must carry no
+          # address of its own.
+          productionLines =
+            let
+              take = acc: rest:
+                if rest == [ ] then acc
+                else if lib.hasInfix "mod tests {" (builtins.head rest) then acc
+                else take (acc ++ [ (builtins.head rest) ]) (builtins.tail rest);
+            in
+            take [ ] codeLines;
+          loopbackHardcodedInTheProbe =
+            builtins.filter (l: lib.hasInfix "127.0.0.1" l || lib.hasInfix "localhost" l)
+              productionLines;
+
+          # THE CREDENTIAL. Anything in a declared health path that looks like
+          # a secret-bearing parameter, at the file where it would be written.
+          credentialish = [ "apikey" "api_key" "api-key" "token" "passwd" "password" "secret" "auth=" ];
+          declaredPaths = lib.mapAttrsToList (id: meta: { inherit id; path = meta.healthCheck.path; })
+            (lib.filterAttrs (_: meta: meta ? healthCheck) catalog);
+          pathsCarryingACredential = builtins.filter
+            (e: builtins.any (needle: lib.hasInfix needle (lib.toLower e.path)) credentialish)
+            declaredPaths;
+          # ...and the probe itself never logs, which is the OTHER sink the
+          # Decluttarr finding names (a journal, not just a response body).
+          probeLogsSomething = builtins.filter
+            (l: lib.hasInfix "eprintln!" l || lib.hasInfix "println!" l)
+            productionLines;
+
+          # Anti-vacuity: at least one catalog app must really declare a
+          # health check, or every assertion about declared paths is a
+          # statement about an empty list.
+          noAppDeclaresAHealthCheck = declaredPaths == [ ];
+        in
+        {
+          ok = codeLines != [ ]
+            && productionLines != [ ]
+            && !noAppDeclaresAHealthCheck
+            && clientCallDeclared
+            && detailReadsIt
+            && listReadsIt
+            && statesTheLimit
+            && statesNoCredentialIsSent
+            && daemonImportsTheTable
+            && daemonExportsTheTable
+            && loopbackHardcodedInTheProbe == [ ]
+            && pathsCarryingACredential == [ ]
+            && probeLogsSomething == [ ]
+            && unbranched == [ ]
+            && orphaned == [ ]
+            && daemonOnly daemonStates uiStates == [ ]
+            && uiOnly daemonStates uiStates == [ ]
+            && daemonOnly daemonEnvelopeKeys uiEnvelopeKeys == [ ]
+            && uiOnly daemonEnvelopeKeys uiEnvelopeKeys == [ ];
+
+          theCommentFilterAteTheWholeFile = codeLines == [ ];
+          theProductionScanFoundNoCode = productionLines == [ ];
+          inherit noAppDeclaresAHealthCheck;
+          apiJsDoesNotExposeTheHealthCall = !clientCallDeclared;
+          theDetailHeaderDoesNotShowHealth = !detailReadsIt;
+          theAppsListDoesNotShowHealth = !listReadsIt;
+          thePanelNoLongerStatesWhatItCannotMeasure = !statesTheLimit;
+          thePanelNoLongerStatesThatNoCredentialIsSent = !statesNoCredentialIsSent;
+          daemonNixDoesNotReadTheSharedAddressTable = !daemonImportsTheTable;
+          theAddressTableIsNotHandedToTheDaemon = !daemonExportsTheTable;
+          theProbeHardcodesAnAddressItCouldFallBackTo = loopbackHardcodedInTheProbe;
+          healthPathsThatCouldCarryASecret = pathsCarryingACredential;
+          theProbeLogsTheUrlItDialled = probeLogsSomething;
+          healthStatesWithNoBranch = unbranched;
+          healthBranchesWithNoState = orphaned;
+          inherit daemonStates daemonEnvelopeKeys;
+          uiHealthStates = uiStates;
+          inherit uiEnvelopeKeys;
+          healthStatesTheDaemonSendsAndTheUiLacks = daemonOnly daemonStates uiStates;
+          healthStatesTheUiExpectsAndTheDaemonNeverSends = uiOnly daemonStates uiStates;
+          envelopeKeysTheDaemonSendsAndTheUiLacks = daemonOnly daemonEnvelopeKeys uiEnvelopeKeys;
+          envelopeKeysTheUiExpectsAndTheDaemonNeverSends = uiOnly daemonEnvelopeKeys uiEnvelopeKeys;
+        };
+
       # The VPN metadata in a catalog meta.nix really names what it claims
       # to: a systemd unit that exists, a sops secret that exists, and a key
       # in that app's own settings schema.
@@ -6867,6 +7153,8 @@
           mkAssertionCheck "parity-view-is-wired" parityViewIsWired;
         app-detail-view-is-wired =
           mkAssertionCheck "app-detail-view-is-wired" appDetailViewIsWired;
+        app-health-view-is-wired =
+          mkAssertionCheck "app-health-view-is-wired" appHealthViewIsWired;
         vpn-metadata-matches-the-unit =
           mkAssertionCheck "vpn-metadata-matches-the-unit" vpnMetadataMatchesTheUnit;
         parity-never-claims-to-be-a-backup =

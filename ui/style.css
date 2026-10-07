@@ -97,6 +97,12 @@ legend { font-weight: 700; padding: 0 .35rem; }
 .pill { display: inline-block; font-size: .8rem; padding: .15rem .5rem; border-radius: 1rem;
         border: 1px solid var(--line); color: var(--muted); }
 .pill.on { color: var(--ok); border-color: var(--ok); }
+/* A state an operator should look at. The WORDS carry the meaning on their
+   own -- every pill using this is labelled with the state's own sentence, so
+   colour is never the only indicator (responsive-and-accessibility.md). The
+   tint is a second channel, not the channel. --danger is the token already
+   measured for AA contrast on both --panel and --bg. */
+.pill.bad { color: var(--danger); border-color: var(--danger); }
 
 table { width: 100%; border-collapse: collapse; }
 th, td { text-align: left; padding: .5rem; border-bottom: 1px solid var(--line); vertical-align: top; }
