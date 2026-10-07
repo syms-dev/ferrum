@@ -41,6 +41,23 @@ ferrum's two goals:
 
 The full design, including why each of these choices was made, is in [`docs/design/2026-08-19-phase-1-design.md`](docs/design/2026-08-19-phase-1-design.md).
 
+## What leaves the machine
+
+**ferrum has no telemetry, no analytics, no crash reporting and no version ping**, and there is no
+ferrum-operated service of any kind for one to talk to. The dashboard makes no external request at
+all — no CDN, no web font, no absolute URL anywhere in `ui/`. What a ferrum host *does* contact is
+your DNS provider, your certificate authority, the Nix binary cache, and — only if you turn it on —
+three address-echo services; everything else is an app you installed doing the job you installed it
+for. The full table, every row traced to the line of code it came from and the unverified ones
+marked as unverified, is in [`docs/EGRESS.md`](docs/EGRESS.md).
+
+That page also carries the warning ferrum did not previously make: publishing an app puts its
+hostname in **public, permanently searchable Certificate Transparency logs**, so the list of what
+runs on your domain is readable by anyone. Whether ferrum should issue one wildcard instead of a
+certificate per app — what each discloses, what each costs when a renewal fails, and a
+recommendation — is argued in
+[`docs/CERTIFICATE-TRANSPARENCY.md`](docs/CERTIFICATE-TRANSPARENCY.md).
+
 ## Platform
 
 ferrum requires NixOS, but you don't have to install it yourself: [nixos-anywhere](https://github.com/nix-community/nixos-anywhere) provisions it onto any kexec-capable box over SSH, home server or rented VPS alike. Both `x86_64-linux` and `aarch64-linux` are first-class targets.
