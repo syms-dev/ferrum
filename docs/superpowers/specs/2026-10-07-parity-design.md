@@ -164,6 +164,19 @@ re-churning downloads and rollback snapshots that were never meant to be protect
       three separate fixtures, one per option, each relocating exactly one of the three under a
       branch and asserting only that one's exclude entry appears.
 
+> **Correction, 2026-10-07, from the pre-implementation spike this spec asked for.** The second
+> criterion above names the wrong path grammar, and the error is the silent, inverted kind. A
+> SnapRAID `exclude` path is relative to **each data disk's own root**, not absolute on the host, so
+> `${branch}/torrents/**` is read as `<disk>/mnt/ferrum-disk-0/torrents/**` and matches nothing that
+> exists. Measured against snapraid 12.4 on real loop-mounted ext4 disks: with that form every
+> download file was still taken into the array; with the disk-root-relative form exactly the
+> intended `media/` files were. The `/torrents/**` glob form is wrong too. Only the trailing-slash
+> directory form — `/torrents/`, `/usenet/` — excludes a directory. The implemented list is
+> therefore `*.unrecoverable`, `/snapraid.content`, `/torrents/`, `/usenet/`, plus a
+> branch-relative entry for any of `stateDir`/`snapshotDir`/`journalDir` that really nests under a
+> data root. `/snapraid.content` is a second spike finding: snapraid writes its own content file
+> onto a data disk and then takes it into the array as ordinary data on the next pass.
+
 **Edge Cases**:
 - An operator adds a `custom/` override that writes new files directly under a pool branch, outside
   the TRaSH layout entirely: not detectable at evaluation time from `config.ferrum.storage` alone.
@@ -173,8 +186,13 @@ re-churning downloads and rollback snapshots that were never meant to be protect
   ordinary `media/` content moving within the protected set, not a reason to exclude anything —
   covered by the same "`media/` never excluded" criterion above.
 - SnapRAID's own handling of hardlinks between `torrents/`/`usenet/` and `media/` (the *arr import
-  mechanism means the same inode can appear in both an excluded and an included directory) is
-  **unverified** against a real SnapRAID binary in this analysis — see Assumptions.
+  mechanism means the same inode can appear in both an excluded and an included directory) was
+  **unverified** when this spec was written. **Resolved by spike, 2026-10-07, against snapraid
+  12.4:** it behaves correctly and the exclusion list is safe. The file is taken into the array
+  exactly once, under its included `media/` name (`snapraid list` reported it once, with `0
+  links`); deleting the excluded `torrents/` name produced no difference in a subsequent `snapraid
+  diff`; and `snapraid fix` restored the `media/` name byte-identical afterwards. Excluding the
+  download directories therefore costs no protection for anything that has been imported.
 
 ---
 

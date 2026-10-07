@@ -4,7 +4,7 @@ A NixOS-based, rollback-safe alternative to [Saltbox](https://github.com/saltyor
 
 **Status: pre-alpha — installs and runs on real hardware; the installer's own VM tests have never passed.**
 
-Built and tested: the rollback engine, the seven-app catalog, the reverse proxy with TLS and SSO, sops secrets, the cross-app reconciler, storage pooling over several disks, `ferrumd` (the unprivileged daemon with its polkit privilege boundary), the schema-driven web UI, and an installer that takes a bare machine to a published, logged-in system, and update discovery, preview and commit. 1,087 Rust unit tests, 46 Nix evaluation checks and nine NixOS VM tests cover them.
+Built and tested: the rollback engine, the seven-app catalog, the reverse proxy with TLS and SSO, sops secrets, the cross-app reconciler, storage pooling over several disks, `ferrumd` (the unprivileged daemon with its polkit privilege boundary), the schema-driven web UI, and an installer that takes a bare machine to a published, logged-in system, and update discovery, preview and commit. Parity over those disks is built too: SnapRAID, with the parity disk structurally kept out of the pool, an exclusion list derived from ferrum's own layout, self-healing sync and scrub timers, and a staleness report that says how many files are not protected and as of when. Parity is not a backup and nothing in ferrum says it is -- see [`docs/storage/parity.md`](docs/storage/parity.md). 1,160 Rust unit tests, 52 Nix checks wired into CI and nine NixOS VM tests cover them.
 
 Proven on a real machine, not just in CI: a rollback that reverted both the system closure and application state together; Plex reachable on a real domain with a real Let's Encrypt certificate, served through ferrum's own nginx vhost from a typed `settings.json` with no hand-written Nix.
 
@@ -84,6 +84,7 @@ ui/                  the web UI — hand-written HTML/CSS/ES modules, no build s
 tests/               NixOS VM tests
 examples/hosts/      example settings.json + host config used by the guard checks
 docs/design/         the approved design spec
+docs/storage/        operator storage procedures (parity, restoring a disk)
 ```
 
 ## Secrets
@@ -309,6 +310,7 @@ checks that the two agree — so where they disagree, the router is right.
 | POST | `/api/secrets/:name` | Writes one sops-encrypted secret | session + CSRF |
 | GET | `/api/generations` | The system generations and their snapshots, for rollback | session |
 | GET | `/api/updates` | The most recent update-check report, or `?job=<uuid>` for one run's own | session |
+| GET | `/api/parity` | The most recent SnapRAID parity status report | session |
 | POST | `/api/jobs` | Starts a privileged `ferrum-apply` job | session + CSRF |
 | GET | `/api/jobs` | Recent jobs (`?limit=`) | session |
 | GET | `/api/jobs/:id` | One job's summary and its progress events | session |
@@ -403,9 +405,10 @@ and up to date". Reports are read from `FERRUM_UPDATE_REPORT_DIR`, falling back 
 
 `POST /api/jobs` takes a body of exactly `{"kind": "<kind>"}` — `preflight`, `apply` (plus an
 optional `"acceptPinChange": "<40-hex revision>"`), `rollback` (plus `"to": <generation>`),
-`restore_state`, `gc`, `check_update`, `update`, or `confirm_update`. Every kind but
-`check_update` claims the daemon's single-job interlock and gets `409` while one is running; the
-read-only check is exempt because a rollback must never be blocked by one.
+`restore_state`, `gc`, `check_update`, `update`, `confirm_update`, `parity_sync`, or
+`parity_status`. Every kind but the two read-only ones — `check_update` and `parity_status` —
+claims the daemon's single-job interlock and gets `409` while one is running; those two are exempt
+because a rollback must never be blocked by a check that only reads.
 
 `acceptPinChange` is the operator's acknowledgement that this rebuild also moves the host to a
 different ferrum revision. **A rollback reverts the system closure and never

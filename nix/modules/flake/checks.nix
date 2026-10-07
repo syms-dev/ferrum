@@ -3369,6 +3369,725 @@
             workingAccepted workingIsAPool;
         };
 
+      # R1. A parity disk must never also be a pool branch, and the check
+      # that says so must fire on EVERY evaluation rather than only at
+      # install time.
+      #
+      # The hazard is specific and silent. crates/ferrum-install/src/
+      # render.rs's `data_disks` detects data disks rather than asking for
+      # them -- "every disk that is not the one being erased and that already
+      # carries a filesystem" -- so a parity disk that was formatted in
+      # advance (which SnapRAID's content file needs) is swept into the pool
+      # by construction. Nothing downstream reports that: the pool mounts,
+      # the apps write to it, and SnapRAID writes a parity file across the
+      # same disk. The library files that land there are then the only ones
+      # on the host with no parity at all, and the parity is invalidated by
+      # the writes landing beside it.
+      #
+      # Read off the REAL assertion list of a really-evaluated host, with
+      # each case scoped to the one message it is supposed to produce. Both
+      # halves of that scoping are load-bearing and this project has been
+      # bitten by getting either wrong: an unscoped "was anything rejected"
+      # passes identically with these assertions deleted and some unrelated
+      # assertion failing instead, and an infix spanning a line break never
+      # matches at all, because these are multi-line Nix strings.
+      #
+      # The anti-vacuity halves are `working` and `off`, and they are what
+      # stop this check passing on a module that refuses everything or
+      # generates nothing: a legitimate disjoint configuration must evaluate
+      # with no parity failure AND produce a real services.snapraid.enable =
+      # true, while a host with parity off must produce no snapraid
+      # configuration at all.
+      #
+      # NOT covered here, deliberately, and it is not an omission: naming the
+      # OS disk itself (`parity.disks = [ "/" ]`) is refused one layer
+      # earlier by hostnames.absolutePath, whose pattern requires at least
+      # one `/<segment>`. Evaluation stops at the type, so an assertion for
+      # it could never fire. `osDiskRefused` below pins that the refusal
+      # really happens rather than taking it on trust.
+      parityDiskIsNeverAPoolBranch =
+        let
+          branches = [ "/mnt/ferrum-check-a" "/mnt/ferrum-check-b" ];
+          pooled = { enable = true; inherit branches; };
+
+          hostWith = storage: ferrumLib.mkHost {
+            inherit system;
+            settings = {
+              schemaVersion = realMigrations.currentVersion;
+              inherit storage;
+            };
+            modules = [ ../../../examples/hosts/minimal/configuration.nix ];
+          };
+
+          # deepSeq inside the tryEval: tryEval alone forces only to WHNF, so
+          # an error raised while evaluating a field of this attrset escapes
+          # the catch entirely and takes the whole check down instead of
+          # being reported. Measured, not assumed -- the first version of
+          # this probe died on the `/` case rather than catching it.
+          probe = storage:
+            let
+              v = {
+                failed = map (a: a.message)
+                  (builtins.filter (a: !a.assertion) (hostWith storage).config.assertions);
+                snapraidEnabled = (hostWith storage).config.services.snapraid.enable;
+              };
+              r = builtins.tryEval (builtins.deepSeq v v);
+            in
+            if r.success then r.value // { threw = false; }
+            else { failed = [ ]; snapraidEnabled = false; threw = true; };
+
+          failuresMatching = phrase: storage:
+            builtins.filter (m: lib.hasInfix phrase m) (probe storage).failed;
+
+          overlapPhrase = "both contain";
+          emptyPhrase = "is on and";
+          reservedPhrase = "is equal to,";
+          anyParityFailure = storage:
+            lib.concatMap (phrase: failuresMatching phrase storage)
+              [ overlapPhrase emptyPhrase reservedPhrase ];
+
+          overlap = { pool = pooled; parity = { enable = true; disks = [ "/mnt/ferrum-check-b" ]; }; };
+          emptyDisks = { pool = pooled; parity = { enable = true; disks = [ ]; }; };
+          reserved = { pool = pooled; parity = { enable = true; disks = [ "/data" ]; }; };
+          osDisk = { pool = pooled; parity = { enable = true; disks = [ "/" ]; }; };
+          working = { pool = pooled; parity = { enable = true; disks = [ "/mnt/ferrum-parity-0" ]; }; };
+          off = { pool = pooled; };
+
+          overlapRejected = failuresMatching overlapPhrase overlap != [ ];
+          emptyRejected = failuresMatching emptyPhrase emptyDisks != [ ];
+          reservedRejected = failuresMatching reservedPhrase reserved != [ ];
+          osDiskRefused = (probe osDisk).threw;
+          workingAccepted = anyParityFailure working == [ ];
+          workingIsConfigured = (probe working).snapraidEnabled;
+          offConfiguresNothing = !(probe off).snapraidEnabled;
+          emptyConfiguresNothing = !(probe emptyDisks).snapraidEnabled;
+
+          # "Fires on EVERY evaluation, not only at first install."
+          #
+          # There is no first-install/later distinction to exercise
+          # directly: a NixOS assertion is read on every `nixos-rebuild`,
+          # full stop. What can drift, and what this pins, is WHERE the
+          # assertion reads its inputs from. An assertion written against
+          # the settings document would catch the installer's output and
+          # miss an operator who later adds the branch from
+          # /etc/ferrum/custom/, and vice versa. So the same overlap is
+          # introduced the OTHER way -- through an ordinary NixOS module
+          # layered on top, which is what /etc/ferrum/custom/*.nix is -- and
+          # must produce the identical refusal.
+          overlapViaModule =
+            let
+              host = ferrumLib.mkHost {
+                inherit system;
+                settings = {
+                  schemaVersion = realMigrations.currentVersion;
+                  storage.pool = pooled;
+                };
+                modules = [
+                  ../../../examples/hosts/minimal/configuration.nix
+                  { ferrum.storage.parity = { enable = true; disks = [ "/mnt/ferrum-check-b" ]; }; }
+                ];
+              };
+              v = map (a: a.message) (builtins.filter (a: !a.assertion) host.config.assertions);
+              r = builtins.tryEval (builtins.deepSeq v v);
+            in
+            if r.success then builtins.filter (m: lib.hasInfix overlapPhrase m) r.value != [ ]
+            else false;
+        in
+        {
+          ok = overlapRejected
+            && emptyRejected
+            && reservedRejected
+            && osDiskRefused
+            && workingAccepted
+            && workingIsConfigured
+            && offConfiguresNothing
+            && emptyConfiguresNothing
+            && overlapViaModule;
+          message =
+            "modules/core/parity.nix does not keep a parity disk out of the "
+            + "mergerfs pool, or refuses a configuration it should accept";
+          inherit overlapRejected emptyRejected reservedRejected osDiskRefused
+            workingAccepted workingIsConfigured offConfiguresNothing
+            emptyConfiguresNothing overlapViaModule;
+        };
+
+      # R2. The SnapRAID exclude list is computed from ferrum's own resolved
+      # storage options, and it is written in the ONE path grammar SnapRAID
+      # actually reads.
+      #
+      # THE GRAMMAR IS THE WHOLE POINT, and it is not the obvious one. A
+      # SnapRAID `exclude` path is relative to EACH data disk's own root, not
+      # absolute on the host. Measured against snapraid 12.4 on real
+      # loop-mounted ext4 disks: the per-branch absolute form
+      # (`/mnt/ferrum-disk-0/torrents/**`) excluded NOTHING -- all seven
+      # files, downloads included, were taken into the array -- because it is
+      # read as `<disk>/mnt/ferrum-disk-0/torrents/**` and matches nothing
+      # that exists. The `/torrents/**` glob form also failed (five taken).
+      # Only `/torrents/` -- the trailing-slash directory form asserted here
+      # -- left exactly the two media/ files.
+      #
+      # That failure is silent and inverted, which is why it is worth a check
+      # rather than a comment: the host still syncs, still reports success,
+      # and still says it is protected, while spending every sync on exactly
+      # the churn the exclusion existed to skip.
+      #
+      # Read off the GENERATED /etc/snapraid.conf as well as the option,
+      # because the option is an intermediate and the file is what snapraid
+      # parses -- the same discipline the separator checks use.
+      #
+      # The anti-vacuity halves: `media/` must NEVER appear (an exclude list
+      # that excluded the library would pass a pure "does torrents appear"
+      # test while destroying the feature), and the default list must be
+      # exactly the expected set rather than a superset -- an unconstrained
+      # "contains" test passes identically on a list that excludes
+      # everything.
+      parityExcludesOnlyTheChurn =
+        let
+          branches = [ "/mnt/ferrum-check-a" "/mnt/ferrum-check-b" ];
+          pooled = { enable = true; inherit branches; };
+          withParity = { enable = true; disks = [ "/mnt/ferrum-parity-0" ]; };
+
+          hostWith = storage: ferrumLib.mkHost {
+            inherit system;
+            settings = {
+              schemaVersion = realMigrations.currentVersion;
+              inherit storage;
+            };
+            modules = [ ../../../examples/hosts/minimal/configuration.nix ];
+          };
+
+          excludesOf = storage: (hostWith storage).config.services.snapraid.exclude;
+          confOf = storage:
+            (hostWith storage).config.environment.etc."snapraid.conf".text;
+
+          defaultHost = { pool = pooled; parity = withParity; };
+          defaultExcludes = excludesOf defaultHost;
+
+          # The exact set a default two-branch host must produce. Spelled out
+          # rather than recomputed from the module, which would make this
+          # check agree with any implementation including a broken one.
+          expected = [
+            "*.unrecoverable"
+            "/snapraid.content"
+            "/torrents/"
+            "/usenet/"
+          ];
+
+          # The trailing-slash directory form, asserted against the file
+          # snapraid actually parses.
+          conf = confOf defaultHost;
+          confHasDirForm =
+            lib.hasInfix "\nexclude /torrents/\n" conf
+            && lib.hasInfix "\nexclude /usenet/\n" conf;
+
+          # No entry anywhere may be an absolute host path: that is the form
+          # that silently matches nothing. Every branch prefix is checked,
+          # against every entry.
+          absoluteEntries = builtins.filter
+            (e: lib.any (b: lib.hasPrefix b e) branches)
+            defaultExcludes;
+
+          # media/ is the content parity exists for.
+          mediaExcluded = builtins.filter (e: lib.hasInfix "media" e) defaultExcludes;
+
+          # Relocating ONE of the three ferrum roots under a branch must add
+          # exactly that one's entry, named relative to the branch -- and
+          # must not add the other two.
+          relocated = attr: value:
+            excludesOf ({ pool = pooled; parity = withParity; } // { ${attr} = value; });
+          stateMoved = relocated "stateDir" "/mnt/ferrum-check-a/ferrum-state";
+          snapsMoved = relocated "snapshotDir" "/mnt/ferrum-check-a/ferrum-snaps";
+          journalMoved = relocated "journalDir" "/mnt/ferrum-check-b/ferrum-journal";
+
+          added = moved: lib.subtractLists defaultExcludes moved;
+          stateAdded = added stateMoved == [ "/ferrum-state/" ];
+          snapsAdded = added snapsMoved == [ "/ferrum-snaps/" ];
+          journalAdded = added journalMoved == [ "/ferrum-journal/" ];
+
+          # And the control for all three: with every root at its default,
+          # OUTSIDE any branch, none of them contributes an entry. Without
+          # this, an implementation that unconditionally emitted all three
+          # would satisfy every assertion above.
+          defaultsContributeNothing =
+            builtins.filter (e: lib.hasInfix "ferrum" e) defaultExcludes == [ ];
+
+          # An unpooled single-data-disk host protects mediaDir itself, and
+          # must still get the churn excluded.
+          unpooled = excludesOf { parity = withParity; };
+        in
+        {
+          ok = lib.naturalSort defaultExcludes == lib.naturalSort expected
+            && confHasDirForm
+            && absoluteEntries == [ ]
+            && mediaExcluded == [ ]
+            && stateAdded
+            && snapsAdded
+            && journalAdded
+            && defaultsContributeNothing
+            && lib.naturalSort unpooled == lib.naturalSort expected;
+          message =
+            "modules/core/parity.nix's SnapRAID exclude list is not the churn "
+            + "of ferrum's own layout, or is written in a path form snapraid "
+            + "does not match";
+          inherit defaultExcludes confHasDirForm absoluteEntries mediaExcluded
+            stateAdded snapsAdded journalAdded defaultsContributeNothing unpooled;
+        };
+
+      # R3. Both parity timers are generated in the self-healing shape, both
+      # are independently disablable, and both units are deprioritized below
+      # anything a person is waiting for.
+      #
+      # WHAT THE UPSTREAM MODULE ACTUALLY DOES, read out of the pinned
+      # nixpkgs rather than assumed: `services.snapraid` schedules its two
+      # units with `startAt`, which is sugar for a bare `OnCalendar` (01:00
+      # for sync, Mon 02:00 for scrub) and nothing else. There is no
+      # `OnBootSec`, no `Persistent`, and no per-unit enable. On a host that
+      # is not always on -- which a home media server frequently is not -- a
+      # calendar time that came due while the machine was asleep is simply
+      # missed, and the array stays unprotected until the same hour comes
+      # round again. So ferrum replaces the timerConfig outright.
+      #
+      # `mkForce` is required rather than stylistic: `startAt` has already
+      # written OnCalendar into the same attribute set, and a merge would
+      # leave a timer that fires on the interval AND at 01:00 -- which is
+      # neither setting's meaning. This check is what holds that, by
+      # asserting OnCalendar is absent from the generated timerConfig.
+      #
+      # The anti-vacuity halves: the default host must HAVE both timers (so
+      # the field assertions are about something), the disabled host must
+      # have both suppressed, and the parity-off host must generate neither
+      # unit at all. Without the last one, every assertion here would pass
+      # against a module that generates nothing anywhere.
+      parityTimersSelfHeal =
+        let
+          branches = [ "/mnt/ferrum-check-a" "/mnt/ferrum-check-b" ];
+          base = { enable = true; disks = [ "/mnt/ferrum-parity-0" ]; };
+
+          hostWith = parity: ferrumLib.mkHost {
+            inherit system;
+            settings = {
+              schemaVersion = realMigrations.currentVersion;
+              storage = {
+                pool = { enable = true; inherit branches; };
+                inherit parity;
+              };
+            };
+            modules = [ ../../../examples/hosts/minimal/configuration.nix ];
+          };
+
+          cfgOf = parity: (hostWith parity).config;
+
+          # Read off systemd.units, which is what actually reaches the
+          # generation: `systemd.timers.<n>.enable = false` leaves the entry
+          # in `systemd.timers` and only clears it here. An options-level
+          # check would have passed on a module that disabled nothing.
+          timerEnabled = parity: name:
+            (cfgOf parity).systemd.units."${name}.timer".enable or null;
+          timerExists = parity: name:
+            (cfgOf parity).systemd.units ? "${name}.timer";
+          timerCfg = parity: name:
+            (cfgOf parity).systemd.timers.${name}.timerConfig or { };
+          ioClass = parity: name:
+            (cfgOf parity).systemd.services.${name}.serviceConfig.IOSchedulingClass or null;
+
+          defaults = base;
+          customInterval = base // {
+            sync.intervalMinutes = 180;
+            scrub.intervalMinutes = 20160;
+          };
+          disabled = base // { sync.enable = false; scrub.enable = false; };
+          syncOnly = base // { scrub.enable = false; };
+          off = { enable = false; disks = [ ]; };
+
+          # The three fields modules/proxy/dns.nix's self-healing timer
+          # carries, and the one that must NOT survive the override.
+          selfHealing = name:
+            let t = timerCfg defaults name; in
+            (t ? OnBootSec) && (t ? OnUnitActiveSec) && (t.Persistent or false) == true
+            && !(t ? OnCalendar);
+
+          intervalIsTheOption =
+            (timerCfg customInterval "snapraid-sync").OnUnitActiveSec or null == "180min"
+            && (timerCfg customInterval "snapraid-scrub").OnUnitActiveSec or null == "20160min";
+
+          # Two DISTINCT units with independent schedules, not one timer
+          # driving both.
+          twoDistinctSchedules =
+            (timerCfg defaults "snapraid-sync").OnUnitActiveSec or null
+            != (timerCfg defaults "snapraid-scrub").OnUnitActiveSec or null
+            && (timerCfg defaults "snapraid-sync").Unit or null == "snapraid-sync.service"
+            && (timerCfg defaults "snapraid-scrub").Unit or null == "snapraid-scrub.service";
+
+          # The sync unit records WHERE ferrum-apply looks.
+          #
+          # Two files name this path independently -- `LAST_SYNC_FILE` in
+          # crates/ferrum-apply/src/parity.rs, which READS it, and
+          # modules/core/parity.nix's `parityStateDir`, whose ExecStopPost
+          # WRITES it -- and nothing else holds them together. The drift is
+          # silent in the worst direction: a host whose Nix side moved would
+          # keep syncing happily while every status surface reported "never
+          # synced" forever, because the reader is looking at a path nothing
+          # writes any more. So the path is read out of the Rust constant and
+          # asserted against the GENERATED unit and tmpfiles rules.
+          lastSyncDir =
+            let
+              src = builtins.readFile ../../../crates/ferrum-apply/src/parity.rs;
+              hits = builtins.filter builtins.isList
+                (builtins.split "pub const LAST_SYNC_FILE: &str = \"([^\"]+)\"" src);
+            in
+            if hits == [ ] then
+              throw ("crates/ferrum-apply/src/parity.rs no longer declares LAST_SYNC_FILE as a "
+                + "string literal, so parity-timers-self-heal cannot check that the unit "
+                + "writes where the reader looks")
+            else dirOf (builtins.head (builtins.head hits));
+
+          syncWritesWhereTheReaderLooks =
+            let cfg = cfgOf defaults; in
+            builtins.elem lastSyncDir
+              (cfg.systemd.services.snapraid-sync.serviceConfig.ReadWritePaths or [ ])
+            && builtins.any (r: lib.hasInfix "d ${lastSyncDir} " r) cfg.systemd.tmpfiles.rules
+            && (cfg.systemd.services.snapraid-sync.serviceConfig.ExecStopPost or null) != null;
+        in
+        {
+          ok = selfHealing "snapraid-sync"
+            && selfHealing "snapraid-scrub"
+            && intervalIsTheOption
+            && twoDistinctSchedules
+            && timerEnabled defaults "snapraid-sync" == true
+            && timerEnabled defaults "snapraid-scrub" == true
+            && timerEnabled disabled "snapraid-sync" == false
+            && timerEnabled disabled "snapraid-scrub" == false
+            # Independently disablable, not one switch for both.
+            && timerEnabled syncOnly "snapraid-sync" == true
+            && timerEnabled syncOnly "snapraid-scrub" == false
+            && ioClass defaults "snapraid-sync" == "idle"
+            && ioClass defaults "snapraid-scrub" == "idle"
+            # A host with both timers off still HAS the units, which is what
+            # makes `ferrum-apply parity-sync` work there.
+            && timerExists disabled "snapraid-sync"
+            && !(timerExists off "snapraid-sync")
+            && !(timerExists off "snapraid-scrub")
+            && syncWritesWhereTheReaderLooks;
+          message =
+            "modules/core/parity.nix's timers are not in the self-healing shape "
+            + "modules/proxy/dns.nix uses, are not independently disablable, or "
+            + "are not deprioritized";
+          syncTimer = timerCfg defaults "snapraid-sync";
+          scrubTimer = timerCfg defaults "snapraid-scrub";
+          disabledSyncEnabled = timerEnabled disabled "snapraid-sync";
+          disabledScrubEnabled = timerEnabled disabled "snapraid-scrub";
+          syncOnlyScrubEnabled = timerEnabled syncOnly "snapraid-scrub";
+          inherit intervalIsTheOption twoDistinctSchedules;
+          syncIo = ioClass defaults "snapraid-sync";
+          scrubIo = ioClass defaults "snapraid-scrub";
+          offHasTimers = timerExists off "snapraid-sync";
+          inherit lastSyncDir syncWritesWhereTheReaderLooks;
+        };
+
+      # R4. The parity view renders every state the producer can send, the
+      # envelope ferrumd actually constructs, and the limitation sentence.
+      #
+      # Three files have to agree and nothing but this holds them together:
+      # crates/ferrum-apply/src/parity.rs owns the state vocabulary,
+      # crates/ferrumd/src/parity.rs owns the envelope, and ui/app.js
+      # transcribes both. A state the daemon can send with no branch in the UI
+      # renders as a blank tile, and a blank tile where "Protected" belongs is
+      # indistinguishable from a blank tile where "a parity disk is missing"
+      # belongs -- which is the whole failure this requirement exists to
+      # prevent. Modelled directly on `updates-view-is-wired`, which exists
+      # because exactly that drift happened on the first day the update files
+      # lived apart.
+      #
+      # Every lookup throws rather than returning an empty list when it cannot
+      # find what it guards. A check that cannot find its subject must fail,
+      # not pass -- this repository shipped three checks in one week that
+      # could not fail, and a vacuous list comparison is how two of them got
+      # that way.
+      parityViewIsWired =
+        let
+          appSrc = builtins.readFile ../../../ui/app.js;
+          lines = lib.splitString "\n" appSrc;
+          rustLines = lib.splitString "\n"
+            (builtins.readFile ../../../crates/ferrum-apply/src/parity.rs);
+          daemonLines = lib.splitString "\n"
+            (builtins.readFile ../../../crates/ferrumd/src/parity.rs);
+          indexHtml = builtins.readFile ../../../ui/index.html;
+
+          indexIn = src: file: what: infix:
+            let
+              hits = builtins.filter (e: lib.hasInfix infix e.l)
+                (lib.imap0 (i: l: { inherit i l; }) src);
+            in
+            if hits == [ ] then
+              throw (file + " no longer has a line containing '" + infix
+                + "', so parity-view-is-wired cannot verify " + what
+                + ". A check that cannot find what it guards must fail, not pass.")
+            else (builtins.head hits).i;
+
+          blockIn = src: file: what: startInfix: isEnd:
+            let
+              after = lib.drop ((indexIn src file what startInfix) + 1) src;
+              take = acc: rest:
+                if rest == [ ] then
+                  throw (file + " opens '" + startInfix
+                    + "' but parity-view-is-wired cannot find the line that closes it")
+                else if isEnd (builtins.head rest) then acc
+                else take (acc ++ [ (builtins.head rest) ]) (builtins.tail rest);
+              block = take [ ] after;
+            in
+            if block == [ ] then
+              throw (file + "'s '" + startInfix + "' block is empty, so every assertion "
+                + "parity-view-is-wired makes about " + what + " would be vacuously true")
+            else block;
+
+          quotedIn = re: line:
+            map builtins.head (builtins.filter builtins.isList (builtins.split re line));
+
+          # A one-line `const NAME = ["a", "b"];` declaration in ui/app.js.
+          vocabOf = what: name:
+            let
+              values = quotedIn "\"([a-zA-Z][a-zA-Z0-9-]*)\""
+                (builtins.elemAt lines (indexIn lines "ui/app.js" what "const ${name} = ["));
+            in
+            if values == [ ] then
+              throw ("ui/app.js declares " + name + " but parity-view-is-wired read no names "
+                + "out of it -- it is no longer a single-line array literal, and an empty "
+                + "vocabulary would make the branch-coverage assertion vacuous")
+            else values;
+
+          # The keys of a one-entry-per-line state table.
+          branchesOf = what: name:
+            let
+              keys = lib.concatMap (quotedIn "\"([a-z-]+)\":")
+                (blockIn lines "ui/app.js" what "const ${name} = {" (l: l == "};"));
+            in
+            if keys == [ ] then
+              throw ("ui/app.js declares " + name
+                + " but parity-view-is-wired found no \"state\": keys in it")
+            else keys;
+
+          uiStates = vocabOf "the parity-state vocabulary" "PARITY_STATES";
+          uiBranches = branchesOf "parity-state rendering" "PARITY_STATE_TEXT";
+
+          # The producer's own enum, read out of its `#[serde(rename_all =
+          # "kebab-case")] pub enum ParityState` block. This is what turns the
+          # UI's list from a transcription into an invariant.
+          rustVariants =
+            let
+              block = blockIn rustLines "crates/ferrum-apply/src/parity.rs"
+                "the ParityState variants" "pub enum ParityState {" (l: l == "}");
+              # One CamelCase variant per non-comment, non-blank line.
+              names = lib.concatMap
+                (l:
+                  let t = lib.removeSuffix "," (lib.trim l); in
+                  if t == "" || lib.hasPrefix "/" t then [ ]
+                  else if builtins.match "[A-Z][A-Za-z]*" t != null then [ t ]
+                  else [ ])
+                block;
+              kebab = name:
+                let
+                  chars = lib.stringToCharacters name;
+                  piece = i: c:
+                    if i == 0 then lib.toLower c
+                    else if c == lib.toUpper c && c != lib.toLower c then "-${lib.toLower c}"
+                    else c;
+                in
+                lib.concatStrings (lib.imap0 piece chars);
+            in
+            if names == [ ] then
+              throw ("crates/ferrum-apply/src/parity.rs declares ParityState but "
+                + "parity-view-is-wired read no variants out of it")
+            else map kebab names;
+
+          # The envelope keys and statuses ferrumd really constructs.
+          daemonHasStatus = s:
+            builtins.any (l: lib.hasInfix "\"status\": \"${s}\"" l) daemonLines;
+          uiEnvelopeStatuses = vocabOf "the envelope statuses" "PARITY_ENVELOPE_STATUSES";
+          uiEnvelopeKeys = vocabOf "the envelope keys" "PARITY_ENVELOPE_KEYS";
+
+          missing = builtins.filter (s: !(builtins.elem s uiBranches)) uiStates;
+          extra = builtins.filter (s: !(builtins.elem s uiStates)) uiBranches;
+          uiMissesRust = builtins.filter (s: !(builtins.elem s uiStates)) rustVariants;
+          rustMissesUi = builtins.filter (s: !(builtins.elem s rustVariants)) uiStates;
+          statusDrift = builtins.filter (s: !(daemonHasStatus s)) uiEnvelopeStatuses;
+          keyDrift = builtins.filter
+            (k: !(builtins.any (l: lib.hasInfix "\"${k}\":" l) daemonLines))
+            uiEnvelopeKeys;
+
+          # R6, mechanically. The limitation sentence lives in the producer and
+          # the UI renders whatever it sends, so what has to be true here is
+          # that the UI does NOT write its own, and that no new surface says
+          # "backup".
+          renderedFromReport = builtins.any
+            (l: lib.hasInfix "orUnknown(report.limitation)" l) lines;
+
+          # The one word this feature may never use about parity, scanned
+          # across the text an operator actually reads.
+          #
+          # SCOPED TO RENDERED TEXT, NOT TO SOURCE, and the scoping is the
+          # whole difficulty rather than a convenience. The first version of
+          # this scanned whole files and failed immediately -- on the comment
+          # explaining why the word is forbidden, and on the unit test that
+          # asserts its absence. A scan that cannot tell "says it" from
+          # "forbids it" reports the rule being enforced as a violation of
+          # itself, and the only way to make it pass would have been to stop
+          # writing the rule down.
+          #
+          # So: the parity view's own block, with comment lines dropped, which
+          # is exactly the strings the browser renders; and the `LIMITATION`
+          # constant, which every other surface takes its words from. The
+          # `nixpkgs` module path (nixos/modules/services/BACKUP/snapraid.nix)
+          # is upstream's filing decision and is deliberately out of scope --
+          # it is not a surface ferrum shows anybody.
+          parityViewBlock =
+            blockIn lines "ui/app.js" "the parity view's rendered text"
+              "// --- parity ---" (l: lib.hasPrefix "// --- routing" l);
+          isComment = l: let t = lib.trim l; in lib.hasPrefix "//" t || lib.hasPrefix "/*" t;
+          limitationLines =
+            blockIn rustLines "crates/ferrum-apply/src/parity.rs"
+              "the limitation sentence" "pub const LIMITATION: &str =" (l: lib.hasSuffix "\";" l);
+          backupMentions =
+            builtins.filter (l: lib.hasInfix "backup" (lib.toLower l))
+              (builtins.filter (l: !(isComment l)) parityViewBlock ++ limitationLines);
+
+          # The nav is hand-written and NOT generated from app.js's `routes`
+          # map, so a view can exist and be unreachable.
+          navLinked = lib.hasInfix "href=\"#/parity\"" indexHtml;
+          routeDeclared = builtins.any (l: lib.hasInfix "\"#/parity\": parityView" l) lines;
+        in
+        {
+          ok = missing == [ ]
+            && extra == [ ]
+            && uiMissesRust == [ ]
+            && rustMissesUi == [ ]
+            && statusDrift == [ ]
+            && keyDrift == [ ]
+            && renderedFromReport
+            && backupMentions == [ ]
+            && navLinked
+            && routeDeclared
+            && builtins.length uiStates >= 8;
+          message =
+            "ui/app.js's parity view is out of step with the state vocabulary "
+            + "crates/ferrum-apply/src/parity.rs owns or the envelope "
+            + "crates/ferrumd/src/parity.rs constructs";
+          inherit missing extra uiMissesRust rustMissesUi statusDrift keyDrift
+            renderedFromReport backupMentions navLinked routeDeclared;
+          stateCount = builtins.length uiStates;
+        };
+
+      # R6. The product says "parity is not a backup" itself, on the surfaces
+      # an operator actually reads -- and never the reverse.
+      #
+      # THE SCAN HAS TO BE SHAPED, NOT A WORD BAN, and getting that wrong is
+      # the obvious mistake rather than a subtle one. A check that simply
+      # forbade the word "backup" anywhere would fail on the heading "Parity
+      # is not a backup" -- which is the exact sentence this requirement
+      # exists to make the product say. It would also fail on the restore
+      # procedure's instruction to use a real backup when both a data disk
+      # and the parity disk are gone, which is the most important advice on
+      # that page. The only way to make that version pass would be to delete
+      # the writing. (`parity-view-is-wired` already learned this once, on
+      # its own first run.)
+      #
+      # So two different assertions over two different shapes:
+      #
+      #   1. REQUIRED. The operator documentation must carry the disclaimer
+      #      and the specific things parity does not survive. This is the
+      #      same required-phrase shape the stale-comment scan uses.
+      #   2. FORBIDDEN. No surface may AFFIRM it -- the handful of phrasings
+      #      that would actually claim parity is a backup, matched
+      #      case-insensitively, across the doc and every parity prose
+      #      surface. Scanning for claims rather than for a word is what lets
+      #      the denial and the claim be told apart.
+      parityNeverClaimsToBeABackup =
+        let
+          doc = builtins.readFile ../../../docs/storage/parity.md;
+          rustSrc = builtins.readFile ../../../crates/ferrum-apply/src/parity.rs;
+          appSrc = builtins.readFile ../../../ui/app.js;
+
+          required = [
+            "Parity is not a backup"
+            "undo a deletion"
+            "ransomware"
+            "the parity disk is **in** that box"
+            "rollback` is not this either"
+          ];
+          missing = builtins.filter (p: !(lib.hasInfix p doc)) required;
+
+          # The claims. Lower-cased on both sides so a capitalised version
+          # cannot slip past, and written as whole phrases so the word on its
+          # own -- which the denial needs -- is not what is being matched.
+          claims = [
+            "parity is a backup"
+            "parity is your backup"
+            "backed up by parity"
+            "parity backs up"
+            "backup of your library"
+            "acts as a backup"
+            "serves as a backup"
+            "a backup of the"
+          ];
+          affirmsIn = name: src:
+            map (c: "${name}: ${c}")
+              (builtins.filter (c: lib.hasInfix c (lib.toLower src)) claims);
+          affirmations =
+            affirmsIn "docs/storage/parity.md" doc
+            ++ affirmsIn "crates/ferrum-apply/src/parity.rs" rustSrc
+            ++ affirmsIn "ui/app.js" appSrc
+            ++ affirmsIn "modules/core/parity.nix"
+              (builtins.readFile ../../../modules/core/parity.nix)
+            ++ affirmsIn "modules/core/options.nix"
+              (builtins.readFile ../../../modules/core/options.nix);
+
+          # The one constant every other surface takes its words from. If it
+          # ever stopped naming the single-disk limit, every surface that
+          # renders it would quietly stop saying it too.
+          #
+          # SCOPED TO THE CONSTANT'S OWN LINES, not to the file. The first
+          # version of this searched the whole of parity.rs and survived a
+          # mutant that gutted the constant -- because the same phrase also
+          # appears in two of that file's TESTS, which assert the constant
+          # says it. A check satisfied by the test that checks the thing is
+          # a check of nothing.
+          limitationBlock =
+            let
+              indexed = lib.imap0 (i: l: { inherit i l; }) (lib.splitString "\n" rustSrc);
+              hits = builtins.filter (e: lib.hasInfix "pub const LIMITATION" e.l) indexed;
+            in
+            if hits == [ ] then
+              throw ("crates/ferrum-apply/src/parity.rs no longer declares LIMITATION, so "
+                + "parity-never-claims-to-be-a-backup cannot check what every parity surface "
+                + "renders. A check that cannot find what it guards must fail, not pass.")
+            else
+              let
+                after = lib.drop (builtins.head hits).i
+                  (lib.splitString "\n" rustSrc);
+                take = acc: rest:
+                  if rest == [ ] then
+                    throw "LIMITATION is declared but its closing `\";` cannot be found"
+                  else
+                    let head = builtins.head rest; in
+                    if lib.hasSuffix "\";" head then acc ++ [ head ]
+                    else take (acc ++ [ head ]) (builtins.tail rest);
+              in
+              lib.concatStringsSep "\n" (take [ ] after);
+          limitationIsSpecific = lib.hasInfix "single local disk" limitationBlock;
+
+          # Anti-vacuity: the claim list must actually be capable of matching.
+          # Without this, a typo in every entry would make `affirmations`
+          # permanently empty and the check permanently, silently green.
+          scannerWorks =
+            affirmsIn "probe" "Parity is a backup of the whole library." != [ ];
+        in
+        {
+          ok = missing == [ ] && affirmations == [ ] && limitationIsSpecific && scannerWorks;
+          message =
+            "the parity surfaces no longer state that parity is not a backup, "
+            + "or one of them now claims it is";
+          inherit missing affirmations limitationIsSpecific scannerWorks;
+        };
+
       # The self-signed certificate follows ferrum.proxy.baseDomain.
       #
       # Its CN and both SANs are built from that option, and the unit that
@@ -4428,8 +5147,17 @@
 
           # The view's own source, delimited by the banner comments this file
           # already uses to separate its sections.
+          #
+          # It ends at the NEXT banner, whichever that is, rather than at
+          # `// --- routing ---` specifically. That is a correction, not a
+          # loosening: the original terminator silently assumed Updates was
+          # the last view in the file, so adding a sixth section between the
+          # two made this block swallow it -- and `foreignJobKinds` then
+          # reported the Parity view's own `parity_status`/`parity_sync`
+          # calls as kinds the Updates screen was starting. The allowlist
+          # below is untouched; what changed is which lines it is applied to.
           updatesBlock = blockAt "the Updates view's own source"
-            "// --- updates ---" (l: lib.hasInfix "// --- routing ---" l);
+            "// --- updates ---" (l: lib.hasPrefix "// --- " l);
 
           # The per-app row builder, to its closing brace at column zero.
           appRowBlock = blockAt "the per-app row builder" "function appRow(" (l: l == "}");
@@ -5302,6 +6030,16 @@
           mkAssertionCheck "pool-branches-are-all-seeded" poolBranchesAreAllSeeded;
         pool-assertions-can-fire =
           mkAssertionCheck "pool-assertions-can-fire" poolAssertionsCanFire;
+        parity-disk-is-never-a-pool-branch =
+          mkAssertionCheck "parity-disk-is-never-a-pool-branch" parityDiskIsNeverAPoolBranch;
+        parity-excludes-only-the-churn =
+          mkAssertionCheck "parity-excludes-only-the-churn" parityExcludesOnlyTheChurn;
+        parity-timers-self-heal =
+          mkAssertionCheck "parity-timers-self-heal" parityTimersSelfHeal;
+        parity-view-is-wired =
+          mkAssertionCheck "parity-view-is-wired" parityViewIsWired;
+        parity-never-claims-to-be-a-backup =
+          mkAssertionCheck "parity-never-claims-to-be-a-backup" parityNeverClaimsToBeABackup;
         media-tree-waits-for-its-mounts =
           mkAssertionCheck "media-tree-waits-for-its-mounts" mediaTreeWaitsForItsMounts;
         branch-roots-are-ownership-checked =

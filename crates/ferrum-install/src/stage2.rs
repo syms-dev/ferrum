@@ -309,6 +309,7 @@ mod tests {
             // host through settings.json, which render.rs owns and tests.
             dns: None,
             plex_claim: None,
+            parity_disk: None,
         }
     }
 

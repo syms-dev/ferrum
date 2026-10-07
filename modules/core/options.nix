@@ -159,6 +159,108 @@ in
           '';
         };
       };
+      parity = {
+        enable = mkOption {
+          type = types.bool;
+          default = false;
+          description = ''
+            Protect the data disks with SnapRAID parity, so that losing one
+            disk loses nothing.
+
+            OFF by default, and that is a decision rather than caution.
+            Parity claims a whole dedicated disk, and "a spare disk exists"
+            is not something ferrum can detect without risking claiming a
+            disk the operator meant for something else. So this follows the
+            same "detect candidates, then ask" shape
+            ferrum.storage.pool.enable already uses.
+
+            PARITY IS NOT A BACKUP. It rebuilds a disk that FAILED. It does
+            not undo a deletion, it does not survive a corruption that was
+            synced before anyone noticed, and it does not survive fire,
+            theft or ransomware -- every one of those reaches the parity
+            disk too, because the parity disk is in the same machine.
+          '';
+        };
+
+        disks = mkOption {
+          # Not types.listOf types.str, for the same two-grammar reason
+          # pool.branches carries: modules/core/parity.nix interpolates each
+          # entry into services.snapraid.parityFiles (which NixOS emits into
+          # the generated /etc/snapraid.conf, a LINE-oriented grammar) and
+          # into the snapraid units' ReadWritePaths, a systemd unit
+          # LIST-field NixOS emits one unescaped line per element. See
+          # modules/lib/hostnames.nix.
+          type = types.listOf hostnames.absolutePath;
+          default = [ ];
+          example = [ "/mnt/ferrum-parity-0" ];
+          description = ''
+            The mount points of the disks dedicated to parity, in order.
+            Their mounts are declared in /etc/ferrum/custom/parity.nix,
+            which is the operator's to edit.
+
+            These are PARITY disks: they hold no library content and are
+            never unioned into the pool. modules/core/parity.nix asserts
+            that none of them is also a ferrum.storage.pool.branches entry,
+            because a disk that is both is not extra space -- it is space
+            SnapRAID and mergerfs are both writing to.
+
+            A list because SnapRAID supports up to six parity levels, each
+            surviving one more simultaneous disk failure. One entry is the
+            configuration ferrum tests end to end.
+          '';
+        };
+
+        sync = {
+          enable = mkOption {
+            type = types.bool;
+            default = true;
+            description = ''
+              Run `snapraid sync` on a timer.
+
+              On by default, which breaks from `ferrum-apply gc`'s
+              manual-only precedent deliberately: gc DELETES snapshots, so
+              the dangerous thing is running it unattended. Sync's risk
+              points the other way -- the dangerous state is NOT running it,
+              because every file written since the last sync is unprotected.
+              Set to false for fully manual control; staleness reporting
+              works identically either way.
+            '';
+          };
+          intervalMinutes = mkOption {
+            type = types.int;
+            default = 1440;
+            description = ''
+              How often `snapraid sync` runs. Nightly by default: a sync
+              reads every changed file and the whole parity file, so it is
+              not something to do hourly on a pool of spinning disks.
+            '';
+          };
+        };
+
+        scrub = {
+          enable = mkOption {
+            type = types.bool;
+            default = true;
+            description = ''
+              Run `snapraid scrub` on a timer. Scrub re-reads a percentage
+              of already-synced data and compares it against the hashes
+              recorded at sync, which is how silent corruption is found
+              while parity can still repair it.
+            '';
+          };
+          intervalMinutes = mkOption {
+            type = types.int;
+            default = 10080;
+            description = ''
+              How often `snapraid scrub` runs. Weekly by default, and
+              deliberately far longer than the sync interval: scrub exists
+              to catch slow bit-rot, and each pass re-reads real data off
+              the disks.
+            '';
+          };
+        };
+      };
+
       mediaGroup = mkOption {
         # Not types.str: modules/core/storage.nix uses this as the ATTRIBUTE
         # NAME in `users.groups.${mediaGroup}`, so it becomes a row in

@@ -199,6 +199,22 @@ export const updates = () => request("GET", "/api/updates");
 export const updatesForJob = (jobId) =>
   request("GET", `/api/updates?job=${encodeURIComponent(jobId)}`);
 
+/// The newest parity status report this host produced.
+///
+/// Same three-key envelope `updates()` uses, and for the same reason: the
+/// caller never has to tell "no report" apart from "a report that happens to
+/// be empty".
+///
+/// Note the two different absences this can describe, which are NOT the same
+/// fact. `status: "never-checked"` means no parity check has ever run here.
+/// A report whose own `state` is `"not-configured"` means the check ran and
+/// found that this host has no parity at all. Rendering them identically
+/// would tell an operator with parity configured, but unchecked, that they
+/// have no parity.
+///
+/// @returns {Promise<{status: string, jobId: string|null, report: object|null}>}
+export const parity = () => request("GET", "/api/parity");
+
 // --- writes --------------------------------------------------------------
 
 /// Writes settings. NEVER triggers an apply -- that is a separate, explicit
@@ -216,11 +232,13 @@ export const putSecret = (name, value) =>
 
 /// Starts a privileged job. `kind` is one of the daemon's closed set:
 /// preflight, apply, rollback, restore_state, gc, check_update, update,
-/// confirm_update.
+/// confirm_update, parity_sync, parity_status.
 ///
-/// Every kind but `check_update` can come back 409 from the daemon's
-/// single-job interlock. `check_update` deliberately does not claim it, so a
-/// read-only check can never stand between an operator and a rollback.
+/// Every kind but the read-only ones can come back 409 from the daemon's
+/// single-job interlock. `check_update` and `parity_status` deliberately do
+/// not claim it, so a read-only check can never stand between an operator
+/// and a rollback. `parity_sync` DOES claim it: it rewrites the parity file
+/// across every data disk.
 export const startJob = (kind, extra = {}) =>
   request("POST", "/api/jobs", { body: { kind, ...extra } });
 

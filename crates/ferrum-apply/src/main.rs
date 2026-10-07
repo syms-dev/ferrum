@@ -4,6 +4,7 @@ mod address_history;
 mod apply;
 mod dns_reconcile;
 mod gc;
+mod parity;
 mod pin;
 mod pin_gate;
 mod preflight;
@@ -143,6 +144,50 @@ enum Command {
     /// to ORDINARY retention, so a confirmed update is still rollbackable
     /// for as long as any other change of the same age is.
     ConfirmUpdate,
+    /// Run a SnapRAID parity sync now, whatever the timer is doing.
+    ///
+    /// R3's manual trigger, and it is independent of the schedule by
+    /// construction rather than by convention: it starts
+    /// `snapraid-sync.service`, which exists whenever parity is configured,
+    /// while `ferrum.storage.parity.sync.enable` governs only the TIMER. An
+    /// operator who turns the timer off keeps exactly this.
+    ParitySync,
+    /// Report whether parity is current, and publish the document ferrumd
+    /// serves at `GET /api/parity`.
+    ///
+    /// Read-only: it runs `systemctl is-active` and `snapraid diff`, neither
+    /// of which writes to the array. It still lives on the privileged side
+    /// because `snapraid diff` opens every data disk and the parity file
+    /// directly -- the same reasoning that keeps ferrumd from shelling out
+    /// to `nix`.
+    ParityStatus,
+    /// Rebuild one data disk's contents from parity.
+    ///
+    /// R5, and the one destructive thing in this feature. Operator-triggered
+    /// only -- there is no timer, no job kind, and no automatic trigger
+    /// anywhere -- and gated behind an acknowledgement that NAMES the disk,
+    /// so agreeing to restore one can never pass the restore of another.
+    ///
+    /// Deliberately NOT exposed through ferrumd. The other parity operations
+    /// are: a sync and a status check are both things an operator should be
+    /// able to start from the web UI. This one overwrites a whole disk, which
+    /// `.claude/rules/human-in-the-loop.md` classes as a one-way door needing
+    /// inventory-shaped approval -- the exact list of what will be touched,
+    /// approved before it runs. The CLI gate below is that: it names the
+    /// disk, its mount point, and what will happen to the files on it, and
+    /// refuses until the operator types a word that matches. Putting a button
+    /// on it would be the same action with a weaker gate.
+    ParityRestore {
+        /// The SnapRAID data-disk name, as `/etc/snapraid.conf` names it.
+        #[arg(long)]
+        disk: String,
+        /// The acknowledgement, which must be `overwrite-<disk>`.
+        #[arg(long)]
+        confirm: Option<String>,
+        /// Additionally accept restoring from parity that is not current.
+        #[arg(long, default_value_t = false)]
+        accept_stale: bool,
+    },
 }
 
 /// Writes the job's `started` line, then runs it.
@@ -1495,6 +1540,145 @@ fn run_gc_inner(progress: &mut progress::Progress) -> anyhow::Result<usize> {
     )
 }
 
+/// Starts a parity sync and reports the outcome.
+///
+/// Prints the summary on stdout so a bare `ferrum-apply parity-sync` over
+/// SSH is useful on its own, and records the same line as job progress so a
+/// dispatched run says the same thing in both places.
+///
+/// # Returns
+/// The process exit code: `0` only when the sync really completed.
+fn run_parity_sync() -> i32 {
+    let outcome = parity::start_sync(&parity::conf_path(), &update_check::RealRunner);
+    let summary = outcome.summary();
+    let code = outcome.exit_code();
+    if code == 0 {
+        println!("{summary}");
+    } else {
+        eprintln!("{summary}");
+    }
+    progress::Progress::open().event("parity-sync", &summary);
+    code
+}
+
+/// Builds the parity status document, publishes it, and prints it.
+///
+/// stdout carries the whole document so a bare `ferrum-apply parity-status`
+/// over SSH is useful on its own, the same way `check-update` is. Nothing in
+/// it is a secret: it names mount points and file counts.
+///
+/// # Returns
+/// The process exit code. `0` whenever a document was produced and
+/// published, INCLUDING for an unhealthy state -- "the array is stale" is a
+/// successful report of a real condition, not a failure of this command. A
+/// non-zero code is reserved for not being able to publish at all, which is
+/// the one case a caller cannot see in the document itself.
+fn run_parity_status() -> i32 {
+    let mut progress = progress::Progress::open();
+    let report = parity::build_report(
+        &parity::StatusInputs {
+            conf: &parity::conf_path(),
+            last_sync_file: &parity::last_sync_path(),
+            now: parity::now_epoch(),
+        },
+        &update_check::RealRunner,
+    );
+
+    match serde_json::to_string(&report) {
+        Ok(body) => println!("{body}"),
+        Err(e) => eprintln!("parity-status: could not serialize the report: {e}"),
+    }
+
+    let summary = parity::summary_line(&report);
+    let job_id = std::env::var("FERRUM_JOB_ID").ok();
+    match parity::write_report(
+        &parity::report_dir(),
+        &parity::report_file_name(job_id.as_deref()),
+        &report,
+    ) {
+        Ok(_) => {
+            progress.complete("ok", &summary);
+            0
+        }
+        Err(e) => {
+            let detail = format!("could not publish the parity report: {e}");
+            eprintln!("parity-status: {detail}");
+            progress.complete("failed", &detail);
+            1
+        }
+    }
+}
+
+/// Rebuilds one data disk from parity, behind R5's gate.
+///
+/// Builds R4's report first and feeds it to the gate, so the decision is
+/// made against this host's real parity state rather than blind to it. The
+/// gate's own prose is printed in every outcome, including the refusals --
+/// an operator told "no" needs to be told what the yes would have meant.
+///
+/// # Arguments
+/// * `disk` - the SnapRAID data-disk name.
+/// * `confirm` - the operator's acknowledgement, if supplied.
+/// * `accept_stale` - whether they additionally accepted stale parity.
+///
+/// # Returns
+/// `0` only when the rebuild ran and succeeded. `2` when the gate refused --
+/// distinct from `1`, so a caller can tell "I did not run it" from "I ran it
+/// and it failed", which are different things to do next.
+fn run_parity_restore(disk: &str, confirm: Option<&str>, accept_stale: bool) -> i32 {
+    let conf_path = parity::conf_path();
+    let conf = std::fs::read_to_string(&conf_path).unwrap_or_default();
+    let report = parity::build_report(
+        &parity::StatusInputs {
+            conf: &conf_path,
+            last_sync_file: &parity::last_sync_path(),
+            now: parity::now_epoch(),
+        },
+        &update_check::RealRunner,
+    );
+
+    let gate = parity::decide_restore(&conf, disk, confirm, accept_stale, &report);
+    if !gate.allowed() {
+        eprintln!("{}", gate.message());
+        return 2;
+    }
+
+    let mut progress = progress::Progress::open();
+    progress.event("parity-restore", gate.message());
+    println!("{}", gate.message());
+
+    // `snapraid fix -d <disk>` is the documented rebuild, and it is run
+    // directly rather than through a unit because there is no unit for it:
+    // the upstream module generates sync and scrub only. See
+    // docs/storage/parity.md, which is the procedure this command performs
+    // and which an operator can equally perform by hand.
+    let args = vec![
+        "-c".to_string(),
+        conf_path.to_string_lossy().into_owned(),
+        "fix".to_string(),
+        "-d".to_string(),
+        disk.to_string(),
+    ];
+    match update_check::CommandRunner::run(&update_check::RealRunner, "snapraid", &args) {
+        Err(e) => {
+            eprintln!("could not run snapraid: {e}");
+            progress.complete("failed", &format!("could not run snapraid: {e}"));
+            1
+        }
+        Ok(out) => {
+            print!("{}", out.stdout);
+            eprint!("{}", out.stderr);
+            if out.success {
+                progress.complete("ok", &format!("restored data disk {disk} from parity"));
+                0
+            } else {
+                progress.complete("failed", &format!("the restore of {disk} did not complete"));
+                1
+            }
+        }
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let exit_code = match cli.command {
@@ -1509,6 +1693,11 @@ fn main() -> anyhow::Result<()> {
         Command::CheckUpdate => run_check_update(),
         Command::Update => run_update(),
         Command::ConfirmUpdate => run_confirm_update(),
+        Command::ParitySync => run_parity_sync(),
+        Command::ParityStatus => run_parity_status(),
+        Command::ParityRestore { disk, confirm, accept_stale } => {
+            run_parity_restore(&disk, confirm.as_deref(), accept_stale)
+        }
         Command::ReconcileDns { config } => run_reconcile_dns(&config),
         Command::PutSecret { name, replace } => run_put_secret(&name, replace),
         Command::RunRequest { path } => match request::read_request(&path) {
@@ -1523,6 +1712,8 @@ fn main() -> anyhow::Result<()> {
                 request::Request::CheckUpdate => run_check_update(),
                 request::Request::Update => run_update(),
                 request::Request::ConfirmUpdate => run_confirm_update(),
+                request::Request::ParitySync => run_parity_sync(),
+                request::Request::ParityStatus => run_parity_status(),
             }),
             Err(e) => {
                 eprintln!("run-request: {e}");

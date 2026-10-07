@@ -155,6 +155,33 @@ pub struct Answers {
     /// never written anywhere. Skipping is reported in the closing summary
     /// as an unfinished step, never silently.
     pub plex_claim: Option<Secret>,
+    /// R1: the `/dev/disk/by-id/` path of the disk the operator dedicated to
+    /// SnapRAID parity, if any.
+    ///
+    /// This exists because data disks are DETECTED, not asked for
+    /// ([`crate::render::data_disks`]: "every disk that is not the one being
+    /// erased and that already carries a filesystem"). A parity disk has to
+    /// carry a filesystem -- SnapRAID's content file needs somewhere to live
+    /// -- so under that rule alone a parity disk is swept into the pool by
+    /// construction, and nothing downstream reports it.
+    /// [`crate::render::split_parity`] is what takes it back out, before
+    /// `custom/media.nix` is rendered.
+    ///
+    /// **Always `None` today.** The interactive question that would set it is
+    /// deliberately not here: which disk is parity interacts with the
+    /// destructive-erase confirmation in `confirm.rs`, and whether ferrum
+    /// formats an unprepared parity disk or refuses, and both are open
+    /// questions in `docs/superpowers/specs/2026-10-07-parity-design.md` that
+    /// the owner has not answered. The mechanical half those answers will
+    /// drive is complete and tested; this field is the seam they plug into,
+    /// and the plumbing behind it is exercised by
+    /// `a_parity_disk_is_removed_from_the_pool_candidates` and its siblings
+    /// rather than left to be discovered later.
+    ///
+    /// Never recovered by [`recover_answers`]: a resumed run re-reads the
+    /// mount it already wrote from `custom/parity.nix`, which is the
+    /// operator's file and not this installer's to re-derive.
+    pub parity_disk: Option<String>,
 }
 
 /// A hostname must be a DNS label: it becomes `networking.hostName` and
@@ -876,6 +903,9 @@ pub fn collect(
         cloudflare_token,
         dns,
         plex_claim,
+        // See the field's own documentation: the question that would set
+        // this is the owner's open UX decision, not this pass's.
+        parity_disk: None,
     })
 }
 
@@ -1254,6 +1284,11 @@ pub fn from_stage2(body: &str, hostname: &str) -> anyhow::Result<Answers> {
         // have to do is keep the settings document and the host's secrets
         // directory in step; `render::set_plex_claim_secret` is that.
         plex_claim: None,
+        // Never recovered: `custom/parity.nix` already carries the mount a
+        // previous run wrote, and that file is the operator's to edit --
+        // re-deriving the disk here would let a resume silently overwrite an
+        // edit they made to it.
+        parity_disk: None,
         dns: dns_from_settings(&doc)?,
     })
 }

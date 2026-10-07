@@ -80,6 +80,20 @@ pub enum JobRequest {
     /// takes the interlock by the fail-closed default rather than by an
     /// exemption.
     ConfirmUpdate,
+    /// Run a parity sync now. Mirrors `request::Request::ParitySync` --
+    /// zero fields, so nothing an API caller supplies decides which disks a
+    /// root process reads or which parity file it overwrites. It takes the
+    /// interlock by the fail-closed default: a sync rewrites the parity
+    /// file, and overlapping it with an apply's quiesce/snapshot sequence is
+    /// new interaction surface nobody has reasoned about.
+    ParitySync,
+    /// The read-only parity status check. Mirrors
+    /// `request::Request::ParityStatus` -- zero fields, and it writes
+    /// nothing to the array at all. Exempt from the interlock for the same
+    /// reason `check_update` is: a read-only check that could not run while
+    /// an apply was running would be unable to answer exactly when an
+    /// operator most wants it to.
+    ParityStatus,
 }
 
 fn jobs_dir() -> std::path::PathBuf {
@@ -153,13 +167,19 @@ pub fn remove_request_file_in(dir: &std::path::Path, uuid: &str) {
 /// interlock, expressed over the `kind` string that actually crosses the
 /// privilege boundary.
 ///
-/// DA-7 exempts exactly one kind, the read-only `check_update`. Two
-/// separate places need that answer -- `create_job_in`, deciding whether an
-/// incoming POST claims it, and `interlock_holder_in`, deciding whether a
-/// unit systemd reports running is holding it -- and the two disagreeing is
-/// the whole shape of this defect class. They ask the same function about
-/// the same string, and that string is the one written into the request
-/// file by `request_body`.
+/// DA-7 exempts the read-only kinds only. Two separate places need that
+/// answer -- `create_job_in`, deciding whether an incoming POST claims it,
+/// and `interlock_holder_in`, deciding whether a unit systemd reports
+/// running is holding it -- and the two disagreeing is the whole shape of
+/// this defect class. They ask the same function about the same string, and
+/// that string is the one written into the request file by `request_body`.
+///
+/// The exempt set is `check_update` and `parity_status`, and the test for
+/// membership is the same in both cases: the job writes nothing a
+/// concurrent job could be reading or rewriting. `parity_status` runs
+/// `systemctl is-active` and `snapraid diff` and publishes one report file
+/// of its own. `parity_sync` is deliberately NOT exempt -- it rewrites the
+/// parity file across every data disk.
 ///
 /// An unrecognized kind claims the interlock. That is the fail-closed
 /// direction: the cost of wrongly holding it is a 409 that clears when the
@@ -169,7 +189,7 @@ pub fn remove_request_file_in(dir: &std::path::Path, uuid: &str) {
 /// # Arguments
 /// * `kind` - the `kind` field of a request, e.g. `"apply"`.
 pub fn kind_takes_interlock(kind: &str) -> bool {
-    kind != "check_update"
+    !matches!(kind, "check_update" | "parity_status")
 }
 
 /// Reads back the `kind` a dispatched job was requested with, from the
@@ -350,6 +370,8 @@ fn request_body(req: &JobRequest) -> serde_json::Value {
         JobRequest::CheckUpdate => serde_json::json!({"kind": "check_update"}),
         JobRequest::Update => serde_json::json!({"kind": "update"}),
         JobRequest::ConfirmUpdate => serde_json::json!({"kind": "confirm_update"}),
+        JobRequest::ParitySync => serde_json::json!({"kind": "parity_sync"}),
+        JobRequest::ParityStatus => serde_json::json!({"kind": "parity_status"}),
     }
 }
 
@@ -1997,7 +2019,9 @@ mod tests {
                     | JobRequest::Gc
                     | JobRequest::CheckUpdate
                     | JobRequest::Update
-                    | JobRequest::ConfirmUpdate => {}
+                    | JobRequest::ConfirmUpdate
+                    | JobRequest::ParitySync
+                    | JobRequest::ParityStatus => {}
                 }
             }
 
@@ -2019,6 +2043,18 @@ mod tests {
                 // them. It is cheap, so there is nothing to buy by
                 // exempting it.
                 (JobRequest::ConfirmUpdate, true),
+                // A sync rewrites the parity file across every data disk
+                // while an apply may be quiescing the apps writing to those
+                // same disks. Overlapping the two is new interaction
+                // surface nobody has reasoned about, so it serializes --
+                // the fail-closed direction, chosen rather than inherited.
+                (JobRequest::ParitySync, true),
+                // Read-only in the same sense check_update is: `systemctl
+                // is-active` and `snapraid diff`, then one report file of
+                // its own. Exempt for the same reason -- a status an
+                // operator cannot ask for during an apply is a status
+                // missing exactly when it is wanted.
+                (JobRequest::ParityStatus, false),
             ];
             for (req, claims) in cases {
                 let kind = request_body(&req)

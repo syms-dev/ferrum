@@ -45,6 +45,37 @@
             "policy": { "type": "string", "enum": ["epmfs", "mfs"] }
           }
         },
+        "parity": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enable": { "type": "boolean" },
+            "disks": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "pattern": "^(/[A-Za-z0-9_][A-Za-z0-9._-]*)+$",
+                "description": "One parity disk mount point, absolute. Pattern-constrained on the ITEM for the same reason pool.branches is, and the sinks are the same shape: modules/core/parity.nix interpolates each entry into services.snapraid.parityFiles, which nixpkgs' snapraid module renders into /etc/snapraid.conf -- a LINE-oriented grammar where a newline is a new directive -- and the same list reaches the generated snapraid-sync/snapraid-scrub units' ReadWritePaths, a systemd unit LIST-field NixOS emits as one unescaped Key=value line per element. Mirrors modules/lib/hostnames.nix's absolutePath, which enforces the same thing at evaluation."
+              }
+            },
+            "sync": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "enable": { "type": "boolean" },
+                "intervalMinutes": { "type": "integer" }
+              }
+            },
+            "scrub": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "enable": { "type": "boolean" },
+                "intervalMinutes": { "type": "integer" }
+              }
+            }
+          }
+        },
         "mediaGroup": {
           "type": "string",
           "pattern": "^[a-z_][a-z0-9_-]*$",

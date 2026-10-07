@@ -138,11 +138,13 @@ let
   # downloads on the OS disk while media lived on the data disks, so imports
   # degraded to copies -- silently, and invisibly until a library was large
   # enough for the duplication to show.
-  trashSubdirs =
-    [ "torrents" "usenet" "usenet/incomplete" "usenet/complete" "media" ]
-    ++ lib.concatMap
-      (cat: [ "torrents/${cat}" "usenet/complete/${cat}" "media/${cat}" ])
-      [ "movies" "tv" "music" "books" ];
+  #
+  # The list itself lives in ./trash-layout.nix because modules/core/
+  # parity.nix needs to know which of these directories are churn, in order
+  # to exclude exactly those from SnapRAID -- and two files each spelling
+  # the layout out would be free to drift, at which point the exclusion
+  # stops matching the tree this module creates and nothing says so.
+  trashSubdirs = (import ./trash-layout.nix { inherit lib; }).subdirs;
 
   # WHERE THE TREE IS CREATED, and why it is not just mediaDir.
   #
