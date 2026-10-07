@@ -30,6 +30,8 @@
 #
 #   1. WHICH disks (R1) -- and the assertion that a parity disk is never
 #      also a pool branch.
+#   2. WHAT TO SKIP (R2) -- an exclude list computed from ferrum's own
+#      resolved storage options, not a copied literal.
 #
 # No new flake input and no new Cargo dependency: pkgs.snapraid comes from
 # the nixpkgs revision flake.lock already pins. It is a real addition to a
@@ -40,6 +42,8 @@ let
   cfg = config.ferrum.storage;
   pool = cfg.pool;
   parity = cfg.parity;
+
+  layout = import ./trash-layout.nix { inherit lib; };
 
   # Path containment, not substring containment. Identical reasoning to
   # modules/core/storage.nix's own `containsPath`, which this deliberately
@@ -83,6 +87,58 @@ let
   contentDir = "/var/lib/ferrum/snapraid";
   contentFiles = [ "${contentDir}/snapraid.content" ]
     ++ map (root: "${root}/snapraid.content") dataRoots;
+
+  # R2: what SnapRAID must NOT protect, computed from the live option values.
+  #
+  # THE PATH GRAMMAR, AND IT IS NOT THE OBVIOUS ONE. A SnapRAID `exclude`
+  # path is relative to EACH data disk's own root, not absolute on the host.
+  # So the per-branch absolute form -- `/mnt/ferrum-disk-0/torrents/**` --
+  # excludes nothing at all: it is read as
+  # `<disk>/mnt/ferrum-disk-0/torrents/**`, which matches no file that
+  # exists. Measured against snapraid 12.4 on real loop-mounted ext4 disks:
+  # with the absolute form every download file was still taken into the
+  # array (7 added, including all of torrents/ and usenet/); with the
+  # disk-root-relative form below exactly the two media/ files were taken.
+  # The `/torrents/**` glob form is wrong too -- it also took the downloads
+  # (5 added). Only the trailing-slash DIRECTORY form excludes a directory.
+  #
+  # This matters more than most generated text, because the failure is
+  # silent and inverted: the host still syncs, still reports success, and
+  # still says it is protected, while spending the entire sync on exactly the
+  # data the exclusion existed to skip.
+  excludeRelative = root: path:
+    lib.optional (lib.hasPrefix "${root}/" path)
+      "/${lib.removePrefix "${root}/" path}/";
+
+  # The churn directories of the TRaSH layout, one entry each, named from
+  # ./trash-layout.nix rather than spelled here -- see that file's header for
+  # why a second copy is the hazard.
+  churnExcludes = map (sub: "/${sub}/") layout.churn;
+
+  # The defensive half. ferrum's own state, snapshot and journal roots live
+  # on @root by default and SnapRAID never sees them -- but nothing stops an
+  # operator relocating one under a pool branch, and modules/core/storage.nix
+  # has no assertion forbidding it. Rather than assume the default, ask the
+  # resolved values: an entry appears only when the path really does nest
+  # under a data root, and names the path relative to that root.
+  stateExcludes = lib.concatMap
+    (path: lib.concatMap (root: excludeRelative root path) dataRoots)
+    [ cfg.stateDir cfg.snapshotDir cfg.journalDir ];
+
+  exclude = lib.unique (
+    [
+      # SnapRAID's own marker for a file a scrub declined to restore. Taking
+      # those into the array would protect the marker, not the file.
+      "*.unrecoverable"
+      # SnapRAID's own content file, which it writes ONTO a data disk and
+      # would otherwise take into the array as ordinary data on the next
+      # pass -- confirmed against snapraid 12.4, which listed
+      # `add snapraid.content` with every other exclusion already in place.
+      "/snapraid.content"
+    ]
+    ++ churnExcludes
+    ++ stateExcludes
+  );
 
   # The disks parity must never collide with, and why each one is here:
   #   * pool branches and mediaDir -- a parity disk inside the pool is not
@@ -193,7 +249,7 @@ in
 
       services.snapraid = {
         enable = true;
-        inherit dataDisks parityFiles contentFiles;
+        inherit dataDisks parityFiles contentFiles exclude;
       };
 
     })

@@ -3511,6 +3511,128 @@
             emptyConfiguresNothing overlapViaModule;
         };
 
+      # R2. The SnapRAID exclude list is computed from ferrum's own resolved
+      # storage options, and it is written in the ONE path grammar SnapRAID
+      # actually reads.
+      #
+      # THE GRAMMAR IS THE WHOLE POINT, and it is not the obvious one. A
+      # SnapRAID `exclude` path is relative to EACH data disk's own root, not
+      # absolute on the host. Measured against snapraid 12.4 on real
+      # loop-mounted ext4 disks: the per-branch absolute form
+      # (`/mnt/ferrum-disk-0/torrents/**`) excluded NOTHING -- all seven
+      # files, downloads included, were taken into the array -- because it is
+      # read as `<disk>/mnt/ferrum-disk-0/torrents/**` and matches nothing
+      # that exists. The `/torrents/**` glob form also failed (five taken).
+      # Only `/torrents/` -- the trailing-slash directory form asserted here
+      # -- left exactly the two media/ files.
+      #
+      # That failure is silent and inverted, which is why it is worth a check
+      # rather than a comment: the host still syncs, still reports success,
+      # and still says it is protected, while spending every sync on exactly
+      # the churn the exclusion existed to skip.
+      #
+      # Read off the GENERATED /etc/snapraid.conf as well as the option,
+      # because the option is an intermediate and the file is what snapraid
+      # parses -- the same discipline the separator checks use.
+      #
+      # The anti-vacuity halves: `media/` must NEVER appear (an exclude list
+      # that excluded the library would pass a pure "does torrents appear"
+      # test while destroying the feature), and the default list must be
+      # exactly the expected set rather than a superset -- an unconstrained
+      # "contains" test passes identically on a list that excludes
+      # everything.
+      parityExcludesOnlyTheChurn =
+        let
+          branches = [ "/mnt/ferrum-check-a" "/mnt/ferrum-check-b" ];
+          pooled = { enable = true; inherit branches; };
+          withParity = { enable = true; disks = [ "/mnt/ferrum-parity-0" ]; };
+
+          hostWith = storage: ferrumLib.mkHost {
+            inherit system;
+            settings = {
+              schemaVersion = realMigrations.currentVersion;
+              inherit storage;
+            };
+            modules = [ ../../../examples/hosts/minimal/configuration.nix ];
+          };
+
+          excludesOf = storage: (hostWith storage).config.services.snapraid.exclude;
+          confOf = storage:
+            (hostWith storage).config.environment.etc."snapraid.conf".text;
+
+          defaultHost = { pool = pooled; parity = withParity; };
+          defaultExcludes = excludesOf defaultHost;
+
+          # The exact set a default two-branch host must produce. Spelled out
+          # rather than recomputed from the module, which would make this
+          # check agree with any implementation including a broken one.
+          expected = [
+            "*.unrecoverable"
+            "/snapraid.content"
+            "/torrents/"
+            "/usenet/"
+          ];
+
+          # The trailing-slash directory form, asserted against the file
+          # snapraid actually parses.
+          conf = confOf defaultHost;
+          confHasDirForm =
+            lib.hasInfix "\nexclude /torrents/\n" conf
+            && lib.hasInfix "\nexclude /usenet/\n" conf;
+
+          # No entry anywhere may be an absolute host path: that is the form
+          # that silently matches nothing. Every branch prefix is checked,
+          # against every entry.
+          absoluteEntries = builtins.filter
+            (e: lib.any (b: lib.hasPrefix b e) branches)
+            defaultExcludes;
+
+          # media/ is the content parity exists for.
+          mediaExcluded = builtins.filter (e: lib.hasInfix "media" e) defaultExcludes;
+
+          # Relocating ONE of the three ferrum roots under a branch must add
+          # exactly that one's entry, named relative to the branch -- and
+          # must not add the other two.
+          relocated = attr: value:
+            excludesOf ({ pool = pooled; parity = withParity; } // { ${attr} = value; });
+          stateMoved = relocated "stateDir" "/mnt/ferrum-check-a/ferrum-state";
+          snapsMoved = relocated "snapshotDir" "/mnt/ferrum-check-a/ferrum-snaps";
+          journalMoved = relocated "journalDir" "/mnt/ferrum-check-b/ferrum-journal";
+
+          added = moved: lib.subtractLists defaultExcludes moved;
+          stateAdded = added stateMoved == [ "/ferrum-state/" ];
+          snapsAdded = added snapsMoved == [ "/ferrum-snaps/" ];
+          journalAdded = added journalMoved == [ "/ferrum-journal/" ];
+
+          # And the control for all three: with every root at its default,
+          # OUTSIDE any branch, none of them contributes an entry. Without
+          # this, an implementation that unconditionally emitted all three
+          # would satisfy every assertion above.
+          defaultsContributeNothing =
+            builtins.filter (e: lib.hasInfix "ferrum" e) defaultExcludes == [ ];
+
+          # An unpooled single-data-disk host protects mediaDir itself, and
+          # must still get the churn excluded.
+          unpooled = excludesOf { parity = withParity; };
+        in
+        {
+          ok = lib.naturalSort defaultExcludes == lib.naturalSort expected
+            && confHasDirForm
+            && absoluteEntries == [ ]
+            && mediaExcluded == [ ]
+            && stateAdded
+            && snapsAdded
+            && journalAdded
+            && defaultsContributeNothing
+            && lib.naturalSort unpooled == lib.naturalSort expected;
+          message =
+            "modules/core/parity.nix's SnapRAID exclude list is not the churn "
+            + "of ferrum's own layout, or is written in a path form snapraid "
+            + "does not match";
+          inherit defaultExcludes confHasDirForm absoluteEntries mediaExcluded
+            stateAdded snapsAdded journalAdded defaultsContributeNothing unpooled;
+        };
+
       # The self-signed certificate follows ferrum.proxy.baseDomain.
       #
       # Its CN and both SANs are built from that option, and the unit that
@@ -5446,6 +5568,8 @@
           mkAssertionCheck "pool-assertions-can-fire" poolAssertionsCanFire;
         parity-disk-is-never-a-pool-branch =
           mkAssertionCheck "parity-disk-is-never-a-pool-branch" parityDiskIsNeverAPoolBranch;
+        parity-excludes-only-the-churn =
+          mkAssertionCheck "parity-excludes-only-the-churn" parityExcludesOnlyTheChurn;
         media-tree-waits-for-its-mounts =
           mkAssertionCheck "media-tree-waits-for-its-mounts" mediaTreeWaitsForItsMounts;
         branch-roots-are-ownership-checked =
