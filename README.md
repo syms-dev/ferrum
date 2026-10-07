@@ -350,6 +350,7 @@ checks that the two agree — so where they disagree, the router is right.
 | GET | `/api/updates` | The most recent update-check report, or `?job=<uuid>` for one run's own | session |
 | GET | `/api/parity` | The most recent SnapRAID parity status report | session |
 | GET | `/api/vpn` | A live reading of each VPN-declaring app's tunnel, with the second it was taken | session |
+| GET | `/api/app-health` | A live reading of whether each catalog app is answering, with the second it was taken | session |
 | POST | `/api/jobs` | Starts a privileged `ferrum-apply` job | session + CSRF |
 | GET | `/api/jobs` | Recent jobs (`?limit=`) | session |
 | GET | `/api/jobs/:id` | One job's summary and its progress events | session |
@@ -406,7 +407,8 @@ list is part of the feature. A green `/api/ready` means ferrumd's own dependenci
 does **not** mean:
 
 - that any app is running, serving or reachable — readiness asks nothing about Sonarr, Plex,
-  qBittorrent or any other unit;
+  qBittorrent or any other unit. That is `GET /api/app-health`'s question, and it is a
+  **separate, session-gated endpoint** rather than part of this one (see below);
 - that the qBittorrent VPN kill switch is intact, or that any app's network namespace is correct;
 - that the media pool is mounted, that every mergerfs branch is present, or that there is free
   space;
@@ -433,6 +435,38 @@ the fixed check names, booleans, the fixed reason words, and the UUID of an appl
 path, hostname, version, generation number, secret name or error string ever reaches it. Both
 locations are rate-limited at the proxy (60/min, burst 10) because every readiness probe does real
 work.
+
+### Per-app health
+
+`GET /api/app-health` answers the question `/api/ready` deliberately refuses: **is each app
+actually answering?** It is a separate endpoint because it needs a different trade. Readiness buys
+its unauthenticated reach with a closed vocabulary that names no host and no port; this body names
+a catalog app and the `host:port` it was dialled at, so it is **session-gated**, like `/api/vpn`.
+No watchdog is pointed at it either — it is a thing to read.
+
+Each enabled app is probed with one HTTP `GET` to the path **its own catalog metadata declares**
+(`meta.healthCheck.path` — `/ping` for the \*arrs, `/identity` for Plex, `/health` for Jellyfin), at
+the address `modules/lib/app-address.nix` says it listens on. That shared table is what makes the
+reading right for qBittorrent on a VPN host, where the WebUI binds inside a network namespace and
+nothing answers on loopback. An app ferrum has no address for is reported as `address-unknown` and
+dialled nowhere, rather than guessed at.
+
+**No credential is ever sent.** Every app's declared health path was measured to need none, and an
+endpoint that answers `401`/`403` is still a good liveness signal — the app is up enough to refuse
+you — so it is reported as `unauthenticated`, not as down. This matters: SABnzbd takes its API key
+as a URL query parameter and logs the failing URL verbatim, so a probe that carried one would put
+it in the journal every time SABnzbd hiccuped.
+
+Nine states, each with a different next action, and none of them collapsed into another: `healthy`,
+`unauthenticated`, `unhealthy` (answered, wrongly), `refused` (nothing listening), `timed-out`
+(accepted the connection, then said nothing — not the same as down), `unreachable`,
+`address-unknown`, `not-enabled`, and `not-measurable` (the app publishes no HTTP endpoint).
+
+Every app is probed **concurrently** with a 3-second ceiling, so one wedged app cannot hold up the
+answer about the rest, and the document carries `checkedAt` — stamped **after** the slowest probe,
+so a timeout cannot overstate how fresh the reading is. The dashboard ages that on screen and says
+"checked N minutes ago" rather than painting a dot that cannot go stale. Before the first reading
+arrives it says "not checked yet", which is a different fact from "healthy".
 
 `GET /api/updates` serves a document ferrum-apply's `check_update` job wrote; ferrumd only reads
 it, and runs no `nix` of its own. It answers `200` with

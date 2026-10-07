@@ -230,6 +230,29 @@ export const parity = () => request("GET", "/api/parity");
 /// @returns {Promise<{checkedAt: string, apps: object}>}
 export const vpn = () => request("GET", "/api/vpn");
 
+/// Whether each catalog app is actually ANSWERING, right now.
+///
+/// One HTTP GET per enabled app, to the path that app's own catalog metadata
+/// declares, at the address this host says it listens on. Taken live per
+/// request and never cached, with `checkedAt` stamped AFTER the slowest probe
+/// finished -- a reading with no "as of when" is a gauge frozen at green.
+///
+/// NOT the same question as `GET /api/ready`, which asks only about ferrumd's
+/// own dependencies and deliberately asks nothing about Sonarr, Plex or
+/// qBittorrent. This one is session-gated precisely because it answers that.
+///
+/// Unlike `vpn()`, `apps` contains EVERY catalog app, including disabled ones
+/// and the one that declares no health check at all: the apps list renders a
+/// row per app, and an absent key would be ambiguous between "ferrum never
+/// checks this one" and "ferrum has not heard of it".
+///
+/// No credential is ever sent, and none can come back: every app's declared
+/// health path was measured to need none, and the path is an input to the
+/// probe that is never serialized into the answer.
+///
+/// @returns {Promise<{checkedAt: string, apps: object}>}
+export const appHealth = () => request("GET", "/api/app-health");
+
 // --- writes --------------------------------------------------------------
 
 /// Writes settings. NEVER triggers an apply -- that is a separate, explicit

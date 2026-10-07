@@ -44,6 +44,7 @@ jobs:
             .#checks.x86_64-linux.ui-renders-every-schema-type \
             .#checks.x86_64-linux.updates-view-is-wired \
             .#checks.x86_64-linux.app-detail-view-is-wired \
+            .#checks.x86_64-linux.app-health-view-is-wired \
             .#checks.x86_64-linux.vpn-metadata-matches-the-unit \
             .#checks.x86_64-linux.installer-offers-every-catalog-app \
             .#checks.x86_64-linux.settings-schema-covers-every-option \

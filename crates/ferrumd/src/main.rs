@@ -1,3 +1,4 @@
+mod app_health;
 mod audit;
 mod auth;
 mod catalog;
@@ -668,6 +669,12 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/updates", axum::routing::get(updates::get_updates))
         .route("/api/parity", axum::routing::get(parity::get_parity))
         .route("/api/vpn", axum::routing::get(vpn::get_vpn))
+        // Per-app health. Inside `protected` deliberately, and NOT folded into
+        // /api/health or /api/ready: this body names a catalog app and the
+        // host:port it was dialled at, which is exactly the host-shape
+        // disclosure health.rs's closed vocabulary refuses to make. See
+        // app_health.rs's own banner.
+        .route("/api/app-health", axum::routing::get(app_health::get_app_health))
         .route("/api/settings", axum::routing::get(settings::get_settings).put(settings::put_settings))
         .route("/api/secrets/:name", axum::routing::post(secrets_api::write_secret))
         .route("/api/session", axum::routing::get(session_handler))
@@ -3125,6 +3132,7 @@ mod tests {
     /// way an absence proof fails without failing.
     const CRATE_SOURCES: &[(&str, &str)] = &[
         ("main.rs", include_str!("main.rs")),
+        ("app_health.rs", include_str!("app_health.rs")),
         ("audit.rs", include_str!("audit.rs")),
         ("auth.rs", include_str!("auth.rs")),
         ("catalog.rs", include_str!("catalog.rs")),
@@ -3769,6 +3777,10 @@ mod tests {
             // and a 500 carrying a CORS header is as much of a finding as
             // a 200 carrying one.
             ("GET", "/api/vpn", "/api/vpn"),
+            // Reads two documents and probes every enabled app; on a fixture
+            // host with no catalog it answers 500, and a 500 carrying a CORS
+            // header is as much of a finding as a 200 carrying one.
+            ("GET", "/api/app-health", "/api/app-health"),
             ("GET", "/api/settings", "/api/settings"),
             ("PUT", "/api/settings", "/api/settings"),
             ("POST", "/api/secrets/:name", "/api/secrets/cors-probe"),
