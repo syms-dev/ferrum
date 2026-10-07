@@ -2159,6 +2159,7 @@ mod tests {
                 ddns_updater: true,
             }),
             plex_claim: None,
+            parity_disk: None,
         }
     }
 

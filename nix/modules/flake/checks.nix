@@ -3369,6 +3369,148 @@
             workingAccepted workingIsAPool;
         };
 
+      # R1. A parity disk must never also be a pool branch, and the check
+      # that says so must fire on EVERY evaluation rather than only at
+      # install time.
+      #
+      # The hazard is specific and silent. crates/ferrum-install/src/
+      # render.rs's `data_disks` detects data disks rather than asking for
+      # them -- "every disk that is not the one being erased and that already
+      # carries a filesystem" -- so a parity disk that was formatted in
+      # advance (which SnapRAID's content file needs) is swept into the pool
+      # by construction. Nothing downstream reports that: the pool mounts,
+      # the apps write to it, and SnapRAID writes a parity file across the
+      # same disk. The library files that land there are then the only ones
+      # on the host with no parity at all, and the parity is invalidated by
+      # the writes landing beside it.
+      #
+      # Read off the REAL assertion list of a really-evaluated host, with
+      # each case scoped to the one message it is supposed to produce. Both
+      # halves of that scoping are load-bearing and this project has been
+      # bitten by getting either wrong: an unscoped "was anything rejected"
+      # passes identically with these assertions deleted and some unrelated
+      # assertion failing instead, and an infix spanning a line break never
+      # matches at all, because these are multi-line Nix strings.
+      #
+      # The anti-vacuity halves are `working` and `off`, and they are what
+      # stop this check passing on a module that refuses everything or
+      # generates nothing: a legitimate disjoint configuration must evaluate
+      # with no parity failure AND produce a real services.snapraid.enable =
+      # true, while a host with parity off must produce no snapraid
+      # configuration at all.
+      #
+      # NOT covered here, deliberately, and it is not an omission: naming the
+      # OS disk itself (`parity.disks = [ "/" ]`) is refused one layer
+      # earlier by hostnames.absolutePath, whose pattern requires at least
+      # one `/<segment>`. Evaluation stops at the type, so an assertion for
+      # it could never fire. `osDiskRefused` below pins that the refusal
+      # really happens rather than taking it on trust.
+      parityDiskIsNeverAPoolBranch =
+        let
+          branches = [ "/mnt/ferrum-check-a" "/mnt/ferrum-check-b" ];
+          pooled = { enable = true; inherit branches; };
+
+          hostWith = storage: ferrumLib.mkHost {
+            inherit system;
+            settings = {
+              schemaVersion = realMigrations.currentVersion;
+              inherit storage;
+            };
+            modules = [ ../../../examples/hosts/minimal/configuration.nix ];
+          };
+
+          # deepSeq inside the tryEval: tryEval alone forces only to WHNF, so
+          # an error raised while evaluating a field of this attrset escapes
+          # the catch entirely and takes the whole check down instead of
+          # being reported. Measured, not assumed -- the first version of
+          # this probe died on the `/` case rather than catching it.
+          probe = storage:
+            let
+              v = {
+                failed = map (a: a.message)
+                  (builtins.filter (a: !a.assertion) (hostWith storage).config.assertions);
+                snapraidEnabled = (hostWith storage).config.services.snapraid.enable;
+              };
+              r = builtins.tryEval (builtins.deepSeq v v);
+            in
+            if r.success then r.value // { threw = false; }
+            else { failed = [ ]; snapraidEnabled = false; threw = true; };
+
+          failuresMatching = phrase: storage:
+            builtins.filter (m: lib.hasInfix phrase m) (probe storage).failed;
+
+          overlapPhrase = "both contain";
+          emptyPhrase = "is on and";
+          reservedPhrase = "is equal to,";
+          anyParityFailure = storage:
+            lib.concatMap (phrase: failuresMatching phrase storage)
+              [ overlapPhrase emptyPhrase reservedPhrase ];
+
+          overlap = { pool = pooled; parity = { enable = true; disks = [ "/mnt/ferrum-check-b" ]; }; };
+          emptyDisks = { pool = pooled; parity = { enable = true; disks = [ ]; }; };
+          reserved = { pool = pooled; parity = { enable = true; disks = [ "/data" ]; }; };
+          osDisk = { pool = pooled; parity = { enable = true; disks = [ "/" ]; }; };
+          working = { pool = pooled; parity = { enable = true; disks = [ "/mnt/ferrum-parity-0" ]; }; };
+          off = { pool = pooled; };
+
+          overlapRejected = failuresMatching overlapPhrase overlap != [ ];
+          emptyRejected = failuresMatching emptyPhrase emptyDisks != [ ];
+          reservedRejected = failuresMatching reservedPhrase reserved != [ ];
+          osDiskRefused = (probe osDisk).threw;
+          workingAccepted = anyParityFailure working == [ ];
+          workingIsConfigured = (probe working).snapraidEnabled;
+          offConfiguresNothing = !(probe off).snapraidEnabled;
+          emptyConfiguresNothing = !(probe emptyDisks).snapraidEnabled;
+
+          # "Fires on EVERY evaluation, not only at first install."
+          #
+          # There is no first-install/later distinction to exercise
+          # directly: a NixOS assertion is read on every `nixos-rebuild`,
+          # full stop. What can drift, and what this pins, is WHERE the
+          # assertion reads its inputs from. An assertion written against
+          # the settings document would catch the installer's output and
+          # miss an operator who later adds the branch from
+          # /etc/ferrum/custom/, and vice versa. So the same overlap is
+          # introduced the OTHER way -- through an ordinary NixOS module
+          # layered on top, which is what /etc/ferrum/custom/*.nix is -- and
+          # must produce the identical refusal.
+          overlapViaModule =
+            let
+              host = ferrumLib.mkHost {
+                inherit system;
+                settings = {
+                  schemaVersion = realMigrations.currentVersion;
+                  storage.pool = pooled;
+                };
+                modules = [
+                  ../../../examples/hosts/minimal/configuration.nix
+                  { ferrum.storage.parity = { enable = true; disks = [ "/mnt/ferrum-check-b" ]; }; }
+                ];
+              };
+              v = map (a: a.message) (builtins.filter (a: !a.assertion) host.config.assertions);
+              r = builtins.tryEval (builtins.deepSeq v v);
+            in
+            if r.success then builtins.filter (m: lib.hasInfix overlapPhrase m) r.value != [ ]
+            else false;
+        in
+        {
+          ok = overlapRejected
+            && emptyRejected
+            && reservedRejected
+            && osDiskRefused
+            && workingAccepted
+            && workingIsConfigured
+            && offConfiguresNothing
+            && emptyConfiguresNothing
+            && overlapViaModule;
+          message =
+            "modules/core/parity.nix does not keep a parity disk out of the "
+            + "mergerfs pool, or refuses a configuration it should accept";
+          inherit overlapRejected emptyRejected reservedRejected osDiskRefused
+            workingAccepted workingIsConfigured offConfiguresNothing
+            emptyConfiguresNothing overlapViaModule;
+        };
+
       # The self-signed certificate follows ferrum.proxy.baseDomain.
       #
       # Its CN and both SANs are built from that option, and the unit that
@@ -5302,6 +5444,8 @@
           mkAssertionCheck "pool-branches-are-all-seeded" poolBranchesAreAllSeeded;
         pool-assertions-can-fire =
           mkAssertionCheck "pool-assertions-can-fire" poolAssertionsCanFire;
+        parity-disk-is-never-a-pool-branch =
+          mkAssertionCheck "parity-disk-is-never-a-pool-branch" parityDiskIsNeverAPoolBranch;
         media-tree-waits-for-its-mounts =
           mkAssertionCheck "media-tree-waits-for-its-mounts" mediaTreeWaitsForItsMounts;
         branch-roots-are-ownership-checked =
