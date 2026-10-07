@@ -51,6 +51,12 @@ three address-echo services; everything else is an app you installed doing the j
 for. The full table, every row traced to the line of code it came from and the unverified ones
 marked as unverified, is in [`docs/EGRESS.md`](docs/EGRESS.md).
 
+**ferrum connects the apps to each other, and you do not have to.** Prowlarr pushes indexers to
+Sonarr and Radarr, both download clients register with all three, and every app is told where the
+media tree is — derived from the catalog on every apply, not configured by you. What that covers,
+what needs the `custom/` escape hatch instead, and what ferrum deliberately does not do, is in
+[`docs/WHATS-ALREADY-WIRED.md`](docs/WHATS-ALREADY-WIRED.md).
+
 That page also carries the warning ferrum did not previously make: publishing an app puts its
 hostname in **public, permanently searchable Certificate Transparency logs**, so the list of what
 runs on your domain is readable by anyone. Whether ferrum should issue one wildcard instead of a

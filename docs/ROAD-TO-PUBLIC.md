@@ -693,7 +693,16 @@ Items that analysis surfaced about **ferrum**, not about the projects analysed:
       cookie** (F5 split the cookie into two scopes the same day), or the netns setup still
       settling mid-apply. **Needs a reproduction before anyone theorises further** — the cause is
       unknown and should be recorded as unknown.
-- [ ] **31. Document what ferrum already did for you.** The owner asked whether Prowlarr was wired
+- [x] **31. Document what ferrum already did for you.** DONE 2026-10-07 —
+      `docs/WHATS-ALREADY-WIRED.md`, linked from the README. Written from the catalog rather than
+      from memory: the integration edges are read out of each app's `meta.nix`, so the page says
+      what the code does rather than what someone remembers it doing. Covers the eight
+      registrations, the root folders and download paths (and **why they share one `mediaDir` — a
+      hardlink cannot cross a filesystem**), what needs `custom/` instead, the untracked-files trap
+      that nearly cost a live host its VPN, and three things ferrum deliberately does **not** do:
+      no off-box backup, no parity, and LAN access depending on NAT hairpin.
+      Screen 4 of the mockups solves the same gap in the UI; this is the docs half.
+- [ ] **31b. Superseded — see above.** Original entry: The owner asked whether Prowlarr was wired
       to Sonarr and Radarr. It was — `ferrum-reconcile` registers all of it on every apply, 8
       registrations on this host. **Having to ask is the defect.** Write the page that says what
       the standard setup already includes, and separately what falls outside it and needs the
