@@ -745,7 +745,16 @@ pub fn summary_line(report: &ParityReport) -> String {
                 missing.join(", ")
             )
         }
-        ParityState::InSync => format!("parity is current; {age}"),
+        // R6. The ONE state that tells an operator they are protected is the
+        // one that must say what that protection is worth, in the same
+        // breath. A line that said "parity is current" and stopped is the
+        // sentence somebody remembers when they later decide they do not
+        // need anything else.
+        //
+        // Only this state, deliberately. Appending it to "a parity disk is
+        // missing" would bury an urgent fact under a standing caveat, and a
+        // caveat on every line is a caveat nobody reads.
+        ParityState::InSync => format!("parity is current; {age}. {LIMITATION}"),
         ParityState::Stale => {
             let n = report
                 .unprotected
@@ -1578,6 +1587,52 @@ No differences
         names.dedup();
         assert_eq!(before, names.len(), "two states share a wire name: {names:?}");
         assert!(names.contains(&"\"in-sync\"".to_string()), "{names:?}");
+    }
+
+    /// R6. The CLI line that reports protection carries the limitation, and
+    /// no CLI line anywhere calls parity a backup.
+    ///
+    /// Asserted over EVERY state rather than over the healthy one alone:
+    /// "the protected line says the right thing" and "no other line says the
+    /// wrong thing" are two different claims, and only the second catches a
+    /// future state whose wording drifts.
+    #[test]
+    fn the_cli_summary_states_the_limitation_when_it_reports_protection() {
+        let (_d, conf, last) = fixture(Some(("1000", "success")));
+
+        let healthy = report(
+            &conf,
+            &last,
+            2000,
+            &ScriptedRunner::new("inactive", Some(REAL_DIFF_CLEAN)),
+        );
+        assert_eq!(healthy.state, ParityState::InSync);
+        let line = summary_line(&healthy);
+        assert!(line.contains("parity is current"), "{line}");
+        assert!(
+            line.contains("single local disk"),
+            "the one line that says you are protected does not say what that \
+             protection is worth: {line}"
+        );
+
+        // Every state's line, including the healthy one, and none of them
+        // uses the word.
+        for state in [
+            ParityState::NotConfigured,
+            ParityState::Syncing,
+            ParityState::NeverSynced,
+            ParityState::LastSyncFailed,
+            ParityState::ParityDiskMissing,
+            ParityState::InSync,
+            ParityState::Stale,
+            ParityState::Unknown,
+        ] {
+            let mut r = healthy.clone();
+            r.state = state;
+            let line = summary_line(&r).to_lowercase();
+            assert!(!line.is_empty(), "{state:?} produced no summary at all");
+            assert!(!line.contains("backup"), "{state:?}: {line}");
+        }
     }
 
     // -------------------------------------------------------------------

@@ -3944,6 +3944,118 @@
           stateCount = builtins.length uiStates;
         };
 
+      # R6. The product says "parity is not a backup" itself, on the surfaces
+      # an operator actually reads -- and never the reverse.
+      #
+      # THE SCAN HAS TO BE SHAPED, NOT A WORD BAN, and getting that wrong is
+      # the obvious mistake rather than a subtle one. A check that simply
+      # forbade the word "backup" anywhere would fail on the heading "Parity
+      # is not a backup" -- which is the exact sentence this requirement
+      # exists to make the product say. It would also fail on the restore
+      # procedure's instruction to use a real backup when both a data disk
+      # and the parity disk are gone, which is the most important advice on
+      # that page. The only way to make that version pass would be to delete
+      # the writing. (`parity-view-is-wired` already learned this once, on
+      # its own first run.)
+      #
+      # So two different assertions over two different shapes:
+      #
+      #   1. REQUIRED. The operator documentation must carry the disclaimer
+      #      and the specific things parity does not survive. This is the
+      #      same required-phrase shape the stale-comment scan uses.
+      #   2. FORBIDDEN. No surface may AFFIRM it -- the handful of phrasings
+      #      that would actually claim parity is a backup, matched
+      #      case-insensitively, across the doc and every parity prose
+      #      surface. Scanning for claims rather than for a word is what lets
+      #      the denial and the claim be told apart.
+      parityNeverClaimsToBeABackup =
+        let
+          doc = builtins.readFile ../../../docs/storage/parity.md;
+          rustSrc = builtins.readFile ../../../crates/ferrum-apply/src/parity.rs;
+          appSrc = builtins.readFile ../../../ui/app.js;
+
+          required = [
+            "Parity is not a backup"
+            "undo a deletion"
+            "ransomware"
+            "the parity disk is **in** that box"
+            "rollback` is not this either"
+          ];
+          missing = builtins.filter (p: !(lib.hasInfix p doc)) required;
+
+          # The claims. Lower-cased on both sides so a capitalised version
+          # cannot slip past, and written as whole phrases so the word on its
+          # own -- which the denial needs -- is not what is being matched.
+          claims = [
+            "parity is a backup"
+            "parity is your backup"
+            "backed up by parity"
+            "parity backs up"
+            "backup of your library"
+            "acts as a backup"
+            "serves as a backup"
+            "a backup of the"
+          ];
+          affirmsIn = name: src:
+            map (c: "${name}: ${c}")
+              (builtins.filter (c: lib.hasInfix c (lib.toLower src)) claims);
+          affirmations =
+            affirmsIn "docs/storage/parity.md" doc
+            ++ affirmsIn "crates/ferrum-apply/src/parity.rs" rustSrc
+            ++ affirmsIn "ui/app.js" appSrc
+            ++ affirmsIn "modules/core/parity.nix"
+              (builtins.readFile ../../../modules/core/parity.nix)
+            ++ affirmsIn "modules/core/options.nix"
+              (builtins.readFile ../../../modules/core/options.nix);
+
+          # The one constant every other surface takes its words from. If it
+          # ever stopped naming the single-disk limit, every surface that
+          # renders it would quietly stop saying it too.
+          #
+          # SCOPED TO THE CONSTANT'S OWN LINES, not to the file. The first
+          # version of this searched the whole of parity.rs and survived a
+          # mutant that gutted the constant -- because the same phrase also
+          # appears in two of that file's TESTS, which assert the constant
+          # says it. A check satisfied by the test that checks the thing is
+          # a check of nothing.
+          limitationBlock =
+            let
+              indexed = lib.imap0 (i: l: { inherit i l; }) (lib.splitString "\n" rustSrc);
+              hits = builtins.filter (e: lib.hasInfix "pub const LIMITATION" e.l) indexed;
+            in
+            if hits == [ ] then
+              throw ("crates/ferrum-apply/src/parity.rs no longer declares LIMITATION, so "
+                + "parity-never-claims-to-be-a-backup cannot check what every parity surface "
+                + "renders. A check that cannot find what it guards must fail, not pass.")
+            else
+              let
+                after = lib.drop (builtins.head hits).i
+                  (lib.splitString "\n" rustSrc);
+                take = acc: rest:
+                  if rest == [ ] then
+                    throw "LIMITATION is declared but its closing `\";` cannot be found"
+                  else
+                    let head = builtins.head rest; in
+                    if lib.hasSuffix "\";" head then acc ++ [ head ]
+                    else take (acc ++ [ head ]) (builtins.tail rest);
+              in
+              lib.concatStringsSep "\n" (take [ ] after);
+          limitationIsSpecific = lib.hasInfix "single local disk" limitationBlock;
+
+          # Anti-vacuity: the claim list must actually be capable of matching.
+          # Without this, a typo in every entry would make `affirmations`
+          # permanently empty and the check permanently, silently green.
+          scannerWorks =
+            affirmsIn "probe" "Parity is a backup of the whole library." != [ ];
+        in
+        {
+          ok = missing == [ ] && affirmations == [ ] && limitationIsSpecific && scannerWorks;
+          message =
+            "the parity surfaces no longer state that parity is not a backup, "
+            + "or one of them now claims it is";
+          inherit missing affirmations limitationIsSpecific scannerWorks;
+        };
+
       # The self-signed certificate follows ferrum.proxy.baseDomain.
       #
       # Its CN and both SANs are built from that option, and the unit that
@@ -5003,8 +5115,17 @@
 
           # The view's own source, delimited by the banner comments this file
           # already uses to separate its sections.
+          #
+          # It ends at the NEXT banner, whichever that is, rather than at
+          # `// --- routing ---` specifically. That is a correction, not a
+          # loosening: the original terminator silently assumed Updates was
+          # the last view in the file, so adding a sixth section between the
+          # two made this block swallow it -- and `foreignJobKinds` then
+          # reported the Parity view's own `parity_status`/`parity_sync`
+          # calls as kinds the Updates screen was starting. The allowlist
+          # below is untouched; what changed is which lines it is applied to.
           updatesBlock = blockAt "the Updates view's own source"
-            "// --- updates ---" (l: lib.hasInfix "// --- routing ---" l);
+            "// --- updates ---" (l: lib.hasPrefix "// --- " l);
 
           # The per-app row builder, to its closing brace at column zero.
           appRowBlock = blockAt "the per-app row builder" "function appRow(" (l: l == "}");
@@ -5885,6 +6006,8 @@
           mkAssertionCheck "parity-timers-self-heal" parityTimersSelfHeal;
         parity-view-is-wired =
           mkAssertionCheck "parity-view-is-wired" parityViewIsWired;
+        parity-never-claims-to-be-a-backup =
+          mkAssertionCheck "parity-never-claims-to-be-a-backup" parityNeverClaimsToBeABackup;
         media-tree-waits-for-its-mounts =
           mkAssertionCheck "media-tree-waits-for-its-mounts" mediaTreeWaitsForItsMounts;
         branch-roots-are-ownership-checked =

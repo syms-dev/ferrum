@@ -67,6 +67,11 @@ jobs:
             .#checks.x86_64-linux.directive-separators-never-reach-a-generated-file \
             .#checks.x86_64-linux.pool-branches-are-all-seeded \
             .#checks.x86_64-linux.pool-assertions-can-fire \
+            .#checks.x86_64-linux.parity-disk-is-never-a-pool-branch \
+            .#checks.x86_64-linux.parity-excludes-only-the-churn \
+            .#checks.x86_64-linux.parity-timers-self-heal \
+            .#checks.x86_64-linux.parity-view-is-wired \
+            .#checks.x86_64-linux.parity-never-claims-to-be-a-backup \
             .#checks.x86_64-linux.media-tree-waits-for-its-mounts \
             .#checks.x86_64-linux.branch-roots-are-ownership-checked \
             .#checks.x86_64-linux.branch-ownership-guard-behaves \
