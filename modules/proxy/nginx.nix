@@ -13,6 +13,14 @@ let
   publicApps = proxyLib.publicApps ferrum;
   selfSignedCertDir = proxyLib.selfSignedCertDir;
 
+  # Where an app ACTUALLY listens, which is not always 127.0.0.1: an app
+  # placed in a network namespace (today only qBittorrent, and only when a
+  # "qbittorrent-vpn" secret exists) binds inside it, and nginx runs in the
+  # root namespace. Shared with modules/core/reconciler.nix rather than
+  # re-derived here -- the reconciler had this exception and nginx did not,
+  # which is the whole defect. See modules/lib/app-address.nix.
+  appHost = (import ../lib/app-address.nix { inherit lib; }).hostFor ferrum;
+
   # The control plane's own vhost (R13/A1). See modules/proxy/lib.nix for why
   # the daemon is shaped like an app and why `daemonPublished` is one shared
   # predicate rather than a condition re-spelled in three files.
@@ -45,11 +53,17 @@ let
   # configuration D6 exists to make work.
   realCertsNeeded = publicApps != { } || daemonPublished;
 
-  mkVhost = _: app:
+  mkVhost = id: app:
     let
       vhostName = vhostNameFor app;
       isPublic = app.exposure == "public";
       authRequestEnabled = proxyLib.authGated ferrum app;
+
+      # Bound once so the two locations below cannot disagree. Only the
+      # APP's upstream moves with the namespace: the /authelia subrequest
+      # below still goes to 127.0.0.1:9091, because Authelia itself runs in
+      # the root namespace alongside nginx and is unaffected.
+      appUpstream = "http://${appHost id}:${toString app.port}";
 
       # The LAN restriction applies to every location, auth-gated or not.
       # Factored out so a bypass location cannot accidentally become the
@@ -78,7 +92,7 @@ let
         (path: {
           name = path;
           value = {
-            proxyPass = "http://127.0.0.1:${toString app.port}";
+            proxyPass = appUpstream;
             proxyWebsockets = true;
             extraConfig = lanRestriction;
           };
@@ -117,7 +131,7 @@ let
           };
 
           "/" = {
-            proxyPass = "http://127.0.0.1:${toString app.port}";
+            proxyPass = appUpstream;
             proxyWebsockets = true;
             extraConfig = lanRestriction + lib.optionalString authRequestEnabled ''
               auth_request /authelia;
@@ -138,9 +152,10 @@ let
     };
 
   # The daemon's vhost is hand-built rather than run through mkVhost, for the
-  # same reason the auth.<baseDomain> vhost below is: mkVhost hardcodes
-  # `http://127.0.0.1:${app.port}` as its upstream, and the daemon's listen
-  # address is an operator-settable option (ferrum.daemon.listenAddress). It
+  # same reason the auth.<baseDomain> vhost below is: mkVhost builds its
+  # upstream from a catalog app's `port` and the app-address table, and the
+  # daemon's listen address is an operator-settable option
+  # (ferrum.daemon.listenAddress) that neither of those knows about. It
   # is still the SAME shape -- same forceSSL, same /authelia subrequest, same
   # auth_request wiring -- because "gated exactly like a catalog app" (A2) is
   # the requirement.
