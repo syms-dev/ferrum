@@ -25,8 +25,8 @@ is not.
 | 1 | **Onboarding** — replace the one-time setup password | **Not built** |
 | 2 | **First run** — "Nothing's running yet", every app offered, Sonarr suggested | **Not built** |
 | 3 | **Dashboard** — per-app health, hostname, port, pending-change banner | **Partial.** No pending-change banner (`grep` for "pending change": 0). Health language barely present (2 occurrences) |
-| 4 | **App detail** — general, access, resources, app settings, **integrations** | **Not built.** No detail view of any kind |
-| 5 | **qBittorrent VPN** — paste a WireGuard config, kill-switch explained | **Not built.** `wireguard`/`vpn`/`killswitch` appear **0 times** in the whole UI |
+| 4 | **App detail** — general, access, resources, app settings, **integrations** | **Built 2026-10-07.** Routed at `#/apps/<id>`; see the note below for the two controls that were reported rather than invented |
+| 5 | **qBittorrent VPN** — paste a WireGuard config, kill-switch explained | **Built 2026-10-07.** Paste field writes through the write-only secrets API; the status is a live reading with a timestamp |
 | 6 | **Apply flow** — review the diff, then live step-by-step progress | **Partial.** Apply and job streaming exist; the designed review-then-progress shape does not |
 | 7 | **Updates** | **Built** |
 | 8 | **Settings** — proxy, authentication, backups, apply behaviour | **Not built as designed.** What exists is "Settings schema", the generic form |
@@ -62,6 +62,32 @@ Neither is a UI gap. Both are product decisions already made in the design and n
   aged well and is now sharper than when it was written — `/api/ready` exists as of 2026-10-07, and
   `health.rs` carries an explicit banner that no watchdog or restart policy may point at it, because
   `main.rs` already records a ferrumd restarted mid-apply by its own generation switch.
+
+## What screens 4 and 5 found that the mockups could not know
+
+Built 2026-10-07. Three controls the mockups draw have **no backend**, and each was reported rather
+than invented — a UI control over a thing ferrum cannot do is worse than no control.
+
+- **The green "Healthy · …" dot in screen 4's header.** ferrum has no per-app health check between
+  applies. `crates/ferrumd/src/health.rs` says so explicitly: readiness asks nothing about Sonarr,
+  Plex or qBittorrent. The header therefore shows **enabled/disabled**, which is what is known, and
+  nothing else. A green dot standing in for a measurement nobody takes is the exact defect
+  ROAD-TO-PUBLIC item 23 names.
+- **Screen 4's "Exposure" select.** Deliberately removed from the UI already — `ui/forms.js` records
+  the reasoning: every app is published on the operator's domain, the module default is `public`
+  wherever a proxy exists, and removing the option from the module tree is the honest finish (it
+  needs a settings-schema migration). An existing explicit `exposure` in a document is still
+  preserved untouched. Not re-added.
+- **Screen 5's "Provider" select and its "Get config" link.** ferrum knows nothing about VPN
+  providers — there is no provider list, no per-provider config fetch, and nothing to populate a
+  select from. The link is also an outbound URL written into `ui/app.js`, which the standing
+  "no external request of any kind" invariant is mechanically checked for. Replaced by a sentence
+  saying what to paste.
+
+One deliberate layout deviation: the mockup puts the kill-switch toggle inside the VPN panel. It is
+rendered by the schema form instead, from qBittorrent's own `settingsSchema`, and the panel reports
+its **effective** value as a fact. Two controls writing one settings key is a worse trade than one
+control in a slightly different place.
 
 ## What to do with this
 

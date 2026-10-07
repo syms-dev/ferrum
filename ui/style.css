@@ -157,6 +157,27 @@ dialog.confirm h3 { margin-top: 0; }
 dialog::backdrop { background: rgba(0,0,0,.6); }
 .login { max-width: 22rem; margin: 3rem auto; }
 
+/* An anchor that has to look and size like a button, because it IS the
+   primary action -- opening an app, or opening its detail view. It stays an
+   <a> so it is middle-clickable and bookmarkable; only the appearance is
+   borrowed. Padding and radius match the `button` rule above deliberately
+   rather than being eyeballed, so the two never drift apart visually. */
+.button-link {
+  display: inline-block; padding: .5rem .6rem; border-radius: .4rem;
+  border: 1px solid var(--line); background: transparent; color: var(--accent);
+  font-weight: 600; text-decoration: none;
+}
+.button-link:hover, .button-link:focus-visible { text-decoration: underline; }
+.crumb { color: var(--muted); font-size: .9rem; margin: 0 0 .25rem; }
+/* The WireGuard config field. Monospace because it is a config file and a
+   proportional font makes a mistyped key impossible to spot; resizable
+   because a provider config is longer than six lines more often than not. */
+textarea {
+  font: .85rem/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  width: 100%; max-width: 40rem; padding: .5rem .6rem; border-radius: .4rem;
+  border: 1px solid var(--line); background: var(--panel); color: var(--text);
+  resize: vertical;
+}
 details.advanced { margin: 1rem 0; border: 1px solid var(--line); border-radius: .5rem; padding: .5rem .75rem; }
 details.advanced summary { cursor: pointer; font-weight: 600; }
 details.advanced[open] summary { margin-bottom: .5rem; }

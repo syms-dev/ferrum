@@ -64,10 +64,13 @@ let
   # decision): Prowlarr registering Sonarr/Radarr is "application" (its
   # own indexer push-sync feature); every other consumes/providesTo edge
   # is "downloadClient".
-  pairKind = consumer: provider:
-    if consumer == "prowlarr" && lib.elem provider [ "sonarr" "radarr" ]
-    then "application"
-    else "downloadClient";
+  #
+  # The rule moved to modules/lib/integrations.nix when the UI's app detail
+  # view grew an Integrations panel that has to say the same sentence. It is
+  # imported rather than restated for the same reason appHost above is: two
+  # files deriving one fact from the same inputs is how the nginx/reconciler
+  # address split happened.
+  pairKind = (import ../lib/integrations.nix { inherit lib catalog; }).pairKind;
 
   pairs = lib.flatten (lib.mapAttrsToList
     (id: _:

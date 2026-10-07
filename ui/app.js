@@ -31,6 +31,7 @@ const state = {
   catalog: null,
   settings: null,
   stream: null, // the live EventSource, so a view teardown can close it
+  ticker: null, // the interval re-ageing an on-screen reading, same reason
 };
 
 function setStatus(message, kind = "") {
@@ -54,6 +55,30 @@ function localTime(epochString) {
 function closeStream() {
   state.stream?.close();
   state.stream = null;
+}
+
+/// Runs `tick` once a minute until the view is torn down.
+///
+/// Exists for one job: keeping a "checked N minutes ago" line honest while a
+/// page sits open. A reading painted once and never re-aged is the frozen
+/// gauge in slow motion -- it was true when it was painted and says nothing
+/// about having stopped being true.
+///
+/// One ticker at a time, cleared by `route()` before any view is painted, so
+/// a view cannot leak a timer that goes on writing into a detached node.
+///
+/// @param {() => void} tick - Called every minute, and never on the first
+///   call: the caller paints the initial value itself, so the line is never
+///   blank for a minute.
+/// @returns {void}
+function startTicker(tick) {
+  closeTicker();
+  state.ticker = setInterval(tick, 60_000);
+}
+
+function closeTicker() {
+  if (state.ticker !== null) clearInterval(state.ticker);
+  state.ticker = null;
 }
 
 // --- login ---------------------------------------------------------------
@@ -106,11 +131,10 @@ function appsView() {
         el("h3", { text: meta.displayName || id }),
         el("p", { class: "hint", text: meta.summary || "" }),
         el("p", { class: enabled ? "pill on" : "pill", text: enabled ? "Enabled" : "Disabled" }),
-        el("button", {
-          type: "button",
-          text: "Configure",
-          onclick: () => appForm(id),
-        }),
+        // A real link, not a button that calls a function. The detail view has
+        // its own route, so this one is middle-clickable, bookmarkable, and
+        // survives a reload -- which a hand-dispatched render never did.
+        el("a", { class: "button-link", href: `#/apps/${id}`, text: `Open ${meta.displayName || id}` }),
       ]),
     );
   }
@@ -124,53 +148,406 @@ function appsView() {
   );
 }
 
-function appForm(id) {
-  const meta = state.catalog.apps[id];
-  const current = state.settings?.apps?.[id] ?? {};
-  const stateRoot = state.settings?.storage?.stateDir ?? "/var/lib/ferrum/state";
+// --- app detail ----------------------------------------------------------
 
-  // Two groups, deliberately. The first is what an operator decides; the
-  // second is everything the catalog already answered correctly. Enabling an
-  // app should not be a configuration exercise -- that is the whole point of
-  // having a catalog, and the comparison being made against Saltbox.
-  const primary = renderForm(appSchema(state.catalog.schema, id, meta), current);
-  const advanced = renderForm(advancedSchema(meta, stateRoot, id), current);
+/// The one screen that knows what an app IS, rather than what its settings
+/// are.
+///
+/// Built to screen 4 of docs/design/mockups/2026-10-07-ferrum-ui-mockups.html,
+/// which the reconciliation beside it recorded as having zero occurrences of
+/// anything resembling it in the shipped UI. What the mockup adds over the
+/// settings form it replaces is CONTEXT: who this app is already wired to,
+/// whether its tunnel is up, where to open it. The form underneath is the
+/// same schema renderer, untouched -- "adding an app needs no UI change" is
+/// the property this screen is built on rather than around.
 
-  const details = el("details", { class: "advanced" }, [
-    el("summary", { text: "Advanced \u2014 the catalog already set these" }),
+/// The hostname an app is published at.
+///
+/// `modules/proxy/lib.nix`'s `vhostNameFor` owns this rule --
+/// `"${app.subdomain}.${ferrum.proxy.baseDomain}"` -- and this is the one
+/// place the browser restates it, because the catalog is host-independent and
+/// cannot carry a hostname that depends on this host's own base domain.
+///
+/// Returns null rather than a plausible-looking wrong answer in every case
+/// where the app is NOT published: no proxy, no base domain, or an app the
+/// catalog marks headless (which gets no vhost and no DNS record at all, so a
+/// link would promise a page that can never answer).
+///
+/// @param {string} id - The catalog app id.
+/// @param {object} meta - That app's catalog metadata.
+/// @returns {string|null} The host, or null when this app has no front door.
+function appHostname(id, meta) {
+  if (meta.headless) return null;
+  const baseDomain = state.settings?.proxy?.baseDomain;
+  if (state.settings?.proxy?.enable === false || !baseDomain) return null;
+  const subdomain = state.settings?.apps?.[id]?.subdomain ?? meta.defaultSubdomain;
+  if (!subdomain) return null;
+  return `${subdomain}.${baseDomain}`;
+}
+
+/// The Integrations panel: who ferrum has already wired this app to.
+///
+/// **Read, never re-derived.** The edges and their registration kinds arrive
+/// in the catalog as `integrationEdges`, computed once by
+/// modules/lib/integrations.nix -- the same module modules/core/reconciler.nix
+/// imports `pairKind` from. Two places deriving "Prowlarr registers Sonarr as
+/// an application" from the same meta.nix is the defect class that produced
+/// the nginx/reconciler address split, and this panel is deliberately not the
+/// second place.
+///
+/// The one thing applied here is the reconciler's own liveness filter: it
+/// registers an edge only when BOTH ends are enabled, so an edge to a
+/// disabled app is listed separately as something that is not wired yet,
+/// rather than claimed as done.
+///
+/// @param {string} id - The catalog app id.
+/// @returns {HTMLElement} The panel.
+function integrationsPanel(id) {
+  const edges = state.catalog.apps[id]?.integrationEdges ?? [];
+  const nameOf = (other) => state.catalog.apps[other]?.displayName || other;
+  const isEnabled = (app) => state.settings?.apps?.[app]?.enable === true;
+  const bothEnabled = (edge) => isEnabled(edge.consumer) && isEnabled(edge.provider);
+
+  const phrase = (edge) => {
+    const weAreTheConsumer = edge.consumer === id;
+    if (edge.kind === "application") {
+      return weAreTheConsumer
+        ? `registers ${nameOf(edge.provider)} as an application, pushing indexers to it`
+        : `is registered as an application in ${nameOf(edge.consumer)}, which pushes indexers here`;
+    }
+    return weAreTheConsumer
+      ? `pulls downloads from ${nameOf(edge.provider)}`
+      : `is registered as a download client in ${nameOf(edge.consumer)}`;
+  };
+
+  const live = edges.filter(bothEnabled);
+  const dormant = edges.filter((edge) => !bothEnabled(edge));
+
+  const body = [];
+  if (live.length) {
+    body.push(el("p", { text: "ferrum-reconcile re-asserts these on every apply, through the apps' own APIs:" }));
+    body.push(el("ul", {}, live.map((edge) => el("li", { text: `This app ${phrase(edge)}.` }))));
+  } else if (edges.length) {
+    body.push(el("p", { text: "Nothing is wired yet \u2014 every app this one connects to is disabled." }));
+  } else {
+    body.push(el("p", { text: "This app has no integrations in the catalog. Nothing registers it, and it registers nothing." }));
+  }
+  if (dormant.length) {
+    body.push(el("p", {
+      class: "hint",
+      text:
+        "Declared in the catalog but not wired, because the other end is not enabled: " +
+        dormant
+          .map((edge) => nameOf(edge.consumer === id ? edge.provider : edge.consumer))
+          .join(", ") +
+        ". Enable it and the next apply connects them.",
+    }));
+  }
+
+  return el("section", { class: "callout" }, [el("h3", { text: "Integrations" }), ...body]);
+}
+
+/// One entry per line, one distinct sentence per state, and every sentence
+/// names a DIFFERENT thing to do next. That is the test a state had to pass
+/// to exist: `unknown` folded into `tunnel-down` would send an operator to
+/// debug WireGuard over a daemon that simply could not reach systemd, and
+/// `not-applied` folded into it would send them to a journal for a unit that
+/// does not exist on this host yet.
+///
+/// Cross-checked against crates/ferrumd/src/vpn.rs's own `VpnState` variants
+/// by checks.app-detail-view-is-wired, so a state the daemon can send with no
+/// branch here fails the build rather than rendering as a blank panel.
+// Kept on ONE line on purpose -- the check reads the quoted names out of it.
+const VPN_STATES = ["not-configured", "not-applied", "starting", "tunnel-configured", "tunnel-down", "unknown"];
+
+/// The two keys `GET /api/vpn` always answers with. Same cross-check.
+const VPN_ENVELOPE_KEYS = ["checkedAt", "apps"];
+
+const VPN_STATE_TEXT = {
+  "not-configured": stateText("No VPN is set up for this app", "Nothing is declared, so there is no tunnel and no kill switch: this app reaches the network the same way every other app does. Paste a WireGuard config below to change that."),
+  "not-applied": stateText("A VPN config is saved, but this host has not been rebuilt yet", "The config is encrypted on disk and systemd knows no tunnel unit, which is what a saved-but-unapplied VPN looks like. Apply, and the tunnel is created."),
+  "starting": stateText("The tunnel is coming up", "systemd is still bringing the namespace up or taking it down. Check again in a moment."),
+  "tunnel-configured": stateText("The tunnel is configured and the kill switch is in place", "The setup ran all the way through: the network namespace exists and the WireGuard interface inside it was configured from your config. See the limit below \u2014 this is not a statement that traffic is flowing."),
+  "tunnel-down": stateText("The tunnel is down, so downloads are blocked", "The kill switch keeps it that way on purpose \u2014 it never falls back to your real IP. The app is bound to the tunnel's own unit, so it is stopped rather than left running outside it. Read that unit's journal for the reason."),
+  "unknown": stateText("ferrum could not find out", "The system bus did not answer, so nothing was measured. This is not the same as the tunnel being down, and it is not the same as it being up."),
+};
+
+/// The qBittorrent VPN panel -- screen 5 of the mockups.
+///
+/// Nothing here names an app. The panel is rendered for whichever app's
+/// catalog metadata declares a `vpn` block (`meta.vpn`), which is what keeps
+/// "adding an app is adding a directory" true for this screen too, and what
+/// stops the systemd unit name living in a second place where it could
+/// silently stop matching the unit service.nix defines.
+///
+/// @param {string} id - The catalog app id.
+/// @param {object} vpnMeta - That app's catalog `vpn` block.
+/// @returns {HTMLElement} The panel, which fetches its own reading.
+function vpnPanel(id, vpnMeta) {
+  const status = el("div", { class: "state" });
+  const age = el("p", { class: "checked-at" });
+  const facts = el("dl", { class: "facts" });
+  const paste = el("textarea", {
+    id: "wg-config",
+    rows: 6,
+    spellcheck: "false",
+    placeholder: "[Interface]\nPrivateKey = ...\nAddress = ...\n\n[Peer]\nPublicKey = ...\nEndpoint = ...",
+  });
+  const note = el("p", { class: "hint", "aria-live": "polite" });
+  const recheck = el("button", { type: "button", class: "ghost", text: "Check again" });
+  const save = el("button", { type: "button", text: "Save VPN config" });
+
+  // The reading's own timestamp, held so the ticker can re-age it without
+  // re-fetching. A page left open must not go on claiming a measurement is
+  // fresh -- the text says how old it is, and keeps saying so as it ages.
+  let checkedAt = null;
+
+  function paintAge() {
+    age.textContent = checkedAt
+      ? `Checked ${localTime(checkedAt)} \u2014 ${relativeAge(checkedAt)}.`
+      : "Not checked yet.";
+  }
+
+  function paint(reading) {
+    const stateName = String(reading?.state ?? "");
+    const text = VPN_STATE_TEXT[stateName];
+    status.replaceChildren();
+    if (!text) {
+      status.appendChild(el("p", {
+        class: "error",
+        text: `The daemon reported VPN state "${orUnknown(stateName)}", which this page does not know how to render. It knows: ${VPN_STATES.join(", ")}.`,
+      }));
+      return;
+    }
+    status.appendChild(el("strong", { text: text.label }));
+    status.appendChild(el("p", { class: "hint", text: text.prose }));
+
+    const rows = [
+      ["Kill switch", reading.killSwitch
+        ? "on \u2014 this app reaches the network only through the tunnel, with no fallback path if it drops"
+        : "OFF \u2014 if the tunnel drops, this app falls back to this host's own address. Turn it on under this app's own options above."],
+      ["Measured from", reading.unit
+        ? `the systemd unit ${reading.unit}, which reported "${orUnknown(reading.activeState)}"`
+        : "nothing \u2014 there is no tunnel configured to measure"],
+    ];
+    facts.replaceChildren(...rows.flatMap(([term, detail]) => [
+      el("dt", { text: term }),
+      el("dd", { text: detail }),
+    ]));
+  }
+
+  async function refresh() {
+    try {
+      const document_ = await api.vpn();
+      const missing = VPN_ENVELOPE_KEYS.filter((key) => !(key in document_));
+      if (missing.length) {
+        note.textContent = `The daemon's VPN answer is missing ${missing.join(", ")}, so this panel cannot be trusted.`;
+        return;
+      }
+      checkedAt = document_.checkedAt;
+      paintAge();
+      paint(document_.apps?.[id]);
+    } catch (err) {
+      note.textContent = `Could not read the VPN status: ${err.message}`;
+    }
+  }
+
+  recheck.addEventListener("click", refresh);
+
+  save.addEventListener("click", async () => {
+    const value = paste.value.trim();
+    if (!value) {
+      note.textContent = "Paste the WireGuard config first.";
+      return;
+    }
+    save.disabled = true;
+    save.textContent = "Saving\u2026";
+    try {
+      // A secret can only be written once settings.json DECLARES it --
+      // secrets_api.rs refuses an undeclared name, deliberately, so the write
+      // surface stays settings-driven. Declaring it is therefore part of
+      // saving a config, not a separate chore for the operator.
+      //
+      // The declaration is merged into the document as it is ON DISK, not
+      // into whatever this session has staged elsewhere: saving a VPN config
+      // must not quietly commit an unrelated pending edit from another
+      // screen.
+      if (!state.settings?.secrets?.[vpnMeta.secret]) {
+        const onDisk = await api.settings();
+        onDisk.secrets = { ...(onDisk.secrets || {}), [vpnMeta.secret]: {} };
+        await api.putSettings(onDisk);
+        state.settings = {
+          ...state.settings,
+          secrets: { ...(state.settings.secrets || {}), [vpnMeta.secret]: {} },
+        };
+      }
+      await api.putSecret(vpnMeta.secret, value);
+      paste.value = "";
+      note.textContent =
+        "Encrypted and written. Apply to bring the tunnel up \u2014 nothing has been rebuilt yet.";
+      await refresh();
+    } catch (err) {
+      note.textContent = `Could not save it: ${err.message}`;
+    } finally {
+      save.disabled = false;
+      save.textContent = "Save VPN config";
+    }
+  });
+
+  // Re-age the reading in place while the page sits open. The reading is not
+  // re-fetched: silently refreshing it would make the operator's screen
+  // disagree with what they last asked for. Only the AGE moves, which is the
+  // honest half -- and it is what turns a static line into one that visibly
+  // goes stale.
+  startTicker(paintAge);
+  paintAge();
+  refresh();
+
+  return el("section", { class: "callout" }, [
+    el("h3", { text: "VPN kill switch" }),
+    status,
+    age,
+    facts,
     el("p", {
       class: "hint",
       text:
-        "Nothing here needs changing to run the app. A value you leave alone is not " +
-        "written to settings.json at all, so it keeps tracking ferrum's own default " +
-        "instead of being frozen at today's value.",
+        "What this can and cannot tell you: ferrum reads whether the tunnel was SET UP, not " +
+        "whether it is carrying traffic. WireGuard is connectionless \u2014 an interface is up " +
+        "from the moment it is configured, peer or no peer \u2014 and ferrumd is unprivileged, " +
+        "so it cannot look inside the namespace to check for a recent handshake.",
     }),
-    advanced.node,
+    el("div", { class: "field" }, [
+      el("label", { for: "wg-config", text: "WireGuard config" }),
+      paste,
+      el("p", {
+        class: "hint",
+        text:
+          "Paste the whole file your provider issued, [Interface] and [Peer] together. " +
+          "Encrypted immediately on save, to this host's own key. ferrumd can write this but " +
+          "can never read it back \u2014 there is no endpoint that returns a secret, by design, " +
+          "so this page cannot show you what is already stored.",
+      }),
+    ]),
+    el("div", { class: "row" }, [save, recheck]),
+    note,
   ]);
+}
+
+/// One app, in full: what it is, what it is connected to, and what you can
+/// change about it.
+///
+/// @param {string} id - The catalog app id, from the `#/apps/<id>` route.
+/// @returns {void}
+function appDetailView(id) {
+  closeStream();
+  const meta = state.catalog?.apps?.[id];
+  if (!meta) {
+    view().replaceChildren(
+      el("section", {}, [
+        el("p", {}, [el("a", { href: "#/apps", text: "\u2190 Apps" })]),
+        el("h2", { text: "No such app" }),
+        el("p", {
+          text:
+            `This host's catalog has no app called "${id}". It may have been renamed, or this ` +
+            "link may be from a different version of ferrum.",
+        }),
+      ]),
+    );
+    return;
+  }
+
+  const current = state.settings?.apps?.[id] ?? {};
+  const stateRoot = state.settings?.storage?.stateDir ?? "/var/lib/ferrum/state";
+  const enabled = current.enable === true;
+
+  // Two groups, deliberately, and both still rendered by the ONE schema
+  // renderer. The first is what an operator decides; the second is everything
+  // the catalog already answered correctly. Enabling an app should not be a
+  // configuration exercise -- that is the whole point of having a catalog.
+  const primary = renderForm(appSchema(state.catalog.schema, id, meta), current);
+  const advanced = renderForm(advancedSchema(meta, stateRoot, id), current);
+
+  const host = appHostname(id, meta);
+  const actions = el("div", { class: "row" }, [
+    host
+      ? // Scheme-relative on purpose. It inherits the scheme the dashboard is
+        // already being served over, which is the right answer on a host
+        // reached either way -- and spelling a scheme out here would put an
+        // absolute URL in this file, which is the exact shape the standing
+        // "no external request of any kind" invariant is checked for.
+        el("a", { class: "button-link", href: `//${host}`, target: "_blank", rel: "noreferrer", text: `Open ${meta.displayName || id} \u2197` })
+      : null,
+    // The catalog's own docsUrl. A link the operator clicks, never a fetch --
+    // this page still requests nothing but its own origin. `noreferrer` so
+    // following it does not hand the destination this host's name.
+    meta.docsUrl
+      ? el("a", { href: meta.docsUrl, target: "_blank", rel: "noreferrer", text: "Docs \u2197" })
+      : null,
+  ]);
+
+  const vpnMeta = meta.vpn;
 
   view().replaceChildren(
     el("section", {}, [
-      el("button", { type: "button", class: "ghost", text: "\u2190 All apps", onclick: appsView }),
+      el("p", { class: "crumb" }, [el("a", { href: "#/apps", text: "\u2190 Apps" }), ` / ${meta.displayName || id}`]),
       el("h2", { text: meta.displayName || id }),
-      el("p", { class: "hint", text: meta.summary || "" }),
+      // What is actually KNOWN about this app, and nothing more. The mockup
+      // puts a green "Healthy" dot here; ferrum has no per-app health check
+      // between applies -- health.rs says in as many words that readiness
+      // asks nothing about Sonarr, Plex or qBittorrent -- so a dot here would
+      // be exactly the frozen gauge this release is trying to stop shipping.
+      el("p", {}, [
+        el("span", { class: enabled ? "pill on" : "pill", text: enabled ? "Enabled" : "Disabled" }),
+        " ",
+        meta.summary || "",
+      ]),
+      host ? el("p", { class: "hint", text: `Published at ${host}.` }) : null,
+      actions,
+
       primary.node,
-      details,
-      el("button", {
-        type: "button",
-        text: "Stage changes",
-        onclick: () => {
-          // Both groups merge into one app object. Each read() already omits
-          // anything still at its default, so an untouched form stages
-          // nothing and settings.json does not grow.
-          const merged = { ...advanced.read(), ...primary.read() };
-          state.settings = {
-            ...state.settings,
-            apps: { ...(state.settings.apps || {}), [id]: merged },
-          };
-          setStatus("Changes staged. Review and apply them on the Apply tab.", "ok");
-          location.hash = "#/apply";
-        },
-      }),
+
+      el("details", { class: "advanced" }, [
+        el("summary", { text: "Advanced \u2014 the catalog already set these" }),
+        el("p", {
+          class: "hint",
+          text:
+            "Nothing here needs changing to run the app. A value you leave alone is not " +
+            "written to settings.json at all, so it keeps tracking ferrum's own default " +
+            "instead of being frozen at today's value.",
+        }),
+        advanced.node,
+      ]),
+
+      vpnMeta ? vpnPanel(id, vpnMeta) : null,
+      integrationsPanel(id),
+
+      el("div", { class: "row" }, [
+        el("button", {
+          type: "button",
+          class: "ghost",
+          text: "Discard",
+          // Re-renders from the staged document, which is where the controls
+          // were populated from, so every edit made since this screen was
+          // painted is dropped and nothing already staged is lost.
+          onclick: () => appDetailView(id),
+        }),
+        el("button", {
+          type: "button",
+          text: "Review changes",
+          onclick: () => {
+            // Both groups merge into one app object. Each read() already omits
+            // anything still at its default, so an untouched form stages
+            // nothing and settings.json does not grow.
+            const merged = { ...advanced.read(), ...primary.read() };
+            state.settings = {
+              ...state.settings,
+              apps: { ...(state.settings.apps || {}), [id]: merged },
+            };
+            setStatus("Changes staged. Review and apply them on the Apply tab.", "ok");
+            location.hash = "#/apply";
+          },
+        }),
+      ]),
     ]),
   );
 }
@@ -1894,8 +2271,23 @@ const routes = {
   "#/parity": parityView,
 };
 
+/// The one parameterised route: `#/apps/<id>`.
+///
+/// Kept as a pattern rather than an entry per app in `routes` above, because
+/// the catalog decides which apps exist and a hand-maintained route table
+/// would be the one place in this UI that had to change when an app was
+/// added. The character class is the catalog's own app-id shape -- the same
+/// one modules/lib/settings-schema.json constrains `apps`' keys to -- so a
+/// hash carrying anything else falls through to the apps list rather than
+/// being looked up.
+const APP_DETAIL_ROUTE = /^#\/apps\/([a-z0-9]([a-z0-9-]*[a-z0-9])?)$/;
+
 async function route() {
-  const handler = routes[location.hash] || appsView;
+  // Before anything is painted, not after: a view that started a ticker must
+  // not leave it writing into the nodes the next view is about to replace.
+  closeTicker();
+  const detail = APP_DETAIL_ROUTE.exec(location.hash);
+  const handler = detail ? () => appDetailView(detail[1]) : routes[location.hash] || appsView;
   setStatus("");
   try {
     await handler();
@@ -1955,6 +2347,7 @@ async function boot() {
 
 api.setUnauthenticatedHandler(() => {
   closeStream();
+  closeTicker();
   $("#nav").hidden = true;
   loginView();
 });
@@ -1963,6 +2356,7 @@ window.addEventListener("hashchange", route);
 $("#logout").addEventListener("click", async () => {
   await api.logout();
   closeStream();
+  closeTicker();
   $("#nav").hidden = true;
   loginView();
 });

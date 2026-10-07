@@ -215,6 +215,21 @@ export const updatesForJob = (jobId) =>
 /// @returns {Promise<{status: string, jobId: string|null, report: object|null}>}
 export const parity = () => request("GET", "/api/parity");
 
+/// What ferrum can establish, RIGHT NOW, about each VPN-declaring app's
+/// tunnel.
+///
+/// Taken live per request, never cached, and the document carries `checkedAt`
+/// so the page can age the reading on screen. That is the whole point: a VPN
+/// indicator with no "as of when" is a gauge frozen at green, and this project
+/// has shipped that defect before.
+///
+/// `apps` is keyed by catalog app id and contains ONLY apps whose metadata
+/// declares a `vpn` block -- an app with no tunnel is absent, not present with
+/// an empty reading.
+///
+/// @returns {Promise<{checkedAt: string, apps: object}>}
+export const vpn = () => request("GET", "/api/vpn");
+
 // --- writes --------------------------------------------------------------
 
 /// Writes settings. NEVER triggers an apply -- that is a separate, explicit

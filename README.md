@@ -133,7 +133,17 @@ then `ferrum-apply put-secret plex-claim` (no `--replace`, there is nothing ther
 
 ### qBittorrent VPN kill switch
 
-qBittorrent's VPN kill-switch config is operator-provided, since it's your own WireGuard peer's config, not something ferrum can generate. To enable it:
+qBittorrent's VPN kill-switch config is operator-provided, since it's your own WireGuard peer's config, not something ferrum can generate.
+
+**The short way: paste it into the dashboard.** Open **Apps → qBittorrent** and paste the whole file
+your provider issued into *VPN config*. ferrumd declares the secret for you, encrypts the text to
+this host's own key, and writes it — then apply. It is encrypted the moment it is saved, and
+**ferrumd can write it but can never read it back**: there is no endpoint that returns a secret, by
+construction, which is why that screen cannot show you what is already stored. The same screen
+reports what ferrum can establish about the tunnel, and when it last established it — see
+*What the VPN reading does and does not prove* below.
+
+The manual way, for a host whose dashboard is not up yet:
 
 1. Get this host's age recipient (its SSH host key's public half, converted):
    ```bash
@@ -161,6 +171,32 @@ what Proton and most other providers hand out) is applied one entry at a time. *
 IPv4-only; each skip is named in `journalctl -u qbt-vpn-netns-setup` so it is a visible decision
 rather than a silent drop. An IPv4 entry the kernel would refuse, or a config with no IPv4 address
 at all, fails the unit at setup time quoting the offending config line.
+
+#### What the VPN reading does and does not prove
+
+`GET /api/vpn` — and the panel on the app's own page — reports a **live reading taken per request**,
+carrying `checkedAt`, the second it was taken. The dashboard ages that on screen ("checked 4 minutes
+ago") rather than painting a dot that cannot go stale. A kill switch last verified before the last
+reboot is not a verified kill switch.
+
+What is actually measured is the state of **one systemd unit**, `qbt-vpn-netns-setup.service`, named
+by qBittorrent's own catalog metadata rather than hard-coded anywhere:
+
+| State | What it means | What to do |
+|---|---|---|
+| `not-configured` | No VPN secret is declared. No tunnel, no kill switch. | Paste a config. |
+| `not-applied` | A config is saved and systemd knows no such unit — this host has not been rebuilt since. | Apply. |
+| `starting` | The unit is coming up or going down. | Wait, re-check. |
+| `tunnel-configured` | The setup script ran all the way through: the namespace exists and the interface in it was configured from your config. | Nothing. |
+| `tunnel-down` | The tunnel is not set up. qBittorrent is bound to that unit, so it is **stopped** rather than left running outside the tunnel — downloads are blocked on purpose. | Read `journalctl -u qbt-vpn-netns-setup`. |
+| `unknown` | ferrumd could not reach the system bus, so nothing was measured. | Not the same as down. |
+
+**`tunnel-configured` is not "traffic is flowing".** WireGuard is connectionless: an interface is up
+from the moment it is configured, peer or no peer, handshake or no handshake. Proving the tunnel
+carries traffic would mean reading `wg show`'s last handshake from *inside* the namespace, and
+ferrumd is deliberately unprivileged (`User=ferrum`, `CapabilityBoundingSet=""`), so it cannot enter
+a namespace or run `wg(8)`. That limit is stated on the screen itself rather than left for you to
+infer.
 
 If this host's SSH host key is ever regenerated, every existing `.sops` file under `ferrum.secretsDir` becomes permanently undecryptable — back up `/etc/ssh/ssh_host_ed25519_key` the same way you'd back up any other credential this box depends on. Auto-generated servarr keys recover on their own (delete the stale `.sops` file and re-apply; a fresh key is generated); a lost `qbittorrent-vpn.sops` must be re-encrypted from your original WireGuard config via the steps above.
 
@@ -313,6 +349,7 @@ checks that the two agree — so where they disagree, the router is right.
 | GET | `/api/generations` | The system generations and their snapshots, for rollback | session |
 | GET | `/api/updates` | The most recent update-check report, or `?job=<uuid>` for one run's own | session |
 | GET | `/api/parity` | The most recent SnapRAID parity status report | session |
+| GET | `/api/vpn` | A live reading of each VPN-declaring app's tunnel, with the second it was taken | session |
 | POST | `/api/jobs` | Starts a privileged `ferrum-apply` job | session + CSRF |
 | GET | `/api/jobs` | Recent jobs (`?limit=`) | session |
 | GET | `/api/jobs/:id` | One job's summary and its progress events | session |

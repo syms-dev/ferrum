@@ -8,6 +8,13 @@
   perSystem = { config, pkgs, lib, ... }:
     let
       catalog = import ../../../modules/lib/catalog.nix { inherit lib; };
+      # The same graph modules/core/reconciler.nix acts on, stamped onto each
+      # app as `integrationEdges` so the UI's Integrations panel transcribes a
+      # computed answer rather than re-deriving one in JavaScript. See the
+      # header of modules/lib/integrations.nix for why that distinction is
+      # worth a file.
+      annotatedCatalog =
+        (import ../../../modules/lib/integrations.nix { inherit lib catalog; }).annotate;
     in
     {
       packages = {
@@ -17,7 +24,7 @@
           text = builtins.toJSON {
             schemaVersion = 1;
             ferrumVersion = inputs.self.shortRev or inputs.self.dirtyShortRev or "dev";
-            apps = catalog;
+            apps = annotatedCatalog;
           };
         };
         ferrum-testapp = pkgs.callPackage ../../../nix/pkgs/testapp { };
