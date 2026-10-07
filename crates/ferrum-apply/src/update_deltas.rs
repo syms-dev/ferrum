@@ -163,6 +163,18 @@ pub fn mark_no_delta(rows: &mut [AppReport], candidate: CandidateState) {
             "this host already runs the revision its ferrum input tracks, so nothing about \
              this app would change",
         ),
+        // The arm that produced the field report. Before PinnedExactly
+        // existed this fell into UpToDate above, so a host pinned at an
+        // exact commit marked EVERY app "up to date" -- which is how an
+        // operator came to be told Prowlarr was current while it sat eight
+        // minor versions behind. Nothing was checked, and the row has to
+        // say that.
+        CandidateState::PinnedExactly => (
+            AppState::NotChecked,
+            "this host pins its ferrum input at an exact commit, so no candidate was resolved \
+             and no update was evaluated -- this is not a statement that this app is up to \
+             date, and it may well not be",
+        ),
         CandidateState::NotNewer => (
             AppState::NotChecked,
             "the revision this host's ferrum input tracks is not newer than what it already \

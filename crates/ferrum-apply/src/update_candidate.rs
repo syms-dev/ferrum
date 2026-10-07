@@ -778,6 +778,11 @@ pub fn resolve(
             input.name
         ));
     }
+    // Set only on the branch that cannot discover anything, and read at the
+    // return below. A bool rather than assigning the state here because the
+    // state is decided in one place for every path, and two places deciding
+    // it is how the two cases got conflated in the first place.
+    let mut cannot_discover = false;
     let candidate_rev = if input.pinned {
         // Only when the pin is what this host is actually built from. An
         // operator who has just edited flake.nix forward is in a genuinely
@@ -785,6 +790,7 @@ pub fn resolve(
         // them nothing can ever be discovered would be false at the exact
         // moment it matters.
         if input.reference == locked.rev {
+            cannot_discover = true;
             warnings.push(format!(
                 "this host pins the ferrum input at an exact commit ({}), so no newer release \
                  can be discovered until you change that pin yourself",
@@ -815,7 +821,11 @@ pub fn resolve(
     };
 
     let mut report = CandidateReport {
-        state: CandidateState::UpToDate,
+        state: if cannot_discover {
+            CandidateState::PinnedExactly
+        } else {
+            CandidateState::UpToDate
+        },
         input_name: Some(input.name.clone()),
         input_url: Some(input.url.clone()),
         reference: Some(input.reference.clone()),
@@ -1220,18 +1230,57 @@ mod tests {
     /// DA-1 keeps hand-pinning as the zero-delegated-trust path. It must
     /// work, make no network call, and say plainly that nothing will ever
     /// be found until the operator moves the pin.
+    ///
+    /// This test asserted `UpToDate` until 2026-10-07 and was wrong to.
+    /// An operator reported that their dashboard said every app was up to
+    /// date while Prowlarr sat eight minor versions behind, and this is
+    /// where it came from: a host that pins an exact commit resolves that
+    /// commit to itself, so the candidate always equals the installed
+    /// revision and the old code reported the state it would report after
+    /// a successful check. The warning was emitted and the headline
+    /// contradicted it. `PinnedExactly` is the fix -- "I cannot tell you"
+    /// is a different finding from "there is nothing to tell".
     #[test]
-    fn a_hand_pinned_host_is_up_to_date_and_told_why_nothing_will_ever_change() {
+    fn a_hand_pinned_host_cannot_check_and_says_so_rather_than_claiming_to_be_current() {
         let h = host(&gh(&format!("syms-dev/ferrum/{OLD}")), OLD, 100);
         let runner = FakeRunner::new(vec![]);
         let outcome = resolve_at(&runner, &h.flake_nix, &h.flake_lock);
-        assert_eq!(outcome.report.state, CandidateState::UpToDate);
+        assert_eq!(
+            outcome.report.state,
+            CandidateState::PinnedExactly,
+            "a host that cannot discover anything must not report the state of a \
+             host that looked and found nothing newer"
+        );
+        assert_ne!(
+            outcome.report.state,
+            CandidateState::UpToDate,
+            "this is the regression itself: up-to-date here is a gauge frozen at green"
+        );
         assert!(runner.programs().is_empty(), "a pinned host queries nothing");
         assert!(
             outcome.warnings.iter().any(|w| w.contains("exact commit")),
             "{:?}",
             outcome.warnings
         );
+    }
+
+    /// Anti-vacuity for the test above, and the half that keeps the new
+    /// state honest: a host that really did look, and really did find its
+    /// own revision, is still `UpToDate`. If `PinnedExactly` ever leaked
+    /// into the ordinary path it would be the same defect pointing the
+    /// other way -- an operator told ferrum cannot check when it just did.
+    #[test]
+    fn a_host_that_tracked_a_ref_and_found_nothing_newer_is_still_up_to_date() {
+        let h = host(&gh("syms-dev/ferrum"), OLD, 100);
+        let runner = FakeRunner::new(vec![ls_remote_ok(OLD)]);
+        let outcome = resolve_at(&runner, &h.flake_nix, &h.flake_lock);
+        assert_eq!(outcome.report.state, CandidateState::UpToDate);
+        assert!(
+            !outcome.warnings.iter().any(|w| w.contains("exact commit")),
+            "a tracking host is not pinned: {:?}",
+            outcome.warnings
+        );
+        assert_eq!(runner.programs(), vec!["git"], "it really did ask");
     }
 
     /// The other half of hand-pinning, and the one the warning gets wrong

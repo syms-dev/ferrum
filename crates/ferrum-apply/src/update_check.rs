@@ -111,6 +111,21 @@ impl CommandRunner for RealRunner {
 pub enum CandidateState {
     /// A candidate was resolved and it is the revision this host already runs.
     UpToDate,
+    /// The host pins its ferrum input at an exact commit that is also the
+    /// one it runs, so no discovery was possible at all.
+    ///
+    /// Distinct from `UpToDate`, and the distinction is the point. Both
+    /// end with "the candidate equals what you run", but they are opposite
+    /// findings: `UpToDate` means ferrum asked what the tracked reference
+    /// resolves to today and the answer was the revision already here,
+    /// while this means there was nothing to ask -- an exact commit
+    /// resolves to itself, so the check cannot discover a newer release
+    /// however many times it runs. Reporting that as `UpToDate` is a gauge
+    /// frozen at green: the operator reads "nothing to do" when the truth
+    /// is "I cannot tell you". Found in the field, by an operator whose
+    /// apps genuinely had updates waiting while the dashboard said they
+    /// did not.
+    PinnedExactly,
     /// A candidate was resolved and it is not newer than the installed one.
     NotNewer,
     /// A newer candidate was resolved; `rev` names it exactly.
@@ -898,6 +913,9 @@ pub fn summary_line(report: &UpdateReport) -> String {
     let excluded = report.apps.len() - enabled;
     let candidate = match report.candidate.state {
         CandidateState::UpToDate => "up to date".to_string(),
+        CandidateState::PinnedExactly => {
+            "cannot check: this host pins an exact commit".to_string()
+        }
         CandidateState::NotNewer => "the tracked ref is not newer than this host".to_string(),
         CandidateState::UpdateAvailable => match &report.candidate.rev {
             Some(rev) => format!("update available: {rev}"),

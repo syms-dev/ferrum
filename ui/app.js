@@ -665,7 +665,12 @@ async function generationsView() {
 /// future -- where ferrum knows the candidate DIFFERS and cannot honestly say
 /// which way. Collapsing that into `not-newer` is what turns one skewed clock
 /// into a permanent, silent "nothing to do".
-const CANDIDATE_STATES = ["up-to-date", "not-newer", "update-available", "check-failed", "order-unknown"];
+// Kept on one line: updates-view-is-wired parses this as a single-line array
+// literal to cross-check it against the Rust CandidateState enum, and reading
+// no names out of it would make its branch-coverage assertion vacuous. It
+// fails loudly rather than passing empty, which is how this comment came to
+// be here.
+const CANDIDATE_STATES = ["up-to-date", "pinned-exactly", "not-newer", "update-available", "check-failed", "order-unknown"];
 
 /// The five values an entry in `apps[]`'s `state` can carry. Same file, same
 /// flake check, same cross-check against `AppState`.
@@ -742,6 +747,10 @@ function stateText(label, prose) {
 // R1's edge cases name.
 const CANDIDATE_STATE_TEXT = {
   "up-to-date": stateText("Up to date", "The tracked reference resolves to the revision this host already pins. There is nothing to apply."),
+  "pinned-exactly": stateText(
+    "Cannot check",
+    "This host pins its ferrum input at an exact commit, which resolves to itself, so no newer release can be discovered however often the check runs. Your apps may well have updates waiting. Point the pin at a release branch or tag to start tracking them.",
+  ),
   "not-newer": stateText("Candidate is not newer — not an update", "The tracked reference resolves to a revision that is older than the pinned one by the commit dates the two carry. ferrum will not offer it, the same way preview-migration refuses to call a lower schema version a migration."),
   "update-available": stateText("Update available", "A revision later than the pinned one exists, by the commit dates the two carry. Nothing has been fetched, built, or applied — a check only reads."),
   "check-failed": stateText("Could not check for updates", "The check did not complete, so this host's update state is unknown. That is not the same as being up to date."),
