@@ -4,7 +4,7 @@ A NixOS-based, rollback-safe alternative to [Saltbox](https://github.com/saltyor
 
 **Status: pre-alpha — installs and runs on real hardware; the installer's own VM tests have never passed.**
 
-Built and tested: the rollback engine, the seven-app catalog, the reverse proxy with TLS and SSO, sops secrets, the cross-app reconciler, storage pooling over several disks, `ferrumd` (the unprivileged daemon with its polkit privilege boundary), the schema-driven web UI, and an installer that takes a bare machine to a published, logged-in system, and update discovery, preview and commit. 1,087 Rust unit tests, 46 Nix evaluation checks and nine NixOS VM tests cover them.
+Built and tested: the rollback engine, the eight-app catalog, the reverse proxy with TLS and SSO, sops secrets, the cross-app reconciler, storage pooling over several disks, `ferrumd` (the unprivileged daemon with its polkit privilege boundary), the schema-driven web UI, and an installer that takes a bare machine to a published, logged-in system, and update discovery, preview and commit. 1,087 Rust unit tests, 48 Nix evaluation checks and nine NixOS VM tests cover them.
 
 Proven on a real machine, not just in CI: a rollback that reverted both the system closure and application state together; Plex reachable on a real domain with a real Let's Encrypt certificate, served through ferrum's own nginx vhost from a typed `settings.json` with no hand-written Nix.
 
@@ -26,7 +26,7 @@ Split-horizon DNS is out of scope: every record points at the public address, so
 
 ## Why
 
-Saltbox deploys Plex/Jellyfin, the *arr apps, download clients and a reverse proxy onto a dedicated Ubuntu box via Ansible, and it works. It has a far larger catalog than ferrum — roughly 300 installable roles against ferrum's seven — and nine years of accumulated edge cases behind it.
+Saltbox deploys Plex/Jellyfin, the *arr apps, download clients and a reverse proxy onto a dedicated Ubuntu box via Ansible, and it works. It has a far larger catalog than ferrum — roughly 300 installable roles against ferrum's eight — and nine years of accumulated edge cases behind it.
 
 What it does not have is rollback of any kind: its own recovery documentation is to delete the application's directory and restore a backup. It has **zero releases and zero tags**, and 171 of its roles pin a floating image tag, so running the same install next week installs different software. Its update resets both role repositories to upstream with no stash, so edits to tracked role files are destroyed — though its inventory system and `/opt/saltbox_mod` are sanctioned override surfaces that survive by design. Secrets are plaintext YAML, hardened to `0600` rather than encrypted.
 
@@ -108,6 +108,8 @@ history) and encrypts it to the host's own age recipient. The Cloudflare DNS-01
 token is the one you will need; the installer handles it for you.
 
 **Sonarr, Radarr and Prowlarr's API keys are fully automatic.** `ferrum-apply` generates and encrypts a random key for each enabled app on first apply; there is nothing an operator needs to do.
+
+**And ferrum spends them on your behalf.** Decluttarr — which clears downloads that cannot finish out of the Sonarr and Radarr queues — normally wants a hand-written `config.yaml` carrying every \*arr's URL and API key. Enabling `decluttarr` writes all of it, because ferrum already knows all of it. It has no web interface, so it gets no subdomain, no certificate and no DNS record; watch it with `journalctl -u decluttarr -f`. Its defaults, and the jobs deliberately left off, are in [`docs/WHATS-ALREADY-WIRED.md`](docs/WHATS-ALREADY-WIRED.md).
 
 ### Plex's claim token
 

@@ -22,6 +22,7 @@ Each app declares what it consumes in its `meta.nix`:
 | Prowlarr | Sonarr, Radarr | each registered as an **application**, so Prowlarr pushes indexers to them |
 | Prowlarr | qBittorrent, SABnzbd | both registered as download clients in Prowlarr |
 | qBittorrent, SABnzbd, Plex, Jellyfin | nothing | they are providers, not consumers |
+| Decluttarr | nothing *through the reconciler* | it has no API to register anything into; ferrum generates its whole configuration instead — see below |
 
 There are exactly two registration kinds. Prowlarr registering Sonarr or Radarr is an
 *application* — its own indexer push-sync feature. Every other edge is a *download client*. An edge
@@ -53,6 +54,53 @@ makes imports instant and space-free.
 
 This also closed a real incident. The apps and the storage layer deriving these paths separately is
 what once left every app pointed at an empty `/srv/media` while the media sat on unmounted disks.
+
+## Decluttarr is configured entirely, and you never see a config file
+
+Decluttarr clears downloads that cannot finish out of the Sonarr and Radarr queues — a torrent
+stalled with no connections, a magnet whose metadata never arrives, a release the \*arr finished
+downloading and then refused to import because what arrived was a `.exe` and not a video. It
+removes the queue entry, blocklists the release so the next search finds a different one, and
+deletes the partial files.
+
+Upstream's instructions are to write a `config.yaml` naming each \*arr's URL and API key, and the
+name your download client is registered under inside each \*arr. **On a ferrum host you write none
+of it.** Every one of those facts is already ferrum's — the ports come from the catalog, the
+addresses from the same place nginx and the reconciler read them, the API keys are the sops secrets
+`ferrum-apply` already generated, and the download-client name is the literal `ferrum-reconcile`
+posted into Sonarr and Radarr. Enabling the app is the whole of the setup.
+
+It has **no web interface**, so it gets no subdomain, no certificate and no DNS record, and nothing
+appears for it on your domain. It is the first app in the catalog like that; the mechanism is in
+`modules/apps/decluttarr/meta.nix`.
+
+**Watch it with `journalctl -u decluttarr -f`.** That is where it says what it removed and why.
+
+The defaults are deliberately patient, because deleting a download somebody wanted is a far worse
+failure than leaving a stuck one in the queue:
+
+| Setting | ferrum's default | Upstream's | Why |
+|---|---|---|---|
+| Interval | 30 minutes | 10 | with the strike count below, something must look broken for ~2.5 hours |
+| `max_strikes` | 5 | 3 | one bad observation is a tracker hiccup, not a dead download |
+| Enabled jobs | 4 | none by default | only the ones that mean "this will never finish" |
+| Import-failure patterns | 6 explicit ones | `*` (any warning) | `*` removes on a transient import warning too |
+| Private trackers | removed from the **queue** only | deleted | the torrent stays in qBittorrent, so your ratio does not |
+| Test mode | off | on | it is installed to do the job; the toggle is in the UI if you want to watch first |
+
+Four jobs are on: `remove_stalled`, `remove_metadata_missing`, `remove_failed_downloads` and
+`remove_failed_imports`. Everything else upstream offers is off, including `remove_orphans` (it
+deletes anything the \*arrs do not know about, which includes whatever you added by hand),
+`remove_bad_files` (it judges by file extension) and the two search jobs (they hammer indexers).
+
+**The manual override is a tag.** Tag a torrent `Keep` in qBittorrent and Decluttarr will not touch
+it, whatever state it is in.
+
+Two things it deliberately does not do here. It is not told about **SABnzbd**: none of the four
+enabled jobs needs a download client to act, and upstream sends the SABnzbd API key as a URL query
+parameter and logs the failing URL verbatim, so configuring it would put that key in your journal
+every time SABnzbd was briefly unreachable. And it is not registered with **Prowlarr**, which has no
+queue for it to act on.
 
 ## The rest, in brief
 
