@@ -74,6 +74,19 @@ pub enum Request {
     /// is fine", which says nothing that distinguishes one held-back
     /// snapshot from another.
     ConfirmUpdate,
+    /// Run a parity sync now. Zero fields, and that is the same rule every
+    /// other variant here follows: it names no disk, no path and no
+    /// schedule. What gets synced is decided entirely by
+    /// `/etc/snapraid.conf`, which the host's own Nix evaluation wrote and
+    /// ferrumd cannot touch. A `ParitySync { disks }` shape -- the rejected
+    /// one -- would have made the request file a way to choose what a root
+    /// process reads and what it overwrites.
+    ParitySync,
+    /// The read-only parity status check. Zero fields, for the same reason,
+    /// and it writes nothing to the array at all: `systemctl is-active` and
+    /// `snapraid diff`, then one report document beside the job's own
+    /// progress file.
+    ParityStatus,
 }
 
 impl Request {
@@ -97,6 +110,8 @@ impl Request {
             Request::CheckUpdate => "check_update",
             Request::Update => "update",
             Request::ConfirmUpdate => "confirm_update",
+            Request::ParitySync => "parity_sync",
+            Request::ParityStatus => "parity_status",
         }
     }
 }
@@ -129,6 +144,8 @@ mod tests {
             (r#"{"kind":"check_update"}"#, "check_update"),
             (r#"{"kind":"update"}"#, "update"),
             (r#"{"kind":"confirm_update"}"#, "confirm_update"),
+            (r#"{"kind":"parity_sync"}"#, "parity_sync"),
+            (r#"{"kind":"parity_status"}"#, "parity_status"),
         ] {
             let path = dir.path().join("req.json");
             std::fs::write(&path, json).unwrap();

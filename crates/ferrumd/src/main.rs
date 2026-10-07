@@ -7,6 +7,7 @@ mod dbus;
 mod generations;
 mod health;
 mod jobs;
+mod parity;
 mod secrets_api;
 mod settings;
 mod sso;
@@ -664,6 +665,7 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/catalog", axum::routing::get(catalog::get_catalog))
         .route("/api/generations", axum::routing::get(generations::get_generations))
         .route("/api/updates", axum::routing::get(updates::get_updates))
+        .route("/api/parity", axum::routing::get(parity::get_parity))
         .route("/api/settings", axum::routing::get(settings::get_settings).put(settings::put_settings))
         .route("/api/secrets/:name", axum::routing::post(secrets_api::write_secret))
         .route("/api/session", axum::routing::get(session_handler))
@@ -3044,6 +3046,7 @@ mod tests {
         ("generations.rs", include_str!("generations.rs")),
         ("health.rs", include_str!("health.rs")),
         ("jobs.rs", include_str!("jobs.rs")),
+        ("parity.rs", include_str!("parity.rs")),
         ("secrets_api.rs", include_str!("secrets_api.rs")),
         ("settings.rs", include_str!("settings.rs")),
         ("sso.rs", include_str!("sso.rs")),
@@ -3668,6 +3671,10 @@ mod tests {
             // answers 200 on a host that has never been checked rather
             // than the 400 a non-UUID `job` would earn.
             ("GET", "/api/updates", "/api/updates"),
+            // Same shape as /api/updates above and for the same reason: the
+            // probe asks for the most recent report, which answers 200 on a
+            // host that has never run a parity check rather than a 404.
+            ("GET", "/api/parity", "/api/parity"),
             ("GET", "/api/settings", "/api/settings"),
             ("PUT", "/api/settings", "/api/settings"),
             ("POST", "/api/secrets/:name", "/api/secrets/cors-probe"),

@@ -39,7 +39,7 @@
 # the nixpkgs revision flake.lock already pins. It is a real addition to a
 # parity-enabled host's closure (snapraid 12.4, which pulls smartmontools),
 # and nothing on a host with ferrum.storage.parity.enable = false.
-{ config, lib, ... }:
+{ config, lib, pkgs, ... }:
 let
   cfg = config.ferrum.storage;
   pool = cfg.pool;
@@ -89,6 +89,35 @@ let
   contentDir = "/var/lib/ferrum/snapraid";
   contentFiles = [ "${contentDir}/snapraid.content" ]
     ++ map (root: "${root}/snapraid.content") dataRoots;
+
+  # R4. Where a completed sync records that it happened, and how it went.
+  #
+  # WHY FERRUM RECORDS THIS AT ALL rather than asking snapraid: `snapraid
+  # status` does not report a wall-clock last-sync time. It reports "days ago
+  # of the last scrub/sync" as a histogram and a sentence, at DAY resolution
+  # and about blocks rather than about a run -- confirmed by running it
+  # against a freshly-synced array, where it said "the oldest block was
+  # scrubbed 0 days ago, the median 0, the newest 0". A dashboard built on
+  # that would say "last synced 0 days ago" for anything under 24 hours,
+  # which is precisely the frozen gauge this requirement exists to prevent.
+  #
+  # ExecStopPost rather than ExecStart or a wrapper, because systemd runs it
+  # whether the sync SUCCEEDED OR FAILED, and exports $SERVICE_RESULT to it
+  # -- so one record covers both, and a failed sync cannot leave behind a
+  # file that looks like a successful one. Two lines, epoch seconds then
+  # systemd's own result word, written to a temporary name and renamed, so a
+  # reader never sees half of one.
+  #
+  # Absolute store paths rather than bare `date`/`mv`: these units set no
+  # `path`, so nothing guarantees coreutils is on PATH inside them.
+  parityStateDir = "/var/lib/ferrum/parity";
+  recordSync = pkgs.writeShellScript "ferrum-parity-record-sync" ''
+    set -eu
+    tmp=${parityStateDir}/last-sync.tmp
+    ${pkgs.coreutils}/bin/printf '%s\n%s\n' \
+      "$(${pkgs.coreutils}/bin/date +%s)" "''${SERVICE_RESULT:-unknown}" > "$tmp"
+    ${pkgs.coreutils}/bin/mv -f "$tmp" ${parityStateDir}/last-sync
+  '';
 
   # R2: what SnapRAID must NOT protect, computed from the live option values.
   #
@@ -247,6 +276,12 @@ in
       # /var/lib/ferrum itself is already 0751 so root can traverse in.
       systemd.tmpfiles.rules = [
         "d ${contentDir} 0750 root root - -"
+        # 0755, not 0750: the unprivileged daemon never reads this directly
+        # -- `ferrum-apply parity-status` does, as root -- but a mode that
+        # root alone can traverse would make the record unreadable from an
+        # ordinary shell for no benefit. The file inside carries a timestamp
+        # and the word "success"; there is nothing here to protect.
+        "d ${parityStateDir} 0755 root root - -"
       ];
 
       services.snapraid = {
@@ -300,8 +335,23 @@ in
       # reading off the same disk. "idle" is the class that means "only when
       # nothing else wants the disk", which is the correct relationship
       # between a background integrity job and somebody watching a film.
-      systemd.services.snapraid-sync.serviceConfig.IOSchedulingClass = "idle";
       systemd.services.snapraid-scrub.serviceConfig.IOSchedulingClass = "idle";
+
+      systemd.services.snapraid-sync.serviceConfig = {
+        IOSchedulingClass = "idle";
+
+        # R4's timestamp, recorded by the run that earns it.
+        #
+        # ReadWritePaths is ADDITIVE here rather than a replacement: NixOS's
+        # unit-option type merges list-valued directives by concatenation,
+        # so this adds the state directory to the list the upstream module
+        # computed from the configured disks rather than dropping it.
+        # Confirmed by evaluating a real host and reading the generated unit
+        # back, which matters because getting it wrong would silently leave
+        # the sync unable to write to the data disks it exists to protect.
+        ExecStopPost = "${recordSync}";
+        ReadWritePaths = [ parityStateDir ];
+      };
     })
   ];
 }

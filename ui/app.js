@@ -1,4 +1,4 @@
-// The ferrum UI: five hash-routed views over the daemon's read-only APIs and
+// The ferrum UI: six hash-routed views over the daemon's read-only APIs and
 // its three mutating ones.
 //
 // No framework, no build step, no external request of any kind. The box this
@@ -1570,6 +1570,310 @@ async function updatesView() {
   }
 }
 
+// --- parity --------------------------------------------------------------
+
+/// The eight values a parity report's `state` can carry.
+///
+/// Kept on one line because the `parity-view-is-wired` flake check reads this
+/// file as text, cross-checks these names against PARITY_STATE_TEXT's keys,
+/// AND cross-checks them against ferrum-apply's own `ParityState` enum. A
+/// state the daemon can send with no branch here fails the build instead of
+/// rendering as an empty tile -- which is the exact failure this view exists
+/// to prevent, since "nobody looked" and "you are protected" look identical
+/// when a branch is missing.
+///
+/// `not-configured` is a state of the HOST, reported inside a report. It is
+/// not the same fact as the envelope's `never-checked`, which means no report
+/// exists yet, and the two are rendered separately below.
+const PARITY_STATES = ["not-configured", "syncing", "never-synced", "last-sync-failed", "parity-disk-missing", "in-sync", "stale", "unknown"];
+
+/// The three keys `GET /api/parity` always answers with, and the two values
+/// its `status` can take. Cross-checked by the same flake check against what
+/// ferrumd's parity.rs actually constructs.
+const PARITY_ENVELOPE_KEYS = ["status", "jobId", "report"];
+const PARITY_ENVELOPE_STATUSES = ["report", "never-checked"];
+
+// One entry per line, one distinct sentence per state. Every one of these is
+// a different thing to do next, and a tile that said "protected" for any of
+// the unhealthy ones would be the frozen gauge this whole feature exists to
+// avoid shipping.
+const PARITY_STATE_TEXT = {
+  "not-configured": stateText("Parity is not set up on this host", "No disk is dedicated to parity, so losing a data disk loses everything that was on it. The other disks are unaffected -- mergerfs does not stripe -- but what was on the failed one is gone."),
+  "syncing": stateText("A parity sync is running", "Parity is being brought up to date right now. What has changed is not reported during a sync: the array is being rewritten underneath the question."),
+  "never-synced": stateText("Parity is set up but has never completed a sync", "Nothing is protected yet. The first sync reads every file on every data disk and is the slowest one; it runs on the schedule, or you can start it here."),
+  "last-sync-failed": stateText("The last parity sync did not succeed", "Parity is as old as the last sync that DID succeed, and may be older than the timestamp below suggests. This is not the same as being out of date -- something went wrong and is likely still wrong."),
+  "parity-disk-missing": stateText("A parity disk is missing", "The parity disk is not mounted, so parity cannot rebuild anything no matter how recent its last sync was. Check that the disk is attached and that its mount came up."),
+  "in-sync": stateText("Protected -- parity is current", "Every file on the data disks is covered by parity as of the last sync, and nothing has changed since."),
+  "stale": stateText("Files have changed since the last parity sync", "Those files are not protected yet: if a data disk failed right now, they would be lost. Everything synced before them is still covered."),
+  "unknown": stateText("ferrum could not determine the parity state", "The check did not complete, so this host's parity state is unknown. That is not the same as being protected."),
+};
+
+/// Which states mean parity is genuinely doing its job.
+///
+/// Used only to decide whether the limitation sentence reads as a qualifier
+/// on good news or as context on bad news. It is shown either way (R6).
+const PARITY_OK_STATES = ["in-sync"];
+
+/// What is wrong with a `/api/parity` envelope, if anything.
+///
+/// @param {object|null} envelope - The parsed body of `GET /api/parity`.
+/// @returns {string|null} An operator-facing problem, or null when the
+///   envelope is one this page knows how to read.
+function parityEnvelopeProblem(envelope) {
+  if (envelope === null || typeof envelope !== "object") {
+    return "The daemon's reply to /api/parity was not an object. This page cannot read it.";
+  }
+  const missing = PARITY_ENVELOPE_KEYS.filter((key) => !(key in envelope));
+  if (missing.length) {
+    return `The daemon's reply to /api/parity is missing ${missing.join(", ")}. This page is probably older than the daemon serving it -- reload it.`;
+  }
+  if (!PARITY_ENVELOPE_STATUSES.includes(envelope.status)) {
+    return `The daemon answered with status "${orUnknown(envelope.status)}", which this page does not understand. It knows: ${PARITY_ENVELOPE_STATUSES.join(", ")}.`;
+  }
+  return null;
+}
+
+/// Paints one parity report into `host`.
+///
+/// Renders the state, then the timestamp it was computed from, then the
+/// figure -- in that order and never the figure alone. A changed-file count
+/// with no "as of when" beside it is a number an operator cannot act on.
+///
+/// @param {HTMLElement} host - The container to replace the contents of.
+/// @param {object} report - The producer's document, verbatim.
+/// @returns {void}
+function renderParityReport(host, report) {
+  host.replaceChildren();
+  const reportState = String(report?.state ?? "");
+  const text = PARITY_STATE_TEXT[reportState];
+  if (!text) {
+    host.appendChild(el("p", {
+      class: "error",
+      text: `The daemon reported parity state "${orUnknown(reportState)}", which this page does not know how to render. It knows: ${PARITY_STATES.join(", ")}.`,
+    }));
+    return;
+  }
+
+  host.appendChild(el("h3", { text: text.label }));
+  host.appendChild(el("p", { text: text.prose }));
+
+  const rows = [];
+  if (report.lastSync) {
+    rows.push(["Last sync", `${localTime(report.lastSync.finishedAt)} (${relativeAge(report.lastSync.finishedAt)})`]);
+    rows.push(["Result reported by systemd", orUnknown(report.lastSync.result)]);
+  } else {
+    rows.push(["Last sync", "never -- no completed sync has been recorded on this host"]);
+  }
+
+  if (report.unprotected) {
+    const u = report.unprotected;
+    const changed = Number(u.added) + Number(u.removed) + Number(u.updated);
+    rows.push([
+      "Changed since that sync",
+      `${changed} file(s) -- ${orUnknown(u.added)} added, ${orUnknown(u.updated)} modified, ${orUnknown(u.removed)} removed`,
+    ]);
+  } else {
+    rows.push(["Changed since that sync", `not available -- ${orUnknown(report.unprotectedUnavailable)}`]);
+  }
+  // Always shown, in every state. A line that appeared only sometimes would
+  // read, when absent, as "there IS a size figure here".
+  rows.push(["Size of the unprotected data", orUnknown(report.unprotectedBytesUnavailable)]);
+
+  for (const d of report.parityDisks || []) {
+    rows.push([`Parity file ${d.path}`, d.present ? "its disk is mounted" : "ITS DISK IS NOT MOUNTED"]);
+  }
+  rows.push(["This report was produced", `${localTime(report.generatedAt)} (${relativeAge(report.generatedAt)})`]);
+
+  host.appendChild(
+    el("table", {}, [
+      el("tbody", {}, rows.map(([k, v]) => el("tr", {}, [el("th", { text: k }), el("td", { text: v })]))),
+    ]),
+  );
+
+  // R6. Carried on EVERY surface that reports a healthy state, and taken from
+  // the report rather than written here, so the one sentence the product
+  // commits to lives in one place. Shown in the other states too -- somebody
+  // reading "a parity disk is missing" is exactly somebody deciding how
+  // worried to be.
+  host.appendChild(
+    el("p", {
+      class: PARITY_OK_STATES.includes(reportState) ? "callout" : "callout warn",
+      text: orUnknown(report.limitation),
+    }),
+  );
+}
+
+/// The Parity view: what parity protects, as of when, and what it does not.
+///
+/// Four states, all rendered and none blank: loading (a live region says the
+/// report is being read), empty (`never-checked`), error (the envelope
+/// problem or the request's own message), and success (a report).
+///
+/// @returns {Promise<void>}
+async function parityView() {
+  closeStream();
+
+  const error = el("p", { class: "error" });
+  const pending = el("p", { class: "hint", role: "status", "aria-live": "polite" });
+  const report = el("div", {});
+  const log = el("pre", { class: "log", hidden: true });
+
+  // Whether a check or a sync this view started is still in flight.
+  let busy = false;
+
+  const check = el("button", { type: "button", text: "Check parity now" });
+  const sync = el("button", { type: "button", text: "Sync parity now" });
+
+  /// Moves both controls in or out of their in-flight state.
+  ///
+  /// The LABEL carries the state, so it survives without colour and is read
+  /// out by anything that reaches the button; the dimming is the secondary
+  /// cue, never the only one.
+  ///
+  /// @param {boolean} inFlight - Whether a job is running right now.
+  /// @param {string} what - "check" or "sync", for the label.
+  /// @returns {void}
+  function setBusy(inFlight, what) {
+    busy = inFlight;
+    check.disabled = inFlight;
+    sync.disabled = inFlight;
+    check.setAttribute("aria-busy", String(inFlight));
+    sync.setAttribute("aria-busy", String(inFlight));
+    check.textContent = inFlight && what === "check" ? "Checking parity…" : "Check parity now";
+    sync.textContent = inFlight && what === "sync" ? "Syncing parity…" : "Sync parity now";
+  }
+
+  /// Re-reads `GET /api/parity` and paints whatever it says.
+  ///
+  /// @returns {Promise<void>}
+  async function refresh() {
+    error.textContent = "";
+    const envelope = await api.parity();
+    const problem = parityEnvelopeProblem(envelope);
+    if (problem) {
+      error.textContent = problem;
+      return;
+    }
+    if (envelope.status === "never-checked") {
+      report.replaceChildren(
+        el("h3", { text: "Parity has not been checked on this host yet" }),
+        el("p", {
+          text:
+            "This says nothing about whether parity is set up -- only that nobody has asked. " +
+            "Run a check to find out.",
+        }),
+      );
+      return;
+    }
+    renderParityReport(report, envelope.report);
+  }
+
+  /// Streams one dispatched job, then refreshes the report.
+  ///
+  /// A sync writes no report of its own, so a finished sync chains straight
+  /// into a check rather than leaving the screen showing the figures from
+  /// before it ran -- which would be the stalest moment to show them.
+  ///
+  /// @param {string} id - The job uuid.
+  /// @param {string} what - "check" or "sync".
+  /// @returns {void}
+  function attach(id, what) {
+    closeStream();
+    setBusy(true, what);
+    log.hidden = false;
+    log.textContent = "";
+    pending.textContent =
+      what === "sync"
+        ? "Syncing parity. A first sync reads every file on every data disk, so this can take hours."
+        : "Checking parity. This reads the array index and compares it against the disks.";
+    state.stream = api.streamJob(id, {
+      onEvent: (e) => {
+        log.textContent += `${e.event}: ${e.detail}\n`;
+        log.scrollTop = log.scrollHeight;
+      },
+      onDone: async () => {
+        pending.textContent = "";
+        try {
+          if (what === "sync") {
+            const job = await api.startJob("parity_status");
+            attach(job.id, "check");
+            return;
+          }
+          await refresh();
+          setStatus("Parity check finished.", "ok");
+        } catch (err) {
+          error.textContent = err.message;
+          // The chain-into-a-check failed, so nothing else will clear the
+          // latch. Without this a host whose refresh errored keeps controls
+          // that never come back -- a worse fault than the one being reported.
+          if (what === "sync") setBusy(false, what);
+        } finally {
+          if (what !== "sync") setBusy(false, what);
+        }
+      },
+      onError: () => {
+        // EventSource reconnects by itself, so an error here is not terminal
+        // and must not clear the in-flight latch.
+      },
+    });
+  }
+
+  check.addEventListener("click", async () => {
+    if (busy) return;
+    try {
+      const job = await api.startJob("parity_status");
+      attach(job.id, "check");
+    } catch (err) {
+      error.textContent = err.message;
+      setBusy(false, "check");
+    }
+  });
+
+  sync.addEventListener("click", async () => {
+    if (busy) return;
+    try {
+      const job = await api.startJob("parity_sync");
+      attach(job.id, "sync");
+    } catch (err) {
+      error.textContent = err.message;
+      setBusy(false, "sync");
+    }
+  });
+
+  view().replaceChildren(
+    el("h2", { text: "Parity" }),
+    el("p", {
+      class: "hint",
+      text:
+        "Parity lets ferrum rebuild a data disk that fails. It is not a copy of your library " +
+        "kept anywhere else, and it protects nothing against deletion, corruption that was " +
+        "synced before anyone noticed, ransomware, fire or theft.",
+    }),
+    el("div", { class: "row" }, [check, sync]),
+    pending,
+    error,
+    report,
+    log,
+  );
+
+  // Painted BEFORE the await, so the view is never a blank screen while the
+  // first request is in flight.
+  report.replaceChildren(
+    el("p", {
+      class: "hint",
+      role: "status",
+      "aria-live": "polite",
+      text: "Reading the last parity report…",
+    }),
+  );
+  try {
+    await refresh();
+  } catch (err) {
+    report.replaceChildren();
+    error.textContent = err.message;
+  }
+}
+
 // --- routing -------------------------------------------------------------
 
 const routes = {
@@ -1578,6 +1882,7 @@ const routes = {
   "#/secrets": secretsView,
   "#/generations": generationsView,
   "#/updates": updatesView,
+  "#/parity": parityView,
 };
 
 async function route() {

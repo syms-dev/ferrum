@@ -303,6 +303,7 @@ checks that the two agree — so where they disagree, the router is right.
 | POST | `/api/secrets/:name` | Writes one sops-encrypted secret | session + CSRF |
 | GET | `/api/generations` | The system generations and their snapshots, for rollback | session |
 | GET | `/api/updates` | The most recent update-check report, or `?job=<uuid>` for one run's own | session |
+| GET | `/api/parity` | The most recent SnapRAID parity status report | session |
 | POST | `/api/jobs` | Starts a privileged `ferrum-apply` job | session + CSRF |
 | GET | `/api/jobs` | Recent jobs (`?limit=`) | session |
 | GET | `/api/jobs/:id` | One job's summary and its progress events | session |
@@ -397,9 +398,10 @@ and up to date". Reports are read from `FERRUM_UPDATE_REPORT_DIR`, falling back 
 
 `POST /api/jobs` takes a body of exactly `{"kind": "<kind>"}` — `preflight`, `apply` (plus an
 optional `"acceptPinChange": "<40-hex revision>"`), `rollback` (plus `"to": <generation>`),
-`restore_state`, `gc`, `check_update`, `update`, or `confirm_update`. Every kind but
-`check_update` claims the daemon's single-job interlock and gets `409` while one is running; the
-read-only check is exempt because a rollback must never be blocked by one.
+`restore_state`, `gc`, `check_update`, `update`, `confirm_update`, `parity_sync`, or
+`parity_status`. Every kind but the two read-only ones — `check_update` and `parity_status` —
+claims the daemon's single-job interlock and gets `409` while one is running; those two are exempt
+because a rollback must never be blocked by a check that only reads.
 
 `acceptPinChange` is the operator's acknowledgement that this rebuild also moves the host to a
 different ferrum revision. **A rollback reverts the system closure and never

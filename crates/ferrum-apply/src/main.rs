@@ -152,6 +152,15 @@ enum Command {
     /// while `ferrum.storage.parity.sync.enable` governs only the TIMER. An
     /// operator who turns the timer off keeps exactly this.
     ParitySync,
+    /// Report whether parity is current, and publish the document ferrumd
+    /// serves at `GET /api/parity`.
+    ///
+    /// Read-only: it runs `systemctl is-active` and `snapraid diff`, neither
+    /// of which writes to the array. It still lives on the privileged side
+    /// because `snapraid diff` opens every data disk and the parity file
+    /// directly -- the same reasoning that keeps ferrumd from shelling out
+    /// to `nix`.
+    ParityStatus,
 }
 
 /// Writes the job's `started` line, then runs it.
@@ -1525,6 +1534,54 @@ fn run_parity_sync() -> i32 {
     code
 }
 
+/// Builds the parity status document, publishes it, and prints it.
+///
+/// stdout carries the whole document so a bare `ferrum-apply parity-status`
+/// over SSH is useful on its own, the same way `check-update` is. Nothing in
+/// it is a secret: it names mount points and file counts.
+///
+/// # Returns
+/// The process exit code. `0` whenever a document was produced and
+/// published, INCLUDING for an unhealthy state -- "the array is stale" is a
+/// successful report of a real condition, not a failure of this command. A
+/// non-zero code is reserved for not being able to publish at all, which is
+/// the one case a caller cannot see in the document itself.
+fn run_parity_status() -> i32 {
+    let mut progress = progress::Progress::open();
+    let report = parity::build_report(
+        &parity::StatusInputs {
+            conf: &parity::conf_path(),
+            last_sync_file: &parity::last_sync_path(),
+            now: parity::now_epoch(),
+        },
+        &update_check::RealRunner,
+    );
+
+    match serde_json::to_string(&report) {
+        Ok(body) => println!("{body}"),
+        Err(e) => eprintln!("parity-status: could not serialize the report: {e}"),
+    }
+
+    let summary = parity::summary_line(&report);
+    let job_id = std::env::var("FERRUM_JOB_ID").ok();
+    match parity::write_report(
+        &parity::report_dir(),
+        &parity::report_file_name(job_id.as_deref()),
+        &report,
+    ) {
+        Ok(_) => {
+            progress.complete("ok", &summary);
+            0
+        }
+        Err(e) => {
+            let detail = format!("could not publish the parity report: {e}");
+            eprintln!("parity-status: {detail}");
+            progress.complete("failed", &detail);
+            1
+        }
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let exit_code = match cli.command {
@@ -1540,6 +1597,7 @@ fn main() -> anyhow::Result<()> {
         Command::Update => run_update(),
         Command::ConfirmUpdate => run_confirm_update(),
         Command::ParitySync => run_parity_sync(),
+        Command::ParityStatus => run_parity_status(),
         Command::ReconcileDns { config } => run_reconcile_dns(&config),
         Command::PutSecret { name, replace } => run_put_secret(&name, replace),
         Command::RunRequest { path } => match request::read_request(&path) {
@@ -1554,6 +1612,8 @@ fn main() -> anyhow::Result<()> {
                 request::Request::CheckUpdate => run_check_update(),
                 request::Request::Update => run_update(),
                 request::Request::ConfirmUpdate => run_confirm_update(),
+                request::Request::ParitySync => run_parity_sync(),
+                request::Request::ParityStatus => run_parity_status(),
             }),
             Err(e) => {
                 eprintln!("run-request: {e}");

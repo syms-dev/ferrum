@@ -3752,6 +3752,198 @@
           offHasTimers = timerExists off "snapraid-sync";
         };
 
+      # R4. The parity view renders every state the producer can send, the
+      # envelope ferrumd actually constructs, and the limitation sentence.
+      #
+      # Three files have to agree and nothing but this holds them together:
+      # crates/ferrum-apply/src/parity.rs owns the state vocabulary,
+      # crates/ferrumd/src/parity.rs owns the envelope, and ui/app.js
+      # transcribes both. A state the daemon can send with no branch in the UI
+      # renders as a blank tile, and a blank tile where "Protected" belongs is
+      # indistinguishable from a blank tile where "a parity disk is missing"
+      # belongs -- which is the whole failure this requirement exists to
+      # prevent. Modelled directly on `updates-view-is-wired`, which exists
+      # because exactly that drift happened on the first day the update files
+      # lived apart.
+      #
+      # Every lookup throws rather than returning an empty list when it cannot
+      # find what it guards. A check that cannot find its subject must fail,
+      # not pass -- this repository shipped three checks in one week that
+      # could not fail, and a vacuous list comparison is how two of them got
+      # that way.
+      parityViewIsWired =
+        let
+          appSrc = builtins.readFile ../../../ui/app.js;
+          lines = lib.splitString "\n" appSrc;
+          rustLines = lib.splitString "\n"
+            (builtins.readFile ../../../crates/ferrum-apply/src/parity.rs);
+          daemonLines = lib.splitString "\n"
+            (builtins.readFile ../../../crates/ferrumd/src/parity.rs);
+          indexHtml = builtins.readFile ../../../ui/index.html;
+
+          indexIn = src: file: what: infix:
+            let
+              hits = builtins.filter (e: lib.hasInfix infix e.l)
+                (lib.imap0 (i: l: { inherit i l; }) src);
+            in
+            if hits == [ ] then
+              throw (file + " no longer has a line containing '" + infix
+                + "', so parity-view-is-wired cannot verify " + what
+                + ". A check that cannot find what it guards must fail, not pass.")
+            else (builtins.head hits).i;
+
+          blockIn = src: file: what: startInfix: isEnd:
+            let
+              after = lib.drop ((indexIn src file what startInfix) + 1) src;
+              take = acc: rest:
+                if rest == [ ] then
+                  throw (file + " opens '" + startInfix
+                    + "' but parity-view-is-wired cannot find the line that closes it")
+                else if isEnd (builtins.head rest) then acc
+                else take (acc ++ [ (builtins.head rest) ]) (builtins.tail rest);
+              block = take [ ] after;
+            in
+            if block == [ ] then
+              throw (file + "'s '" + startInfix + "' block is empty, so every assertion "
+                + "parity-view-is-wired makes about " + what + " would be vacuously true")
+            else block;
+
+          quotedIn = re: line:
+            map builtins.head (builtins.filter builtins.isList (builtins.split re line));
+
+          # A one-line `const NAME = ["a", "b"];` declaration in ui/app.js.
+          vocabOf = what: name:
+            let
+              values = quotedIn "\"([a-zA-Z][a-zA-Z0-9-]*)\""
+                (builtins.elemAt lines (indexIn lines "ui/app.js" what "const ${name} = ["));
+            in
+            if values == [ ] then
+              throw ("ui/app.js declares " + name + " but parity-view-is-wired read no names "
+                + "out of it -- it is no longer a single-line array literal, and an empty "
+                + "vocabulary would make the branch-coverage assertion vacuous")
+            else values;
+
+          # The keys of a one-entry-per-line state table.
+          branchesOf = what: name:
+            let
+              keys = lib.concatMap (quotedIn "\"([a-z-]+)\":")
+                (blockIn lines "ui/app.js" what "const ${name} = {" (l: l == "};"));
+            in
+            if keys == [ ] then
+              throw ("ui/app.js declares " + name
+                + " but parity-view-is-wired found no \"state\": keys in it")
+            else keys;
+
+          uiStates = vocabOf "the parity-state vocabulary" "PARITY_STATES";
+          uiBranches = branchesOf "parity-state rendering" "PARITY_STATE_TEXT";
+
+          # The producer's own enum, read out of its `#[serde(rename_all =
+          # "kebab-case")] pub enum ParityState` block. This is what turns the
+          # UI's list from a transcription into an invariant.
+          rustVariants =
+            let
+              block = blockIn rustLines "crates/ferrum-apply/src/parity.rs"
+                "the ParityState variants" "pub enum ParityState {" (l: l == "}");
+              # One CamelCase variant per non-comment, non-blank line.
+              names = lib.concatMap
+                (l:
+                  let t = lib.removeSuffix "," (lib.trim l); in
+                  if t == "" || lib.hasPrefix "/" t then [ ]
+                  else if builtins.match "[A-Z][A-Za-z]*" t != null then [ t ]
+                  else [ ])
+                block;
+              kebab = name:
+                let
+                  chars = lib.stringToCharacters name;
+                  piece = i: c:
+                    if i == 0 then lib.toLower c
+                    else if c == lib.toUpper c && c != lib.toLower c then "-${lib.toLower c}"
+                    else c;
+                in
+                lib.concatStrings (lib.imap0 piece chars);
+            in
+            if names == [ ] then
+              throw ("crates/ferrum-apply/src/parity.rs declares ParityState but "
+                + "parity-view-is-wired read no variants out of it")
+            else map kebab names;
+
+          # The envelope keys and statuses ferrumd really constructs.
+          daemonHasStatus = s:
+            builtins.any (l: lib.hasInfix "\"status\": \"${s}\"" l) daemonLines;
+          uiEnvelopeStatuses = vocabOf "the envelope statuses" "PARITY_ENVELOPE_STATUSES";
+          uiEnvelopeKeys = vocabOf "the envelope keys" "PARITY_ENVELOPE_KEYS";
+
+          missing = builtins.filter (s: !(builtins.elem s uiBranches)) uiStates;
+          extra = builtins.filter (s: !(builtins.elem s uiStates)) uiBranches;
+          uiMissesRust = builtins.filter (s: !(builtins.elem s uiStates)) rustVariants;
+          rustMissesUi = builtins.filter (s: !(builtins.elem s rustVariants)) uiStates;
+          statusDrift = builtins.filter (s: !(daemonHasStatus s)) uiEnvelopeStatuses;
+          keyDrift = builtins.filter
+            (k: !(builtins.any (l: lib.hasInfix "\"${k}\":" l) daemonLines))
+            uiEnvelopeKeys;
+
+          # R6, mechanically. The limitation sentence lives in the producer and
+          # the UI renders whatever it sends, so what has to be true here is
+          # that the UI does NOT write its own, and that no new surface says
+          # "backup".
+          renderedFromReport = builtins.any
+            (l: lib.hasInfix "orUnknown(report.limitation)" l) lines;
+
+          # The one word this feature may never use about parity, scanned
+          # across the text an operator actually reads.
+          #
+          # SCOPED TO RENDERED TEXT, NOT TO SOURCE, and the scoping is the
+          # whole difficulty rather than a convenience. The first version of
+          # this scanned whole files and failed immediately -- on the comment
+          # explaining why the word is forbidden, and on the unit test that
+          # asserts its absence. A scan that cannot tell "says it" from
+          # "forbids it" reports the rule being enforced as a violation of
+          # itself, and the only way to make it pass would have been to stop
+          # writing the rule down.
+          #
+          # So: the parity view's own block, with comment lines dropped, which
+          # is exactly the strings the browser renders; and the `LIMITATION`
+          # constant, which every other surface takes its words from. The
+          # `nixpkgs` module path (nixos/modules/services/BACKUP/snapraid.nix)
+          # is upstream's filing decision and is deliberately out of scope --
+          # it is not a surface ferrum shows anybody.
+          parityViewBlock =
+            blockIn lines "ui/app.js" "the parity view's rendered text"
+              "// --- parity ---" (l: lib.hasPrefix "// --- routing" l);
+          isComment = l: let t = lib.trim l; in lib.hasPrefix "//" t || lib.hasPrefix "/*" t;
+          limitationLines =
+            blockIn rustLines "crates/ferrum-apply/src/parity.rs"
+              "the limitation sentence" "pub const LIMITATION: &str =" (l: lib.hasSuffix "\";" l);
+          backupMentions =
+            builtins.filter (l: lib.hasInfix "backup" (lib.toLower l))
+              (builtins.filter (l: !(isComment l)) parityViewBlock ++ limitationLines);
+
+          # The nav is hand-written and NOT generated from app.js's `routes`
+          # map, so a view can exist and be unreachable.
+          navLinked = lib.hasInfix "href=\"#/parity\"" indexHtml;
+          routeDeclared = builtins.any (l: lib.hasInfix "\"#/parity\": parityView" l) lines;
+        in
+        {
+          ok = missing == [ ]
+            && extra == [ ]
+            && uiMissesRust == [ ]
+            && rustMissesUi == [ ]
+            && statusDrift == [ ]
+            && keyDrift == [ ]
+            && renderedFromReport
+            && backupMentions == [ ]
+            && navLinked
+            && routeDeclared
+            && builtins.length uiStates >= 8;
+          message =
+            "ui/app.js's parity view is out of step with the state vocabulary "
+            + "crates/ferrum-apply/src/parity.rs owns or the envelope "
+            + "crates/ferrumd/src/parity.rs constructs";
+          inherit missing extra uiMissesRust rustMissesUi statusDrift keyDrift
+            renderedFromReport backupMentions navLinked routeDeclared;
+          stateCount = builtins.length uiStates;
+        };
+
       # The self-signed certificate follows ferrum.proxy.baseDomain.
       #
       # Its CN and both SANs are built from that option, and the unit that
@@ -5691,6 +5883,8 @@
           mkAssertionCheck "parity-excludes-only-the-churn" parityExcludesOnlyTheChurn;
         parity-timers-self-heal =
           mkAssertionCheck "parity-timers-self-heal" parityTimersSelfHeal;
+        parity-view-is-wired =
+          mkAssertionCheck "parity-view-is-wired" parityViewIsWired;
         media-tree-waits-for-its-mounts =
           mkAssertionCheck "media-tree-waits-for-its-mounts" mediaTreeWaitsForItsMounts;
         branch-roots-are-ownership-checked =
