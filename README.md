@@ -78,6 +78,7 @@ ui/                  the web UI — hand-written HTML/CSS/ES modules, no build s
 tests/               NixOS VM tests
 examples/hosts/      example settings.json + host config used by the guard checks
 docs/design/         the approved design spec
+docs/storage/        operator storage procedures (parity, restoring a disk)
 ```
 
 ## Secrets

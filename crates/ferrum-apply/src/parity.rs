@@ -763,6 +763,214 @@ pub fn summary_line(report: &ParityReport) -> String {
     }
 }
 
+// ---------------------------------------------------------------------------
+// R5: restoring from parity. The gate, not the rebuild.
+// ---------------------------------------------------------------------------
+
+/// Pulls the data-disk names out of a generated `/etc/snapraid.conf`.
+///
+/// These are what `snapraid fix -d` takes, and what a restore has to name.
+///
+/// # Arguments
+/// * `conf` - the contents of `/etc/snapraid.conf`.
+///
+/// # Returns
+/// `(name, path)` for each `data` line, in file order.
+pub fn data_disks(conf: &str) -> Vec<(String, String)> {
+    conf.lines()
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            if parts.next()? != "data" {
+                return None;
+            }
+            let name = parts.next()?.to_string();
+            let path = parts.next()?.to_string();
+            Some((name, path))
+        })
+        .collect()
+}
+
+/// The exact word an operator must type to authorise a restore.
+///
+/// It names the DISK, so an acknowledgement of one restore cannot pass a
+/// different one -- the same rule `pin_gate` and `way_in` already apply to
+/// their own acknowledgements, and for the same reason: a generic "yes"
+/// survives the thing it was agreeing to changing underneath it.
+///
+/// # Arguments
+/// * `disk` - the SnapRAID data-disk name, e.g. `d1`.
+///
+/// # Returns
+/// The token for that disk.
+pub fn restore_token(disk: &str) -> String {
+    format!("overwrite-{disk}")
+}
+
+/// Whether a restore may proceed, and if not, exactly why.
+///
+/// Never `Allowed` by default and never `Allowed` on silence: every variant
+/// below is reached by an explicit decision, and the operator's
+/// acknowledgement is one of the inputs rather than something inferred from
+/// the absence of an objection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RestoreGate {
+    /// The named disk is not one this host's snapraid configuration has.
+    UnknownDisk(String),
+    /// Restoring cannot work at all in this state -- there is nothing to
+    /// restore from. Not overridable, because an override would only produce
+    /// a confident failure.
+    Impossible(String),
+    /// The operator did not supply the acknowledgement, or supplied the
+    /// wrong one. Carries the prose naming exactly what would be overwritten.
+    NeedsConfirmation(String),
+    /// Parity is not current, so a restore would bring back an older version
+    /// of anything written since the last successful sync -- and silently
+    /// lose anything written since it entirely. Overridable, deliberately:
+    /// an older copy of a failed disk is usually far better than none, and
+    /// refusing outright would be ferrum deciding that for the operator.
+    StaleNeedsAcknowledgement(String),
+    /// Go ahead. Carries the prose that was confirmed, so the caller logs
+    /// the same words the operator agreed to.
+    Allowed(String),
+}
+
+impl RestoreGate {
+    /// Whether this gate lets the restore run.
+    pub fn allowed(&self) -> bool {
+        matches!(self, RestoreGate::Allowed(_))
+    }
+
+    /// The operator-facing explanation.
+    pub fn message(&self) -> &str {
+        match self {
+            RestoreGate::UnknownDisk(m)
+            | RestoreGate::Impossible(m)
+            | RestoreGate::NeedsConfirmation(m)
+            | RestoreGate::StaleNeedsAcknowledgement(m)
+            | RestoreGate::Allowed(m) => m,
+        }
+    }
+}
+
+/// The sentence naming exactly what a restore would overwrite.
+///
+/// "Exactly" is the requirement and it is why this names the disk, its mount
+/// point, and the word the operator has to type. A confirmation that says
+/// only "are you sure?" is a confirmation of nothing.
+fn restore_prose(disk: &str, path: &str) -> String {
+    format!(
+        "A restore REWRITES data disk {disk} at {path}. Every file SnapRAID \
+         recorded there is rebuilt from parity, overwriting whatever is at \
+         that path now -- including files you have changed since the last \
+         sync. Nothing else on this host is touched. Parity protects against \
+         a single local disk failing; it does not undo a deletion and it does \
+         not survive losing the machine. To go ahead, pass \
+         --confirm {token}.",
+        token = restore_token(disk)
+    )
+}
+
+/// Decides whether a restore may run.
+///
+/// Reads R4's status rather than operating blind to it, which is the
+/// requirement's fourth criterion: a restore from stale parity brings back an
+/// older version of anything written since the last successful sync, and the
+/// operator has to be told that before relying on it rather than after.
+///
+/// # Arguments
+/// * `conf` - the contents of `/etc/snapraid.conf`.
+/// * `disk` - the data-disk name to restore.
+/// * `confirm` - the acknowledgement the operator supplied, if any.
+/// * `accept_stale` - whether the operator additionally accepted restoring
+///   from parity that is not current.
+/// * `report` - R4's own document for this host.
+///
+/// # Returns
+/// The gate decision, carrying the prose in every case.
+pub fn decide_restore(
+    conf: &str,
+    disk: &str,
+    confirm: Option<&str>,
+    accept_stale: bool,
+    report: &ParityReport,
+) -> RestoreGate {
+    let disks = data_disks(conf);
+    let Some((_, path)) = disks.iter().find(|(name, _)| name == disk) else {
+        let known: Vec<&str> = disks.iter().map(|(n, _)| n.as_str()).collect();
+        return RestoreGate::UnknownDisk(format!(
+            "{disk} is not a data disk on this host. This host has: {}.",
+            if known.is_empty() { "none".to_string() } else { known.join(", ") }
+        ));
+    };
+
+    // Checked BEFORE the confirmation, so an operator in a state where
+    // restoring cannot work is told that rather than being asked to type a
+    // word that would then fail anyway.
+    match report.state {
+        ParityState::NotConfigured => {
+            return RestoreGate::Impossible(
+                "parity is not configured on this host, so there is nothing to restore from"
+                    .to_string(),
+            )
+        }
+        ParityState::NeverSynced => {
+            return RestoreGate::Impossible(
+                "parity has never completed a sync on this host, so it holds nothing to \
+                 restore from"
+                    .to_string(),
+            )
+        }
+        ParityState::ParityDiskMissing => {
+            return RestoreGate::Impossible(
+                "a parity disk is missing, so there is nothing to restore from. Attach it \
+                 and check again before trying to rebuild anything."
+                    .to_string(),
+            )
+        }
+        ParityState::Syncing => {
+            return RestoreGate::Impossible(
+                "a parity sync is running. Restoring while the parity file is being \
+                 rewritten would read a half-updated array; wait for it to finish."
+                    .to_string(),
+            )
+        }
+        _ => {}
+    }
+
+    let prose = restore_prose(disk, path);
+    if confirm != Some(restore_token(disk).as_str()) {
+        return RestoreGate::NeedsConfirmation(prose);
+    }
+
+    let stale_reason = match report.state {
+        ParityState::Stale => Some(format!(
+            "{} file(s) have changed since the last successful parity sync. Those files are \
+             NOT in parity: a restore brings back the version from the last sync, and \
+             anything created since is simply absent.",
+            report.unprotected.map(|c| c.unprotected_files()).unwrap_or(0)
+        )),
+        ParityState::LastSyncFailed => Some(
+            "the last parity sync did not succeed, so the parity on disk is as old as the \
+             last one that did -- possibly much older than it looks."
+                .to_string(),
+        ),
+        ParityState::Unknown => Some(
+            "ferrum could not determine how current the parity is, so it cannot tell you \
+             what a restore would bring back."
+                .to_string(),
+        ),
+        _ => None,
+    };
+
+    match stale_reason {
+        Some(why) if !accept_stale => RestoreGate::StaleNeedsAcknowledgement(format!(
+            "{why} Restoring anyway is usually still the right call -- an older copy beats \
+             none -- but it is your decision, not ferrum's. Pass --accept-stale to proceed."
+        )),
+        _ => RestoreGate::Allowed(prose),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1370,5 +1578,182 @@ No differences
         names.dedup();
         assert_eq!(before, names.len(), "two states share a wire name: {names:?}");
         assert!(names.contains(&"\"in-sync\"".to_string()), "{names:?}");
+    }
+
+    // -------------------------------------------------------------------
+    // R5: the restore gate
+    // -------------------------------------------------------------------
+
+    const CONF: &str = "data d0 /mnt/ferrum-disk-0\n\
+                        data d1 /mnt/ferrum-disk-1\n\
+                        parity /mnt/ferrum-parity-0/snapraid.parity\n\
+                        content /var/lib/ferrum/snapraid/snapraid.content\n";
+
+    fn report_in(state: ParityState, unprotected: Option<DiffCounts>) -> ParityReport {
+        ParityReport {
+            schema_version: REPORT_SCHEMA_VERSION,
+            state,
+            generated_at: 2000,
+            last_sync: Some(LastSync { finished_at: 1000, result: "success".into() }),
+            elapsed_seconds: Some(1000),
+            unprotected,
+            unprotected_unavailable: None,
+            unprotected_bytes_unavailable: BYTES_UNAVAILABLE.to_string(),
+            parity_disks: vec![ParityDisk {
+                path: "/mnt/ferrum-parity-0/snapraid.parity".into(),
+                present: true,
+            }],
+            limitation: LIMITATION.to_string(),
+        }
+    }
+
+    #[test]
+    fn the_data_disk_names_come_out_of_the_generated_config() {
+        assert_eq!(
+            data_disks(CONF),
+            vec![
+                ("d0".to_string(), "/mnt/ferrum-disk-0".to_string()),
+                ("d1".to_string(), "/mnt/ferrum-disk-1".to_string()),
+            ]
+        );
+        assert!(data_disks("parity /x\ncontent /y\n").is_empty());
+    }
+
+    /// A restore never runs on silence. No acknowledgement means no restore,
+    /// and the refusal carries the words the operator has to agree to.
+    #[test]
+    fn a_restore_never_runs_without_an_acknowledgement() {
+        let r = report_in(ParityState::InSync, Some(DiffCounts::default()));
+        let gate = decide_restore(CONF, "d1", None, false, &r);
+        assert!(!gate.allowed());
+        assert!(matches!(gate, RestoreGate::NeedsConfirmation(_)));
+        // It names the disk, the path, and the word -- "exactly what will be
+        // overwritten", not "are you sure".
+        let m = gate.message();
+        assert!(m.contains("d1"), "{m}");
+        assert!(m.contains("/mnt/ferrum-disk-1"), "{m}");
+        assert!(m.contains("overwrite-d1"), "{m}");
+        assert!(m.contains("REWRITES"), "{m}");
+    }
+
+    /// The acknowledgement names the disk, so agreeing to restore one disk
+    /// can never pass the restore of another.
+    #[test]
+    fn an_acknowledgement_for_one_disk_does_not_authorise_another() {
+        let r = report_in(ParityState::InSync, Some(DiffCounts::default()));
+        assert!(decide_restore(CONF, "d1", Some("overwrite-d1"), false, &r).allowed());
+        assert!(!decide_restore(CONF, "d1", Some("overwrite-d0"), false, &r).allowed());
+        assert!(!decide_restore(CONF, "d1", Some("yes"), false, &r).allowed());
+        assert!(!decide_restore(CONF, "d1", Some(""), false, &r).allowed());
+    }
+
+    /// A disk this host does not have is refused before anything else, and
+    /// the message says which disks it does have.
+    #[test]
+    fn an_unknown_disk_is_refused_and_the_real_ones_are_named() {
+        let r = report_in(ParityState::InSync, Some(DiffCounts::default()));
+        let gate = decide_restore(CONF, "d9", Some("overwrite-d9"), true, &r);
+        assert!(matches!(gate, RestoreGate::UnknownDisk(_)));
+        assert!(gate.message().contains("d0, d1"), "{}", gate.message());
+    }
+
+    /// R4's status is READ, not ignored: a stale array needs a second,
+    /// separate acknowledgement, and the warning says what will be lost.
+    #[test]
+    fn restoring_from_stale_parity_surfaces_the_warning_before_it_runs() {
+        let r = report_in(
+            ParityState::Stale,
+            Some(DiffCounts { added: 3, updated: 1, ..Default::default() }),
+        );
+        let gate = decide_restore(CONF, "d1", Some("overwrite-d1"), false, &r);
+        assert!(!gate.allowed());
+        assert!(matches!(gate, RestoreGate::StaleNeedsAcknowledgement(_)));
+        let m = gate.message();
+        assert!(m.contains('4'), "the count of unprotected files is missing: {m}");
+        assert!(m.contains("NOT in parity"), "{m}");
+
+        // Overridable, and only with the second explicit flag.
+        assert!(decide_restore(CONF, "d1", Some("overwrite-d1"), true, &r).allowed());
+    }
+
+    /// A failed or unknown last sync warns for the same reason staleness
+    /// does: the parity is not as current as it looks.
+    #[test]
+    fn a_failed_or_unknown_sync_warns_before_a_restore_too() {
+        for state in [ParityState::LastSyncFailed, ParityState::Unknown] {
+            let r = report_in(state, None);
+            let gate = decide_restore(CONF, "d1", Some("overwrite-d1"), false, &r);
+            assert!(
+                matches!(gate, RestoreGate::StaleNeedsAcknowledgement(_)),
+                "{state:?} did not warn: {gate:?}"
+            );
+            assert!(decide_restore(CONF, "d1", Some("overwrite-d1"), true, &r).allowed());
+        }
+    }
+
+    /// Four states in which a restore cannot work are refused outright, and
+    /// --accept-stale does NOT override them -- an override there would only
+    /// produce a confident failure.
+    #[test]
+    fn a_restore_that_could_not_work_is_refused_and_not_overridable() {
+        for state in [
+            ParityState::NotConfigured,
+            ParityState::NeverSynced,
+            ParityState::ParityDiskMissing,
+            ParityState::Syncing,
+        ] {
+            let r = report_in(state, None);
+            let gate = decide_restore(CONF, "d1", Some("overwrite-d1"), true, &r);
+            assert!(
+                matches!(gate, RestoreGate::Impossible(_)),
+                "{state:?} was not refused: {gate:?}"
+            );
+            assert!(!gate.message().is_empty());
+        }
+    }
+
+    /// The control, and the one that stops every assertion above passing
+    /// against a gate that refuses everything: a current array with the right
+    /// acknowledgement goes ahead.
+    #[test]
+    fn a_current_array_with_the_right_acknowledgement_proceeds() {
+        let r = report_in(ParityState::InSync, Some(DiffCounts { equal: 9, ..Default::default() }));
+        let gate = decide_restore(CONF, "d0", Some("overwrite-d0"), false, &r);
+        assert!(gate.allowed(), "{gate:?}");
+        // The allowed gate carries the same prose the operator agreed to, so
+        // the log records what was consented to rather than a bare "ok".
+        assert!(gate.message().contains("/mnt/ferrum-disk-0"));
+    }
+
+    /// R6 again, on this surface: the restore gate never calls parity a
+    /// backup, in any of its five outcomes.
+    #[test]
+    fn the_restore_gate_never_calls_parity_a_backup() {
+        let states = [
+            ParityState::InSync,
+            ParityState::Stale,
+            ParityState::NotConfigured,
+            ParityState::NeverSynced,
+            ParityState::ParityDiskMissing,
+            ParityState::Syncing,
+            ParityState::LastSyncFailed,
+            ParityState::Unknown,
+        ];
+        for state in states {
+            let r = report_in(state, Some(DiffCounts { added: 1, ..Default::default() }));
+            for confirm in [None, Some("overwrite-d1"), Some("nope")] {
+                for accept in [false, true] {
+                    let m = decide_restore(CONF, "d1", confirm, accept, &r)
+                        .message()
+                        .to_lowercase();
+                    assert!(!m.contains("backup"), "{state:?}: {m}");
+                }
+            }
+        }
+        // And the one that reports a healthy state states the limitation.
+        let healthy = report_in(ParityState::InSync, Some(DiffCounts::default()));
+        assert!(decide_restore(CONF, "d1", None, false, &healthy)
+            .message()
+            .contains("single local disk"));
     }
 }
