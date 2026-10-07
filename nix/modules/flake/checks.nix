@@ -3633,6 +3633,125 @@
             stateAdded snapsAdded journalAdded defaultsContributeNothing unpooled;
         };
 
+      # R3. Both parity timers are generated in the self-healing shape, both
+      # are independently disablable, and both units are deprioritized below
+      # anything a person is waiting for.
+      #
+      # WHAT THE UPSTREAM MODULE ACTUALLY DOES, read out of the pinned
+      # nixpkgs rather than assumed: `services.snapraid` schedules its two
+      # units with `startAt`, which is sugar for a bare `OnCalendar` (01:00
+      # for sync, Mon 02:00 for scrub) and nothing else. There is no
+      # `OnBootSec`, no `Persistent`, and no per-unit enable. On a host that
+      # is not always on -- which a home media server frequently is not -- a
+      # calendar time that came due while the machine was asleep is simply
+      # missed, and the array stays unprotected until the same hour comes
+      # round again. So ferrum replaces the timerConfig outright.
+      #
+      # `mkForce` is required rather than stylistic: `startAt` has already
+      # written OnCalendar into the same attribute set, and a merge would
+      # leave a timer that fires on the interval AND at 01:00 -- which is
+      # neither setting's meaning. This check is what holds that, by
+      # asserting OnCalendar is absent from the generated timerConfig.
+      #
+      # The anti-vacuity halves: the default host must HAVE both timers (so
+      # the field assertions are about something), the disabled host must
+      # have both suppressed, and the parity-off host must generate neither
+      # unit at all. Without the last one, every assertion here would pass
+      # against a module that generates nothing anywhere.
+      parityTimersSelfHeal =
+        let
+          branches = [ "/mnt/ferrum-check-a" "/mnt/ferrum-check-b" ];
+          base = { enable = true; disks = [ "/mnt/ferrum-parity-0" ]; };
+
+          hostWith = parity: ferrumLib.mkHost {
+            inherit system;
+            settings = {
+              schemaVersion = realMigrations.currentVersion;
+              storage = {
+                pool = { enable = true; inherit branches; };
+                inherit parity;
+              };
+            };
+            modules = [ ../../../examples/hosts/minimal/configuration.nix ];
+          };
+
+          cfgOf = parity: (hostWith parity).config;
+
+          # Read off systemd.units, which is what actually reaches the
+          # generation: `systemd.timers.<n>.enable = false` leaves the entry
+          # in `systemd.timers` and only clears it here. An options-level
+          # check would have passed on a module that disabled nothing.
+          timerEnabled = parity: name:
+            (cfgOf parity).systemd.units."${name}.timer".enable or null;
+          timerExists = parity: name:
+            (cfgOf parity).systemd.units ? "${name}.timer";
+          timerCfg = parity: name:
+            (cfgOf parity).systemd.timers.${name}.timerConfig or { };
+          ioClass = parity: name:
+            (cfgOf parity).systemd.services.${name}.serviceConfig.IOSchedulingClass or null;
+
+          defaults = base;
+          customInterval = base // {
+            sync.intervalMinutes = 180;
+            scrub.intervalMinutes = 20160;
+          };
+          disabled = base // { sync.enable = false; scrub.enable = false; };
+          syncOnly = base // { scrub.enable = false; };
+          off = { enable = false; disks = [ ]; };
+
+          # The three fields modules/proxy/dns.nix's self-healing timer
+          # carries, and the one that must NOT survive the override.
+          selfHealing = name:
+            let t = timerCfg defaults name; in
+            (t ? OnBootSec) && (t ? OnUnitActiveSec) && (t.Persistent or false) == true
+            && !(t ? OnCalendar);
+
+          intervalIsTheOption =
+            (timerCfg customInterval "snapraid-sync").OnUnitActiveSec or null == "180min"
+            && (timerCfg customInterval "snapraid-scrub").OnUnitActiveSec or null == "20160min";
+
+          # Two DISTINCT units with independent schedules, not one timer
+          # driving both.
+          twoDistinctSchedules =
+            (timerCfg defaults "snapraid-sync").OnUnitActiveSec or null
+            != (timerCfg defaults "snapraid-scrub").OnUnitActiveSec or null
+            && (timerCfg defaults "snapraid-sync").Unit or null == "snapraid-sync.service"
+            && (timerCfg defaults "snapraid-scrub").Unit or null == "snapraid-scrub.service";
+        in
+        {
+          ok = selfHealing "snapraid-sync"
+            && selfHealing "snapraid-scrub"
+            && intervalIsTheOption
+            && twoDistinctSchedules
+            && timerEnabled defaults "snapraid-sync" == true
+            && timerEnabled defaults "snapraid-scrub" == true
+            && timerEnabled disabled "snapraid-sync" == false
+            && timerEnabled disabled "snapraid-scrub" == false
+            # Independently disablable, not one switch for both.
+            && timerEnabled syncOnly "snapraid-sync" == true
+            && timerEnabled syncOnly "snapraid-scrub" == false
+            && ioClass defaults "snapraid-sync" == "idle"
+            && ioClass defaults "snapraid-scrub" == "idle"
+            # A host with both timers off still HAS the units, which is what
+            # makes `ferrum-apply parity-sync` work there.
+            && timerExists disabled "snapraid-sync"
+            && !(timerExists off "snapraid-sync")
+            && !(timerExists off "snapraid-scrub");
+          message =
+            "modules/core/parity.nix's timers are not in the self-healing shape "
+            + "modules/proxy/dns.nix uses, are not independently disablable, or "
+            + "are not deprioritized";
+          syncTimer = timerCfg defaults "snapraid-sync";
+          scrubTimer = timerCfg defaults "snapraid-scrub";
+          disabledSyncEnabled = timerEnabled disabled "snapraid-sync";
+          disabledScrubEnabled = timerEnabled disabled "snapraid-scrub";
+          syncOnlyScrubEnabled = timerEnabled syncOnly "snapraid-scrub";
+          inherit intervalIsTheOption twoDistinctSchedules;
+          syncIo = ioClass defaults "snapraid-sync";
+          scrubIo = ioClass defaults "snapraid-scrub";
+          offHasTimers = timerExists off "snapraid-sync";
+        };
+
       # The self-signed certificate follows ferrum.proxy.baseDomain.
       #
       # Its CN and both SANs are built from that option, and the unit that
@@ -5570,6 +5689,8 @@
           mkAssertionCheck "parity-disk-is-never-a-pool-branch" parityDiskIsNeverAPoolBranch;
         parity-excludes-only-the-churn =
           mkAssertionCheck "parity-excludes-only-the-churn" parityExcludesOnlyTheChurn;
+        parity-timers-self-heal =
+          mkAssertionCheck "parity-timers-self-heal" parityTimersSelfHeal;
         media-tree-waits-for-its-mounts =
           mkAssertionCheck "media-tree-waits-for-its-mounts" mediaTreeWaitsForItsMounts;
         branch-roots-are-ownership-checked =

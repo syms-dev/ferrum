@@ -4,6 +4,7 @@ mod address_history;
 mod apply;
 mod dns_reconcile;
 mod gc;
+mod parity;
 mod pin;
 mod pin_gate;
 mod preflight;
@@ -143,6 +144,14 @@ enum Command {
     /// to ORDINARY retention, so a confirmed update is still rollbackable
     /// for as long as any other change of the same age is.
     ConfirmUpdate,
+    /// Run a SnapRAID parity sync now, whatever the timer is doing.
+    ///
+    /// R3's manual trigger, and it is independent of the schedule by
+    /// construction rather than by convention: it starts
+    /// `snapraid-sync.service`, which exists whenever parity is configured,
+    /// while `ferrum.storage.parity.sync.enable` governs only the TIMER. An
+    /// operator who turns the timer off keeps exactly this.
+    ParitySync,
 }
 
 /// Writes the job's `started` line, then runs it.
@@ -1495,6 +1504,27 @@ fn run_gc_inner(progress: &mut progress::Progress) -> anyhow::Result<usize> {
     )
 }
 
+/// Starts a parity sync and reports the outcome.
+///
+/// Prints the summary on stdout so a bare `ferrum-apply parity-sync` over
+/// SSH is useful on its own, and records the same line as job progress so a
+/// dispatched run says the same thing in both places.
+///
+/// # Returns
+/// The process exit code: `0` only when the sync really completed.
+fn run_parity_sync() -> i32 {
+    let outcome = parity::start_sync(&parity::conf_path(), &update_check::RealRunner);
+    let summary = outcome.summary();
+    let code = outcome.exit_code();
+    if code == 0 {
+        println!("{summary}");
+    } else {
+        eprintln!("{summary}");
+    }
+    progress::Progress::open().event("parity-sync", &summary);
+    code
+}
+
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let exit_code = match cli.command {
@@ -1509,6 +1539,7 @@ fn main() -> anyhow::Result<()> {
         Command::CheckUpdate => run_check_update(),
         Command::Update => run_update(),
         Command::ConfirmUpdate => run_confirm_update(),
+        Command::ParitySync => run_parity_sync(),
         Command::ReconcileDns { config } => run_reconcile_dns(&config),
         Command::PutSecret { name, replace } => run_put_secret(&name, replace),
         Command::RunRequest { path } => match request::read_request(&path) {

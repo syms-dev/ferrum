@@ -32,6 +32,8 @@
 #      also a pool branch.
 #   2. WHAT TO SKIP (R2) -- an exclude list computed from ferrum's own
 #      resolved storage options, not a copied literal.
+#   3. WHEN (R3) -- timers in the self-healing shape modules/proxy/dns.nix
+#      already uses, rather than the module's bare OnCalendar.
 #
 # No new flake input and no new Cargo dependency: pkgs.snapraid comes from
 # the nixpkgs revision flake.lock already pins. It is a real addition to a
@@ -252,6 +254,54 @@ in
         inherit dataDisks parityFiles contentFiles exclude;
       };
 
+      # R3. The upstream module schedules both units with `startAt`, which is
+      # sugar for a bare `OnCalendar`. That is the wrong shape for a host that
+      # is not always on: a nightly OnCalendar that came due while the machine
+      # was asleep is simply missed, and the array stays unprotected until the
+      # same hour comes round again.
+      #
+      # The shape below is modules/proxy/dns.nix's, copied because it is the
+      # one already proven here for a non-destructive self-healing background
+      # task: a first run shortly after boot catches the common real case (the
+      # library changed while the box was down), OnUnitActiveSec paces the
+      # rest, and Persistent = true makes a missed run happen on resume rather
+      # than a full interval later.
+      #
+      # mkForce because `startAt` has already populated timerConfig with
+      # OnCalendar, and a merge would leave BOTH -- a timer that fires on the
+      # interval and again at 01:00, which is not what either setting says.
+      systemd.timers.snapraid-sync = {
+        enable = parity.sync.enable;
+        timerConfig = lib.mkForce {
+          OnBootSec = "15min";
+          OnUnitActiveSec = "${toString parity.sync.intervalMinutes}min";
+          Persistent = true;
+          Unit = "snapraid-sync.service";
+        };
+      };
+
+      systemd.timers.snapraid-scrub = {
+        enable = parity.scrub.enable;
+        timerConfig = lib.mkForce {
+          # Later than sync's, so a host that has just booted syncs what
+          # changed while it was off before it spends I/O re-reading what
+          # did not.
+          OnBootSec = "45min";
+          OnUnitActiveSec = "${toString parity.scrub.intervalMinutes}min";
+          Persistent = true;
+          Unit = "snapraid-scrub.service";
+        };
+      };
+
+      # Both units already carry Nice = 19, IOSchedulingPriority = 7 and
+      # CPUSchedulingPolicy = "batch" from the upstream module. What they do
+      # NOT carry is an IOSchedulingClass, so that priority is a
+      # best-effort priority: a sync still competes with a Plex transcode
+      # reading off the same disk. "idle" is the class that means "only when
+      # nothing else wants the disk", which is the correct relationship
+      # between a background integrity job and somebody watching a film.
+      systemd.services.snapraid-sync.serviceConfig.IOSchedulingClass = "idle";
+      systemd.services.snapraid-scrub.serviceConfig.IOSchedulingClass = "idle";
     })
   ];
 }
