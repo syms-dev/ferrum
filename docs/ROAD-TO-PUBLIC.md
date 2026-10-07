@@ -660,6 +660,22 @@ Items that analysis surfaced about **ferrum**, not about the projects analysed:
       upstream. **Two defects, not one.** The UI must surface warnings; and "up-to-date" is the
       wrong word when nothing *can* be discovered — that is "cannot check". **A gauge frozen at
       green, which is item 23's failure mode arriving in a different place.**
+- [x] **27. The Updates view says "up-to-date" when it cannot check at all.** DONE 2026-10-07,
+      `0a0de84`. Two defects, both fixed. `CandidateState::PinnedExactly` now exists: a host pinned
+      at an exact commit resolves it to itself, so the old code returned the state it would return
+      after a successful check that found nothing newer — and `update_deltas.rs` then mapped that
+      onto **every app row**, individually labelling each "nothing about this app would change".
+      That file already understood the distinction everywhere else; the pinned case had nowhere to
+      land. Two tests, the second being why the first is worth anything: a tracking host that
+      really did query and really did find its own revision is still `UpToDate`.
+      **The owner's box is a pinned host, so it will now say "Cannot check" — which is true.**
+
+- [x] **The UI mockups are in the repo.** 2026-10-07 — `docs/design/mockups/` plus the
+      reconciliation at `docs/design/2026-10-07-ui-mockups-vs-implementation.md`. **The owner's
+      recollection that the designs "seemed to be all implemented" was wrong:** three of eight
+      screens do not exist, and the app detail view has zero occurrences of anything resembling it.
+      Three of the five field observations below were already solved by these designs.
+
 - [ ] **28. Generations show nothing about what changed between them.** No diff, no "what did this
       apply actually do". The data largely exists — `built_pin`, `built_toplevel`, the journal, the
       job records — and nothing renders it. Owner's framing: this belongs inside the dashboard
