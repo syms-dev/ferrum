@@ -329,14 +329,25 @@ export function appSchema(fullSchema, appId, meta = {}) {
         title: "Enabled",
         description: "Run this app on this host.",
       },
-      subdomain: {
-        type: "string",
-        default: meta.defaultSubdomain,
-        title: "Subdomain",
-        description:
-          "Reached at this label under your base domain. The one knob here people " +
-          "genuinely want to change.",
-      },
+      // Omitted entirely for an app the catalog marks `headless`: it has no
+      // web interface, gets no vhost and no DNS record (see
+      // modules/lib/app-submodule.nix's exposure default), so offering a
+      // "reached at this label" field would promise a URL that will never
+      // answer -- and would invite an edit that does nothing.
+      //
+      // This still matches on no app id, which is the line this file draws:
+      // `headless` arrives from the catalog the same way defaultSubdomain
+      // beside it does.
+      ...(meta.headless ? {} : {
+        subdomain: {
+          type: "string",
+          default: meta.defaultSubdomain,
+          title: "Subdomain",
+          description:
+            "Reached at this label under your base domain. The one knob here people " +
+            "genuinely want to change.",
+        },
+      }),
       settings: {
         ...(meta.settingsSchema ?? { type: "object", properties: {} }),
         title: `${meta.displayName || appId} options`,
@@ -363,13 +374,19 @@ export function advancedSchema(meta = {}, stateRoot = "/var/lib/ferrum/state", a
       // matters behind the proxy, and stateDir moved outside the ferrum state
       // root silently removes the app from snapshot and rollback -- the one
       // guarantee this whole project exists to provide.
-      port: {
-        type: "integer",
-        default: meta.defaultPort,
-        readOnly: true,
-        title: "Port",
-        description: "Loopback port behind the proxy. Set by the catalog.",
-      },
+      // Same reason as `subdomain` in appSchema above: a headless app binds
+      // no socket at all, so its catalog port is 0 and showing it as "the
+      // loopback port behind the proxy" would describe a proxy that does
+      // not exist for this app.
+      ...(meta.headless ? {} : {
+        port: {
+          type: "integer",
+          default: meta.defaultPort,
+          readOnly: true,
+          title: "Port",
+          description: "Loopback port behind the proxy. Set by the catalog.",
+        },
+      }),
       mediaAccess: {
         type: "string",
         enum: ["none", "read", "readwrite"],

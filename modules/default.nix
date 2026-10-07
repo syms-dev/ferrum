@@ -62,5 +62,6 @@
     ./apps/plex/service.nix
     ./apps/sabnzbd/service.nix
     ./apps/qbittorrent/service.nix
+    ./apps/decluttarr/service.nix
   ];
 }
