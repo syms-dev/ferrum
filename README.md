@@ -139,6 +139,12 @@ qBittorrent's VPN kill-switch config is operator-provided, since it's your own W
 3. Add `"qbittorrent-vpn"` to `ferrum.secrets` in `settings.json` — this is what actually enables qBittorrent's VPN-gated network namespace; the file's mere presence on disk is not enough on its own.
 4. Re-apply. qBittorrent's traffic now routes exclusively through the tunnel; see `modules/apps/qbittorrent/service.nix` for the kill-switch mechanism itself.
 
+Its WebUI moves with it. Inside the namespace it is no longer on the host's loopback, so the reverse
+proxy and the cross-app reconciler reach it across the management veth pair instead — one shared
+value, `modules/lib/app-address.nix`, that both of them read. The `netns-apps-are-proxied-reachably`
+check holds them together: it derives "this app is in a namespace" from the generated systemd units
+and fails if anything proxies such an app at an address that cannot reach it.
+
 Encrypt the provider's file exactly as it was issued — there is nothing to edit out of it. A config
 carrying several comma-separated addresses (`Address = 10.2.0.2/32, 2a07:b944::2:2/128`, which is
 what Proton and most other providers hand out) is applied one entry at a time. **IPv6 entries in
