@@ -450,6 +450,38 @@
       # the catalog *default* is pinned). If a future app genuinely needs a
       # differing default, this check is the thing that stops it shipping
       # until the installer is taught to read subdomains.
+      #
+      # HEADLESS APPS ARE EXEMPT FROM THE FIRST HALF, and the exemption is
+      # narrower than it looks. The invariant above is about a NAME: the
+      # installer must plan, publish and verify the same hostname the host
+      # serves. An app whose meta.nix declares `headless = true` serves no
+      # hostname at all -- modules/lib/app-submodule.nix defaults it to
+      # exposure = "local", so modules/proxy/lib.nix's publicApps excludes
+      # it and neither dns.nix nor acme.nix ever names it. There is nothing
+      # for the two sides to agree about.
+      #
+      # It is also the SAFE direction. Adding such an app to CATALOG_APPS
+      # would be the defect: crates/ferrum-install/src/dns.rs's
+      # desired_records() maps every selected app to "<id>.<baseDomain>"
+      # unconditionally, so a default "install everything" run would create
+      # a public A record -- and main.rs's url_report would print an https
+      # URL -- for a process with no socket. Keeping it out of that list
+      # keeps "every app the installer selects gets a record and a URL" true
+      # by construction, instead of adding a second list of exceptions in
+      # Rust that nothing holds to the catalog.
+      #
+      # The cost, stated plainly: a headless app is not offered during
+      # install and is enabled afterwards from the dashboard (or
+      # settings.json). The upgrade path, if that ever stops being
+      # acceptable, is to teach the installer to carry the headless set and
+      # filter the three hostname-shaped consumers by it -- at which point
+      # this exemption is deleted, not widened.
+      #
+      # The second half (defaultSubdomain == id) is deliberately NOT
+      # exempted. A headless app still has a subdomain option, it still
+      # participates in nginx.nix's collision detection over enabled apps,
+      # and holding the whole catalog to one rule is cheaper than
+      # remembering which half applies to whom.
       installerOffersEveryCatalogApp =
         let
           answersSrc = builtins.readFile ../../../crates/ferrum-install/src/answers.rs;
@@ -502,8 +534,25 @@
 
           catalog = import ../../../modules/lib/catalog.nix { inherit lib; };
           catalogApps = builtins.attrNames catalog;
-          missing = builtins.filter (a: !(builtins.elem a declared)) catalogApps;
+          # The apps that have a front door, which is the set this half is
+          # about. Read off the catalog's own `headless` mark, never a list
+          # of ids here -- the same rule modules/core/options.nix's
+          # headlessViolations follows.
+          offerable = builtins.filter (a: !(catalog.${a}.headless or false)) catalogApps;
+          missing = builtins.filter (a: !(builtins.elem a declared)) offerable;
+          # Still measured against the WHOLE catalog: the installer offering
+          # an app that does not exist is a bug whether or not that app
+          # would have had a hostname. An entry naming a headless app is
+          # caught by the explicit test below instead, which says why.
           extra = builtins.filter (a: !(builtins.elem a catalogApps)) declared;
+          # The exemption, held to its own floor in both directions: a
+          # headless app must NOT appear in CATALOG_APPS (it would get a DNS
+          # record and a printed https URL -- see the header), and the
+          # headless set must not be empty, or the three lines above are
+          # testing nothing and the exemption is dead code that reads as
+          # coverage.
+          headlessApps = builtins.filter (a: catalog.${a}.headless or false) catalogApps;
+          headlessOffered = builtins.filter (a: builtins.elem a declared) headlessApps;
 
           # The installer names records, urls and reachability checks after
           # the app id; the host names its vhost after the subdomain. See
@@ -512,12 +561,32 @@
           renamed = builtins.filter (id: catalog.${id}.defaultSubdomain != id) catalogApps;
         in
         {
-          ok = missing == [ ] && extra == [ ] && renamed == [ ];
+          ok = missing == [ ] && extra == [ ] && renamed == [ ]
+            && headlessApps != [ ] && headlessOffered == [ ];
           message =
             "crates/ferrum-install/src/answers.rs's CATALOG_APPS is out of step with "
             + "modules/lib/catalog.nix."
             + (lib.optionalString (missing != [ ])
                 " In the catalog but not offered by the installer: ${lib.concatStringsSep ", " missing}.")
+            + (lib.optionalString (headlessApps == [ ])
+                (" No app in the catalog declares headless = true, so this check's"
+                  + " headless exemption is now testing nothing: `missing` is"
+                  + " measured over a set identical to the whole catalog and the"
+                  + " exemption below is unreachable. Either an app lost its mark"
+                  + " -- in which case it also lost its exposure default and now"
+                  + " gets a vhost, a certificate and a DNS record -- or the"
+                  + " exemption should be deleted along with this branch."))
+            + (lib.optionalString (headlessOffered != [ ])
+                (" These apps have no web interface and must NOT be in CATALOG_APPS: "
+                  + lib.concatStringsSep ", " headlessOffered
+                  + ". crates/ferrum-install/src/dns.rs's desired_records() maps every"
+                  + " selected app to '<id>.<baseDomain>' unconditionally, and"
+                  + " main.rs's url_report prints 'https://<id>.<baseDomain>' for each"
+                  + " one. Offering a headless app there publishes a public DNS record"
+                  + " and advertises a URL for a process that listens on nothing --"
+                  + " which is the whole failure modules/lib/app-submodule.nix's"
+                  + " headless exposure default exists to prevent, reintroduced from"
+                  + " the installer side where the host's own checks cannot see it."))
             + (lib.optionalString (extra != [ ])
                 " Offered by the installer but not in the catalog: ${lib.concatStringsSep ", " extra}.")
             + (lib.optionalString (renamed != [ ])
@@ -5058,6 +5127,14 @@
               # configuration the defect actually shipped on, so it is the
               # one worth pinning, and enabling the whole catalog means a
               # future namespaced app joins the corpus automatically.
+              #
+              # Since a headless app defaults to "local" instead, the corpus
+              # now contains both kinds, and `scan` below judges each by
+              # whether the generated config has a vhost for it rather than
+              # assuming every enabled app has one. That is a strengthening,
+              # not an exemption: an app with no vhost is required to have
+              # NOTHING in the config proxying to it, which is the property
+              # that was previously assumed and never checked.
               apps = lib.mapAttrs (_: _: { enable = true; }) catalog;
             };
             modules = [
@@ -5110,6 +5187,13 @@
               # named after its catalog id has to teach this check that
               # mapping rather than slip past it.
               hasUnit = host.config.systemd.services ? ${id};
+              # Does the GENERATED config give this app a front door? Read
+              # off the evaluated virtualHosts, not off the catalog's
+              # `headless` mark and not off `exposure`: the thing this check
+              # is about is what nginx was actually told, and deriving the
+              # question from the same metadata that is supposed to produce
+              # the answer is how a guard comes to agree with itself.
+              proxied = vhosts ? ${vhost};
               isolation = orDash (
                 if host.config.systemd.services ? ${id} then isolationOf host id else null
               );
@@ -5179,10 +5263,31 @@
               n=$(jq '.apps | length' "$manifest")
               [ "$n" -gt 0 ] || fail "$label: the manifest lists no enabled apps at all, so there is nothing to judge"
 
-              jq -r '.apps[] | [.id, .vhost, .port, .isolation, .nginxHost, (.hasUnit|tostring)] | @tsv' "$manifest" \
-              | while IFS="$(printf '\t')" read -r id vhost port isolation nginxhost hasunit; do
+              jq -r '.apps[] | [.id, .vhost, .port, .isolation, .nginxHost, (.hasUnit|tostring), (.proxied|tostring)] | @tsv' "$manifest" \
+              | while IFS="$(printf '\t')" read -r id vhost port isolation nginxhost hasunit proxied; do
                   [ "$hasunit" = "true" ] \
                     || fail "$label: no systemd unit named '$id' exists on the generated host, so this check cannot tell whether $id is in a network namespace -- teach it the unit name rather than leaving it unjudged"
+
+                  # An app with no vhost is not skipped, it is held to the
+                  # OPPOSITE requirement: nothing in the generated config
+                  # may reach for it. That is the whole point of a headless
+                  # app (modules/lib/app-submodule.nix), and leaving it
+                  # merely unexamined would let a future change hand it a
+                  # vhost with nobody noticing -- which is the defect this
+                  # file exists to catch, in its purest form: a proxy_pass
+                  # to a port that was never going to be bound.
+                  if [ "$proxied" != "true" ]; then
+                    echo "$label: $id has no vhost; asserting the config does not reach for it"
+                    if grep -q "server_name $vhost" "$conf"; then
+                      fail "$label: $id's manifest says it has no vhost, but the generated config contains a 'server_name $vhost'. Two readings of one fact disagreeing -- see modules/proxy/lib.nix's exposedApps."
+                    fi
+                    if grep -q "proxy_pass[[:space:]]\+https\?://[^;]*:$port\b" "$conf"; then
+                      echo "--- offending lines ---" >&2
+                      grep -n "proxy_pass[[:space:]]\+https\?://[^;]*:$port\b" "$conf" >&2 || true
+                      fail "$label: $id gets no vhost, yet the generated config proxies to its port $port (lines above). Either it has a front door after all, or some other app has been pointed at this one's port."
+                    fi
+                    continue
+                  fi
 
                   grep -q "server_name $vhost" "$conf" \
                     || fail "$label: the generated config has no $vhost vhost, so scanning it says nothing about $id"
@@ -5230,6 +5335,19 @@
               || fail "the VPN host's generated units show NO app in a network namespace, so the scan above exercised nothing. Either modules/apps/qbittorrent/service.nix no longer sets NetworkNamespacePath=, or declaring the \"qbittorrent-vpn\" secret no longer switches it on -- either way this check has to follow the mechanism rather than quietly testing a host that no longer has one."
             echo "vpn: $isolatedCount isolated app(s)"
 
+            # Anti-vacuity, half one-b: BOTH branches of the proxied test
+            # above must be reachable on this corpus. Without a proxied app
+            # the whole original check is dead; without an unproxied one the
+            # branch asserting "nothing reaches for it" is dead, and a dead
+            # branch reads as coverage.
+            proxiedCount=$(jq '[.apps[] | select(.proxied)] | length' "$vpnManifestPath")
+            unproxiedCount=$(jq '[.apps[] | select(.proxied | not)] | length' "$vpnManifestPath")
+            [ "$proxiedCount" -ge 1 ] \
+              || fail "no enabled app on this fixture gets a vhost, so the reachability scan above judged nothing. The fixture enables the whole catalog with the proxy on; if none of them is published, modules/lib/app-submodule.nix's exposure default has changed."
+            [ "$unproxiedCount" -ge 1 ] \
+              || fail "every enabled app on this fixture gets a vhost, so the \"no vhost means nothing may reach for it\" branch above is unreachable. Either the catalog no longer contains a headless app -- in which case it also lost the exposure default that keeps it out of nginx, Authelia, ACME and DNS -- or that mark stopped doing anything."
+            echo "vpn: $proxiedCount proxied, $unproxiedCount unproxied"
+
             # Anti-vacuity, half two: the fix, mechanically reverted. Every
             # isolated app's upstream is rewritten back to 127.0.0.1 and the
             # SAME predicate is re-run on it; it must reject.
@@ -5259,6 +5377,347 @@
             grep -q "proxy_pass http://127.0.0.1:$qbtPort;" "$plainConf" \
               || fail "on a host with no VPN secret qBittorrent is no longer proxied at http://127.0.0.1:$qbtPort -- the non-VPN output was supposed to be byte-identical"
             echo "plain: nothing isolated, qBittorrent still at 127.0.0.1:$qbtPort"
+
+            echo ok > $out
+          '';
+
+      # An app with no web interface gets NO front door, on all four of the
+      # surfaces that make one -- and cannot be given one by accident.
+      #
+      # WHY THIS IS A SEPARATE CHECK FROM netnsAppsAreProxiedReachably.
+      # That one reads the generated nginx.conf, and nginx is only one of
+      # four independent generators keyed on modules/proxy/lib.nix's
+      # exposedApps/publicApps: authelia.nix writes an access_control rule,
+      # acme.nix orders a certificate, dns.nix publishes a public A record.
+      # modules/proxy/lib.nix's own header says, about the DAEMON, that
+      # those four "must agree EXACTLY or the dashboard only half-exists".
+      # The same is true in the negative direction here, and it is worse: a
+      # certificate and a public DNS record for a name that can never answer
+      # are a durable, externally visible artefact -- the certificate is
+      # logged to Certificate Transparency and the record is in a zone
+      # anyone can query -- while the nginx half merely 502s.
+      #
+      # EVERY ASSERTION BELOW IS READ OFF THE EVALUATED CONFIGURATION, never
+      # off the catalog mark that is supposed to produce it, and never off a
+      # list of app names. The fixture enables the WHOLE catalog, so a future
+      # headless app joins this corpus by existing.
+      #
+      # It has four parts, and the last two are what stop it agreeing with
+      # itself:
+      #
+      #   1. no headless app's hostname appears in any of the four.
+      #   2. a POSITIVE CONTROL: a non-headless app's hostname appears in
+      #      all four. Without it, a detector that always answered "absent"
+      #      -- a renamed option, a fixture that stopped generating anything
+      #      -- would pass part 1 triumphantly.
+      #   3. an ANTI-VACUITY floor: the catalog must actually contain a
+      #      headless app, or part 1 ranges over nothing.
+      #   4. a NEGATIVE CONTROL on the only route by which a headless app
+      #      could acquire a front door: `exposure` is an operator-settable
+      #      option, reachable from custom/ and from a hand-edited
+      #      settings.json. Setting it to "public" must be REFUSED at eval
+      #      (modules/core/options.nix's headlessViolations), and the same
+      #      probe must find the catalog default accepted -- otherwise the
+      #      refusal could be unconditional and prove nothing.
+      headlessAppsGetNoFrontDoor =
+        let
+          baseDomain = "example.test";
+
+          # The whole catalog, proxy on, SSO on, DNS on -- i.e. every
+          # generator that can produce a front door is switched on, and
+          # every app is at its own default exposure. That default is
+          # "public" for an ordinary app, which is what makes part 2's
+          # positive control real rather than arranged.
+          mkFullHost = extra: ferrumLib.mkHost {
+            inherit system;
+            settings = {
+              schemaVersion = realMigrations.currentVersion;
+              proxy = {
+                enable = true;
+                inherit baseDomain;
+                acme.email = "a@${baseDomain}";
+                dns = {
+                  enable = true;
+                  recordMode = "a";
+                  staticAddress = "203.0.113.10";
+                };
+              };
+              auth = { enable = true; adminEmail = "a@${baseDomain}"; };
+              apps = lib.mapAttrs (_: _: { enable = true; }) catalog // extra;
+            };
+            modules = [
+              ../../../examples/hosts/minimal/configuration.nix
+              { ferrum.secretsDir = toString ../../../examples/hosts/minimal/secrets; }
+            ];
+          };
+
+          cfg = (mkFullHost { }).config;
+
+          vhostNames = builtins.attrNames cfg.services.nginx.virtualHosts;
+          certNames = builtins.attrNames cfg.security.acme.certs;
+          autheliaDomains = map (r: r.domain)
+            cfg.services.authelia.instances.main.settings.access_control.rules;
+
+          hostnameOf = id: "${cfg.ferrum.apps.${id}.subdomain}.${baseDomain}";
+
+          # One row per enabled app, each field read off the evaluated
+          # configuration. The DNS column is absent on purpose: unlike the
+          # other three, modules/proxy/dns.nix's record set is a DERIVATION
+          # (system.build.ferrumDnsConfig, a JSON file), so it is carried in
+          # as a build input below and joined to this manifest in the
+          # builder -- the same shape netnsAppsAreProxiedReachably uses, and
+          # for the same reason: reading the real artefact beats
+          # re-deriving it here and then agreeing with myself.
+          manifest = builtins.toJSON {
+            apps = lib.mapAttrsToList
+              (id: _: {
+                inherit id;
+                hostname = hostnameOf id;
+                headless = catalog.${id}.headless or false;
+                vhost = builtins.elem (hostnameOf id) vhostNames;
+                cert = builtins.elem (hostnameOf id) certNames;
+                authelia = builtins.elem (hostnameOf id) autheliaDomains;
+              })
+              (lib.filterAttrs (_: a: a.enable) cfg.ferrum.apps);
+          };
+
+          headlessIds = builtins.attrNames
+            (lib.filterAttrs (_: m: m.headless or false) catalog);
+
+          # Part 4. Scoped to this assertion's own message, on a phrase it
+          # keeps to one line -- the same discipline every tryEval probe in
+          # this file uses, and for the same reason.
+          refusesExposure = id: exposure:
+            let
+              probe = builtins.tryEval (
+                builtins.filter (m: lib.hasInfix "has been given one anyway" m)
+                  (map (a: a.message)
+                    (builtins.filter (a: !a.assertion)
+                      (mkFullHost { ${id} = { enable = true; inherit exposure; }; })
+                        .config.assertions)));
+            in
+            if probe.success then probe.value != [ ] else true;
+
+          notRefused = builtins.filter (id: !(refusesExposure id "public")) headlessIds;
+          refusedAtDefault = builtins.filter (id: refusesExposure id "local") headlessIds;
+        in
+        pkgs.runCommand "ferrum-check-headless-apps-get-no-front-door"
+          {
+            nativeBuildInputs = [ pkgs.jq ];
+            inherit manifest;
+            passAsFile = [ "manifest" ];
+            dnsConfig = cfg.system.build.ferrumDnsConfig;
+            # Part 4's verdict, carried in rather than re-derived in shell:
+            # it is a statement about the module system, which only Nix can
+            # evaluate. Empty strings mean "clean", which is what the two
+            # tests below require.
+            notRefused = lib.concatStringsSep " " notRefused;
+            refusedAtDefault = lib.concatStringsSep " " refusedAtDefault;
+          }
+          ''
+            set -eu
+
+            fail() {
+              echo "headless-apps-get-no-front-door: $1" >&2
+              echo "--- manifest ---" >&2; jq . "$manifestPath" >&2
+              echo "--- dns records ---" >&2; jq '.records' "$dnsConfig" >&2
+              exit 1
+            }
+
+            # Join the DNS artefact onto the manifest, so every row carries
+            # all four surfaces and one loop judges them together.
+            jq --slurpfile dns "$dnsConfig" \
+              '($dns[0].records | map(.name)) as $names
+               | [ .apps[] | . as $r | $r + { dns: ($names | index($r.hostname) != null) } ]' \
+              "$manifestPath" > rows.json
+
+            total=$(jq 'length' rows.json)
+            headless=$(jq '[.[] | select(.headless)] | length' rows.json)
+            fronted=$(jq '[.[] | select(.headless | not)] | length' rows.json)
+
+            # Anti-vacuity, both directions. Part 1 over an empty set passes
+            # for free, and part 2's positive control over an empty set
+            # proves the detector works on nothing.
+            [ "$total" -gt 0 ] || fail "the fixture enabled no apps at all, so nothing below judged anything"
+            [ "$headless" -ge 1 ] \
+              || fail "no enabled app declares headless = true, so the absence test below ranges over nothing. Either the catalog lost its headless app -- in which case it also lost the exposure default that keeps it out of nginx, Authelia, ACME and DNS -- or modules/lib/catalog.nix stopped carrying the mark."
+            [ "$fronted" -ge 1 ] \
+              || fail "no enabled app is published, so the positive control below cannot distinguish 'headless apps get nothing' from 'this check can see nothing'"
+
+            # Part 1: a headless app has none of the four.
+            if ! jq -e '[.[] | select(.headless) | select(.vhost or .cert or .authelia or .dns)] | length == 0' rows.json > /dev/null; then
+              jq -r '.[] | select(.headless) | select(.vhost or .cert or .authelia or .dns)
+                     | "  " + .id + " (" + .hostname + "):"
+                       + (if .vhost then " nginx-vhost" else "" end)
+                       + (if .cert then " acme-certificate" else "" end)
+                       + (if .authelia then " authelia-rule" else "" end)
+                       + (if .dns then " public-dns-record" else "" end)' rows.json >&2
+              fail "an app that listens on NOTHING has been given a front door (above). A vhost proxies to a port no process will ever bind, which 502s on every real request while Authelia's 302 makes an unauthenticated probe look healthy -- the defect 2ec53b6 fixed. The certificate and the DNS record are worse than that: both are durable and externally visible, one in Certificate Transparency and one in a public zone. See modules/lib/app-submodule.nix's exposure default."
+            fi
+
+            # Part 2: the positive control. Every published app has all four,
+            # so an absence in part 1 is evidence rather than blindness.
+            if ! jq -e '[.[] | select(.headless | not) | select((.vhost and .cert and .authelia and .dns) | not)] | length == 0' rows.json > /dev/null; then
+              jq -r '.[] | select(.headless | not) | select((.vhost and .cert and .authelia and .dns) | not)
+                     | "  " + .id + " (" + .hostname + ") is missing:"
+                       + (if .vhost then "" else " nginx-vhost" end)
+                       + (if .cert then "" else " acme-certificate" end)
+                       + (if .authelia then "" else " authelia-rule" end)
+                       + (if .dns then "" else " public-dns-record" end)' rows.json >&2
+              fail "an ordinary app at its default exposure did NOT get one of the four artefacts (above). Part 1 above proves nothing while this is true: it would report 'headless apps have no vhost' on a fixture where NOBODY has a vhost."
+            fi
+
+            # Part 4: the only route by which a headless app could acquire a
+            # front door is an operator setting exposure, and it must be
+            # refused at evaluation rather than silently ignored.
+            [ -z "$notRefused" ] \
+              || fail "setting exposure = \"public\" on these headless apps was ACCEPTED: $notRefused. modules/core/options.nix's headlessViolations assertion is supposed to refuse it; without that refusal, every artefact part 1 checks comes back the moment anyone edits settings.json or drops a module in custom/."
+            [ -z "$refusedAtDefault" ] \
+              || fail "the headless exposure refusal also fires at the catalog DEFAULT for: $refusedAtDefault. An assertion that rejects the configuration ferrum itself generates is unconditional, so the negative control above proves nothing about what it actually detects."
+
+            echo "judged $total enabled apps: $headless headless (no vhost, no certificate, no Authelia rule, no DNS record), $fronted published (all four present)"
+            echo "exposure = \"public\" on a headless app: refused at eval; the default is accepted"
+            echo ok > $out
+          '';
+
+      # Decluttarr's generated configuration agrees with what ferrum
+      # actually did to the rest of the host.
+      #
+      # modules/apps/decluttarr/service.nix generates that file at eval time
+      # out of three facts ferrum already owns: where each app listens, what
+      # the download client is CALLED inside the *arrs, and which API keys
+      # exist. Each of those has a second owner elsewhere in the tree, and a
+      # disagreement between the two is silent in a specific and nasty way:
+      # Decluttarr does not crash, it logs "not reachable" or quietly matches
+      # nothing, every half hour, forever. There is no 502 and no failed
+      # unit -- just a janitor that stopped working.
+      #
+      #   * THE NAME. crates/ferrum-reconcile/src/main.rs registers the
+      #     download client in Sonarr and Radarr as `"name": provider_id` --
+      #     the bare catalog id. Decluttarr matches a queue item to a client
+      #     by exactly that string (src/settings/_download_clients.py's
+      #     get_download_client_by_name); get it wrong and every
+      #     torrent-specific decision silently degrades to a plain remove,
+      #     including for the private-tracker and "Keep"-tagged cases the
+      #     service module is careful about.
+      #
+      #   * THE ADDRESS. modules/lib/app-address.nix's header names exactly
+      #     this risk: "a THIRD consumer that hand-copies 127.0.0.1 fails
+      #     there instead of in the field". Decluttarr is that third
+      #     consumer. The fixture is therefore a VPN host, where qBittorrent
+      #     is NOT on loopback, and the check compares Decluttarr's own
+      #     base_url against the address the reconciler was given.
+      #
+      #   * THE KEY. The generated template lives in the world-readable Nix
+      #     store, so it must contain no API key at all -- the real one is
+      #     inserted into a tmpfs copy at start by the unit's root
+      #     ExecStartPre. That is a security property of the design, and an
+      #     innocent-looking edit (interpolating the key "just for
+      #     simplicity") would publish every *arr key to every local user.
+      #
+      # Everything is read from the generated artefacts: the template is
+      # found by following the unit's own ExecStartPre script, never passed
+      # in from Nix, so the file under test is provably the file systemd
+      # will hand the binary.
+      decluttarrKnowsTheClientFerrumRegistered =
+        let
+          vpnDecluttarrHost = ferrumLib.mkHost {
+            inherit system;
+            settings = {
+              schemaVersion = realMigrations.currentVersion;
+              apps = {
+                sonarr.enable = true;
+                radarr.enable = true;
+                qbittorrent.enable = true;
+                decluttarr.enable = true;
+              };
+            };
+            modules = [
+              ../../../examples/hosts/minimal/configuration.nix
+              { ferrum.secretsDir = toString ../../../examples/hosts/minimal/secrets; }
+              # The only way to make qBittorrent non-loopback, which is what
+              # makes the address half of this check non-vacuous.
+              { ferrum.secrets."qbittorrent-vpn" = { }; }
+            ];
+          };
+          dcfg = vpnDecluttarrHost.config;
+        in
+        pkgs.runCommand "ferrum-check-decluttarr-knows-the-client-ferrum-registered"
+          {
+            nativeBuildInputs = [ pkgs.jq pkgs.gnugrep ];
+            # The unit's own pre-start script, as a store path. Reading the
+            # template out of THIS is what makes the assertions below about
+            # the real unit rather than about a value re-derived here.
+            preScript = dcfg.systemd.services.decluttarr.serviceConfig.ExecStartPre;
+            reconcileConfig =
+              dcfg.systemd.services.ferrum-reconcile.environment.FERRUM_RECONCILE_CONFIG;
+            reconcileSrc = ../../../crates/ferrum-reconcile/src/main.rs;
+            clientName = catalog.qbittorrent.id;
+          }
+          ''
+            set -eu
+
+            fail() {
+              echo "decluttarr-knows-the-client-ferrum-registered: $1" >&2
+              exit 1
+            }
+
+            # ExecStartPre carries systemd's "+" privilege prefix, which is
+            # not part of the path.
+            script=''${preScript#+}
+            case "$script" in
+              /nix/store/*) ;;
+              *) fail "decluttarr.service's ExecStartPre is '$preScript', which is not a store path -- this check cannot read the config it renders" ;;
+            esac
+
+            template=$(grep -o '/nix/store/[^ "'"'"']*-decluttarr-config-template\.json' "$script" | head -n1)
+            [ -n "$template" ] \
+              || fail "decluttarr.service's pre-start script no longer references a decluttarr-config-template.json, so this check cannot find the generated configuration at all. If the rendering moved, teach this check where -- do not leave it reading nothing."
+            [ -f "$template" ] || fail "the template path '$template' found in the pre-start script does not exist"
+            echo "template: $template"
+
+            # ---- the key must NOT be here ----
+            keys=$(jq -r '[.instances[][] | .api_key] | map(select(. != "")) | join(", ")' "$template")
+            [ -z "$keys" ] \
+              || fail "the generated template in the WORLD-READABLE Nix store contains a non-empty api_key ($keys). Every local user can read /nix/store. The key belongs only in the tmpfs copy the unit's root ExecStartPre renders at start -- see modules/apps/decluttarr/service.nix."
+            arrCount=$(jq '[.instances[][]] | length' "$template")
+            [ "$arrCount" -ge 1 ] \
+              || fail "the generated template configures no *arr instance at all, so the empty-key assertion above passed over an empty list"
+            echo "api keys in the store template: none, over $arrCount configured *arr instance(s)"
+
+            # ---- the name must be the one ferrum-reconcile registers ----
+            name=$(jq -r '.download_clients.qbittorrent[0].name' "$template")
+            [ "$name" = "$clientName" ] \
+              || fail "Decluttarr is told the download client is called '$name', but ferrum-reconcile registers it as '$clientName'. Decluttarr matches a queue item to its client by that exact string, so a mismatch silently turns every torrent-aware decision into a plain remove -- the private-tracker and protected-tag handling in modules/apps/decluttarr/service.nix stop applying, with nothing logged."
+
+            # And the Rust side of that claim, pinned rather than assumed.
+            grep -q '"name": provider_id' "$reconcileSrc" \
+              || fail "crates/ferrum-reconcile/src/main.rs no longer registers a download client as '\"name\": provider_id', so the assertion above is comparing Decluttarr's config against a convention that has changed. Find the new name and teach both ends."
+
+            # ---- the address must be the one the reconciler was given ----
+            for app in qbittorrent sonarr radarr; do
+              if [ "$app" = qbittorrent ]; then
+                want_url=$(jq -r '.download_clients.qbittorrent[0].base_url' "$template")
+              else
+                want_url=$(jq -r --arg a "$app" '.instances[$a][0].base_url' "$template")
+              fi
+              rhost=$(jq -r --arg a "$app" '.apps[$a].host' "$reconcileConfig")
+              rport=$(jq -r --arg a "$app" '.apps[$a].port' "$reconcileConfig")
+              [ "$want_url" = "http://$rhost:$rport" ] \
+                || fail "Decluttarr is pointed at $app via '$want_url' while ferrum-reconcile is told it lives at '$rhost:$rport'. Two independently generated files, for two consumers of ONE fact -- where $app actually listens. That is the defect 2ec53b6 fixed, in its third consumer. See modules/lib/app-address.nix."
+              echo "$app: $want_url, agreeing with the reconciler"
+            done
+
+            # Anti-vacuity: on this fixture qBittorrent must genuinely NOT be
+            # on loopback, or the address comparison above is three copies of
+            # "127.0.0.1" agreeing with each other and would pass for an
+            # implementation that hardcoded it.
+            qhost=$(jq -r '.apps.qbittorrent.host' "$reconcileConfig")
+            case "$qhost" in
+              127.*|localhost|"[::1]")
+                fail "this fixture declares the \"qbittorrent-vpn\" secret, yet qBittorrent is still reached at '$qhost'. The network namespace is what makes the address assertion above mean something; without it this check would pass for a Decluttarr module that hardcoded loopback." ;;
+            esac
+            echo "qbittorrent is at $qhost, off loopback, so the address assertions were real"
 
             echo ok > $out
           '';
@@ -5687,6 +6146,17 @@
         # header), which would slow down and complicate a file whose own
         # subject is the daemon's read-only surface.
         daemon-apply-end-to-end = import ../../../tests/daemon-apply-end-to-end.nix { inherit pkgs; sopsNix = inputs.sops-nix; };
+
+        # A catalog app with no web interface must get no vhost, no
+        # certificate, no Authelia rule and no DNS record -- and must not be
+        # able to acquire one. See the definition for why all four are one
+        # check rather than four.
+        headless-apps-get-no-front-door = headlessAppsGetNoFrontDoor;
+
+        # The one fact about Decluttarr that neither side can verify alone:
+        # the download-client name it looks for is the name ferrum-reconcile
+        # actually registered.
+        decluttarr-knows-the-client-ferrum-registered = decluttarrKnowsTheClientFerrumRegistered;
       };
     };
 }

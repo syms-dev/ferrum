@@ -679,8 +679,63 @@ in
             && (catalog.${name}.portIsFixed or false)
             && app.port != catalog.${name}.defaultPort)
           config.ferrum.apps);
+
+      # The same "a uniform option has to be uniformly HONOURED" rule, for
+      # the app that honours NEITHER port nor subdomain nor exposure --
+      # because it has no socket at all.
+      #
+      # modules/lib/app-submodule.nix already defaults a headless app's
+      # exposure to "local", which is what keeps it out of
+      # modules/proxy/lib.nix's exposedApps and publicApps and therefore out
+      # of every vhost, Authelia rule, certificate and DNS record. But a
+      # DEFAULT is only the common case: `exposure = "public"` is still
+      # expressible from custom/ and from a hand-edited settings.json, and
+      # silently ignoring it would make an operator-set option mean nothing.
+      # Worse than nothing, in fact -- it would read as "this app is
+      # published" in the document the UI renders while the host published
+      # no such thing.
+      #
+      # Keyed on the catalog's own `headless`, never on a list of app ids
+      # here, for the reason fixedPortViolations above gives.
+      headlessViolations = lib.flatten (lib.mapAttrsToList
+        (name: app:
+          lib.optional (app.exposure != "local")
+            ("ferrum.apps.${name}.exposure = \"${app.exposure}\"")
+          ++ lib.optional (app.port != catalog.${name}.defaultPort)
+            ("ferrum.apps.${name}.port = ${toString app.port}"))
+        (lib.filterAttrs
+          (name: app: app.enable && (catalog.${name}.headless or false))
+          config.ferrum.apps));
     in
     [
+      {
+        assertion = headlessViolations == [ ];
+        message = ''
+          An app with no web interface has been given one anyway:
+          ${lib.concatStringsSep "; " headlessViolations}.
+
+          These applications declare `headless = true` in their own
+          modules/apps/<id>/meta.nix because they listen on nothing, in any
+          namespace, on any host -- they are outbound API clients, not
+          servers. Their port and their exposure are inert by construction,
+          and ferrum keeps them that way rather than letting a setting look
+          effective while doing nothing.
+
+          Moving `exposure` off "local" is the one that actually breaks
+          something, and it is the exact defect fixed in 2ec53b6: any other
+          value makes modules/proxy/nginx.nix generate a vhost whose
+          `proxy_pass` points at a port nothing is bound to, plus an
+          Authelia rule, a Let's Encrypt certificate and a public DNS record
+          for a name that can only ever answer 502. Authelia redirects the
+          unauthenticated probe before nginx dials the backend, so that
+          hostname looks healthy from outside while being permanently
+          broken.
+
+          Leave both at their catalog defaults. A headless app needs no
+          hostname to be reachable at: it is already running, and its work
+          is visible in `journalctl -u <id>`.
+        '';
+      }
       {
         assertion = fixedPortViolations == [ ];
         message = ''

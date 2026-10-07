@@ -60,10 +60,37 @@ types.attrsOf (types.submodule ({ name, ... }:
       # Note for whoever enables many apps at once: each "public" app requests
       # its own certificate, and Let's Encrypt rate-limits per registered
       # domain. Staging first is the cheap way to find that out.
+      #
+      # AND THE EXCEPTION, which is what makes a UI-less app expressible at
+      # all: an app whose meta.nix declares `headless = true` defaults to
+      # "local" whether or not a proxy exists, because it has no HTTP surface
+      # for a vhost to point at. "local" is reused rather than a fourth enum
+      # value being added, and that is the whole trick: the property a
+      # headless app needs is exactly the property "local" already has --
+      # modules/proxy/lib.nix's exposedApps and publicApps both exclude it,
+      # so nginx builds no vhost, authelia.nix writes no access_control rule,
+      # acme.nix orders no certificate and dns.nix publishes no record,
+      # without one line of per-app knowledge in any of those four files. A
+      # new enum member would instead have made every `!= "local"` test in
+      # this tree silently wrong.
+      #
+      # The one thing "local" additionally promises -- reachable through
+      # ferrumd's own internal proxying -- is simply never exercised, because
+      # nothing asks a process with no socket for a page.
+      #
+      # modules/core/options.nix refuses an enabled headless app that has
+      # been moved off this default, rather than quietly ignoring the move:
+      # the alternative is `exposure = "public"` meaning nothing, which is
+      # the "a uniform option has to be uniformly HONOURED" complaint that
+      # file already makes about `port`.
       exposure = mkOption {
         type = types.enum [ "local" "lan" "public" ];
-        default = if proxyEnabled then "public" else "local";
-        defaultText = lib.literalExpression ''if ferrum.proxy.enable then "public" else "local"'';
+        default =
+          if (meta.headless or false) then "local"
+          else if proxyEnabled then "public"
+          else "local";
+        defaultText = lib.literalExpression
+          ''if meta.headless then "local" else if ferrum.proxy.enable then "public" else "local"'';
         description = ''
           local  -- loopback only, reached through the ferrum UI's own proxying.
           lan    -- an nginx vhost restricted to ferrum.proxy.trustedNetworks.

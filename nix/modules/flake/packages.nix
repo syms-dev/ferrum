@@ -66,6 +66,12 @@
         ferrum-ui = pkgs.callPackage ../../../nix/pkgs/ferrum-ui {
           uiSrc = ../../../ui;
         };
+        # Also present in nix/overlays/default.nix, for the same reason
+        # ferrum-ui is: modules/apps/decluttarr/service.nix reads
+        # pkgs.decluttarr. Published here as well so `nix build
+        # .#decluttarr` can demonstrate the entry point without evaluating a
+        # whole host, and so CI builds the app ferrum packages itself.
+        decluttarr = pkgs.callPackage ../../../nix/pkgs/decluttarr { };
         ferrum-settings-schema = pkgs.writeTextFile {
           name = "ferrum-settings-schema.json";
           destination = "/share/ferrum/settings-schema.json";
