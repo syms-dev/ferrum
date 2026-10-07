@@ -4987,6 +4987,282 @@
             echo "a real multi-address provider config parses into separate addresses" > $out
           '';
 
+      # An app placed in a network namespace must not be proxied at an
+      # address that cannot reach it.
+      #
+      # THE DEFECT, measured on the owner's running host on 2026-10-06 and
+      # not hypothesised:
+      #
+      #   ip netns list                 -> qbt-vpn (id: 0)
+      #   ss -ltnp | grep :8090         -> nothing in the root namespace
+      #   ip netns exec qbt-vpn ss -ltn -> LISTEN 0 50 *:8090
+      #   nginx.conf                    -> proxy_pass http://127.0.0.1:8090;
+      #   curl http://127.0.0.1:8090/   -> exit 7, connection refused
+      #   curl http://10.200.1.2:8090/  -> HTTP 200
+      #
+      # modules/apps/qbittorrent/service.nix setns's qBittorrent into
+      # `qbt-vpn` whenever a "qbittorrent-vpn" secret is declared, so its
+      # WebUI binds inside that namespace. nginx runs in the ROOT namespace
+      # and rendered `proxy_pass http://127.0.0.1:<port>` for every app with
+      # no exception, so the vhost an app gets by DEFAULT (app-submodule.nix
+      # gives exposure = "public") could not reach it. Nothing noticed,
+      # because Authelia's forward-auth answers an unauthenticated probe
+      # with a 302 before nginx ever dials the backend: the failure is
+      # visible only after you log in.
+      #
+      # WHAT THIS CHECK IS, AND WHAT IT DELIBERATELY IS NOT. It is not "is
+      # qBittorrent's proxy_pass 10.200.1.2" -- that would be the same
+      # hand-copied constant a third time, and a hand-copy is the bug. The
+      # isolated set is DERIVED from the evaluated configuration: an app
+      # counts as isolated when its own generated systemd unit carries
+      # NetworkNamespacePath=, JoinsNamespaceOf= or PrivateNetwork=true. Any
+      # future app put in a namespace is covered the day it is, with no edit
+      # here and no list of app names to keep in sync.
+      #
+      # It also does not consult modules/lib/app-address.nix, the file the
+      # fix lives in: a check that asked the fix whether the fix had been
+      # applied would pass for as long as the fix was self-consistent. What
+      # it asserts instead are two independent properties of the GENERATED
+      # artifacts -- (a) no proxy_pass anywhere in the real nginx.conf dials
+      # an isolated app on a loopback address, and (b) nginx.conf and
+      # ferrum-reconcile's config, two separately generated files for two
+      # separately running consumers, name the SAME host for every enabled
+      # app. (b) is what catches a third consumer hand-copying 127.0.0.1 the
+      # way nginx did.
+      #
+      # Both halves of the anti-vacuity obligation are inside the check: it
+      # re-runs its own predicate against a conf whose isolated-app upstreams
+      # have been rewritten back to loopback -- the fix, mechanically
+      # reverted -- and requires that to FAIL, and it evaluates a second,
+      # VPN-less host and requires the isolated set there to be EMPTY with
+      # qBittorrent still on plain loopback. A predicate that fired on every
+      # host, or on no host, is caught by one of those two. That is not
+      # hypothetical caution: a guard in this file was once dead on every
+      # real host because it tested a value nixpkgs' own nat module never
+      # leaves empty, and it was green everywhere.
+      #
+      # The daemon vhost and its two health locations are out of scope on
+      # purpose: ferrumd is not a catalog app, it is not namespaced, and its
+      # upstream comes from the operator-settable ferrum.daemon.listenAddress
+      # that daemon-vhost-enforced and nginx-config-parses already own.
+      netnsAppsAreProxiedReachably =
+        let
+          mkNetnsHost = extra: ferrumLib.mkHost {
+            inherit system;
+            settings = {
+              schemaVersion = realMigrations.currentVersion;
+              proxy = { enable = true; baseDomain = "example.test"; acme.email = "a@example.test"; };
+              auth = { enable = true; adminEmail = "a@example.test"; };
+              # Every catalog app, at its DEFAULT exposure -- which is
+              # "public" (modules/lib/app-submodule.nix). The default is the
+              # configuration the defect actually shipped on, so it is the
+              # one worth pinning, and enabling the whole catalog means a
+              # future namespaced app joins the corpus automatically.
+              apps = lib.mapAttrs (_: _: { enable = true; }) catalog;
+            };
+            modules = [
+              ../../../examples/hosts/minimal/configuration.nix
+              # The same override mkMinimalHost uses: sops.secrets.<>.sopsFile
+              # is a real Nix path and must point somewhere that exists.
+              { ferrum.secretsDir = toString ../../../examples/hosts/minimal/secrets; }
+            ] ++ extra;
+          };
+
+          # Declaring the secret name is what switches the VPN-gated
+          # namespace on (qbittorrent/service.nix's `vpnEnabled`), and
+          # therefore the only way to make an isolated app exist at all.
+          vpnHost = mkNetnsHost [ { ferrum.secrets."qbittorrent-vpn" = { }; } ];
+          plainHost = mkNetnsHost [ ];
+
+          # Is this app's own unit severed from the root namespace? Read off
+          # the GENERATED unit, never from an app-name list. All three keys,
+          # because all three sever it and any of them produces this defect.
+          isolationOf = host: id:
+            let svc = host.config.systemd.services.${id}.serviceConfig or { }; in
+            if (svc.NetworkNamespacePath or null) != null
+            then "NetworkNamespacePath=${svc.NetworkNamespacePath}"
+            else if (svc.JoinsNamespaceOf or [ ]) != [ ] then "JoinsNamespaceOf"
+            else if (svc.PrivateNetwork or false) then "PrivateNetwork=true"
+            else null;
+
+          # The host part of a generated `http://host:port` upstream.
+          upstreamHost = s:
+            let m = builtins.match "https?://([^/]*):[0-9]+" s; in
+            if m == null then null else builtins.head m;
+
+          # "-" rather than null for the absent cases: these go through
+          # @tsv, and a tab is an IFS whitespace character, so bash collapses
+          # a run of them and an empty field silently shifts every later
+          # column. A placeholder keeps the record rectangular.
+          orDash = v: if v == null || v == "" then "-" else v;
+
+          appReport = host: id: app:
+            let
+              vhost = "${app.subdomain}.example.test";
+              vhosts = host.config.services.nginx.virtualHosts;
+            in
+            {
+              inherit id vhost;
+              port = toString app.port;
+              # A missing unit is a FAILURE, not a skip: it means this check
+              # cannot see whether the app is isolated, and a silent skip is
+              # how a guard stops guarding. An app whose systemd unit is not
+              # named after its catalog id has to teach this check that
+              # mapping rather than slip past it.
+              hasUnit = host.config.systemd.services ? ${id};
+              isolation = orDash (
+                if host.config.systemd.services ? ${id} then isolationOf host id else null
+              );
+              nginxHost = orDash (
+                if vhosts ? ${vhost}
+                then upstreamHost (vhosts.${vhost}.locations."/".proxyPass or "")
+                else null
+              );
+            };
+
+          manifestFor = host: builtins.toJSON {
+            apps = lib.mapAttrsToList (appReport host)
+              (lib.filterAttrs (_: a: a.enable) host.config.ferrum.apps);
+          };
+
+          # The file ferrum-reconcile is actually handed, carried in as a
+          # build input -- NOT read at eval time, which would need it
+          # realized first. rootFoldersReachTheApps above does the same.
+          reconcileConfigOf = host:
+            host.config.systemd.services.ferrum-reconcile.environment.FERRUM_RECONCILE_CONFIG;
+        in
+        pkgs.runCommand "ferrum-check-netns-apps-are-proxied-reachably"
+          {
+            nativeBuildInputs = [ pkgs.jq pkgs.gnugrep pkgs.gnused pkgs.diffutils ];
+            # The UNITS, not a config path read out of them in Nix: a string
+            # pulled out with builtins.match carries no store reference and
+            # the file would not exist in the sandbox. Same reasoning as
+            # nginx-config-parses above.
+            vpnUnit = vpnHost.config.systemd.units."nginx.service".unit;
+            plainUnit = plainHost.config.systemd.units."nginx.service".unit;
+            vpnReconcile = reconcileConfigOf vpnHost;
+            plainReconcile = reconcileConfigOf plainHost;
+            vpnManifest = manifestFor vpnHost;
+            plainManifest = manifestFor plainHost;
+            passAsFile = [ "vpnManifest" "plainManifest" ];
+          }
+          ''
+            set -eu
+
+            fail() {
+              echo "netns-apps-are-proxied-reachably: $1" >&2
+              exit 1
+            }
+
+            confOf() {
+              # Both halves out of the unit, so this reads the exact file
+              # systemd will hand the exact binary -- not a reconstruction.
+              grep -m1 '^ExecStart=' "$1/nginx.service" \
+                | grep -o -- "-c '[^']*'" | cut -d"'" -f2
+            }
+
+            # A loopback upstream on a given port, in every spelling nginx
+            # accepts for one. 127.0.0.0/8 as a class rather than the single
+            # blessed string, for the same reason acceptedLoopbackSpellings
+            # above is a class. printf '%s' with the pattern as an ARGUMENT,
+            # so no backslash in it is eaten on the way out.
+            loopbackRe() {
+              printf '%s' "proxy_pass[[:space:]]\+https\?://\(127\.[0-9]\+\.[0-9]\+\.[0-9]\+\|localhost\|\[::1\]\):$1\b"
+            }
+
+            # The predicate, over a real nginx.conf, a real manifest and the
+            # real reconciler config. Echoes every app it judged, so a
+            # vacuous run is visible in the build log rather than
+            # indistinguishable from a clean one.
+            scan() {
+              local conf="$1" manifest="$2" reconcile="$3" label="$4" n rc
+              n=$(jq '.apps | length' "$manifest")
+              [ "$n" -gt 0 ] || fail "$label: the manifest lists no enabled apps at all, so there is nothing to judge"
+
+              jq -r '.apps[] | [.id, .vhost, .port, .isolation, .nginxHost, (.hasUnit|tostring)] | @tsv' "$manifest" \
+              | while IFS="$(printf '\t')" read -r id vhost port isolation nginxhost hasunit; do
+                  [ "$hasunit" = "true" ] \
+                    || fail "$label: no systemd unit named '$id' exists on the generated host, so this check cannot tell whether $id is in a network namespace -- teach it the unit name rather than leaving it unjudged"
+
+                  grep -q "server_name $vhost" "$conf" \
+                    || fail "$label: the generated config has no $vhost vhost, so scanning it says nothing about $id"
+                  grep -q "proxy_pass[[:space:]]\+https\?://[^;]*:$port\b" "$conf" \
+                    || fail "$label: nothing in the generated config proxies to $id's port $port, so this check is reading the wrong corpus"
+
+                  if [ "$isolation" != "-" ]; then
+                    echo "$label: $id is isolated ($isolation), upstream host $nginxhost"
+                    if grep -q "$(loopbackRe "$port")" "$conf"; then
+                      echo "--- offending lines ---" >&2
+                      grep -n "$(loopbackRe "$port")" "$conf" >&2 || true
+                      fail "$id runs in its own network namespace ($isolation) and nginx -- which runs in the ROOT namespace -- is told to proxy it at a LOOPBACK address on port $port (lines above). Nothing is listening there, so that vhost 502s on every authenticated request while an unauthenticated probe still looks healthy, because Authelia answers it with a 302 first. Fix it where both consumers read it: modules/lib/app-address.nix."
+                    fi
+                  fi
+
+                  reconcilerhost=$(jq -r --arg id "$id" '.apps[$id].host // "-"' "$reconcile")
+                  [ "$nginxhost" = "$reconcilerhost" ] \
+                    || fail "$label: nginx proxies $id at '$nginxhost' while ferrum-reconcile is told '$reconcilerhost'. Two independently generated files, for two consumers of ONE fact -- where $id actually listens -- disagreeing. That is exactly how this defect was introduced. See modules/lib/app-address.nix."
+                done
+              rc=$?
+
+              # NOT left to `set -e`: the loop is a pipeline element and so
+              # runs in a SUBSHELL, and `set -e` is suspended for the whole
+              # body of a function called in an `if` condition -- which is
+              # how the negative control below calls this. Without an
+              # explicit return, scan would hand back the status of the echo
+              # beneath it and the control would pass on a broken config.
+              [ "$rc" -eq 0 ] || return "$rc"
+              echo "$label: scanned $n enabled apps"
+            }
+
+            vpnConf=$(confOf "$vpnUnit")
+            plainConf=$(confOf "$plainUnit")
+            case "$vpnConf" in
+              /nix/store/*) ;;
+              *) fail "nginx.service's ExecStart does not pass a store config path (-c $vpnConf) -- services.nginx.enableReload is probably on and the file under test is now /etc/nginx/nginx.conf, which this check cannot see" ;;
+            esac
+
+            scan "$vpnConf" "$vpnManifestPath" "$vpnReconcile" vpn
+
+            # Anti-vacuity, half one: the VPN host must actually CONTAIN an
+            # isolated app, or the scan above exercised nothing.
+            isolatedCount=$(jq '[.apps[] | select(.isolation != "-")] | length' "$vpnManifestPath")
+            [ "$isolatedCount" -ge 1 ] \
+              || fail "the VPN host's generated units show NO app in a network namespace, so the scan above exercised nothing. Either modules/apps/qbittorrent/service.nix no longer sets NetworkNamespacePath=, or declaring the \"qbittorrent-vpn\" secret no longer switches it on -- either way this check has to follow the mechanism rather than quietly testing a host that no longer has one."
+            echo "vpn: $isolatedCount isolated app(s)"
+
+            # Anti-vacuity, half two: the fix, mechanically reverted. Every
+            # isolated app's upstream is rewritten back to 127.0.0.1 and the
+            # SAME predicate is re-run on it; it must reject.
+            sed "$(jq -r '.apps[] | select(.isolation != "-")
+                   | "s|proxy_pass http://" + .nginxHost + ":" + .port + ";|proxy_pass http://127.0.0.1:" + .port + ";|g"' \
+                   "$vpnManifestPath")" "$vpnConf" > reverted.conf
+            if cmp -s "$vpnConf" reverted.conf; then
+              fail "rewriting every isolated app's upstream back to loopback changed nothing in the generated config, so the negative control below would be the positive one again -- either the upstream is already loopback, or it is no longer spelled the way this rewrite expects"
+            fi
+            if scan reverted.conf "$vpnManifestPath" "$vpnReconcile" reverted > reverted.log 2>&1; then
+              cat reverted.log >&2
+              fail "the scan PASSED on a config whose isolated-app upstreams were rewritten back to 127.0.0.1 -- it cannot detect the defect it exists to detect"
+            fi
+            grep -q 'runs in its own network namespace' reverted.log \
+              || { cat reverted.log >&2; fail "the scan rejected the reverted config, but for some reason other than the loopback upstream, so the negative control proves nothing"; }
+            echo "reverted-control: rejected, as it must be"
+
+            # Anti-vacuity, half three: a host with NO VPN secret. Nothing is
+            # isolated, nothing is demanded, and qBittorrent's upstream is
+            # still plain loopback -- the "non-VPN output is unchanged" half
+            # of the requirement, asserted rather than assumed.
+            plainIsolated=$(jq '[.apps[] | select(.isolation != "-")] | length' "$plainManifestPath")
+            [ "$plainIsolated" -eq 0 ] \
+              || fail "a host with no \"qbittorrent-vpn\" secret shows $plainIsolated app(s) in a network namespace -- the kill switch is being built on hosts that did not ask for it"
+            scan "$plainConf" "$plainManifestPath" "$plainReconcile" plain
+            qbtPort=$(jq -r '.apps[] | select(.id == "qbittorrent") | .port' "$plainManifestPath")
+            grep -q "proxy_pass http://127.0.0.1:$qbtPort;" "$plainConf" \
+              || fail "on a host with no VPN secret qBittorrent is no longer proxied at http://127.0.0.1:$qbtPort -- the non-VPN output was supposed to be byte-identical"
+            echo "plain: nothing isolated, qBittorrent still at 127.0.0.1:$qbtPort"
+
+            echo ok > $out
+          '';
+
       mkAssertionCheck = name: result:
         pkgs.runCommand "ferrum-check-${name}" { } (
           if result.ok then
@@ -5012,6 +5288,7 @@
           mkAssertionCheck "nginx-emits-no-cors-headers" nginxEmitsNoCorsHeaders;
         root-folders-reach-the-apps = rootFoldersReachTheApps;
         wireguard-config-with-many-addresses = wireguardConfigWithManyAddresses;
+        netns-apps-are-proxied-reachably = netnsAppsAreProxiedReachably;
         dns-record-set = dnsRecordSet;
         ddns-updater-needs-no-static-address =
           mkAssertionCheck "ddns-updater-needs-no-static-address" ddnsUpdaterNeedsNoStaticAddress;

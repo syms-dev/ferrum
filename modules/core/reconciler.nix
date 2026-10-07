@@ -12,13 +12,12 @@ let
   enabledApps = lib.filterAttrs (_: app: app.enable) ferrum.apps;
 
   # qBittorrent's real reachable address depends on whether the VPN kill
-  # switch (Phase 1.3/1.4a) put it in an isolated network namespace --
-  # confirmed by reading modules/apps/qbittorrent/service.nix's own
-  # qbt-vpn-netns-setup script: the veth pair's host-reachable side is a
-  # hardcoded 10.200.1.2. Every other app always runs in the root
-  # namespace, always reachable at 127.0.0.1.
-  vpnEnabled = ferrum.secrets ? "qbittorrent-vpn";
-  appHost = id: if id == "qbittorrent" && vpnEnabled then "10.200.1.2" else "127.0.0.1";
+  # switch (Phase 1.3/1.4a) put it in an isolated network namespace. That
+  # rule used to be spelled out here, and only here -- which is exactly how
+  # modules/proxy/nginx.nix came to render `proxy_pass http://127.0.0.1:
+  # <port>` for an app that is not there. It now lives in one place both
+  # this file and the proxy read; see modules/lib/app-address.nix.
+  appHost = (import ../lib/app-address.nix { inherit lib; }).hostFor ferrum;
 
   # Which apps have a reconciler-usable bare-value API key, and under what
   # secret name (Task 1). qBittorrent needs none (LocalHostAuth = false).
