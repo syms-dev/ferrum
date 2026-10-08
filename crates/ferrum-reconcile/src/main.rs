@@ -25,6 +25,22 @@ struct Pair {
     kind: String, // "downloadClient" | "application"
     consumer: String,
     provider: String,
+    /// The download-client category this consumer's grabs are tagged with,
+    /// and therefore the subdirectory its downloads land in.
+    ///
+    /// Supplied by modules/core/reconciler.nix from the SAME
+    /// `catalog.<id>.mediaCategory` attribute that builds the app's root
+    /// folder, so the directory ferrum creates and the category ferrum
+    /// registers cannot be two independently-decided strings. This binary
+    /// deliberately does not derive it: the previous value here was the
+    /// consumer's own app id, which named a directory nothing ever created
+    /// (`usenet/complete/sonarr`), while the `usenet/complete/tv` the
+    /// storage module did create stayed empty.
+    ///
+    /// `None` for a consumer that manages no library -- see
+    /// `register_download_client` for why Prowlarr is that case.
+    #[serde(default)]
+    category: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -215,6 +231,24 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The download-client category one pair registers.
+///
+/// A one-line function on purpose: it is the single seam at which the
+/// category's SOURCE is decided, and the whole of defect 1 was that this
+/// seam read `pair.consumer` -- the app id -- instead of the category Nix
+/// derives from `catalog.<id>.mediaCategory`, the same attribute that
+/// builds the app's root folder. Naming the seam is what makes it
+/// testable without a running *arr.
+///
+/// # Arguments
+/// * `pair` - one registration pair as modules/core/reconciler.nix emitted it.
+///
+/// # Returns
+/// The category, or `None` for a consumer that manages no library.
+fn pair_category(pair: &Pair) -> Option<&str> {
+    pair.category.as_deref()
+}
+
 fn reconcile_pair(config: &ReconcileConfig, pair: &Pair) -> anyhow::Result<()> {
     let consumer = config
         .apps
@@ -238,6 +272,7 @@ fn reconcile_pair(config: &ReconcileConfig, pair: &Pair) -> anyhow::Result<()> {
             &consumer_key,
             &pair.provider,
             provider,
+            pair_category(pair),
         ),
         "application" => register_application(consumer, &consumer_key, &pair.provider, provider),
         other => anyhow::bail!(
@@ -553,6 +588,91 @@ fn find_existing_id(base: &str, path: &str, api_key: &str, name: &str) -> anyhow
         .and_then(|v| v["id"].as_u64()))
 }
 
+/// The whole existing registration object, not only its id.
+///
+/// `find_existing_id` is enough to decide "do I need to create this?", but
+/// not enough to decide "is what is already there still right?" -- and
+/// registrations are idempotent BY NAME, so an app registered before a
+/// correction would otherwise keep the wrong value forever. See
+/// `registration_needing_category_fix`.
+///
+/// # Arguments
+/// * `base` / `path` / `api_key` - the consumer's API.
+/// * `name` - the registration's name, which is the provider's app id.
+///
+/// # Returns
+/// The existing object, or `None` when nothing of that name exists.
+///
+/// # Errors
+/// When the call fails or returns something that is not a JSON array.
+fn find_existing(
+    base: &str,
+    path: &str,
+    api_key: &str,
+    name: &str,
+) -> anyhow::Result<Option<serde_json::Value>> {
+    let resp: Vec<serde_json::Value> = ureq::get(&format!("{base}{path}"))
+        .set("X-Api-Key", api_key)
+        .call()
+        .map_err(|e| anyhow::anyhow!("GET {base}{path} failed: {e}"))?
+        .into_json()
+        .map_err(|e| anyhow::anyhow!("GET {base}{path} returned invalid JSON: {e}"))?;
+    Ok(resp.into_iter().find(|v| v["name"] == name))
+}
+
+/// An existing registration with ONLY its category field corrected, or
+/// `None` when it is already right.
+///
+/// Why this exists at all: every registration here is idempotent by NAME,
+/// so once `qbittorrent` is registered in Sonarr, no later apply touches
+/// it. That is the behaviour you want for a value the operator may have
+/// tuned -- and exactly the wrong behaviour for a value ferrum derives and
+/// then corrects. Without this, the category fix would land only on hosts
+/// that had never been set up, and never on the host it was found on.
+///
+/// One field, deliberately. Everything else in that object -- priority,
+/// enable, removeCompletedDownloads, any setting touched by hand in the
+/// app's own UI -- is returned unchanged, because ferrum has no opinion
+/// about it and overwriting it would be a worse bug than the one being
+/// fixed.
+///
+/// # Arguments
+/// * `existing` - the registration as the app's API returned it.
+/// * `field` - the category field's name for this consumer.
+/// * `category` - the category it should carry; `None` means no category,
+///   which is the empty string on the wire.
+///
+/// # Returns
+/// `Some(updated)` when the value differs, `None` when it already matches.
+fn registration_needing_category_fix(
+    existing: &serde_json::Value,
+    field: &str,
+    category: Option<&str>,
+) -> Option<serde_json::Value> {
+    let want = category.unwrap_or("");
+    let fields = existing.get("fields")?.as_array()?;
+    let current = fields
+        .iter()
+        .find(|f| f["name"] == field)
+        .map(|f| f["value"].as_str().unwrap_or(""))
+        // A category field the app did not return at all is absent, which
+        // is the same state as empty -- and must still be corrected when a
+        // category is wanted.
+        .unwrap_or("");
+    if current == want {
+        return None;
+    }
+
+    let mut updated = existing.clone();
+    let updated_fields = updated.get_mut("fields")?.as_array_mut()?;
+    if let Some(f) = updated_fields.iter_mut().find(|f| f["name"] == field) {
+        f["value"] = serde_json::json!(want);
+    } else {
+        updated_fields.push(serde_json::json!({ "name": field, "value": want }));
+    }
+    Some(updated)
+}
+
 /// The consumer's own downloadclient API base path -- v3 for Sonarr/
 /// Radarr, v1 for Prowlarr (confirmed for real: Prowlarr's servarr
 /// framework fork uses v1 throughout, unlike Sonarr/Radarr's v3).
@@ -653,39 +773,49 @@ fn ensure_sabnzbd_category(
     Ok(())
 }
 
-fn register_download_client(
+/// Builds the exact JSON body a downloadclient registration POSTs.
+///
+/// Extracted from `register_download_client` so the body itself can be
+/// asserted in a test rather than only the code that assembles it. The
+/// defect this guards is entirely a question of what one field's VALUE is:
+/// the category told the *arrs to use `sonarr`/`radarr`, directories
+/// nothing in ferrum creates, while the `tv`/`movies` directories
+/// modules/core/trash-layout.nix does create stayed empty.
+///
+/// # Arguments
+/// * `consumer_id` - the *arr being configured; decides the API dialect.
+/// * `provider_id` - the download client being registered into it.
+/// * `provider` - the client's host/port.
+/// * `provider_key` - the client's own API key, where it needs one.
+/// * `category` - the category to tag this consumer's grabs with, or
+///   `None` for a consumer that manages no library.
+///
+/// # Returns
+/// The registration body, ready to POST.
+///
+/// # Errors
+/// When the consumer or provider is one this binary knows no convention
+/// for.
+fn download_client_body(
     consumer_id: &str,
-    consumer: &AppConnInfo,
-    consumer_key: &str,
     provider_id: &str,
     provider: &AppConnInfo,
-) -> anyhow::Result<()> {
-    let base = base_url(consumer);
-    let path = download_client_api_path(consumer_id)?;
-    if find_existing_id(&base, path, consumer_key, provider_id)?.is_some() {
-        return Ok(());
-    }
-
-    // Only Sabnzbd needs its own key read here (qBittorrent needs none) --
-    // read_api_key handles both, called with the PROVIDER's own secret path.
-    let provider_key = read_api_key(&provider.api_key_secret_path)?;
-
-    if provider_id == "sabnzbd" {
-        let key = provider_key.as_ref().ok_or_else(|| {
-            anyhow::anyhow!("SABnzbd provider has no API key configured -- cannot ensure its category")
-        })?;
-        ensure_sabnzbd_category(provider, key, consumer_id)?;
-    }
-
+    provider_key: &Option<String>,
+    category: Option<&str>,
+) -> anyhow::Result<serde_json::Value> {
     let (implementation, config_contract, protocol, extra_fields) =
-        provider_implementation(provider_id, &provider_key)?;
+        provider_implementation(provider_id, provider_key)?;
     let category_field = category_field_name(consumer_id)?;
 
     let mut fields = vec![
         serde_json::json!({ "name": "host", "value": provider.host }),
         serde_json::json!({ "name": "port", "value": provider.port }),
         serde_json::json!({ "name": "useSsl", "value": false }),
-        serde_json::json!({ "name": category_field, "value": consumer_id }),
+        // An absent category is the empty string, which is what every
+        // *arr's own downloadclient schema shows as this field's default
+        // and what the app's UI displays as "no category". It is not the
+        // same as inventing one.
+        serde_json::json!({ "name": category_field, "value": category.unwrap_or("") }),
     ];
     if let Some(obj) = extra_fields.as_object() {
         for (k, v) in obj {
@@ -716,6 +846,73 @@ fn register_download_client(
     if consumer_id == "prowlarr" {
         body["categories"] = serde_json::json!([]);
     }
+
+    Ok(body)
+}
+
+/// Registers one download client into one *arr.
+///
+/// # Arguments
+/// * `consumer_id` / `consumer` / `consumer_key` - the *arr being
+///   configured and the credential for its own API.
+/// * `provider_id` / `provider` - the download client being registered.
+/// * `category` - the category this consumer's grabs are tagged with, from
+///   the catalog; `None` for a consumer that manages no library.
+///
+/// # Errors
+/// When either app's API refuses the call, or SABnzbd's category cannot be
+/// created.
+fn register_download_client(
+    consumer_id: &str,
+    consumer: &AppConnInfo,
+    consumer_key: &str,
+    provider_id: &str,
+    provider: &AppConnInfo,
+    category: Option<&str>,
+) -> anyhow::Result<()> {
+    let base = base_url(consumer);
+    let path = download_client_api_path(consumer_id)?;
+    let category_field = category_field_name(consumer_id)?;
+    let existing = find_existing(&base, path, consumer_key, provider_id)?;
+
+    // Only Sabnzbd needs its own key read here (qBittorrent needs none) --
+    // read_api_key handles both, called with the PROVIDER's own secret path.
+    let provider_key = read_api_key(&provider.api_key_secret_path)?;
+
+    // A category SABnzbd does not already know is rejected at registration
+    // time, so it has to exist first. With no category there is nothing to
+    // create: SABnzbd's own default applies and the job lands at the root
+    // of complete_dir, a directory ferrum does create.
+    if provider_id == "sabnzbd" {
+        if let Some(cat) = category {
+            let key = provider_key.as_ref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "SABnzbd provider has no API key configured -- cannot ensure its category"
+                )
+            })?;
+            ensure_sabnzbd_category(provider, key, cat)?;
+        }
+    }
+
+    if let Some(existing) = existing {
+        // Already registered. Correct the one field ferrum derives, and
+        // nothing else -- see registration_needing_category_fix for why
+        // leaving it alone was not an option.
+        let Some(updated) = registration_needing_category_fix(&existing, category_field, category)
+        else {
+            return Ok(());
+        };
+        let id = updated["id"]
+            .as_u64()
+            .ok_or_else(|| anyhow::anyhow!("{consumer_id}'s existing {provider_id} client has no id"))?;
+        ureq::put(&format!("{base}{path}/{id}"))
+            .set("X-Api-Key", consumer_key)
+            .send_json(updated)
+            .map_err(|e| anyhow::anyhow!("PUT {base}{path}/{id} for {provider_id} failed: {e}"))?;
+        return Ok(());
+    }
+
+    let body = download_client_body(consumer_id, provider_id, provider, &provider_key, category)?;
 
     ureq::post(&format!("{base}{path}"))
         .set("X-Api-Key", consumer_key)
@@ -838,6 +1035,250 @@ mod tests {
         );
         assert_eq!(values("section"), vec!["categories".to_string()]);
         assert_eq!(values("output"), vec!["json".to_string()]);
+    }
+
+    fn conn(host: &str, port: u16) -> AppConnInfo {
+        AppConnInfo {
+            host: host.to_string(),
+            port,
+            api_key_secret_path: None,
+        }
+    }
+
+    /// The value of the field whose name `category_field_name` returns,
+    /// read back out of a real registration body.
+    fn category_value_in(body: &serde_json::Value, field: &str) -> String {
+        body["fields"]
+            .as_array()
+            .expect("the body has a fields array")
+            .iter()
+            .find(|f| f["name"] == field)
+            .unwrap_or_else(|| panic!("no {field} field in {body}"))["value"]
+            .as_str()
+            .expect("the category is a string")
+            .to_string()
+    }
+
+    /// THE DEFECT. The category told the *arrs to use was the consumer's
+    /// own app id -- `sonarr`, `radarr` -- so SABnzbd wrote completed TV
+    /// jobs into `usenet/complete/sonarr`, a directory ferrum never
+    /// creates, while the `usenet/complete/tv` that
+    /// modules/core/trash-layout.nix does create stayed empty. Confirmed
+    /// on the owner's host: both category trees created and empty, and
+    /// SABnzbd holding one category, `[[prowlarr]]`.
+    ///
+    /// The value now comes from the config, which
+    /// modules/core/reconciler.nix fills from the same
+    /// `catalog.<id>.mediaCategory` it builds the root folder from. This
+    /// test pins the end of that wire: whatever Nix supplies is what goes
+    /// on the API call, verbatim and in the right field.
+    #[test]
+    fn the_registered_category_is_the_media_category_not_the_app_id() {
+        let qbt = conn("127.0.0.1", 8090);
+
+        // Deserialized exactly as modules/core/reconciler.nix emits it, so
+        // the whole wire is under test and not just its far end.
+        let sonarr_pair: Pair = serde_json::from_str(
+            r#"{"kind":"downloadClient","consumer":"sonarr","provider":"qbittorrent","category":"tv"}"#,
+        )
+        .unwrap();
+        let sonarr = download_client_body(
+            &sonarr_pair.consumer,
+            &sonarr_pair.provider,
+            &qbt,
+            &None,
+            pair_category(&sonarr_pair),
+        )
+        .unwrap();
+        assert_eq!(
+            category_value_in(&sonarr, "tvCategory"),
+            "tv",
+            "sonarr's grabs must be tagged with the directory ferrum creates: {sonarr}"
+        );
+
+        let radarr_pair: Pair = serde_json::from_str(
+            r#"{"kind":"downloadClient","consumer":"radarr","provider":"sabnzbd","category":"movies"}"#,
+        )
+        .unwrap();
+        let radarr = download_client_body(
+            &radarr_pair.consumer,
+            &radarr_pair.provider,
+            &conn("127.0.0.1", 8080),
+            &Some("k".to_string()),
+            pair_category(&radarr_pair),
+        )
+        .unwrap();
+        assert_eq!(
+            category_value_in(&radarr, "movieCategory"),
+            "movies",
+            "radarr's grabs must be tagged with the directory ferrum creates: {radarr}"
+        );
+    }
+
+    /// Prowlarr's decision, pinned.
+    ///
+    /// Prowlarr is an indexer manager: it has no `mediaCategory` because it
+    /// manages no library, and its download-client registration exists for
+    /// the Test button and for interactive searches launched from its own
+    /// UI. A grab made that way belongs to no library, so there is no
+    /// library category that is true of it -- giving it `tv` would file a
+    /// manually-grabbed album under television, and giving it `prowlarr`
+    /// is the original defect in a new costume.
+    ///
+    /// So it gets no category, which is the empty string every *arr's own
+    /// downloadclient schema carries as this field's default. The effect is
+    /// that such a grab lands at the ROOT of the client's download tree --
+    /// `<mediaDir>/torrents` or `<mediaDir>/usenet/complete` -- both of
+    /// which ferrum does create. The invariant holds for Prowlarr the same
+    /// way it holds for Sonarr: ferrum never names a directory it did not
+    /// make.
+    #[test]
+    fn prowlarr_gets_no_category_because_it_manages_no_library() {
+        let qbt = conn("127.0.0.1", 8090);
+        let pair: Pair = serde_json::from_str(
+            r#"{"kind":"downloadClient","consumer":"prowlarr","provider":"qbittorrent","category":null}"#,
+        )
+        .unwrap();
+        assert_eq!(pair_category(&pair), None);
+        let body = download_client_body(
+            &pair.consumer,
+            &pair.provider,
+            &qbt,
+            &None,
+            pair_category(&pair),
+        )
+        .unwrap();
+        assert_eq!(
+            category_value_in(&body, "category"),
+            "",
+            "an indexer manager has no library category: {body}"
+        );
+        assert_eq!(
+            body["categories"],
+            serde_json::json!([]),
+            "Prowlarr still needs its own top-level categories list: {body}"
+        );
+    }
+
+    /// Anti-vacuity for the two tests above: the assertion really reads the
+    /// category out of the body rather than matching anything. A body built
+    /// with the OLD value -- the consumer's app id -- must not satisfy it.
+    #[test]
+    fn the_old_app_id_category_would_still_be_visible_here() {
+        let qbt = conn("127.0.0.1", 8090);
+        let old =
+            download_client_body("sonarr", "qbittorrent", &qbt, &None, Some("sonarr")).unwrap();
+        assert_eq!(
+            category_value_in(&old, "tvCategory"),
+            "sonarr",
+            "the helper reports what is actually in the body: {old}"
+        );
+        assert_ne!(category_value_in(&old, "tvCategory"), "tv");
+    }
+
+    /// An existing registration as an *arr's own API returns it, with a
+    /// hand-tuned field beside the category so the "one field only" claim
+    /// has something to be false about.
+    fn existing_client(category_field: &str, category: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": 3,
+            "name": "qbittorrent",
+            "enable": true,
+            "priority": 7,
+            "removeCompletedDownloads": false,
+            "implementation": "QBittorrent",
+            "configContract": "QBittorrentSettings",
+            "fields": [
+                { "name": "host", "value": "127.0.0.1" },
+                { "name": "port", "value": 8090 },
+                { "name": category_field, "value": category },
+                { "name": "initialState", "value": 1 },
+            ],
+        })
+    }
+
+    /// The half of defect 1 that decides whether the fix reaches a REAL
+    /// host. Every registration here is idempotent by name, so once
+    /// `qbittorrent` exists in Sonarr no later apply touches it -- and the
+    /// owner's host already has all six. Correcting the category on an
+    /// existing registration is what makes "the blast radius is the next
+    /// apply" actually true rather than true only for a fresh install.
+    #[test]
+    fn an_already_registered_client_has_its_wrong_category_corrected() {
+        let before = existing_client("tvCategory", "sonarr");
+        let after = registration_needing_category_fix(&before, "tvCategory", Some("tv"))
+            .expect("a wrong category must be corrected");
+        assert_eq!(category_value_in(&after, "tvCategory"), "tv");
+        assert_eq!(after["id"], 3, "the id is needed for the PUT: {after}");
+    }
+
+    /// And it touches nothing else. Overwriting a priority or a toggle the
+    /// operator set by hand would be a worse bug than the one being fixed,
+    /// because ferrum has no opinion about those at all.
+    #[test]
+    fn correcting_a_category_leaves_every_other_field_alone() {
+        let before = existing_client("tvCategory", "sonarr");
+        let after =
+            registration_needing_category_fix(&before, "tvCategory", Some("tv")).unwrap();
+        assert_eq!(after["priority"], 7);
+        assert_eq!(after["removeCompletedDownloads"], false);
+        assert_eq!(category_value_in(&after, "host"), "127.0.0.1");
+        assert_eq!(
+            after["fields"].as_array().unwrap().len(),
+            before["fields"].as_array().unwrap().len(),
+            "no field was added or dropped: {after}"
+        );
+        for name in ["host", "port", "initialState"] {
+            let b = before["fields"].as_array().unwrap().iter().find(|f| f["name"] == name);
+            let a = after["fields"].as_array().unwrap().iter().find(|f| f["name"] == name);
+            assert_eq!(a, b, "{name} changed: {after}");
+        }
+    }
+
+    /// Anti-vacuity, and the property that keeps this from becoming a PUT
+    /// on every single apply forever: a registration that is already right
+    /// produces no update at all.
+    #[test]
+    fn a_correct_registration_is_left_entirely_alone() {
+        let right = existing_client("tvCategory", "tv");
+        assert!(
+            registration_needing_category_fix(&right, "tvCategory", Some("tv")).is_none(),
+            "a correct category must not be rewritten on every apply"
+        );
+        let none_wanted = existing_client("category", "");
+        assert!(
+            registration_needing_category_fix(&none_wanted, "category", None).is_none(),
+            "an already-empty category must not be rewritten either"
+        );
+    }
+
+    /// Prowlarr's direction: the live host has `[[prowlarr]]` registered,
+    /// and the correct end state is no category at all.
+    #[test]
+    fn an_app_id_category_is_cleared_for_a_consumer_with_no_library() {
+        let before = existing_client("category", "prowlarr");
+        let after = registration_needing_category_fix(&before, "category", None)
+            .expect("prowlarr's app-id category must be cleared");
+        assert_eq!(category_value_in(&after, "category"), "");
+    }
+
+    /// A field the app did not return at all is the same state as empty --
+    /// and must still be filled in when a category is wanted, rather than
+    /// being read as "already correct".
+    #[test]
+    fn a_missing_category_field_is_added_rather_than_read_as_correct() {
+        let before = serde_json::json!({
+            "id": 1,
+            "name": "sabnzbd",
+            "fields": [ { "name": "host", "value": "127.0.0.1" } ],
+        });
+        let after = registration_needing_category_fix(&before, "tvCategory", Some("tv"))
+            .expect("an absent category field must be added");
+        assert_eq!(category_value_in(&after, "tvCategory"), "tv");
+        assert!(
+            registration_needing_category_fix(&before, "tvCategory", None).is_none(),
+            "an absent field with no category wanted is already correct"
+        );
     }
 
     #[test]

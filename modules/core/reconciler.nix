@@ -19,6 +19,10 @@ let
   # this file and the proxy read; see modules/lib/app-address.nix.
   appHost = (import ../lib/app-address.nix { inherit lib; }).hostFor ferrum;
 
+  # The one list of library categories, and the guard that keeps every
+  # app's declared mediaCategory drawn from it -- see trash-layout.nix.
+  layout = import ./trash-layout.nix { inherit lib; };
+
   # Which apps have a reconciler-usable bare-value API key, and under what
   # secret name (Task 1). qBittorrent needs none (LocalHostAuth = false).
   appKeySecretName = id:
@@ -75,7 +79,41 @@ let
   pairs = lib.flatten (lib.mapAttrsToList
     (id: _:
       map
-        (providerId: { kind = pairKind id providerId; consumer = id; provider = providerId; })
+        (providerId:
+          let kind = pairKind id providerId; in
+          { inherit kind; consumer = id; provider = providerId; }
+          // lib.optionalAttrs (kind == "downloadClient") {
+            # The download-client CATEGORY, and it comes from the SAME
+            # catalog attribute `rootFolders` below reads.
+            #
+            # It used to be the consumer's own app id, decided inside
+            # crates/ferrum-reconcile. So the *arrs told their download
+            # clients to use "sonarr"/"radarr" while
+            # modules/core/trash-layout.nix created torrents/tv and
+            # usenet/complete/movies -- a directory ferrum never made next
+            # to a directory ferrum never filled. Confirmed on the owner's
+            # host: all eight category directories created and empty, and
+            # SABnzbd holding exactly one category, [[prowlarr]].
+            #
+            # Reading `mediaCategory` here means the directory ferrum
+            # CREATES and the category ferrum REGISTERS are the same string
+            # from the same place. trash-layout.nix's own
+            # `mediaCategoryErrors` (asserted below) closes the remaining
+            # gap by refusing to evaluate a catalog whose mediaCategory is
+            # not one of the categories that layout creates directories for.
+            #
+            # null for a consumer that manages no library. Prowlarr is the
+            # only one: it is an indexer manager, and its download-client
+            # registration exists for the Test button and for interactive
+            # searches launched from its own UI. Such a grab belongs to no
+            # library, so no library category is true of it -- giving it
+            # "tv" would file a manually-grabbed album under television.
+            # With no category the client's own default applies, which is
+            # the ROOT of its download tree (<mediaDir>/torrents,
+            # <mediaDir>/usenet/complete) -- both directories ferrum does
+            # create, so the invariant holds for Prowlarr too.
+            category = catalog.${id}.mediaCategory or null;
+          })
         (builtins.filter (p: enabledApps ? ${p}) (catalog.${id}.integrations.consumes or [ ])))
     enabledApps);
 
@@ -139,7 +177,11 @@ let
   } // plexConfig));
 in
 {
-  assertions = map (msg: { assertion = false; message = msg; }) realSymmetryErrors;
+  # Both scan the WHOLE catalog, not just the enabled apps: a metadata bug
+  # should fail eval regardless of which subset of apps a given host happens
+  # to enable.
+  assertions = map (msg: { assertion = false; message = msg; })
+    (realSymmetryErrors ++ layout.mediaCategoryErrors catalog);
 
   # Runs when there is EITHER a registration or a root folder to set. A
   # single *arr with no peers still needs its root folder, and gating only

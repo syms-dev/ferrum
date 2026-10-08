@@ -2563,6 +2563,200 @@
           echo ok > $out
         '';
 
+      # THE CATEGORY FERRUM REGISTERS AND THE DIRECTORY FERRUM CREATES
+      # CANNOT DISAGREE AGAIN.
+      #
+      # They did. `modules/core/trash-layout.nix` created torrents/tv,
+      # torrents/movies, usenet/complete/tv and usenet/complete/movies, while
+      # crates/ferrum-reconcile decided the download-client category
+      # independently and chose the consumer's own app id -- so the *arrs
+      # told SABnzbd and qBittorrent to use "sonarr"/"radarr"/"prowlarr",
+      # directories nothing in ferrum ever creates, and the eight it did
+      # create stayed empty. Confirmed on the owner's host: both category
+      # trees present and empty, SABnzbd holding exactly one category,
+      # [[prowlarr]].
+      #
+      # That is the fourth time two places have computed one value here
+      # (nginx and the reconciler on addresses; Rust and Nix on the parity
+      # last-sync path; the integration rule before modules/lib/
+      # integrations.nix), so it is closed the same way those were: ONE
+      # source, and a build failure if anything drifts off it. Two halves,
+      # because one source is only half the job:
+      #
+      #   1. THE GUARD. trash-layout.nix exports `mediaCategoryErrors`, which
+      #      refuses a catalog whose declared mediaCategory is not one of the
+      #      categories that layout creates directories for.
+      #      modules/core/reconciler.nix asserts it over the whole catalog.
+      #      Run here against the REAL catalog and against synthetic ones, so
+      #      the rejecting arm is exercised and not merely defined.
+      #   2. THE ARTIFACTS. Build a real host and compare the two things that
+      #      actually ship: the JSON ferrum-reconcile is handed, and the
+      #      systemd-tmpfiles rules that create the tree. Every category in
+      #      the config must name a directory in the rules. This is the half
+      #      that would have caught the defect, because the defect lived in
+      #      neither file -- it lived in the gap between them.
+      categoryAndDirectoryCannotDiverge =
+        let
+          layout = import ../../../modules/core/trash-layout.nix { inherit lib; };
+
+          host = ferrumLib.mkHost {
+            inherit system;
+            settings = {
+              schemaVersion = realMigrations.currentVersion;
+              apps = {
+                sonarr.enable = true;
+                radarr.enable = true;
+                prowlarr.enable = true;
+                qbittorrent.enable = true;
+                sabnzbd.enable = true;
+              };
+            };
+            modules = [ ../../../examples/hosts/minimal/configuration.nix ];
+          };
+          cfgPath = host.config.systemd.services.ferrum-reconcile.environment.FERRUM_RECONCILE_CONFIG;
+          tmpfilesRules = pkgs.writeText "ferrum-tmpfiles-rules"
+            (lib.concatStringsSep "\n" host.config.systemd.tmpfiles.rules);
+
+          # Every downloadClient pair this host really registers, as
+          # `<consumer> <provider> <category-or-null>`.
+          expectedPairs = 6;
+        in
+        pkgs.runCommand "ferrum-check-category-vs-directory"
+          {
+            realCatalogErrors = builtins.toJSON (layout.mediaCategoryErrors catalog);
+            # A synthetic app naming a category the layout DOES create.
+            goodCatalogErrors = builtins.toJSON (layout.mediaCategoryErrors {
+              lidarr.mediaCategory = "music";
+              # An app with no library at all must not be flagged.
+              prowlarr = { };
+            });
+            # A synthetic app naming one it does NOT. If this comes back
+            # empty the guard is decorative.
+            badCatalogErrors = builtins.toJSON (layout.mediaCategoryErrors {
+              podcastarr.mediaCategory = "podcasts";
+            });
+            # A guard nobody calls protects nothing. modules/core/
+            # reconciler.nix must actually feed it into `assertions`, over
+            # the WHOLE catalog rather than the enabled subset -- a metadata
+            # bug should fail eval on every host, not only on one that
+            # happens to enable the offending app.
+            reconcilerAssertsTheGuard =
+              if lib.hasInfix "layout.mediaCategoryErrors catalog"
+                (builtins.readFile ../../../modules/core/reconciler.nix)
+              then "yes" else "no";
+            # And this host must have no failing assertion of its own, so a
+            # green result above is not sitting on top of a broken eval.
+            hostAssertionFailures = builtins.toJSON
+              (map (a: a.message) (builtins.filter (a: !a.assertion) host.config.assertions));
+          } ''
+          set -eu
+          jq=${pkgs.jq}/bin/jq
+          cfg=${cfgPath}
+          rules=${tmpfilesRules}
+
+          fail() {
+            echo "category/directory check: $1" >&2
+            echo "--- reconcile config ---" >&2; cat "$cfg" >&2
+            echo "--- tmpfiles rules ---" >&2; cat "$rules" >&2
+            exit 1
+          }
+
+          # Does this host's OWN tmpfiles ruleset create this exact
+          # directory? Matched on the path field, not on the mode, so the
+          # permissions work is free to change the mode without quietly
+          # turning this check into a tautology.
+          creates() {
+            ${pkgs.gawk}/bin/awk -v want="$1" \
+              '$1 == "d" && $2 == want { found = 1 } END { exit !found }' "$rules"
+          }
+
+          # --- half 1: the exported guard, both arms --------------------
+          [ "$realCatalogErrors" = "[]" ] \
+            || fail "the real catalog declares a mediaCategory the layout creates no directory for: $realCatalogErrors"
+          [ "$goodCatalogErrors" = "[]" ] \
+            || fail "the guard rejected a category that IS in the layout, so it over-rejects: $goodCatalogErrors"
+          [ "$badCatalogErrors" != "[]" ] \
+            || fail "the guard accepted mediaCategory \"podcasts\", which the layout creates no directory for. It is decorative -- it would accept the original defect too."
+          case "$badCatalogErrors" in
+            *podcastarr*podcasts*) ;;
+            *) fail "the guard's rejection does not name the app and the bad category: $badCatalogErrors" ;;
+          esac
+          [ "$reconcilerAssertsTheGuard" = "yes" ] \
+            || fail "modules/core/reconciler.nix no longer asserts layout.mediaCategoryErrors over the whole catalog, so the guard above is defined and never run"
+          [ "$hostAssertionFailures" = "[]" ] \
+            || fail "this host has failing assertions, so the comparison below is standing on a broken eval: $hostAssertionFailures"
+
+          # --- half 2: the two shipped artifacts ------------------------
+          # Assigned first and asserted non-empty: `set -e` does not abort
+          # on a failed command substitution inside a `for`/`while` list, so
+          # an eval that produced nothing would otherwise iterate zero times
+          # and report green having compared nothing.
+          rows="$($jq -r '.pairs[] | select(.kind == "downloadClient")
+                          | "\(.consumer) \(.provider) \(.category // "-")"' "$cfg")"
+          [ -n "$rows" ] || fail "this host registers no download clients at all, so nothing was compared"
+
+          checked=0
+          while read -r consumer provider category; do
+            clientRoot="$($jq -r --arg a "$provider" \
+              '.downloadPaths[] | select(.app == $a) | .path' "$cfg")"
+            [ -n "$clientRoot" ] \
+              || fail "$consumer registers $provider, but the config tells $provider no download path"
+
+            if [ "$category" = "-" ]; then
+              # No category means the client's own default, which is the
+              # ROOT of its download tree. That directory must exist too.
+              creates "$clientRoot" \
+                || fail "$consumer registers $provider with no category, so its grabs land in $clientRoot -- a directory this host does not create"
+            else
+              creates "$clientRoot/$category" \
+                || fail "$consumer tells $provider to use category \"$category\", so completed jobs land in $clientRoot/$category -- a directory this host does not create. The category and the tree have diverged; see modules/core/trash-layout.nix."
+            fi
+            checked=$((checked + 1))
+          done <<ROWS
+          $rows
+          ROWS
+
+          [ "$checked" = "${toString expectedPairs}" ] \
+            || fail "compared $checked download-client pairs, expected ${toString expectedPairs}"
+
+          # The exact rulings, pinned. Half 2 above proves consistency; these
+          # three prove it is consistent on the RIGHT values rather than on
+          # some other pair of agreeing strings.
+          $jq -e '.pairs[] | select(.consumer == "sonarr" and .kind == "downloadClient") | select(.category == "tv")' "$cfg" > /dev/null \
+            || fail "sonarr's download-client category is not \"tv\""
+          $jq -e '.pairs[] | select(.consumer == "radarr" and .kind == "downloadClient") | select(.category == "movies")' "$cfg" > /dev/null \
+            || fail "radarr's download-client category is not \"movies\""
+          $jq -e '[.pairs[] | select(.consumer == "prowlarr" and .kind == "downloadClient") | .category] | all(. == null)' "$cfg" > /dev/null \
+            || fail "prowlarr was given a library category. It manages no library: an indexer manager's grabs belong to no library, so none is true of them. See modules/core/reconciler.nix."
+
+          # Root folders go through the same tie, from the same attribute.
+          # Not `jq | while read`: a pipeline's loop body runs in a subshell,
+          # where `fail`'s exit would end the subshell and leave this check
+          # green on a real mismatch.
+          roots="$($jq -r '.rootFolders[].path' "$cfg")"
+          [ -n "$roots" ] || fail "this host registers no root folders at all"
+          for p in $roots; do
+            creates "$p" || fail "a root folder points at $p, which this host does not create"
+          done
+
+          # --- anti-vacuity for `creates`, in both directions -----------
+          # The negative control is the ORIGINAL DEFECT: the old category
+          # was the consumer's app id, so if `creates` cannot tell
+          # torrents/sonarr from torrents/tv it would have passed the very
+          # bug it exists to catch.
+          torrents="$($jq -r '.downloadPaths[] | select(.app == "qbittorrent") | .path' "$cfg")"
+          creates "$torrents/tv" \
+            || fail "positive control failed: $torrents/tv is in the tree and creates() did not find it"
+          if creates "$torrents/sonarr"; then
+            fail "negative control failed: creates() claims $torrents/sonarr exists. It does not -- that is the directory the old app-id category named. This check would pass the original defect."
+          fi
+          if creates "$torrents/podcasts"; then
+            fail "negative control failed: creates() finds a directory that was never declared"
+          fi
+
+          echo "checked $checked download-client categories against the tree this host creates" > $out
+        '';
+
       # modules/proxy/dns.nix decides WHICH hostnames ferrum publishes a
       # record for, and that decision was proven correct exactly once -- by
       # hand-evaluating ferrumDnsConfig and reading the JSON. That is good
@@ -7555,6 +7749,11 @@
         # the download-client name it looks for is the name ferrum-reconcile
         # actually registered.
         decluttarr-knows-the-client-ferrum-registered = decluttarrKnowsTheClientFerrumRegistered;
+
+        # The download-client category ferrum registers and the directory
+        # ferrum creates are one value from one source, and this is what
+        # fails the build if they ever stop being.
+        category-and-directory-cannot-diverge = categoryAndDirectoryCannotDiverge;
       };
     };
 }
