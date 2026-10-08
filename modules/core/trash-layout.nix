@@ -36,6 +36,43 @@ in
 {
   inherit categories churn stable;
 
+  # THE TIE between this layout and the apps that name parts of it.
+  #
+  # `categories` above is the ONE list of library categories ferrum knows.
+  # modules/core/storage.nix turns it into directories; each app's own
+  # meta.nix names one of them in `mediaCategory`; and
+  # modules/core/reconciler.nix uses that same attribute for BOTH the app's
+  # root folder and the download-client category it registers. So the
+  # category ferrum registers and the directory ferrum creates are the same
+  # string by construction -- as long as every declared mediaCategory is
+  # actually drawn from this list. This function is what makes that a build
+  # failure rather than an assumption.
+  #
+  # It is the fourth time this repository has had two places computing one
+  # value (nginx and the reconciler on addresses; Rust and Nix on the parity
+  # last-sync path; the integration rule before modules/lib/integrations.nix),
+  # and it is handled the same way: one source, and an eval-time failure if
+  # anything drifts off it.
+  #
+  # Exported as a FUNCTION of the catalog rather than applied here, so
+  # nix/modules/flake/checks.nix can run the real shipped guard against
+  # synthetic catalogs and prove it rejects a bad one as well as accepting
+  # the real one. A guard whose rejecting arm has never been taken is a
+  # guard nobody has tested.
+  #
+  # Arguments:
+  #   catalogAttrs - an attrset of app id -> meta (modules/lib/catalog.nix's
+  #                  own shape). An app with no library omits mediaCategory.
+  # Returns: a list of human-readable error strings, empty when consistent.
+  mediaCategoryErrors = catalogAttrs:
+    builtins.filter (x: x != null) (lib.mapAttrsToList
+      (id: meta:
+        let cat = meta.mediaCategory or null; in
+        if cat == null || lib.elem cat categories then null
+        else
+          "modules/apps/${id}/meta.nix declares mediaCategory \"${cat}\", which is not one of the categories modules/core/trash-layout.nix creates directories for (${lib.concatStringsSep ", " categories}). That attribute is the app's root folder AND the download-client category ferrum registers, so a value off this list means ferrum would tell a download client to write into a directory nothing ever creates -- which is exactly the defect this guard was added for: the categories used to be the app ids, so completed jobs went to usenet/complete/sonarr while the usenet/complete/tv ferrum did create stayed empty. Either add \"${cat}\" to `categories` in trash-layout.nix, or name one of the existing ones.")
+      catalogAttrs);
+
   # Every directory ferrum creates under a data root, in the order
   # systemd-tmpfiles needs them (parents before children).
   subdirs =

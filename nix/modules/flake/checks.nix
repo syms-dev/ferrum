@@ -2563,6 +2563,342 @@
           echo ok > $out
         '';
 
+      # THE CATEGORY FERRUM REGISTERS AND THE DIRECTORY FERRUM CREATES
+      # CANNOT DISAGREE AGAIN.
+      #
+      # They did. `modules/core/trash-layout.nix` created torrents/tv,
+      # torrents/movies, usenet/complete/tv and usenet/complete/movies, while
+      # crates/ferrum-reconcile decided the download-client category
+      # independently and chose the consumer's own app id -- so the *arrs
+      # told SABnzbd and qBittorrent to use "sonarr"/"radarr"/"prowlarr",
+      # directories nothing in ferrum ever creates, and the eight it did
+      # create stayed empty. Confirmed on the owner's host: both category
+      # trees present and empty, SABnzbd holding exactly one category,
+      # [[prowlarr]].
+      #
+      # That is the fourth time two places have computed one value here
+      # (nginx and the reconciler on addresses; Rust and Nix on the parity
+      # last-sync path; the integration rule before modules/lib/
+      # integrations.nix), so it is closed the same way those were: ONE
+      # source, and a build failure if anything drifts off it. Two halves,
+      # because one source is only half the job:
+      #
+      #   1. THE GUARD. trash-layout.nix exports `mediaCategoryErrors`, which
+      #      refuses a catalog whose declared mediaCategory is not one of the
+      #      categories that layout creates directories for.
+      #      modules/core/reconciler.nix asserts it over the whole catalog.
+      #      Run here against the REAL catalog and against synthetic ones, so
+      #      the rejecting arm is exercised and not merely defined.
+      #   2. THE ARTIFACTS. Build a real host and compare the two things that
+      #      actually ship: the JSON ferrum-reconcile is handed, and the
+      #      systemd-tmpfiles rules that create the tree. Every category in
+      #      the config must name a directory in the rules. This is the half
+      #      that would have caught the defect, because the defect lived in
+      #      neither file -- it lived in the gap between them.
+      categoryAndDirectoryCannotDiverge =
+        let
+          layout = import ../../../modules/core/trash-layout.nix { inherit lib; };
+
+          host = ferrumLib.mkHost {
+            inherit system;
+            settings = {
+              schemaVersion = realMigrations.currentVersion;
+              apps = {
+                sonarr.enable = true;
+                radarr.enable = true;
+                prowlarr.enable = true;
+                qbittorrent.enable = true;
+                sabnzbd.enable = true;
+              };
+            };
+            modules = [ ../../../examples/hosts/minimal/configuration.nix ];
+          };
+          cfgPath = host.config.systemd.services.ferrum-reconcile.environment.FERRUM_RECONCILE_CONFIG;
+          tmpfilesRules = pkgs.writeText "ferrum-tmpfiles-rules"
+            (lib.concatStringsSep "\n" host.config.systemd.tmpfiles.rules);
+
+          # Every downloadClient pair this host really registers, as
+          # `<consumer> <provider> <category-or-null>`.
+          expectedPairs = 6;
+        in
+        pkgs.runCommand "ferrum-check-category-vs-directory"
+          {
+            realCatalogErrors = builtins.toJSON (layout.mediaCategoryErrors catalog);
+            # A synthetic app naming a category the layout DOES create.
+            goodCatalogErrors = builtins.toJSON (layout.mediaCategoryErrors {
+              lidarr.mediaCategory = "music";
+              # An app with no library at all must not be flagged.
+              prowlarr = { };
+            });
+            # A synthetic app naming one it does NOT. If this comes back
+            # empty the guard is decorative.
+            badCatalogErrors = builtins.toJSON (layout.mediaCategoryErrors {
+              podcastarr.mediaCategory = "podcasts";
+            });
+            # A guard nobody calls protects nothing. modules/core/
+            # reconciler.nix must actually feed it into `assertions`, over
+            # the WHOLE catalog rather than the enabled subset -- a metadata
+            # bug should fail eval on every host, not only on one that
+            # happens to enable the offending app.
+            reconcilerAssertsTheGuard =
+              if lib.hasInfix "layout.mediaCategoryErrors catalog"
+                (builtins.readFile ../../../modules/core/reconciler.nix)
+              then "yes" else "no";
+            # And this host must have no failing assertion of its own, so a
+            # green result above is not sitting on top of a broken eval.
+            hostAssertionFailures = builtins.toJSON
+              (map (a: a.message) (builtins.filter (a: !a.assertion) host.config.assertions));
+          } ''
+          set -eu
+          jq=${pkgs.jq}/bin/jq
+          cfg=${cfgPath}
+          rules=${tmpfilesRules}
+
+          fail() {
+            echo "category/directory check: $1" >&2
+            echo "--- reconcile config ---" >&2; cat "$cfg" >&2
+            echo "--- tmpfiles rules ---" >&2; cat "$rules" >&2
+            exit 1
+          }
+
+          # Does this host's OWN tmpfiles ruleset create this exact
+          # directory? Matched on the path field, not on the mode, so the
+          # permissions work is free to change the mode without quietly
+          # turning this check into a tautology.
+          creates() {
+            ${pkgs.gawk}/bin/awk -v want="$1" \
+              '$1 == "d" && $2 == want { found = 1 } END { exit !found }' "$rules"
+          }
+
+          # --- half 1: the exported guard, both arms --------------------
+          [ "$realCatalogErrors" = "[]" ] \
+            || fail "the real catalog declares a mediaCategory the layout creates no directory for: $realCatalogErrors"
+          [ "$goodCatalogErrors" = "[]" ] \
+            || fail "the guard rejected a category that IS in the layout, so it over-rejects: $goodCatalogErrors"
+          [ "$badCatalogErrors" != "[]" ] \
+            || fail "the guard accepted mediaCategory \"podcasts\", which the layout creates no directory for. It is decorative -- it would accept the original defect too."
+          case "$badCatalogErrors" in
+            *podcastarr*podcasts*) ;;
+            *) fail "the guard's rejection does not name the app and the bad category: $badCatalogErrors" ;;
+          esac
+          [ "$reconcilerAssertsTheGuard" = "yes" ] \
+            || fail "modules/core/reconciler.nix no longer asserts layout.mediaCategoryErrors over the whole catalog, so the guard above is defined and never run"
+          [ "$hostAssertionFailures" = "[]" ] \
+            || fail "this host has failing assertions, so the comparison below is standing on a broken eval: $hostAssertionFailures"
+
+          # --- half 2: the two shipped artifacts ------------------------
+          # Assigned first and asserted non-empty: `set -e` does not abort
+          # on a failed command substitution inside a `for`/`while` list, so
+          # an eval that produced nothing would otherwise iterate zero times
+          # and report green having compared nothing.
+          rows="$($jq -r '.pairs[] | select(.kind == "downloadClient")
+                          | "\(.consumer) \(.provider) \(.category // "-")"' "$cfg")"
+          [ -n "$rows" ] || fail "this host registers no download clients at all, so nothing was compared"
+
+          checked=0
+          while read -r consumer provider category; do
+            clientRoot="$($jq -r --arg a "$provider" \
+              '.downloadPaths[] | select(.app == $a) | .path' "$cfg")"
+            [ -n "$clientRoot" ] \
+              || fail "$consumer registers $provider, but the config tells $provider no download path"
+
+            if [ "$category" = "-" ]; then
+              # No category means the client's own default, which is the
+              # ROOT of its download tree. That directory must exist too.
+              creates "$clientRoot" \
+                || fail "$consumer registers $provider with no category, so its grabs land in $clientRoot -- a directory this host does not create"
+            else
+              creates "$clientRoot/$category" \
+                || fail "$consumer tells $provider to use category \"$category\", so completed jobs land in $clientRoot/$category -- a directory this host does not create. The category and the tree have diverged; see modules/core/trash-layout.nix."
+            fi
+            checked=$((checked + 1))
+          done <<ROWS
+          $rows
+          ROWS
+
+          [ "$checked" = "${toString expectedPairs}" ] \
+            || fail "compared $checked download-client pairs, expected ${toString expectedPairs}"
+
+          # The exact rulings, pinned. Half 2 above proves consistency; these
+          # three prove it is consistent on the RIGHT values rather than on
+          # some other pair of agreeing strings.
+          $jq -e '.pairs[] | select(.consumer == "sonarr" and .kind == "downloadClient") | select(.category == "tv")' "$cfg" > /dev/null \
+            || fail "sonarr's download-client category is not \"tv\""
+          $jq -e '.pairs[] | select(.consumer == "radarr" and .kind == "downloadClient") | select(.category == "movies")' "$cfg" > /dev/null \
+            || fail "radarr's download-client category is not \"movies\""
+          $jq -e '[.pairs[] | select(.consumer == "prowlarr" and .kind == "downloadClient") | .category] | all(. == null)' "$cfg" > /dev/null \
+            || fail "prowlarr was given a library category. It manages no library: an indexer manager's grabs belong to no library, so none is true of them. See modules/core/reconciler.nix."
+
+          # Root folders go through the same tie, from the same attribute.
+          # Not `jq | while read`: a pipeline's loop body runs in a subshell,
+          # where `fail`'s exit would end the subshell and leave this check
+          # green on a real mismatch.
+          roots="$($jq -r '.rootFolders[].path' "$cfg")"
+          [ -n "$roots" ] || fail "this host registers no root folders at all"
+          for p in $roots; do
+            creates "$p" || fail "a root folder points at $p, which this host does not create"
+          done
+
+          # --- anti-vacuity for `creates`, in both directions -----------
+          # The negative control is the ORIGINAL DEFECT: the old category
+          # was the consumer's app id, so if `creates` cannot tell
+          # torrents/sonarr from torrents/tv it would have passed the very
+          # bug it exists to catch.
+          torrents="$($jq -r '.downloadPaths[] | select(.app == "qbittorrent") | .path' "$cfg")"
+          creates "$torrents/tv" \
+            || fail "positive control failed: $torrents/tv is in the tree and creates() did not find it"
+          if creates "$torrents/sonarr"; then
+            fail "negative control failed: creates() claims $torrents/sonarr exists. It does not -- that is the directory the old app-id category named. This check would pass the original defect."
+          fi
+          if creates "$torrents/podcasts"; then
+            fail "negative control failed: creates() finds a directory that was never declared"
+          fi
+
+          echo "checked $checked download-client categories against the tree this host creates" > $out
+        '';
+
+      # THE SHARED MEDIA TREE IS ACTUALLY SHARED.
+      #
+      # ferrum already had two thirds of TRaSH's recommended permissions
+      # recipe: a separate user per app, all of them in one media group. The
+      # third third was missing entirely -- no unit set `UMask`, and the tree
+      # was created 0775 rather than setgid 2775. Confirmed on the owner's
+      # host: `grep -rn UMask modules/` returned nothing, and the live tree
+      # was drwxrwxr-x.
+      #
+      # The consequence is specific and silent. systemd's default umask is
+      # 0022, so a job directory SABnzbd creates inside the download tree
+      # comes out 0755 sabnzbd:sabnzbd. Sonarr is in the media group but not
+      # in sabnzbd's, so it can traverse and read -- a hardlink import still
+      # SUCCEEDS, because link() needs read on the source and write on the
+      # destination directory. What it cannot do is unlink the download copy
+      # afterwards, because deleting needs write on the CONTAINING directory.
+      # So nothing ever fails; undeletable leftovers simply accumulate.
+      #
+      # Both halves are needed and neither is sufficient: `UMask 002` gives
+      # the group the write bit, and setgid is what gives new directories the
+      # shared GROUP rather than the creating user's own primary group. This
+      # check asserts both, from the rendered units and the rendered tmpfiles
+      # rules of one real host, and it asserts the apps that must NOT have
+      # them don't -- an all-apps rule would pass by accident.
+      mediaWritersShareTheirGroup =
+        let
+          host = ferrumLib.mkHost {
+            inherit system;
+            settings = {
+              schemaVersion = realMigrations.currentVersion;
+              apps = {
+                sonarr.enable = true;
+                radarr.enable = true;
+                prowlarr.enable = true;
+                qbittorrent.enable = true;
+                sabnzbd.enable = true;
+                # Both media servers, because they are the two apps whose
+                # upstream nixpkgs modules have their own opinion about
+                # UMask -- jellyfin's is 0077, which is stricter than
+                # systemd's default and makes its writes into the shared
+                # tree unreadable by the group entirely.
+                jellyfin.enable = true;
+                plex.enable = true;
+              };
+            };
+            modules = [ ../../../examples/hosts/minimal/configuration.nix ];
+          };
+          hcfg = host.config;
+          mediaDir = hcfg.ferrum.storage.mediaDir;
+
+          enabled = lib.filterAttrs (_: a: a.enable) hcfg.ferrum.apps;
+          # The predicate is the SAME one each service.nix already uses to
+          # decide media-group membership. A unit in the media group is a
+          # unit that can create files in the shared tree, so the umask that
+          # makes those files group-writable belongs to exactly that set --
+          # one predicate reused, not a second one invented.
+          inTheMediaGroup = lib.filterAttrs (_: a: a.mediaAccess != "none") enabled;
+          outOfIt = lib.filterAttrs (_: a: a.mediaAccess == "none") enabled;
+
+          # id -> the UMask its unit really renders, or a marker. "no unit"
+          # matters: a catalog app whose systemd unit is not named after it
+          # would otherwise be silently reported as compliant.
+          umaskOf = id:
+            if !(hcfg.systemd.services ? ${id}) then "NO-UNIT"
+            else hcfg.systemd.services.${id}.serviceConfig.UMask or "UNSET";
+
+          report = ids: lib.concatStringsSep "\n" (map (id: "${id} ${umaskOf id}") ids);
+
+          # Every `d` rule this host declares for the media tree, as
+          # "<path> <mode>".
+          mediaModes = lib.concatStringsSep "\n" (lib.concatMap
+            (rule:
+              let f = builtins.filter (x: builtins.isString x && x != "") (builtins.split "[ ]+" rule); in
+              if builtins.length f >= 3 && builtins.head f == "d"
+                && (builtins.elemAt f 1 == mediaDir || lib.hasPrefix "${mediaDir}/" (builtins.elemAt f 1))
+              then [ "${builtins.elemAt f 1} ${builtins.elemAt f 2}" ]
+              else [ ])
+            hcfg.systemd.tmpfiles.rules);
+        in
+        pkgs.runCommand "ferrum-check-media-permissions"
+          {
+            writers = report (builtins.attrNames inTheMediaGroup);
+            nonWriters = report (builtins.attrNames outOfIt);
+            inherit mediaModes mediaDir;
+          } ''
+          set -eu
+          fail() {
+            echo "media-permissions check: $1" >&2
+            echo "--- apps in the media group ---" >&2; echo "$writers" >&2
+            echo "--- apps not in it ---" >&2; echo "$nonWriters" >&2
+            echo "--- media tree modes ---" >&2; echo "$mediaModes" >&2
+            exit 1
+          }
+
+          # --- half 1: UMask on exactly the units that share the tree ----
+          [ -n "$writers" ] || fail "no app on this host is in the media group, so nothing was checked"
+          n=0
+          while read -r id umask; do
+            [ -n "$id" ] || continue
+            case "$umask" in
+              0002) ;;
+              NO-UNIT) fail "$id is in the media group but has no systemd unit of its own name, so this check cannot see what it runs with" ;;
+              UNSET) fail "$id writes into the shared tree with no UMask, so systemd's default 0022 applies: every file and directory it creates is group-READ-only, and the other apps can never delete inside it" ;;
+              *) fail "$id runs with UMask $umask; the shared tree needs 0002" ;;
+            esac
+            n=$((n + 1))
+          done <<WRITERS
+          $writers
+          WRITERS
+          [ "$n" -ge 4 ] || fail "only $n media-writing apps were checked; this host enables more than that"
+
+          # Negative control. An app with no media access is not in the
+          # group and has no business loosening its umask -- and if the rule
+          # were "every app", half 1 above would pass by accident.
+          while read -r id umask; do
+            [ -n "$id" ] || continue
+            [ "$umask" = "UNSET" ] \
+              || fail "$id has mediaAccess = none, so it is not in the media group, yet it runs with UMask $umask"
+          done <<OTHERS
+          $nonWriters
+          OTHERS
+          case "$nonWriters" in
+            *prowlarr*) ;;
+            *) fail "the negative control examined nothing: prowlarr (mediaAccess = none) is not in the list" ;;
+          esac
+
+          # --- half 2: the tree is setgid -------------------------------
+          [ -n "$mediaModes" ] || fail "this host declares no tmpfiles rule under $mediaDir at all"
+          m=0
+          while read -r path mode; do
+            [ -n "$path" ] || continue
+            [ "$mode" = "2775" ] \
+              || fail "$path is created $mode. Without the setgid bit a directory a download client creates under it inherits the CLIENT's primary group, not the media group -- so the umask above buys nothing and the other apps still cannot delete inside it."
+            m=$((m + 1))
+          done <<MODES
+          $mediaModes
+          MODES
+          [ "$m" -ge 10 ] || fail "only $m media directories were examined; the TRaSH layout has more than that"
+
+          echo "checked $n media-writing units and $m media directories" > $out
+        '';
+
       # modules/proxy/dns.nix decides WHICH hostnames ferrum publishes a
       # record for, and that decision was proven correct exactly once -- by
       # hand-evaluating ferrumDnsConfig and reading the JSON. That is good
@@ -7555,6 +7891,17 @@
         # the download-client name it looks for is the name ferrum-reconcile
         # actually registered.
         decluttarr-knows-the-client-ferrum-registered = decluttarrKnowsTheClientFerrumRegistered;
+
+        # The download-client category ferrum registers and the directory
+        # ferrum creates are one value from one source, and this is what
+        # fails the build if they ever stop being.
+        category-and-directory-cannot-diverge = categoryAndDirectoryCannotDiverge;
+
+        # Every app that writes into the shared media tree does so with
+        # UMask 0002, and the tree is setgid -- the two thirds of TRaSH's
+        # permissions recipe ferrum had adopted the users and the group for
+        # and then left out.
+        media-writers-share-their-group = mediaWritersShareTheirGroup;
       };
     };
 }
