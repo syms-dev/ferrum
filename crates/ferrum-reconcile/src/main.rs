@@ -232,6 +232,22 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
+    // After the download paths, because a category's save path is built
+    // from the download root those calls establish -- and independently of
+    // them, for the same reason the loops above are independent of each
+    // other.
+    match ensure_qbittorrent_categories(&config) {
+        Ok(done) => {
+            for d in done {
+                println!("ferrum-reconcile: qbittorrent category {d}");
+            }
+        }
+        Err(e) => {
+            eprintln!("ferrum-reconcile: qbittorrent categories FAILED: {e}");
+            had_error = true;
+        }
+    }
+
     if let Some(plex) = &config.plex {
         match reconcile_plex(plex) {
             Ok(msgs) => {
@@ -366,6 +382,191 @@ fn ensure_root_folder(config: &ReconcileConfig, rf: &RootFolder) -> anyhow::Resu
     Ok(true)
 }
 
+/// The preferences blob qBittorrent's `setPreferences` is given.
+///
+/// Extracted so the body can be asserted directly. `auto_tmm_enabled` is
+/// the half of defect 2 that is easy to miss: a category only tells
+/// qBittorrent WHERE a torrent should go, and with Torrent Management Mode
+/// left at its default of Manual it ignores that and uses the global save
+/// path, so every torrent lands flat in `<mediaDir>/torrents` no matter
+/// what the *arr tagged it with. TRaSH says so outright -- "Ensure 'Torrent
+/// Management Mode' is set to 'Automatic' -- Your downloads will not go
+/// into the category folder otherwise" (qBittorrent Basic Setup, fetched
+/// 2026-10-07).
+///
+/// Deliberately NOT set here: `category_changed_tmm_enabled` and
+/// `save_path_changed_tmm_enabled`, which decide whether qBittorrent
+/// RELOCATES torrents it already has when a path or category changes. Those
+/// move files on a live host; ferrum has no business flipping them, and
+/// leaving them at qBittorrent's own defaults is what keeps this change
+/// forward-only. `auto_tmm_enabled` governs newly added torrents, so
+/// everything already seeding keeps the save path it has.
+///
+/// # Arguments
+/// * `dp` - the download paths Nix derived for qBittorrent.
+///
+/// # Returns
+/// The JSON blob, ready to be form-encoded under the `json` field.
+fn qbittorrent_preferences(dp: &DownloadPath) -> serde_json::Value {
+    let mut prefs = serde_json::json!({
+        "save_path": dp.path,
+        "auto_tmm_enabled": true,
+    });
+    if let Some(inc) = &dp.incomplete_path {
+        prefs["temp_path"] = serde_json::json!(inc);
+        prefs["temp_path_enabled"] = serde_json::json!(true);
+    }
+    prefs
+}
+
+/// One qBittorrent category and the directory it routes torrents into.
+#[derive(Debug, PartialEq, Eq)]
+struct QbtCategory {
+    name: String,
+    save_path: String,
+}
+
+/// Every category qBittorrent must itself hold, and where each one saves.
+///
+/// A category registered on the *arr side only TAGS a torrent. For
+/// qBittorrent to route it, the category has to exist in qBittorrent with a
+/// save path -- and on the owner's host `categories.json` was empty, so
+/// everything landed flat in `<mediaDir>/torrents`.
+///
+/// Derived here rather than configured separately, from the two facts Nix
+/// already supplies: the categories its consumers register, and the
+/// download root Nix already tells qBittorrent to use. So the category's
+/// save path and the category's name come from the same pair of values that
+/// produced the *arr-side registration and the directory on disk -- there is
+/// no third place for them to disagree from.
+///
+/// # Arguments
+/// * `config` - the whole reconcile config.
+///
+/// # Returns
+/// The wanted categories, deduplicated and in a stable order. Empty when
+/// qBittorrent is not enabled, has no download path, or no enabled consumer
+/// registers a category with it.
+fn wanted_qbittorrent_categories(config: &ReconcileConfig) -> Vec<QbtCategory> {
+    let Some(root) = config
+        .download_paths
+        .iter()
+        .find(|dp| dp.app == "qbittorrent")
+        .map(|dp| dp.path.as_str())
+    else {
+        return Vec::new();
+    };
+
+    let mut names: Vec<&str> = config
+        .pairs
+        .iter()
+        .filter(|p| p.kind == "downloadClient" && p.provider == "qbittorrent")
+        .filter_map(|p| pair_category(p))
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+
+    names
+        .into_iter()
+        .map(|name| QbtCategory {
+            save_path: format!("{root}/{name}"),
+            name: name.to_string(),
+        })
+        .collect()
+}
+
+/// What to do about one wanted category, given what qBittorrent already has.
+#[derive(Debug, PartialEq, Eq)]
+enum QbtCategoryAction {
+    /// Absent -- create it.
+    Create,
+    /// Present but routing somewhere else -- repoint it.
+    Repoint,
+    /// Already correct.
+    Nothing,
+}
+
+/// Decides create / repoint / nothing for one category.
+///
+/// Separated from the HTTP so the decision can be tested without a running
+/// qBittorrent. `Nothing` is the one that matters most: this runs after
+/// every apply, so a category that is already right must produce no call at
+/// all.
+///
+/// # Arguments
+/// * `existing` - qBittorrent's own `/torrents/categories` map.
+/// * `wanted` - one category and the path it should save to.
+///
+/// # Returns
+/// The action to take.
+fn qbittorrent_category_action(
+    existing: &serde_json::Value,
+    wanted: &QbtCategory,
+) -> QbtCategoryAction {
+    let Some(entry) = existing.get(&wanted.name) else {
+        return QbtCategoryAction::Create;
+    };
+    // qBittorrent reports the save path as "" for a category created with
+    // none, which is not the same as the path we want.
+    let current = entry.get("savePath").and_then(|p| p.as_str()).unwrap_or("");
+    if current == wanted.save_path {
+        QbtCategoryAction::Nothing
+    } else {
+        QbtCategoryAction::Repoint
+    }
+}
+
+/// Creates or repoints every category qBittorrent needs.
+///
+/// Runs after `set_download_path`, because a category's save path is built
+/// from the download root that call establishes.
+///
+/// # Arguments
+/// * `config` - the whole reconcile config.
+///
+/// # Returns
+/// One line per category acted on, for the unit's log.
+///
+/// # Errors
+/// When qBittorrent's API refuses a call. Not when there is nothing to do.
+fn ensure_qbittorrent_categories(config: &ReconcileConfig) -> anyhow::Result<Vec<String>> {
+    let wanted = wanted_qbittorrent_categories(config);
+    if wanted.is_empty() {
+        return Ok(Vec::new());
+    }
+    let app = config
+        .apps
+        .get("qbittorrent")
+        .ok_or_else(|| anyhow::anyhow!("categories are wanted for qbittorrent, which is not an app on this host"))?;
+    let base = base_url(app);
+
+    // LocalHostAuth is off, so no credential is needed from localhost --
+    // the same reason set_download_path's qBittorrent arm sends none.
+    let existing: serde_json::Value = ureq::get(&format!("{base}/api/v2/torrents/categories"))
+        .call()
+        .map_err(|e| anyhow::anyhow!("GET qBittorrent categories failed: {e}"))?
+        .into_json()
+        .map_err(|e| anyhow::anyhow!("qBittorrent categories returned invalid JSON: {e}"))?;
+
+    let mut done = Vec::new();
+    for cat in &wanted {
+        // createCategory returns 409 on a name that exists and
+        // editCategory returns 409 on one that does not, so which endpoint
+        // to call is decided from what is actually there rather than by
+        // calling one and swallowing its error.
+        let endpoint = match qbittorrent_category_action(&existing, cat) {
+            QbtCategoryAction::Nothing => continue,
+            QbtCategoryAction::Create => "createCategory",
+            QbtCategoryAction::Repoint => "editCategory",
+        };
+        ureq::post(&format!("{base}/api/v2/torrents/{endpoint}"))
+            .send_form(&[("category", cat.name.as_str()), ("savePath", cat.save_path.as_str())])
+            .map_err(|e| anyhow::anyhow!("qBittorrent {endpoint} '{}' failed: {e}", cat.name))?;
+        done.push(format!("{} -> {}", cat.name, cat.save_path));
+    }
+    Ok(done)
+}
+
 /// Points a download client at the shared media root.
 ///
 /// Both clients are driven through their own APIs rather than by writing
@@ -406,13 +607,8 @@ fn set_download_path(config: &ReconcileConfig, dp: &DownloadPath) -> anyhow::Res
         // from localhost. setPreferences takes a JSON blob as a form
         // field, which is its own peculiar shape rather than a JSON body.
         "qbittorrent" => {
-            let mut prefs = serde_json::json!({ "save_path": dp.path });
-            if let Some(inc) = &dp.incomplete_path {
-                prefs["temp_path"] = serde_json::json!(inc);
-                prefs["temp_path_enabled"] = serde_json::json!(true);
-            }
             ureq::post(&format!("{base}/api/v2/app/setPreferences"))
-                .send_form(&[("json", &prefs.to_string())])
+                .send_form(&[("json", &qbittorrent_preferences(dp).to_string())])
                 .map_err(|e| anyhow::anyhow!("qBittorrent setPreferences failed: {e}"))?;
             Ok(())
         }
@@ -1394,6 +1590,138 @@ mod tests {
             snake.root_folders.is_empty() && snake.download_paths.is_empty(),
             "a key name this binary does not read is dropped without a word"
         );
+    }
+
+    /// THE DEFECT. `categories.json` on the owner's host was empty, so
+    /// qBittorrent was on Manual torrent management and everything landed
+    /// flat in `torrents/`. A category registered on the *arr side only
+    /// TAGS a torrent; for qBittorrent to ROUTE it, the category has to
+    /// exist in qBittorrent with a save path.
+    ///
+    /// Both halves of each entry are derived from values Nix already
+    /// supplies -- the pair's category and qBittorrent's own download root
+    /// -- so the category's save path cannot drift from the directory the
+    /// tree has or from the category the *arr registers.
+    #[test]
+    fn qbittorrent_gets_a_category_per_consumer_pointing_at_its_directory() {
+        let wanted = wanted_qbittorrent_categories(&real_shaped_config());
+        assert_eq!(
+            wanted,
+            vec![
+                QbtCategory { name: "movies".into(), save_path: "/data/torrents/movies".into() },
+                QbtCategory { name: "tv".into(), save_path: "/data/torrents/tv".into() },
+            ],
+            "qBittorrent must hold one category per library category, each routing to its own directory"
+        );
+    }
+
+    /// Prowlarr's null category must not become a category named "null",
+    /// an empty-named one, or `/data/torrents/`.
+    #[test]
+    fn a_consumer_with_no_category_contributes_none() {
+        let wanted = wanted_qbittorrent_categories(&real_shaped_config());
+        assert!(
+            wanted.iter().all(|c| !c.name.is_empty() && c.name != "null"),
+            "a null category leaked into qBittorrent: {wanted:?}"
+        );
+        assert!(
+            wanted.iter().all(|c| !c.save_path.ends_with('/')),
+            "a category routes at the download root itself: {wanted:?}"
+        );
+    }
+
+    /// SABnzbd's categories are SABnzbd's problem
+    /// (`ensure_sabnzbd_category`). A pair whose provider is sabnzbd must
+    /// not produce a qBittorrent category, or the two clients' category
+    /// lists would mirror each other for no reason.
+    #[test]
+    fn only_pairs_whose_provider_is_qbittorrent_count() {
+        let mut config = real_shaped_config();
+        config.pairs.retain(|p| p.provider == "sabnzbd");
+        assert!(
+            wanted_qbittorrent_categories(&config).is_empty(),
+            "sabnzbd pairs produced qBittorrent categories"
+        );
+    }
+
+    /// With qBittorrent not enabled there is no download root to build a
+    /// save path from, and nothing to create categories in.
+    #[test]
+    fn no_qbittorrent_download_path_means_no_categories() {
+        let mut config = real_shaped_config();
+        config.download_paths.retain(|dp| dp.app != "qbittorrent");
+        assert!(wanted_qbittorrent_categories(&config).is_empty());
+    }
+
+    /// create / repoint / nothing, and the `Nothing` arm is the one that
+    /// keeps this from becoming two HTTP calls on every apply forever.
+    #[test]
+    fn a_category_is_created_repointed_or_left_alone() {
+        let tv = QbtCategory { name: "tv".into(), save_path: "/data/torrents/tv".into() };
+
+        let empty = serde_json::json!({});
+        assert_eq!(qbittorrent_category_action(&empty, &tv), QbtCategoryAction::Create);
+
+        // The live-host state: a category that exists with no save path at
+        // all, which routes nowhere.
+        let pathless = serde_json::json!({ "tv": { "name": "tv", "savePath": "" } });
+        assert_eq!(qbittorrent_category_action(&pathless, &tv), QbtCategoryAction::Repoint);
+
+        let elsewhere =
+            serde_json::json!({ "tv": { "name": "tv", "savePath": "/mnt/old/tv" } });
+        assert_eq!(qbittorrent_category_action(&elsewhere, &tv), QbtCategoryAction::Repoint);
+
+        let correct =
+            serde_json::json!({ "tv": { "name": "tv", "savePath": "/data/torrents/tv" } });
+        assert_eq!(qbittorrent_category_action(&correct, &tv), QbtCategoryAction::Nothing);
+
+        // Another category being right says nothing about this one.
+        let other =
+            serde_json::json!({ "movies": { "name": "movies", "savePath": "/data/torrents/movies" } });
+        assert_eq!(qbittorrent_category_action(&other, &tv), QbtCategoryAction::Create);
+    }
+
+    /// The other half of defect 2, and the half that is easy to miss: with
+    /// Torrent Management Mode left at qBittorrent's default of Manual, a
+    /// categorised torrent still uses the global save path, so the
+    /// categories above would exist and route nothing.
+    #[test]
+    fn qbittorrent_is_put_into_automatic_torrent_management() {
+        let dp = DownloadPath {
+            app: "qbittorrent".into(),
+            path: "/data/torrents".into(),
+            incomplete_path: None,
+        };
+        let prefs = qbittorrent_preferences(&dp);
+        assert_eq!(
+            prefs["auto_tmm_enabled"],
+            serde_json::json!(true),
+            "without Automatic mode the categories route nothing: {prefs}"
+        );
+        assert_eq!(prefs["save_path"], serde_json::json!("/data/torrents"));
+    }
+
+    /// And it does NOT touch the two preferences that would relocate
+    /// torrents the host already has. Those move files on a live box;
+    /// `auto_tmm_enabled` governs newly added torrents only, which is what
+    /// makes this change forward-only.
+    #[test]
+    fn nothing_that_relocates_existing_torrents_is_touched() {
+        let dp = DownloadPath {
+            app: "qbittorrent".into(),
+            path: "/data/torrents".into(),
+            incomplete_path: Some("/data/incomplete".into()),
+        };
+        let prefs = qbittorrent_preferences(&dp);
+        for key in ["category_changed_tmm_enabled", "save_path_changed_tmm_enabled"] {
+            assert!(
+                prefs.get(key).is_none(),
+                "{key} would relocate torrents this host already has: {prefs}"
+            );
+        }
+        // The temp-path handling this replaced must still be there.
+        assert_eq!(prefs["temp_path"], serde_json::json!("/data/incomplete"));
+        assert_eq!(prefs["temp_path_enabled"], serde_json::json!(true));
     }
 
     #[test]

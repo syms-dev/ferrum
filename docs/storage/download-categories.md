@@ -34,6 +34,34 @@ would file a manually-grabbed album under television. With no category the
 client's own default applies, which is the **root** of its download tree, and
 ferrum creates that too.
 
+## qBittorrent needs the category too
+
+A category registered on the \*arr side only **tags** a torrent. For
+qBittorrent to **route** it, the category has to exist in qBittorrent with a
+save path — and two things were missing:
+
+1. **No categories at all.** `categories.json` on the owner's host was empty.
+   `ferrum-reconcile` now creates one category per consumer category, each
+   saving to that category's directory under qBittorrent's own download root
+   (`ensure_qbittorrent_categories`). Both halves come from values Nix already
+   supplies — the pair's category and the download path — so the save path
+   cannot drift from the directory the tree has.
+2. **Manual torrent management.** With Torrent Management Mode left at
+   qBittorrent's default of Manual, a categorised torrent still uses the
+   global save path, so the categories would exist and route nothing. ferrum
+   now sets `auto_tmm_enabled`.
+
+Deliberately **not** set: `category_changed_tmm_enabled` and
+`save_path_changed_tmm_enabled`, which decide whether qBittorrent *relocates*
+torrents it already has when a path or category changes. Those move files on a
+live host. `auto_tmm_enabled` governs newly added torrents only, so everything
+already seeding keeps the save path it has and every hardlink an \*arr has
+already made stays intact.
+
+SABnzbd needs none of this: it was already given its category over the API
+before each registration (`ensure_sabnzbd_category`), and it routes by
+category unconditionally.
+
 ## Upgrading an existing host
 
 Before this fix the categories were the \*arr app ids (`sonarr`, `radarr`,
@@ -50,8 +78,10 @@ already under way:
   under the old category completes into the old directory and imports
   normally.
 - **Already-seeding torrents keep their save path.** A category only decides
-  where a *newly added* torrent is saved. Existing torrents, and the hardlinks
-  the \*arrs made from them, are untouched.
+  where a *newly added* torrent is saved, and ferrum does not turn on either
+  of the preferences that would make qBittorrent relocate what it already
+  holds. Existing torrents, and the hardlinks the \*arrs made from them, are
+  untouched.
 - **No migration is run, and none is needed.** What remains is cosmetic: the
   old `torrents/sonarr` and `usenet/complete/sonarr` directories (empty once
   their last job imports), and the stale `sonarr`/`radarr`/`prowlarr` category
