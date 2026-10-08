@@ -211,10 +211,35 @@ in
       # so that an operator pointing Plex at a library finds it already
       # there, and so every app agrees on where things go without anyone
       # configuring a path by hand.
-      "d ${cfg.mediaDir} 0775 root ${cfg.mediaGroup} - -"
+      #
+      # 2775, NOT 0775: the leading 2 is setgid, and it is half of what
+      # makes this tree genuinely shared.
+      #
+      # ferrum runs each app as its own user and puts them all in
+      # ${cfg.mediaGroup} -- which is TRaSH's recommended layout, and which
+      # buys nothing on its own. Without setgid, a job directory SABnzbd
+      # creates under usenet/complete/ inherits SABnzbd's OWN primary group
+      # (sabnzbd), not this one, so Sonarr is not in the group that owns it.
+      # Sonarr can still traverse and read it, which means a hardlink import
+      # SUCCEEDS -- link() needs read on the source and write on the
+      # destination directory, and media/ is group-writable. What Sonarr
+      # cannot do is unlink the download copy afterwards, because deleting
+      # needs write on the CONTAINING directory. So nothing ever fails;
+      # undeletable leftovers accumulate in the download tree, invisibly,
+      # until a disk fills.
+      #
+      # The other half is `UMask = "0002"` on every unit in this group (see
+      # each app's service.nix): setgid decides the GROUP a new file gets,
+      # the umask decides whether that group may write to it. Either alone
+      # leaves the same hole. checks.media-writers-share-their-group asserts
+      # both, from the rendered units and these rendered rules.
+      #
+      # Confirmed against the owner's live host, which had neither: the tree
+      # was drwxrwxr-x and `grep -rn UMask modules/` returned nothing.
+      "d ${cfg.mediaDir} 2775 root ${cfg.mediaGroup} - -"
     ]
     ++ lib.concatMap
-      (root: map (sub: "d ${root}/${sub} 0775 root ${cfg.mediaGroup} - -") trashSubdirs)
+      (root: map (sub: "d ${root}/${sub} 2775 root ${cfg.mediaGroup} - -") trashSubdirs)
       treeRoots
     ++ [
       "d ${cfg.journalDir} 0750 root ${ferrumdGroup} - -"
@@ -263,7 +288,7 @@ in
           only at boot (see modules/proxy/authelia.nix:102-104), so a
           colliding value is not a one-time boot failure: it is re-applied in
           the middle of every apply, forever. journalDir = mediaDir would flip
-          the media tree from 0775 root:${cfg.mediaGroup} to 0750
+          the media tree from 2775 root:${cfg.mediaGroup} to 0750
           root:${ferrumdGroup} and break every app; journalDir = stateDir
           would regroup the state subvolume root; journalDir =
           /var/lib/ferrum collides with the rule declared above. The default

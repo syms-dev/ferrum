@@ -2757,6 +2757,148 @@
           echo "checked $checked download-client categories against the tree this host creates" > $out
         '';
 
+      # THE SHARED MEDIA TREE IS ACTUALLY SHARED.
+      #
+      # ferrum already had two thirds of TRaSH's recommended permissions
+      # recipe: a separate user per app, all of them in one media group. The
+      # third third was missing entirely -- no unit set `UMask`, and the tree
+      # was created 0775 rather than setgid 2775. Confirmed on the owner's
+      # host: `grep -rn UMask modules/` returned nothing, and the live tree
+      # was drwxrwxr-x.
+      #
+      # The consequence is specific and silent. systemd's default umask is
+      # 0022, so a job directory SABnzbd creates inside the download tree
+      # comes out 0755 sabnzbd:sabnzbd. Sonarr is in the media group but not
+      # in sabnzbd's, so it can traverse and read -- a hardlink import still
+      # SUCCEEDS, because link() needs read on the source and write on the
+      # destination directory. What it cannot do is unlink the download copy
+      # afterwards, because deleting needs write on the CONTAINING directory.
+      # So nothing ever fails; undeletable leftovers simply accumulate.
+      #
+      # Both halves are needed and neither is sufficient: `UMask 002` gives
+      # the group the write bit, and setgid is what gives new directories the
+      # shared GROUP rather than the creating user's own primary group. This
+      # check asserts both, from the rendered units and the rendered tmpfiles
+      # rules of one real host, and it asserts the apps that must NOT have
+      # them don't -- an all-apps rule would pass by accident.
+      mediaWritersShareTheirGroup =
+        let
+          host = ferrumLib.mkHost {
+            inherit system;
+            settings = {
+              schemaVersion = realMigrations.currentVersion;
+              apps = {
+                sonarr.enable = true;
+                radarr.enable = true;
+                prowlarr.enable = true;
+                qbittorrent.enable = true;
+                sabnzbd.enable = true;
+                # Both media servers, because they are the two apps whose
+                # upstream nixpkgs modules have their own opinion about
+                # UMask -- jellyfin's is 0077, which is stricter than
+                # systemd's default and makes its writes into the shared
+                # tree unreadable by the group entirely.
+                jellyfin.enable = true;
+                plex.enable = true;
+              };
+            };
+            modules = [ ../../../examples/hosts/minimal/configuration.nix ];
+          };
+          hcfg = host.config;
+          mediaDir = hcfg.ferrum.storage.mediaDir;
+
+          enabled = lib.filterAttrs (_: a: a.enable) hcfg.ferrum.apps;
+          # The predicate is the SAME one each service.nix already uses to
+          # decide media-group membership. A unit in the media group is a
+          # unit that can create files in the shared tree, so the umask that
+          # makes those files group-writable belongs to exactly that set --
+          # one predicate reused, not a second one invented.
+          inTheMediaGroup = lib.filterAttrs (_: a: a.mediaAccess != "none") enabled;
+          outOfIt = lib.filterAttrs (_: a: a.mediaAccess == "none") enabled;
+
+          # id -> the UMask its unit really renders, or a marker. "no unit"
+          # matters: a catalog app whose systemd unit is not named after it
+          # would otherwise be silently reported as compliant.
+          umaskOf = id:
+            if !(hcfg.systemd.services ? ${id}) then "NO-UNIT"
+            else hcfg.systemd.services.${id}.serviceConfig.UMask or "UNSET";
+
+          report = ids: lib.concatStringsSep "\n" (map (id: "${id} ${umaskOf id}") ids);
+
+          # Every `d` rule this host declares for the media tree, as
+          # "<path> <mode>".
+          mediaModes = lib.concatStringsSep "\n" (lib.concatMap
+            (rule:
+              let f = builtins.filter (x: builtins.isString x && x != "") (builtins.split "[ ]+" rule); in
+              if builtins.length f >= 3 && builtins.head f == "d"
+                && (builtins.elemAt f 1 == mediaDir || lib.hasPrefix "${mediaDir}/" (builtins.elemAt f 1))
+              then [ "${builtins.elemAt f 1} ${builtins.elemAt f 2}" ]
+              else [ ])
+            hcfg.systemd.tmpfiles.rules);
+        in
+        pkgs.runCommand "ferrum-check-media-permissions"
+          {
+            writers = report (builtins.attrNames inTheMediaGroup);
+            nonWriters = report (builtins.attrNames outOfIt);
+            inherit mediaModes mediaDir;
+          } ''
+          set -eu
+          fail() {
+            echo "media-permissions check: $1" >&2
+            echo "--- apps in the media group ---" >&2; echo "$writers" >&2
+            echo "--- apps not in it ---" >&2; echo "$nonWriters" >&2
+            echo "--- media tree modes ---" >&2; echo "$mediaModes" >&2
+            exit 1
+          }
+
+          # --- half 1: UMask on exactly the units that share the tree ----
+          [ -n "$writers" ] || fail "no app on this host is in the media group, so nothing was checked"
+          n=0
+          while read -r id umask; do
+            [ -n "$id" ] || continue
+            case "$umask" in
+              0002) ;;
+              NO-UNIT) fail "$id is in the media group but has no systemd unit of its own name, so this check cannot see what it runs with" ;;
+              UNSET) fail "$id writes into the shared tree with no UMask, so systemd's default 0022 applies: every file and directory it creates is group-READ-only, and the other apps can never delete inside it" ;;
+              *) fail "$id runs with UMask $umask; the shared tree needs 0002" ;;
+            esac
+            n=$((n + 1))
+          done <<WRITERS
+          $writers
+          WRITERS
+          [ "$n" -ge 4 ] || fail "only $n media-writing apps were checked; this host enables more than that"
+
+          # Negative control. An app with no media access is not in the
+          # group and has no business loosening its umask -- and if the rule
+          # were "every app", half 1 above would pass by accident.
+          while read -r id umask; do
+            [ -n "$id" ] || continue
+            [ "$umask" = "UNSET" ] \
+              || fail "$id has mediaAccess = none, so it is not in the media group, yet it runs with UMask $umask"
+          done <<OTHERS
+          $nonWriters
+          OTHERS
+          case "$nonWriters" in
+            *prowlarr*) ;;
+            *) fail "the negative control examined nothing: prowlarr (mediaAccess = none) is not in the list" ;;
+          esac
+
+          # --- half 2: the tree is setgid -------------------------------
+          [ -n "$mediaModes" ] || fail "this host declares no tmpfiles rule under $mediaDir at all"
+          m=0
+          while read -r path mode; do
+            [ -n "$path" ] || continue
+            [ "$mode" = "2775" ] \
+              || fail "$path is created $mode. Without the setgid bit a directory a download client creates under it inherits the CLIENT's primary group, not the media group -- so the umask above buys nothing and the other apps still cannot delete inside it."
+            m=$((m + 1))
+          done <<MODES
+          $mediaModes
+          MODES
+          [ "$m" -ge 10 ] || fail "only $m media directories were examined; the TRaSH layout has more than that"
+
+          echo "checked $n media-writing units and $m media directories" > $out
+        '';
+
       # modules/proxy/dns.nix decides WHICH hostnames ferrum publishes a
       # record for, and that decision was proven correct exactly once -- by
       # hand-evaluating ferrumDnsConfig and reading the JSON. That is good
@@ -7754,6 +7896,12 @@
         # ferrum creates are one value from one source, and this is what
         # fails the build if they ever stop being.
         category-and-directory-cannot-diverge = categoryAndDirectoryCannotDiverge;
+
+        # Every app that writes into the shared media tree does so with
+        # UMask 0002, and the tree is setgid -- the two thirds of TRaSH's
+        # permissions recipe ferrum had adopted the users and the group for
+        # and then left out.
+        media-writers-share-their-group = mediaWritersShareTheirGroup;
       };
     };
 }

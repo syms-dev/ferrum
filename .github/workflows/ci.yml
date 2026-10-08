@@ -61,6 +61,7 @@ jobs:
             .#checks.x86_64-linux.ddns-updater-needs-no-static-address \
             .#checks.x86_64-linux.root-folders-reach-the-apps \
             .#checks.x86_64-linux.category-and-directory-cannot-diverge \
+            .#checks.x86_64-linux.media-writers-share-their-group \
             .#checks.x86_64-linux.wireguard-config-with-many-addresses \
             .#checks.x86_64-linux.netns-apps-are-proxied-reachably \
             .#checks.x86_64-linux.migration-mechanism \
