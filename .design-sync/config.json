@@ -1,0 +1,33 @@
+{
+  "projectId": "3cc6fd5c-713c-4d14-af66-10590d2688b6",
+  "shape": "package",
+  "pkg": "@ferrum/ui-kit",
+  "globalName": "FerrumUiKit",
+  "buildCmd": "npm --prefix ui-kit run build",
+  "cssEntry": "dist/styles.css",
+  "overrides": {
+    "SchemaField": {
+      "cardMode": "column"
+    },
+    "ConfirmErase": {
+      "cardMode": "single",
+      "viewport": "760x560"
+    },
+    "UpdateList": {
+      "cardMode": "column"
+    },
+    "DriftPanel": {
+      "cardMode": "column"
+    },
+    "VpnSettings": {
+      "cardMode": "column"
+    },
+    "StepRail": {
+      "cardMode": "column"
+    },
+    "RiskySetting": {
+      "cardMode": "column"
+    }
+  },
+  "readmeHeader": ".design-sync/conventions.md"
+}

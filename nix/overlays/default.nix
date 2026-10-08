@@ -1,5 +1,5 @@
 # The pure ferrum overlay: pkgs.ferrum-apply, pkgs.ferrum-reconcile,
-# pkgs.ferrumd, and pkgs.ferrum-testapp.
+# pkgs.ferrumd, pkgs.ferrum-testapp, and pkgs.decluttarr.
 #
 # Single source of truth, imported from both nix/modules/flake/overlays.nix
 # (the flake's own `overlays.default` output) and modules/core/overlays.nix
@@ -14,6 +14,20 @@ final: prev: {
   # real host, long after the package itself builds fine.
   ferrumd = final.callPackage ../pkgs/ferrumd { };
   ferrum-testapp = final.callPackage ../pkgs/testapp { };
+  # modules/core/daemon.nix reads pkgs.ferrum-ui for FERRUM_UI_DIR. The task
+  # plan lists only nix/modules/flake/packages.nix for this package, which
+  # would have reproduced the exact gap the ferrumd comment above describes
+  # and that ferrum-catalog hit in Phase 1.5b Task 2 -- builds fine, fails on
+  # every real host eval. Added here deliberately, not incidentally.
+  ferrum-ui = final.callPackage ../pkgs/ferrum-ui {
+    uiSrc = ../../ui;
+  };
+  # The one catalog app whose upstream is neither in nixpkgs nor on PyPI, so
+  # ferrum has to build it. modules/apps/decluttarr/service.nix references
+  # pkgs.decluttarr, which is exactly the shape of the gap the ferrumd comment
+  # above describes -- defining it only in nix/modules/flake/packages.nix
+  # builds fine and fails on every real host eval.
+  decluttarr = final.callPackage ../pkgs/decluttarr { };
   ferrum-settings-schema = final.writeTextFile {
     name = "ferrum-settings-schema.json";
     destination = "/share/ferrum/settings-schema.json";

@@ -1,0 +1,13 @@
+.fk-field { margin-bottom: 1rem; }
+.fk-field-label { display: block; font-weight: 600; margin-bottom: .25rem; }
+.fk-field input[type="text"], .fk-field input[type="number"], .fk-field select {
+  font: inherit; padding: .5rem .6rem; border-radius: var(--ferrum-radius-sm);
+  border: 1px solid var(--ferrum-line); background: var(--ferrum-panel);
+  color: var(--ferrum-text); width: 100%; max-width: 26rem;
+}
+.fk-field input:focus-visible, .fk-field select:focus-visible {
+  outline: 3px solid var(--ferrum-accent); outline-offset: 1px;
+}
+.fk-field-note { color: var(--ferrum-muted); font-size: .9rem; margin: .25rem 0 0; max-width: 60ch; }
+.fk-field[data-unsupported="true"] .fk-field-note { color: var(--ferrum-danger); }
+.fk-field code { font-family: var(--ferrum-mono); }

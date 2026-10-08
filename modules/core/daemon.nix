@@ -10,8 +10,135 @@
 { config, lib, pkgs, ... }:
 let
   ferrum = config.ferrum;
+
+  listenAddress = ferrum.daemon.listenAddress;
+
+  # R5. Single sign-on exists only where the dashboard is published AND
+  # Authelia is on -- the same `daemonPublished` predicate every other
+  # consumer reads (modules/proxy/lib.nix), so the vhost, the Authelia cookie
+  # scope, the certificate, the DNS record and this all appear and disappear
+  # together. One definition rather than a sixth re-spelling of the condition.
+  proxyLib = import ../proxy/lib.nix { inherit lib; };
+  ssoEnabled = proxyLib.daemonPublished ferrum && ferrum.auth.enable;
+
+  # Where each ENABLED app actually listens, for ferrumd's per-app health
+  # probe (crates/ferrumd/src/app_health.rs).
+  #
+  # The FOURTH consumer of modules/lib/app-address.nix, and read from it for
+  # the reason that file's header gives in as many words: "a THIRD consumer
+  # that hand-copies 127.0.0.1 fails there instead of in the field". nginx was
+  # the consumer that hand-copied it, Decluttarr was the third, and a health
+  # probe is the worst possible place for a fourth -- it would report
+  # qBittorrent as DOWN on every VPN host, because the WebUI binds inside the
+  # qbt-vpn namespace and nothing answers at 127.0.0.1:8090 in the root one.
+  # A status that is wrong in the reassuring direction is bad; one that is
+  # wrong in the alarming direction sends an operator to debug a perfectly
+  # healthy app.
+  #
+  # Rendered as `host:port` rather than as a host alone, by that file's own
+  # `addressFor`, so the PORT comes from the shared source too. The port is
+  # not simply `app.port`: Plex and Jellyfin carry the catalog's
+  # `portIsFixed` mark because they cannot honour that option at any layer,
+  # and a probe built on the operator's value would report a perfectly
+  # healthy Plex as refused. See `portFor` in modules/lib/app-address.nix.
+  #
+  # Only enabled apps appear. ferrumd reports an enabled app that is absent
+  # from this table as `address-unknown` and dials nothing -- it has NO
+  # loopback fallback, deliberately, because a fallback is precisely the
+  # hand-copied 127.0.0.1 this file exists to avoid.
+  appAddress = (import ../lib/app-address.nix { inherit lib; }).addressFor
+    (import ../lib/catalog.nix { inherit lib; }) ferrum;
+  appAddresses = lib.mapAttrs
+    (id: _: appAddress id)
+    (lib.filterAttrs (_: app: app.enable) ferrum.apps);
+
+  # 127.0.0.0/8 by its first octet, plus the two other spellings of the
+  # same thing. Split rather than prefix-matched so that "127.0.0.1.example"
+  # -- a string that starts with "127." and is not an address at all -- is
+  # not quietly admitted.
+  octets = lib.splitString "." listenAddress;
+  # Each part must be a NUMBER, and that is not a detail. Until this
+  # function existed the guard checked only how many parts there were and
+  # what the first one said, which made it a shape heuristic rather than an
+  # address parse -- and the difference was exploitable. Split
+  # `127.0.0.1 ; return 200 "pwned" ; #` on "." and you get four parts whose
+  # head is "127", so the old predicate accepted it; modules/proxy/nginx.nix
+  # then interpolated the whole string into proxy_pass, real nginx parsed
+  # the result with EXIT 0, and the control plane's own vhost answered
+  # `HTTP/1.1 200` with the attacker's body. Proved end to end, with a real
+  # nginx, before this line was written.
+  #
+  # builtins.match anchors implicitly -- it matches the WHOLE string or
+  # returns null -- which is the property doing the work here: no suffix
+  # after a valid number can survive, whether it starts with a space, a
+  # semicolon or a newline.
+  #
+  # Leading zeros are refused rather than tolerated because "127.010.0.1" is
+  # read as decimal by some resolvers and octal by others, and an address
+  # whose meaning depends on who parses it has no place in a guard whose
+  # entire job is that two programs agree on one.
+  isOctet = part:
+    builtins.match "0|[1-9][0-9]{0,2}" part != null && lib.toInt part <= 255;
+  # "localhost" is deliberately NOT here, and it is the one spelling that
+  # looks safest. It is a NAME, so the two consumers of this option resolve
+  # it differently and neither is wrong: nginx resolves it once at config
+  # load and load-balances across every address /etc/hosts offers -- on a
+  # stock host that is ::1 AND 127.0.0.1 -- while ferrumd's
+  # TcpListener::bind (crates/ferrumd/src/main.rs:585) takes the FIRST
+  # address its resolver returns and binds only that one. Measured:
+  # "localhost:7788".to_socket_addrs() yields [[::1]:7788, 127.0.0.1:7788],
+  # so nginx sends roughly half the dashboard's requests at a port nothing
+  # is listening on. That is an intermittent 502 whose cause is in neither
+  # program's logs -- strictly worse than the clean refusal an operator gets
+  # from any other name, and the reason this accepts literals only.
+  listenIsLoopback =
+    (builtins.length octets == 4
+      && builtins.head octets == "127"
+      && builtins.all isOctet octets)
+    || listenAddress == "::1";
 in
 lib.mkIf ferrum.daemon.enable {
+  assertions = [
+    {
+      # A5, enforced rather than merely described.
+      #
+      # modules/lib/settings-schema.json types daemon.listenAddress as a
+      # bare { "type": "string" }, and ferrumd's own PUT /api/settings
+      # validates against that schema -- so the web UI could write
+      # "0.0.0.0" into /etc/ferrum/settings.json, the next apply would
+      # build cleanly, and the daemon would come up on every interface
+      # with Authelia and nginx bypassed entirely. Nothing in either
+      # language said otherwise: changing the default in
+      # crates/ferrumd/src/main.rs left all 103 of that crate's tests
+      # green, and no Nix check varied the option at all.
+      #
+      # Caught here, at evaluation, because that is the last moment it is
+      # cheap. ferrumd itself cannot refuse the value it is handed: by the
+      # time the process reads FERRUMD_LISTEN_ADDRESS the host is built and
+      # the generation is being activated, so the only thing it could do is
+      # fail to start -- which takes the UI away instead of protecting it.
+      assertion = listenIsLoopback;
+      message = ''
+        ferrum.daemon.listenAddress = "${listenAddress}" is not a loopback address.
+        ferrumd holds this host's settings, its secrets API and its system
+        generations, and the only login in front of it is Authelia, in nginx
+        (modules/proxy/nginx.nix). Binding anything else puts the control
+        plane on the network with that gate bypassed.
+
+        Publishing the dashboard is what ferrum.daemon.subdomain and
+        ferrum.proxy are for: nginx reaches ferrumd over loopback and gates
+        it there. Set ferrum.daemon.listenAddress to 127.0.0.1 (or another
+        127.0.0.0/8 address, or ::1), and reach the UI from elsewhere either
+        through the proxy or over an SSH tunnel to that port.
+
+        This wants a literal, so "localhost" is refused too even though it
+        resolves to one. nginx load-balances across every address the name
+        resolves to and ferrumd binds only the first, so that spelling costs
+        you intermittent 502s instead of a clean failure.
+      '';
+    }
+  ];
+
   users.users.ferrum = {
     isSystemUser = true;
     group = "ferrum";
@@ -165,6 +292,55 @@ lib.mkIf ferrum.daemon.enable {
       FERRUM_JOBS_DIR = "/var/lib/ferrum/jobs";
       FERRUM_REQUESTS_DIR = "/run/ferrum/requests";
       FERRUM_SETTINGS_SCHEMA = "${pkgs.ferrum-settings-schema}/share/ferrum/settings-schema.json";
+      # The per-app metadata GET /api/catalog serves. Built since Phase 1.1
+      # and, until now, consumed by nothing -- nix/modules/flake/packages.nix
+      # said so in its own header comment.
+      FERRUM_CATALOG = "${pkgs.ferrum-catalog}/share/ferrum/catalog.json";
+      # `{"<app id>": "<host>:<port>"}` for every enabled app, from
+      # modules/lib/app-address.nix. See `appAddresses` above for why this is
+      # derived rather than assumed, and crates/ferrumd/src/app_health.rs for
+      # what happens when an app is missing from it (nothing is dialled).
+      FERRUM_APP_ADDRESSES = builtins.toJSON appAddresses;
+      FERRUM_PROFILES_DIR = "/nix/var/nix/profiles";
+      FERRUM_JOURNAL_DIR = ferrum.storage.journalDir;
+      FERRUM_UI_DIR = "${pkgs.ferrum-ui}/share/ferrum/ui";
+    }
+    # R5. The two variables that turn single sign-on on, and the condition
+    # that decides whether it exists at all.
+    #
+    # `ssoEnabled` is `daemonPublished && ferrum.auth.enable`, and both terms
+    # are load-bearing:
+    #
+    #  * Without publication there is no ferrum.<baseDomain> vhost, so there is
+    #    no cookie scope for it (modules/proxy/authelia.nix emits the control
+    #    plane's session.cookies entry on the same predicate) and nothing for
+    #    Authelia to decide about. That host is reached over the SSH tunnel
+    #    modules/core/daemon.nix's A5 assertion protects, and R5's own
+    #    acceptance criterion is that the tunnel must not become dependent on
+    #    the proxy it exists to survive. Leaving these unset is what guarantees
+    #    it: crates/ferrumd/src/sso.rs builds no verifier, POST /api/sso
+    #    answers 404, and the password login is untouched.
+    #  * Without Authelia there is nobody to ask.
+    #
+    # FERRUMD_SSO_ORIGIN is the dashboard's own published origin and is what
+    # ferrumd sends as X-Original-URL, so Authelia decides against the control
+    # plane's cookie scope and no other. It is derived here, from the host's
+    # own configuration, precisely so that it can never come from a request.
+    #
+    # L-04. From proxyLib.controlPlaneCookieDomain rather than re-spelled from
+    # subdomain and baseDomain. The two were byte-identical, but they are the
+    # SAME fact -- "the hostname whose cookie scope the control plane keeps to
+    # itself" -- and modules/proxy/lib.nix exists because a second copy of a
+    # derivation drifts from the first. If this one ever drifted, ferrumd
+    # would ask Authelia about a different scope than the one authelia.nix
+    # configured, which is exactly the isolation SEC-M02 bought, handed back.
+    // lib.optionalAttrs ssoEnabled {
+      FERRUMD_SSO_ORIGIN = "https://${proxyLib.controlPlaneCookieDomain ferrum}";
+      # The same loopback address modules/proxy/nginx.nix writes into every
+      # /authelia subrequest location. Set explicitly rather than left to
+      # sso.rs's default so the two places that name Authelia's port are both
+      # greppable.
+      FERRUMD_AUTHELIA_ADDRESS = "127.0.0.1:9091";
     };
     serviceConfig = {
       Type = "simple";

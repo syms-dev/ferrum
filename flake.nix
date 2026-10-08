@@ -14,6 +14,17 @@
       url = "github:Mic92/sops-nix";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+
+    # Drives the Phase 1.6a installer's destructive step: kexec, disko,
+    # install, and the --extra-files transfer that puts the host flake at
+    # /etc/ferrum. Taken as a flake input rather than from nixpkgs so the
+    # Docker image's contents are pinned by this repo's flake.lock, which
+    # is what makes the image reproducible rather than merely built.
+    nixos-anywhere = {
+      url = "github:nix-community/nixos-anywhere";
+      inputs.nixpkgs.follows = "nixpkgs";
+      inputs.disko.follows = "disko";
+    };
   };
 
   outputs = inputs@{ flake-parts, nixpkgs, ... }:

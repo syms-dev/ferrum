@@ -1,0 +1,25 @@
+.fk-confirm-scrim {
+  position: fixed; inset: 0; z-index: 50;
+  display: flex; align-items: center; justify-content: center; padding: 1rem;
+  background: rgb(0 0 0 / .55);
+  overflow: auto;
+}
+.fk-confirm {
+  background: var(--ferrum-panel); color: var(--ferrum-text);
+  border: 1px solid var(--ferrum-danger); border-radius: var(--ferrum-radius);
+  padding: 1.1rem 1.2rem; max-width: 30rem; width: 100%;
+}
+.fk-confirm h3 { margin: 0 0 .5rem; font-size: 1.05rem; color: var(--ferrum-danger); }
+.fk-confirm p { margin: 0 0 1rem; font-size: .9rem; line-height: 1.5; }
+.fk-confirm code { font-family: var(--ferrum-mono); font-size: .85em; }
+.fk-confirm-actions { display: flex; gap: .5rem; justify-content: flex-end; flex-wrap: wrap; }
+.fk-confirm-actions button {
+  font: inherit; font-size: .9rem; cursor: pointer; padding: .45rem 1rem;
+  border-radius: var(--ferrum-radius-sm); border: 1px solid var(--ferrum-line);
+  background: transparent; color: var(--ferrum-text);
+}
+.fk-confirm-actions button:focus-visible { outline: 3px solid var(--ferrum-accent); outline-offset: 2px; }
+.fk-confirm-actions .fk-confirm-go {
+  border-color: var(--ferrum-danger); color: var(--ferrum-danger); font-weight: 700;
+}
+.fk-confirm-actions .fk-confirm-go:hover { background: var(--ferrum-wash-danger); }

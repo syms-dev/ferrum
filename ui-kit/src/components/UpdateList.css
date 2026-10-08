@@ -1,0 +1,31 @@
+.fk-upd {
+  border: 1px solid var(--ferrum-line); border-radius: var(--ferrum-radius);
+  background: var(--ferrum-panel); padding: 1.1rem 1.25rem; display: grid; gap: .85rem;
+}
+.fk-upd-head { display: flex; flex-wrap: wrap; gap: .6rem; align-items: baseline; }
+.fk-upd-head h2 { margin: 0; font-size: 1.05rem; }
+.fk-upd-when {
+  margin-left: auto; font-family: var(--ferrum-mono);
+  font-size: .8rem; color: var(--ferrum-muted);
+}
+.fk-upd-table { width: 100%; border-collapse: collapse; font-size: .85rem; }
+.fk-upd-table tr { border-top: 1px solid var(--ferrum-line); }
+.fk-upd-table th { text-align: left; padding: .5rem .75rem .5rem 0; width: 9rem; font-weight: 700; }
+.fk-upd-table td { padding: .5rem .75rem .5rem 0; vertical-align: top; }
+.fk-upd-ver { font-family: var(--ferrum-mono); color: var(--ferrum-muted); white-space: nowrap; }
+.fk-upd-why { color: var(--ferrum-muted); }
+.fk-upd-foot {
+  display: flex; flex-wrap: wrap; gap: .6rem; align-items: center;
+  border-top: 1px solid var(--ferrum-line); padding-top: .85rem;
+  font-size: .8rem; color: var(--ferrum-muted);
+}
+.fk-upd-foot button {
+  font: inherit; font-size: .85rem; cursor: pointer; padding: .55rem .95rem;
+  border-radius: var(--ferrum-radius-sm); border: 1px solid var(--ferrum-line);
+  background: transparent; color: var(--ferrum-text);
+}
+.fk-upd-foot button:hover { border-color: var(--ferrum-accent); color: var(--ferrum-accent); }
+@media (max-width: 40rem) {
+  .fk-upd-table th { width: auto; }
+  .fk-upd-why { display: none; }
+}

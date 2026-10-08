@@ -1,0 +1,26 @@
+.fk-vpn {
+  border: 1px solid var(--ferrum-line); border-radius: var(--ferrum-radius);
+  background: var(--ferrum-panel); padding: 1.1rem 1.25rem; display: grid; gap: .85rem;
+}
+.fk-vpn[data-leaking="true"] { border-color: var(--ferrum-danger); background: var(--ferrum-wash-danger); }
+.fk-vpn-head { display: flex; flex-wrap: wrap; gap: .6rem; align-items: center; }
+.fk-vpn-head h3 { margin: 0; font-size: 1.05rem; }
+.fk-vpn[data-leaking="true"] .fk-vpn-head h3 { color: var(--ferrum-danger); }
+.fk-vpn-when {
+  margin-left: auto; font-family: var(--ferrum-mono);
+  font-size: .8rem; color: var(--ferrum-muted);
+}
+.fk-vpn-note { margin: 0; max-width: 72ch; font-size: .88rem; line-height: 1.5; color: var(--ferrum-muted); }
+.fk-vpn[data-leaking="true"] .fk-vpn-note { color: var(--ferrum-text); }
+.fk-vpn-grid {
+  margin: 0; display: grid; gap: .55rem 1.5rem;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  border-top: 1px solid var(--ferrum-line); padding-top: .85rem;
+}
+.fk-vpn-grid > div { display: grid; gap: .2rem; }
+.fk-vpn-grid dt {
+  font-family: var(--ferrum-mono); font-size: .72rem; letter-spacing: .06em;
+  text-transform: uppercase; color: var(--ferrum-muted);
+}
+.fk-vpn-grid dd { margin: 0; }
+.fk-vpn-mono { font-family: var(--ferrum-mono); font-size: .85rem; color: var(--ferrum-text); }

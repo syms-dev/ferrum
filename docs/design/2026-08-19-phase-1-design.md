@@ -10,7 +10,7 @@ Saltbox deploys a containerised media stack (Plex/Jellyfin, the *arr apps, downl
 - **User edits are destroyed by design.** `sb update` runs `git clean -df` and `git reset --hard @{u}` twice with no stash. Customisation is confined to a variable surface the maintainers chose; anything outside it is explicitly unsupported.
 - **Silent state drift.** [#495](https://github.com/saltyorg/Saltbox/issues/495): container state declared in the inventory was ignored because `state: started` is hardcoded. [#475](https://github.com/saltyorg/Saltbox/issues/475): a failed `mv` was `ignoring`-ed and cleanup deleted user data anyway.
 - **Secrets in plaintext**, with a Cloudflare *Global* API key as the documented default.
-- **Backups off by default**, uncompressed, unencrypted at rest, hours of downtime.
+- **Backups off by default**, uncompressed, unencrypted at rest. (Downtime is hours on the common ext4 install; on btrfs Saltbox snapshots and restarts containers in seconds. Corrected 2026-10-06 — the unqualified claim was wrong.)
 - **Ubuntu-only, x86_64-only, clean-dedicated-machine-only**, enforced by an Ansible assert. ARM is explicitly refused.
 - **No GUI and none planned** — the docs state all setup happens in text editors and on the command line.
 
@@ -214,7 +214,9 @@ Parameters go in a root-read JSON file rather than the unit name, which removes 
 
 The resulting property is statable: **compromising ferrumd gets you the power expressed by the settings schema, not arbitrary Nix evaluation as root.** It holds only because `settings` is restricted to JSON scalars and `custom/` is unwritable — which is exactly what `checks.schema-uniformity` mechanically enforces.
 
-Auth: local accounts, argon2id, server-side sessions, CSRF on mutations, rate-limited login. First run generates a one-time setup token readable only over SSH. **No default password, ever** — Saltbox ships `password1234`.
+Auth: local accounts, argon2id, server-side sessions, CSRF on mutations, rate-limited login. First run generates a one-time setup token readable only over SSH. **No default password, ever.**
+
+> **Correction, 2026-10-06.** This paragraph originally ended "— Saltbox ships `password1234`". That was already wrong when it was written: Saltbox changed the default to `password12345678` in commit `ce48beb9` on 2025-03-22, eleven months earlier, and its `schema/accounts.schema.yml` now carries `not_equals: "password1234"`, actively rejecting the value we accused it of shipping. Verified against the live repository. The claim is withdrawn rather than reworded — ferrum's own "no default password, ever" stands on its own and needed no foil.
 
 Progress streams as JSONL written by `ferrum-apply` and re-emitted over SSE, so a job survives a ferrumd restart and replays cleanly for a reconnecting client.
 
@@ -266,6 +268,56 @@ The demo that sells the project arrives at the end of 1.2: enable testapp v1, wr
 4. **Rolling our own sops write path.** The never-decrypt property is valuable but off the beaten path.
 5. **What "rollback" means to a user versus what it does.** Media files, download queues, ACME certs and Authelia users do *not* revert. The confirmation dialog must list concretely what will and will not roll back. Getting this wrong is how a technically correct product earns a reputation for losing data.
 6. **Scope creep in the reconciler.** Declarative *arr configuration is bottomless. Phase 1 holds to app-to-app registration and defers quality profiles to Recyclarr.
+
+## What the first real install taught us about testing
+
+*Added 2026-09-15, after the first ferrum host was installed on real hardware.*
+
+The install found **ten defects**. The VM suite was fully green throughout, and
+**six of the ten were invisible to it**. That is not a gap in any individual
+test; it is a gap in what the suite is shaped to ask.
+
+Every VM test builds a host from a Nix expression and drives it through
+systemd units or explicit store paths. A real operator installs a machine from
+nothing and then types commands at a shell. The defects living in the gap
+between those two things were:
+
+- **`/etc/ferrum` was never provisioned by any module.** `daemon.nix` asserted
+  it existed; nothing created it. Invisible because a VM test's host is built,
+  never installed.
+- **`ferrum-apply` was in no `systemPackages`.** The binary existed only as a
+  store path inside a unit's `ExecStart`, so `ferrum-apply apply` was "command
+  not found" on a real box. Invisible because tests invoke it by store path or
+  through systemd — never as a bare command.
+- **`FERRUM_FLAKE_REF` defaulted to `nixosConfigurations.default`**, which no
+  real host flake uses. Invisible because tests set it explicitly.
+- **The first install cannot have apps enabled** — sops requires each
+  `sopsFile` to exist at eval time, but secrets are generated on the host
+  afterwards. Invisible because test hosts have placeholder secrets committed.
+- **The template assumed UEFI.** Invisible because VM tests do not exercise a
+  bootloader on real firmware.
+- **A `#` comment inside a `makeWrapper` shell continuation** broke the build
+  with `--set-default: command not found`. Invisible to `nix eval`, which sees
+  a perfectly valid string: the error only exists once a shell reads it.
+
+The shared shape: *a test that never acts like a human never finds what a human
+hits.* Three concrete conclusions for later phases:
+
+1. **Eval is not build, and build is not run.** Each catches a strictly
+   different class. `nix eval` passing says nothing about whether a generated
+   shell script is syntactically whole.
+2. **At least one test must use the operator's own interface** — a bare command
+   on `PATH`, against defaults, with nothing pre-set in the environment.
+3. **Install-from-nothing is its own test target.** Every VM test starts from a
+   built host, so nothing before that point was covered until a real machine
+   was built. `nixos-anywhere --vm-test` is the cheap way to cover most of it.
+
+What did *not* fail is worth recording too: the rollback engine. Ten defects,
+all of them in the install path and the operator surface, none in the
+mechanism the project exists for. When a build failed mid-apply on real
+hardware, the host was left completely untouched — generation unchanged,
+application state unchanged, no snapshot written, every service still running
+— because `apply` builds before it stops anything. The design held.
 
 ## Open items
 

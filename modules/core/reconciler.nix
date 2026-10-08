@@ -12,13 +12,16 @@ let
   enabledApps = lib.filterAttrs (_: app: app.enable) ferrum.apps;
 
   # qBittorrent's real reachable address depends on whether the VPN kill
-  # switch (Phase 1.3/1.4a) put it in an isolated network namespace --
-  # confirmed by reading modules/apps/qbittorrent/service.nix's own
-  # qbt-vpn-netns-setup script: the veth pair's host-reachable side is a
-  # hardcoded 10.200.1.2. Every other app always runs in the root
-  # namespace, always reachable at 127.0.0.1.
-  vpnEnabled = ferrum.secrets ? "qbittorrent-vpn";
-  appHost = id: if id == "qbittorrent" && vpnEnabled then "10.200.1.2" else "127.0.0.1";
+  # switch (Phase 1.3/1.4a) put it in an isolated network namespace. That
+  # rule used to be spelled out here, and only here -- which is exactly how
+  # modules/proxy/nginx.nix came to render `proxy_pass http://127.0.0.1:
+  # <port>` for an app that is not there. It now lives in one place both
+  # this file and the proxy read; see modules/lib/app-address.nix.
+  appHost = (import ../lib/app-address.nix { inherit lib; }).hostFor ferrum;
+
+  # The one list of library categories, and the guard that keeps every
+  # app's declared mediaCategory drawn from it -- see trash-layout.nix.
+  layout = import ./trash-layout.nix { inherit lib; };
 
   # Which apps have a reconciler-usable bare-value API key, and under what
   # secret name (Task 1). qBittorrent needs none (LocalHostAuth = false).
@@ -65,27 +68,125 @@ let
   # decision): Prowlarr registering Sonarr/Radarr is "application" (its
   # own indexer push-sync feature); every other consumes/providesTo edge
   # is "downloadClient".
-  pairKind = consumer: provider:
-    if consumer == "prowlarr" && lib.elem provider [ "sonarr" "radarr" ]
-    then "application"
-    else "downloadClient";
+  #
+  # The rule moved to modules/lib/integrations.nix when the UI's app detail
+  # view grew an Integrations panel that has to say the same sentence. It is
+  # imported rather than restated for the same reason appHost above is: two
+  # files deriving one fact from the same inputs is how the nginx/reconciler
+  # address split happened.
+  pairKind = (import ../lib/integrations.nix { inherit lib catalog; }).pairKind;
 
   pairs = lib.flatten (lib.mapAttrsToList
     (id: _:
       map
-        (providerId: { kind = pairKind id providerId; consumer = id; provider = providerId; })
+        (providerId:
+          let kind = pairKind id providerId; in
+          { inherit kind; consumer = id; provider = providerId; }
+          // lib.optionalAttrs (kind == "downloadClient") {
+            # The download-client CATEGORY, and it comes from the SAME
+            # catalog attribute `rootFolders` below reads.
+            #
+            # It used to be the consumer's own app id, decided inside
+            # crates/ferrum-reconcile. So the *arrs told their download
+            # clients to use "sonarr"/"radarr" while
+            # modules/core/trash-layout.nix created torrents/tv and
+            # usenet/complete/movies -- a directory ferrum never made next
+            # to a directory ferrum never filled. Confirmed on the owner's
+            # host: all eight category directories created and empty, and
+            # SABnzbd holding exactly one category, [[prowlarr]].
+            #
+            # Reading `mediaCategory` here means the directory ferrum
+            # CREATES and the category ferrum REGISTERS are the same string
+            # from the same place. trash-layout.nix's own
+            # `mediaCategoryErrors` (asserted below) closes the remaining
+            # gap by refusing to evaluate a catalog whose mediaCategory is
+            # not one of the categories that layout creates directories for.
+            #
+            # null for a consumer that manages no library. Prowlarr is the
+            # only one: it is an indexer manager, and its download-client
+            # registration exists for the Test button and for interactive
+            # searches launched from its own UI. Such a grab belongs to no
+            # library, so no library category is true of it -- giving it
+            # "tv" would file a manually-grabbed album under television.
+            # With no category the client's own default applies, which is
+            # the ROOT of its download tree (<mediaDir>/torrents,
+            # <mediaDir>/usenet/complete) -- both directories ferrum does
+            # create, so the invariant holds for Prowlarr too.
+            category = catalog.${id}.mediaCategory or null;
+          })
         (builtins.filter (p: enabledApps ? ${p}) (catalog.${id}.integrations.consumes or [ ])))
     enabledApps);
 
-  reconcileConfigFile = pkgs.writeText "ferrum-reconcile-config.json" (builtins.toJSON {
+  # One root folder per enabled app that manages a library, derived from
+  # the catalog rather than listed here -- same reasoning as `pairs`.
+  #
+  # The path is built from ferrum.storage.mediaDir, so the apps are told
+  # about exactly the tree modules/core/storage.nix created. Those two
+  # disagreeing is what left every app pointed at an empty /srv/media
+  # while the media sat on unmounted disks.
+  rootFolders = lib.flatten (lib.mapAttrsToList
+    (id: _:
+      let cat = catalog.${id}.mediaCategory or null; in
+      lib.optional (cat != null) {
+        app = id;
+        path = "${config.ferrum.storage.mediaDir}/media/${cat}";
+      })
+    enabledApps);
+
+  # Same shape as rootFolders: derived from the catalog, built from
+  # mediaDir, so the download tree and the library tree are the same tree.
+  downloadPaths = lib.flatten (lib.mapAttrsToList
+    (id: _:
+      let
+        sub = catalog.${id}.downloadSubdir or null;
+        inc = catalog.${id}.downloadIncompleteSubdir or null;
+      in
+      lib.optional (sub != null) ({
+        app = id;
+        path = "${config.ferrum.storage.mediaDir}/${sub}";
+      } // lib.optionalAttrs (inc != null) {
+        incompletePath = "${config.ferrum.storage.mediaDir}/${inc}";
+      }))
+    enabledApps);
+
+  # Plex, which does not fit the app/pair model: no API key, claimed to a
+  # plex.tv account rather than configured, and unusable until it is.
+  #
+  # The claim token is a ferrum SECRET rather than a settings value. It
+  # grants association of a server with an account, and settings.json is
+  # world-readable by design (the UI renders it); plex/meta.nix's
+  # settingsSchema.claimToken is the wrong home for it for that reason.
+  plexApp = config.ferrum.apps.plex or { enable = false; };
+  plexClaimDeclared = config.ferrum.secrets ? "plex-claim";
+  plexConfig = lib.optionalAttrs (plexApp.enable or false) {
+    plex = {
+      baseUrl = "http://127.0.0.1:${toString plexApp.port}";
+      preferencesPath =
+        "${plexApp.stateDir}/Plex Media Server/Preferences.xml";
+      claimTokenPath = if plexClaimDeclared then "/run/secrets/plex-claim" else null;
+      libraries = [
+        { kind = "movie"; name = "Movies"; path = "${config.ferrum.storage.mediaDir}/media/movies"; }
+        { kind = "show"; name = "TV Shows"; path = "${config.ferrum.storage.mediaDir}/media/tv"; }
+      ];
+    };
+  };
+
+  reconcileConfigFile = pkgs.writeText "ferrum-reconcile-config.json" (builtins.toJSON ({
     apps = lib.mapAttrs appConnInfo enabledApps;
-    inherit pairs;
-  });
+    inherit pairs rootFolders downloadPaths;
+  } // plexConfig));
 in
 {
-  assertions = map (msg: { assertion = false; message = msg; }) realSymmetryErrors;
+  # Both scan the WHOLE catalog, not just the enabled apps: a metadata bug
+  # should fail eval regardless of which subset of apps a given host happens
+  # to enable.
+  assertions = map (msg: { assertion = false; message = msg; })
+    (realSymmetryErrors ++ layout.mediaCategoryErrors catalog);
 
-  systemd.services.ferrum-reconcile = lib.mkIf (pairs != [ ]) {
+  # Runs when there is EITHER a registration or a root folder to set. A
+  # single *arr with no peers still needs its root folder, and gating only
+  # on pairs meant it silently got nothing.
+  systemd.services.ferrum-reconcile = lib.mkIf (pairs != [ ] || rootFolders != [ ] || downloadPaths != [ ] || plexConfig != { }) {
     description = "Register download clients and indexer applications across the catalog";
     after = [ "ferrum-apps.target" ];
     wantedBy = [ "ferrum-apps.target" ];

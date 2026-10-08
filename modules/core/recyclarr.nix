@@ -47,6 +47,38 @@ let
     };
 in
 lib.mkIf recyclarrEnabled {
+  # Recyclarr syncs Sonarr and Radarr and nothing else, so with neither of
+  # them enabled `configuration` above is the empty attrset and
+  # services.recyclarr installs a timer that wakes up on schedule to sync
+  # nothing. It succeeds every time, so nothing anywhere ever reports it --
+  # the operator sees a green unit and concludes the feature is working.
+  #
+  # An assertion rather than quietly declining to enable the service
+  # (`enable = configuration != { }`), because those are different
+  # statements to the person who set the option: one tells them their
+  # configuration does not do what they asked for, the other silently makes
+  # `ferrum.recyclarr.enable = true` mean nothing. Reachable from PUT
+  # /api/settings, where enabling Recyclarr and enabling an *arr are two
+  # separate switches an operator can flip in either order.
+  assertions = [
+    {
+      assertion = sonarrEnabled || radarrEnabled;
+      message = ''
+        ferrum.recyclarr.enable is on, but neither ferrum.apps.sonarr nor
+        ferrum.apps.radarr is enabled.
+
+        Recyclarr syncs TRaSH-Guide quality definitions INTO those two
+        applications and has nothing else to act on, so this host would get
+        a systemd timer with an empty configuration: it would run on
+        schedule, sync nothing, and succeed -- which is the one outcome
+        nothing reports, because a green unit looks like a working feature.
+
+        Enable ferrum.apps.sonarr or ferrum.apps.radarr, or set
+        ferrum.recyclarr.enable = false.
+      '';
+    }
+  ];
+
   services.recyclarr = {
     enable = true;
     inherit configuration;

@@ -126,6 +126,15 @@ lib.mkIf app.enable {
     serviceConfig = lib.filterAttrs (_: v: v != null) {
       MemoryMax = app.resources.memoryMax;
       CPUQuota = app.resources.cpuQuota;
+    } // lib.optionalAttrs (app.mediaAccess != "none") {
+      # The other half of the shared-tree recipe modules/core/storage.nix's
+      # tmpfiles rules carry the setgid half of. Same predicate as the
+      # media-group membership above, because it is the same fact: a unit in
+      # that group creates files in the shared tree, and 0002 is what keeps
+      # them group-WRITABLE -- systemd's default 0022 leaves them group-read-
+      # only, so another app can import from them and then never delete
+      # them. See storage.nix for the whole failure.
+      UMask = "0002";
     };
   };
 }

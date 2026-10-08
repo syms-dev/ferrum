@@ -33,20 +33,113 @@ impl Db {
                 user_id INTEGER NOT NULL REFERENCES users(id),
                 csrf_token TEXT NOT NULL,
                 created_at INTEGER NOT NULL,
-                expires_at INTEGER NOT NULL
+                expires_at INTEGER NOT NULL,
+                last_seen_at INTEGER NOT NULL DEFAULT 0,
+                origin TEXT NOT NULL DEFAULT 'password'
             );
             CREATE TABLE IF NOT EXISTS login_attempts (
                 username TEXT NOT NULL,
                 attempted_at INTEGER NOT NULL,
-                succeeded INTEGER NOT NULL
+                succeeded INTEGER NOT NULL,
+                ip TEXT NOT NULL DEFAULT '',
+                peer TEXT NOT NULL DEFAULT ''
             );
             ",
         )?;
+        // `CREATE TABLE IF NOT EXISTS` does nothing to a table that already
+        // exists, so a host provisioned before these columns were added
+        // would keep the old shape and fail on the first query naming one.
+        Self::add_column_if_missing(&conn, "login_attempts", "ip", "TEXT NOT NULL DEFAULT ''")?;
+        // SEC-03. `ip` holds a key derived from a value the caller can
+        // choose; `peer` holds the trust domain it cannot
+        // (client_addr.rs's `peer_key`). Both are needed, and they are
+        // separate columns rather than one composite string because the
+        // throttle asks two different questions of them -- "how often has
+        // THIS key failed" and "how many DISTINCT keys has this peer failed
+        // under". The default of '' is correct for rows written before this
+        // column existed: they are pruned within five minutes anyway, and an
+        // empty peer groups them together rather than attributing them to a
+        // real one.
+        Self::add_column_if_missing(&conn, "login_attempts", "peer", "TEXT NOT NULL DEFAULT ''")?;
+        Self::add_column_if_missing(&conn, "sessions", "last_seen_at", "INTEGER NOT NULL DEFAULT 0")?;
+        // R5. How a session was obtained, because `require_session` treats the
+        // two differently: a session ferrumd's own password login issued stands
+        // on its own, and a session an Authelia identity produced is re-checked
+        // against Authelia on every request so that logging out there does not
+        // leave a usable session here. The default of 'password' is the correct
+        // reading of every row written before this column existed -- it was the
+        // only way to get one.
+        Self::add_column_if_missing(&conn, "sessions", "origin", "TEXT NOT NULL DEFAULT 'password'")?;
+        // A session that predates the idle timeout has no last_seen_at, and
+        // the column default of 0 would read as "idle since 1970" -- logging
+        // every existing operator out the moment they upgrade. Seeding from
+        // created_at gives them the remainder of a normal idle window
+        // instead, which is the honest answer to "when did we last see this
+        // session?" when the answer was never recorded.
+        conn.execute("UPDATE sessions SET last_seen_at = created_at WHERE last_seen_at = 0", [])?;
         Ok(Self { conn: Mutex::new(conn) })
+    }
+
+    /// Adds one column to an existing table, if it is not already there.
+    ///
+    /// SQLite has no `ADD COLUMN IF NOT EXISTS`, and the obvious shortcut --
+    /// running the `ALTER` unconditionally and discarding the error -- would
+    /// swallow a real failure alongside the expected "duplicate column name",
+    /// which is the error suppression this project treats as a defect in its
+    /// own right. Reading `PRAGMA table_info` first asks the question
+    /// directly, so a genuine failure still propagates.
+    ///
+    /// `table`, `column` and `decl` are compile-time literals from this
+    /// module, never anything off the wire; SQLite does not accept bound
+    /// parameters in DDL, so they are formatted in.
+    ///
+    /// # Arguments
+    /// * `conn` - the open connection to migrate.
+    /// * `table` - the table to add to.
+    /// * `column` - the column name to ensure exists.
+    /// * `decl` - the column's SQL type and constraints.
+    ///
+    /// # Errors
+    /// Any SQLite failure reading the table's shape or applying the `ALTER`.
+    fn add_column_if_missing(
+        conn: &Connection,
+        table: &str,
+        column: &str,
+        decl: &str,
+    ) -> anyhow::Result<()> {
+        let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+        let existing: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<String>, _>>()?;
+        if !existing.iter().any(|name| name == column) {
+            conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"), [])?;
+        }
+        Ok(())
     }
 
     pub fn conn(&self) -> MutexGuard<'_, Connection> {
         self.conn.lock().expect("ferrumd database mutex was poisoned by a prior panic")
+    }
+
+    /// The same connection, but `None` instead of a panic when the mutex is
+    /// poisoned by a prior panic.
+    ///
+    /// Every ordinary caller uses `conn()` and SHOULD panic there: a request
+    /// handler can do nothing sensible with a poisoned database, and
+    /// `run_blocking` turns the panic into a 500 rather than taking the
+    /// daemon down. The readiness probe in `health.rs` is the single
+    /// exception, and the reason is its whole job. It exists to REPORT that
+    /// ferrumd is broken; a probe that panicked would abort the connection
+    /// instead of answering, and a monitor reading a reset connection learns
+    /// only "something" -- which is exactly the diagnosis the endpoint was
+    /// added to replace. `None` is reported as a failed database check, which
+    /// is the honest reading: a poisoned mutex means every other request on
+    /// this daemon is already panicking.
+    ///
+    /// # Returns
+    /// The locked connection, or `None` if the mutex is poisoned.
+    pub fn conn_if_usable(&self) -> Option<MutexGuard<'_, Connection>> {
+        self.conn.lock().ok()
     }
 }
 
@@ -67,6 +160,43 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 3);
+    }
+
+    /// R5's migration, on the shape a host provisioned before it really has.
+    ///
+    /// `CREATE TABLE IF NOT EXISTS` does nothing to an existing table, so
+    /// without the `ALTER` the first `SELECT ... origin` on an upgraded host
+    /// fails and nobody can log in at all. Built by hand rather than by
+    /// opening an old binary, so the fixture states the old shape explicitly.
+    #[test]
+    fn an_existing_sessions_table_gains_the_origin_column_defaulting_to_password() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE sessions (
+                     token TEXT PRIMARY KEY,
+                     user_id INTEGER NOT NULL,
+                     csrf_token TEXT NOT NULL,
+                     created_at INTEGER NOT NULL,
+                     expires_at INTEGER NOT NULL,
+                     last_seen_at INTEGER NOT NULL DEFAULT 0
+                 );
+                 INSERT INTO sessions VALUES ('t', 1, 'c', 100, 200, 100);",
+            )
+            .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        let origin: String = db
+            .conn()
+            .query_row("SELECT origin FROM sessions WHERE token = 't'", [], |row| row.get(0))
+            .expect("the pre-R5 row must survive the migration and be readable");
+        assert_eq!(
+            origin, "password",
+            "a session that predates SSO was obtained with a password, and must not be \
+             re-checked against an Authelia it never involved"
+        );
     }
 
     #[test]

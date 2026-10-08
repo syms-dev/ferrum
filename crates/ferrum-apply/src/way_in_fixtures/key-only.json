@@ -1,0 +1,442 @@
+{
+  "allowedTcpPortRanges": [],
+  "allowedTcpPorts": [
+    22,
+    80,
+    443
+  ],
+  "authorizedKeysCommand": "none",
+  "authorizedKeysFiles": [
+    "%h/.ssh/authorized_keys",
+    "/etc/ssh/authorized_keys.d/%u"
+  ],
+  "firewallEnabled": true,
+  "firewallOpaque": false,
+  "mutableUsers": false,
+  "passwordAuthentication": false,
+  "permitRootLogin": "prohibit-password",
+  "sshEnabled": true,
+  "sshPorts": [
+    22
+  ],
+  "users": [
+    {
+      "home": "/var/empty",
+      "keyFiles": [],
+      "keys": [],
+      "name": "dhcpcd",
+      "password": null,
+      "shell": "/nix/store/r296cf2gaqs0hd8yknpd7ch1l6cbpcyf-shadow-4.18.0/bin/nologin"
+    },
+    {
+      "home": "/var/empty",
+      "keyFiles": [],
+      "keys": [],
+      "name": "ferrum",
+      "password": null,
+      "shell": "/nix/store/r296cf2gaqs0hd8yknpd7ch1l6cbpcyf-shadow-4.18.0/bin/nologin"
+    },
+    {
+      "home": "/var/empty",
+      "keyFiles": [],
+      "keys": [],
+      "name": "jellyfin",
+      "password": null,
+      "shell": "/nix/store/r296cf2gaqs0hd8yknpd7ch1l6cbpcyf-shadow-4.18.0/bin/nologin"
+    },
+    {
+      "home": "/run/dbus",
+      "keyFiles": [],
+      "keys": [],
+      "name": "messagebus",
+      "password": null,
+      "shell": "/nix/store/r296cf2gaqs0hd8yknpd7ch1l6cbpcyf-shadow-4.18.0/bin/nologin"
+    },
+    {
+      "home": "/var/empty",
+      "keyFiles": [],
+      "keys": [],
+      "name": "nginx",
+      "password": null,
+      "shell": "/nix/store/r296cf2gaqs0hd8yknpd7ch1l6cbpcyf-shadow-4.18.0/bin/nologin"
+    },
+    {
+      "home": "/var/empty",
+      "keyFiles": [],
+      "keys": [],
+      "name": "nixbld1",
+      "password": null,
+      "shell": "/nix/store/r296cf2gaqs0hd8yknpd7ch1l6cbpcyf-shadow-4.18.0/bin/nologin"
+    },
+    {
+      "home": "/var/empty",
+      "keyFiles": [],
+      "keys": [],
+      "name": "nixbld10",
+      "password": null,
+      "shell": "/nix/store/r296cf2gaqs0hd8yknpd7ch1l6cbpcyf-shadow-4.18.0/bin/nologin"
+    },
+    {
+      "home": "/var/empty",
+      "keyFiles": [],
+      "keys": [],
+      "name": "nixbld11",
+      "password": null,
+      "shell": "/nix/store/r296cf2gaqs0hd8yknpd7ch1l6cbpcyf-shadow-4.18.0/bin/nologin"
+    },
+    {
+      "home": "/var/empty",
+      "keyFiles": [],
+      "keys": [],
+      "name": "nixbld12",
+      "password": null,
+      "shell": "/nix/store/r296cf2gaqs0hd8yknpd7ch1l6cbpcyf-shadow-4.18.0/bin/nologin"
+    },
+    {
+      "home": "/var/empty",
+      "keyFiles": [],
+      "keys": [],
+      "name": "nixbld13",
+      "password": null,
+      "shell": "/nix/store/r296cf2gaqs0hd8yknpd7ch1l6cbpcyf-shadow-4.18.0/bin/nologin"
+    },
+    {
+      "home": "/var/empty",
+      "keyFiles": [],
+      "keys": [],
+      "name": "nixbld14",
+      "password": null,
+      "shell": "/nix/store/r296cf2gaqs0hd8yknpd7ch1l6cbpcyf-shadow-4.18.0/bin/nologin"
+    },
+    {
+      "home": "/var/empty",
+      "keyFiles": [],
+      "keys": [],
+      "name": "nixbld15",
+      "password": null,
+      "shell": "/nix/store/r296cf2gaqs0hd8yknpd7ch1l6cbpcyf-shadow-4.18.0/bin/nologin"
+    },
+    {
+      "home": "/var/empty",
+      "keyFiles": [],
+      "keys": [],
+      "name": "nixbld16",
+      "password": null,
+      "shell": "/nix/store/r296cf2gaqs0hd8yknpd7ch1l6cbpcyf-shadow-4.18.0/bin/nologin"
+    },
+    {
+      "home": "/var/empty",
+      "keyFiles": [],
+      "keys": [],
+      "name": "nixbld17",
+      "password": null,
+      "shell": "/nix/store/r296cf2gaqs0hd8yknpd7ch1l6cbpcyf-shadow-4.18.0/bin/nologin"
+    },
+    {
+      "home": "/var/empty",
+      "keyFiles": [],
+      "keys": [],
+      "name": "nixbld18",
+      "password": null,
+      "shell": "/nix/store/r296cf2gaqs0hd8yknpd7ch1l6cbpcyf-shadow-4.18.0/bin/nologin"
+    },
+    {
+      "home": "/var/empty",
+      "keyFiles": [],
+      "keys": [],
+      "name": "nixbld19",
+      "password": null,
+      "shell": "/nix/store/r296cf2gaqs0hd8yknpd7ch1l6cbpcyf-shadow-4.18.0/bin/nologin"
+    },
+    {
+      "home": "/var/empty",
+      "keyFiles": [],
+      "keys": [],
+      "name": "nixbld2",
+      "password": null,
+      "shell": "/nix/store/r296cf2gaqs0hd8yknpd7ch1l6cbpcyf-shadow-4.18.0/bin/nologin"
+    },
+    {
+      "home": "/var/empty",
+      "keyFiles": [],
+      "keys": [],
+      "name": "nixbld20",
+      "password": null,
+      "shell": "/nix/store/r296cf2gaqs0hd8yknpd7ch1l6cbpcyf-shadow-4.18.0/bin/nologin"
+    },
+    {
+      "home": "/var/empty",
+      "keyFiles": [],
+      "keys": [],
+      "name": "nixbld21",
+      "password": null,
+      "shell": "/nix/store/r296cf2gaqs0hd8yknpd7ch1l6cbpcyf-shadow-4.18.0/bin/nologin"
+    },
+    {
+      "home": "/var/empty",
+      "keyFiles": [],
+      "keys": [],
+      "name": "nixbld22",
+      "password": null,
+      "shell": "/nix/store/r296cf2gaqs0hd8yknpd7ch1l6cbpcyf-shadow-4.18.0/bin/nologin"
+    },
+    {
+      "home": "/var/empty",
+      "keyFiles": [],
+      "keys": [],
+      "name": "nixbld23",
+      "password": null,
+      "shell": "/nix/store/r296cf2gaqs0hd8yknpd7ch1l6cbpcyf-shadow-4.18.0/bin/nologin"
+    },
+    {
+      "home": "/var/empty",
+      "keyFiles": [],
+      "keys": [],
+      "name": "nixbld24",
+      "password": null,
+      "shell": "/nix/store/r296cf2gaqs0hd8yknpd7ch1l6cbpcyf-shadow-4.18.0/bin/nologin"
+    },
+    {
+      "home": "/var/empty",
+      "keyFiles": [],
+      "keys": [],
+      "name": "nixbld25",
+      "password": null,
+      "shell": "/nix/store/r296cf2gaqs0hd8yknpd7ch1l6cbpcyf-shadow-4.18.0/bin/nologin"
+    },
+    {
+      "home": "/var/empty",
+      "keyFiles": [],
+      "keys": [],
+      "name": "nixbld26",
+      "password": null,
+      "shell": "/nix/store/r296cf2gaqs0hd8yknpd7ch1l6cbpcyf-shadow-4.18.0/bin/nologin"
+    },
+    {
+      "home": "/var/empty",
+      "keyFiles": [],
+      "keys": [],
+      "name": "nixbld27",
+      "password": null,
+      "shell": "/nix/store/r296cf2gaqs0hd8yknpd7ch1l6cbpcyf-shadow-4.18.0/bin/nologin"
+    },
+    {
+      "home": "/var/empty",
+      "keyFiles": [],
+      "keys": [],
+      "name": "nixbld28",
+      "password": null,
+      "shell": "/nix/store/r296cf2gaqs0hd8yknpd7ch1l6cbpcyf-shadow-4.18.0/bin/nologin"
+    },
+    {
+      "home": "/var/empty",
+      "keyFiles": [],
+      "keys": [],
+      "name": "nixbld29",
+      "password": null,
+      "shell": "/nix/store/r296cf2gaqs0hd8yknpd7ch1l6cbpcyf-shadow-4.18.0/bin/nologin"
+    },
+    {
+      "home": "/var/empty",
+      "keyFiles": [],
+      "keys": [],
+      "name": "nixbld3",
+      "password": null,
+      "shell": "/nix/store/r296cf2gaqs0hd8yknpd7ch1l6cbpcyf-shadow-4.18.0/bin/nologin"
+    },
+    {
+      "home": "/var/empty",
+      "keyFiles": [],
+      "keys": [],
+      "name": "nixbld30",
+      "password": null,
+      "shell": "/nix/store/r296cf2gaqs0hd8yknpd7ch1l6cbpcyf-shadow-4.18.0/bin/nologin"
+    },
+    {
+      "home": "/var/empty",
+      "keyFiles": [],
+      "keys": [],
+      "name": "nixbld31",
+      "password": null,
+      "shell": "/nix/store/r296cf2gaqs0hd8yknpd7ch1l6cbpcyf-shadow-4.18.0/bin/nologin"
+    },
+    {
+      "home": "/var/empty",
+      "keyFiles": [],
+      "keys": [],
+      "name": "nixbld32",
+      "password": null,
+      "shell": "/nix/store/r296cf2gaqs0hd8yknpd7ch1l6cbpcyf-shadow-4.18.0/bin/nologin"
+    },
+    {
+      "home": "/var/empty",
+      "keyFiles": [],
+      "keys": [],
+      "name": "nixbld4",
+      "password": null,
+      "shell": "/nix/store/r296cf2gaqs0hd8yknpd7ch1l6cbpcyf-shadow-4.18.0/bin/nologin"
+    },
+    {
+      "home": "/var/empty",
+      "keyFiles": [],
+      "keys": [],
+      "name": "nixbld5",
+      "password": null,
+      "shell": "/nix/store/r296cf2gaqs0hd8yknpd7ch1l6cbpcyf-shadow-4.18.0/bin/nologin"
+    },
+    {
+      "home": "/var/empty",
+      "keyFiles": [],
+      "keys": [],
+      "name": "nixbld6",
+      "password": null,
+      "shell": "/nix/store/r296cf2gaqs0hd8yknpd7ch1l6cbpcyf-shadow-4.18.0/bin/nologin"
+    },
+    {
+      "home": "/var/empty",
+      "keyFiles": [],
+      "keys": [],
+      "name": "nixbld7",
+      "password": null,
+      "shell": "/nix/store/r296cf2gaqs0hd8yknpd7ch1l6cbpcyf-shadow-4.18.0/bin/nologin"
+    },
+    {
+      "home": "/var/empty",
+      "keyFiles": [],
+      "keys": [],
+      "name": "nixbld8",
+      "password": null,
+      "shell": "/nix/store/r296cf2gaqs0hd8yknpd7ch1l6cbpcyf-shadow-4.18.0/bin/nologin"
+    },
+    {
+      "home": "/var/empty",
+      "keyFiles": [],
+      "keys": [],
+      "name": "nixbld9",
+      "password": null,
+      "shell": "/nix/store/r296cf2gaqs0hd8yknpd7ch1l6cbpcyf-shadow-4.18.0/bin/nologin"
+    },
+    {
+      "home": "/var/empty",
+      "keyFiles": [],
+      "keys": [],
+      "name": "nobody",
+      "password": null,
+      "shell": "/nix/store/r296cf2gaqs0hd8yknpd7ch1l6cbpcyf-shadow-4.18.0/bin/nologin"
+    },
+    {
+      "home": "/var/empty",
+      "keyFiles": [],
+      "keys": [],
+      "name": "nscd",
+      "password": null,
+      "shell": "/nix/store/r296cf2gaqs0hd8yknpd7ch1l6cbpcyf-shadow-4.18.0/bin/nologin"
+    },
+    {
+      "home": "/var/empty",
+      "keyFiles": [],
+      "keys": [],
+      "name": "plex",
+      "password": null,
+      "shell": "/nix/store/r296cf2gaqs0hd8yknpd7ch1l6cbpcyf-shadow-4.18.0/bin/nologin"
+    },
+    {
+      "home": "/var/empty",
+      "keyFiles": [],
+      "keys": [],
+      "name": "polkituser",
+      "password": null,
+      "shell": "/nix/store/r296cf2gaqs0hd8yknpd7ch1l6cbpcyf-shadow-4.18.0/bin/nologin"
+    },
+    {
+      "home": "/var/empty",
+      "keyFiles": [],
+      "keys": [],
+      "name": "qbittorrent",
+      "password": null,
+      "shell": "/nix/store/r296cf2gaqs0hd8yknpd7ch1l6cbpcyf-shadow-4.18.0/bin/nologin"
+    },
+    {
+      "home": "/var/lib/ferrum/state/radarr",
+      "keyFiles": [],
+      "keys": [],
+      "name": "radarr",
+      "password": null,
+      "shell": "/nix/store/r296cf2gaqs0hd8yknpd7ch1l6cbpcyf-shadow-4.18.0/bin/nologin"
+    },
+    {
+      "home": "/root",
+      "keyFiles": [],
+      "keys": [
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIprobe operator@example"
+      ],
+      "name": "root",
+      "password": null,
+      "shell": "/nix/store/xcwzxf2a03byzs29kglfr8w99hkfq9ln-bash-interactive-5.3p3/bin/bash"
+    },
+    {
+      "home": "/var/empty",
+      "keyFiles": [],
+      "keys": [],
+      "name": "sabnzbd",
+      "password": null,
+      "shell": "/nix/store/r296cf2gaqs0hd8yknpd7ch1l6cbpcyf-shadow-4.18.0/bin/nologin"
+    },
+    {
+      "home": "/var/lib/ferrum/state/sonarr",
+      "keyFiles": [],
+      "keys": [],
+      "name": "sonarr",
+      "password": null,
+      "shell": "/nix/store/r296cf2gaqs0hd8yknpd7ch1l6cbpcyf-shadow-4.18.0/bin/nologin"
+    },
+    {
+      "home": "/var/empty",
+      "keyFiles": [],
+      "keys": [],
+      "name": "sshd",
+      "password": null,
+      "shell": "/nix/store/r296cf2gaqs0hd8yknpd7ch1l6cbpcyf-shadow-4.18.0/bin/nologin"
+    },
+    {
+      "home": "/var/empty",
+      "keyFiles": [],
+      "keys": [],
+      "name": "systemd-coredump",
+      "password": null,
+      "shell": "/nix/store/r296cf2gaqs0hd8yknpd7ch1l6cbpcyf-shadow-4.18.0/bin/nologin"
+    },
+    {
+      "home": "/var/empty",
+      "keyFiles": [],
+      "keys": [],
+      "name": "systemd-network",
+      "password": null,
+      "shell": "/nix/store/r296cf2gaqs0hd8yknpd7ch1l6cbpcyf-shadow-4.18.0/bin/nologin"
+    },
+    {
+      "home": "/var/empty",
+      "keyFiles": [],
+      "keys": [],
+      "name": "systemd-oom",
+      "password": null,
+      "shell": "/nix/store/r296cf2gaqs0hd8yknpd7ch1l6cbpcyf-shadow-4.18.0/bin/nologin"
+    },
+    {
+      "home": "/var/empty",
+      "keyFiles": [],
+      "keys": [],
+      "name": "systemd-resolve",
+      "password": null,
+      "shell": "/nix/store/r296cf2gaqs0hd8yknpd7ch1l6cbpcyf-shadow-4.18.0/bin/nologin"
+    },
+    {
+      "home": "/var/empty",
+      "keyFiles": [],
+      "keys": [],
+      "name": "systemd-timesync",
+      "password": null,
+      "shell": "/nix/store/r296cf2gaqs0hd8yknpd7ch1l6cbpcyf-shadow-4.18.0/bin/nologin"
+    }
+  ]
+}

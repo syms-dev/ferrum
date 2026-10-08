@@ -1,0 +1,14 @@
+.fk-rail { list-style: none; margin: 0; padding: 0; }
+.fk-rail-row {
+  display: flex; align-items: baseline; gap: .6rem;
+  padding: .45rem .1rem; border-bottom: 1px solid var(--ferrum-line);
+  font-size: .9rem;
+}
+.fk-rail-row:last-child { border-bottom: 0; }
+.fk-rail-row[data-state="now"] { font-weight: 650; }
+.fk-rail-row[data-state="todo"] { color: var(--ferrum-muted); }
+.fk-rail-row[data-state="done"] > span:first-child::after { content: " ✓"; color: var(--ferrum-ok); }
+.fk-rail-el {
+  margin-left: auto; font-family: var(--ferrum-mono); font-size: .8rem;
+  color: var(--ferrum-muted); font-variant-numeric: tabular-nums;
+}

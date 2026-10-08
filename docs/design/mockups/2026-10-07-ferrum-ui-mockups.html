@@ -1,0 +1,873 @@
+<!doctype html><html><head><meta charset=utf8><meta name=viewport content="width=device-width,initial-scale=1"><style>:root{color-scheme:light}body{margin:0;padding:0;font:14px -apple-system,BlinkMacSystemFont,sans-serif;background:#faf9f5;color:#141413}img{max-width:100%}</style></head><body>
+<title>Ferrum UI Mockups</title>
+<style>
+  :root {
+    --bg: #17140f;
+    --surface: #211c16;
+    --surface-2: #2a241c;
+    --border: #362f24;
+    --text: #f0ece4;
+    --text-2: #a89e8f;
+    --text-3: #756b5c;
+    --accent: #c4622d;
+    --accent-text: #ffddc9;
+    --on-accent: #2a1408;
+    --green: #5fae7a;
+    --amber: #d9a441;
+    --red: #c9584f;
+    --knob: #fff;
+    --amber-bg: #3a2f16;
+    --info-bg: #241d15;
+    --info-border: #3a2e22;
+    --app-sonarr-bg: #1d3a4a;
+    --app-sonarr-fg: #5bc8e8;
+    --app-radarr-bg: #4a3a15;
+    --app-radarr-fg: #f2c230;
+    --app-prowlarr-bg: #2f2a4a;
+    --app-prowlarr-fg: #9b8ce0;
+    --app-jellyfin-bg: #3a1f42;
+    --app-jellyfin-fg: #c67fd9;
+    --app-plex-bg: #3d3013;
+    --app-plex-fg: #e5a00d;
+    --app-qbittorrent-bg: #1a2f4a;
+    --app-qbittorrent-fg: #6ea3e8;
+    --app-sabnzbd-bg: #4a3210;
+    --app-sabnzbd-fg: #f2a530;
+  }
+  body { background: var(--bg); color: var(--text); font-family: 'IBM Plex Sans', system-ui, sans-serif; margin: 0; padding: 2rem 1rem 4rem; }
+  a { color: var(--accent); }
+  a:hover { color: var(--accent-text); }
+  .mono { font-family: 'IBM Plex Mono', ui-monospace, monospace; }
+  .field-label { font-size: 12px; color: var(--text-2); margin-bottom: 6px; display: block; }
+  .field-input { width: 100%; box-sizing: border-box; background: var(--surface-2); border: 0.5px solid var(--border); border-radius: 6px; padding: 8px 10px; color: var(--text); font-size: 13px; font-family: 'IBM Plex Mono', ui-monospace, monospace; }
+  .field-select { width: 100%; box-sizing: border-box; background: var(--surface-2); border: 0.5px solid var(--border); border-radius: 6px; padding: 8px 10px; color: var(--text); font-size: 13px; }
+  .section { background: var(--surface); border: 0.5px solid var(--border); border-radius: 10px; padding: 18px 20px; margin-bottom: 14px; }
+  .section-title { font-size: 13px; font-weight: 500; margin: 0 0 14px; }
+  .toggle-on { width: 34px; height: 18px; border-radius: 9px; background: var(--accent); position: relative; flex-shrink: 0; }
+  .toggle-on .knob { width: 14px; height: 14px; border-radius: 50%; background: var(--knob); position: absolute; top: 2px; right: 2px; }
+  .toggle-off { width: 34px; height: 18px; border-radius: 9px; background: var(--surface-2); border: 0.5px solid var(--border); position: relative; flex-shrink: 0; }
+  .toggle-off .knob { width: 14px; height: 14px; border-radius: 50%; background: var(--text-3); position: absolute; top: 1px; left: 2px; }
+
+  .screens { max-width: 1080px; margin: 0 auto; display: flex; flex-direction: column; gap: 2.5rem; }
+  .screen-label { font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-2); margin: 0 0 0.75rem; }
+  .screen-frame { overflow-x: auto; border-radius: 14px; background: #0f0d0a; padding: 1px; }
+  .screen-frame > .inner { min-width: max-content; }
+  h1 { font-size: 22px; font-weight: 500; }
+  h2 { font-size: 18px; font-weight: 500; }
+</style>
+
+<div class="screens">
+
+  <div>
+    <p style="text-align: center; font-size: 13px; color: var(--text-2); max-width: 640px; margin: 0 auto 2rem;">Swipe each screen sideways to see its full width &mdash; they're built desktop-first, so a phone viewport only shows a slice at a time.</p>
+  </div>
+
+  <div>
+    <p class="screen-label">1. Onboarding</p>
+    <div class="screen-frame"><div class="inner">
+      <div style="min-width: 480px; min-height: 600px; box-sizing: border-box; display: flex; align-items: center; justify-content: center; padding: 40px;">
+        <div style="width: 100%; max-width: 380px;">
+          <div style="display: flex; flex-direction: column; align-items: center; text-align: center; margin-bottom: 28px;">
+            <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="1.7" aria-hidden="true" style="margin-bottom: 14px;"><path d="M12 2 4 6v6c0 5 3.4 8.7 8 10 4.6-1.3 8-5 8-10V6l-8-4z"/></svg>
+            <h1 style="font-size: 18px; font-weight: 500; margin: 0 0 6px;">Welcome to ferrum</h1>
+            <p style="font-size: 13px; color: var(--text-2); margin: 0; line-height: 1.6;">You signed in with the one-time setup password.<br>Set a real one before continuing.</p>
+          </div>
+          <div style="background: var(--surface); border: 0.5px solid var(--border); border-radius: 10px; padding: 20px;">
+            <div style="margin-bottom: 14px;">
+              <label class="field-label">New password</label>
+              <input class="field-input" type="password" value="&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;">
+            </div>
+            <div style="margin-bottom: 18px;">
+              <label class="field-label">Confirm password</label>
+              <input class="field-input" type="password" value="&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;">
+            </div>
+            <button style="width: 100%; padding: 10px; border-radius: 6px; border: none; background: var(--accent); color: var(--on-accent); font-size: 13px; font-weight: 500; cursor: pointer; margin-bottom: 10px;">Set password &amp; continue</button>
+            <div style="text-align: center;">
+              <a href="#" style="font-size: 12px; color: var(--text-3);">Skip for now</a>
+            </div>
+          </div>
+          <div style="display: flex; align-items: center; justify-content: center; gap: 8px; margin-top: 24px;">
+            <div style="width: 6px; height: 6px; border-radius: 50%; background: var(--accent);" aria-hidden="true"></div>
+            <div style="width: 6px; height: 6px; border-radius: 50%; background: var(--border);" aria-hidden="true"></div>
+            <span style="font-size: 11px; color: var(--text-3); margin-left: 6px;">Step 1 of 2 &middot; next: enable your first app</span>
+          </div>
+        </div>
+      </div>
+    </div></div>
+  </div>
+
+  <div>
+    <p class="screen-label">2. First run &mdash; nothing enabled yet</p>
+    <div class="screen-frame"><div class="inner">
+      <div style="min-width: 1040px; padding-bottom: 40px;">
+        <div style="display: flex; align-items: center; justify-content: space-between; padding: 14px 28px; border-bottom: 0.5px solid var(--border);">
+          <div style="display: flex; align-items: center; gap: 8px;">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="2" aria-hidden="true"><path d="M12 2 4 6v6c0 5 3.4 8.7 8 10 4.6-1.3 8-5 8-10V6l-8-4z"/></svg>
+            <span style="font-size: 15px; font-weight: 500; letter-spacing: 0.3px;">ferrum</span>
+          </div>
+        </div>
+        <div style="padding: 40px 28px 24px; text-align: center; max-width: 480px; margin: 0 auto;">
+          <h1 style="font-size: 19px; font-weight: 500; margin: 0 0 8px;">Nothing's running yet</h1>
+          <p style="font-size: 13px; color: var(--text-2); margin: 0; line-height: 1.6;">Every app below is ready to go &mdash; pick one to enable it. Sonarr's a good place to start, since Prowlarr and your download clients will register with it automatically.</p>
+        </div>
+        <div style="padding: 8px 28px 24px; max-width: 1040px; margin: 0 auto;">
+          <div style="display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px;">
+            <div style="background: var(--surface); border: 1.5px solid var(--accent); border-radius: 10px; padding: 16px; position: relative;">
+              <span style="position: absolute; top: -9px; left: 14px; background: var(--accent); color: var(--on-accent); font-size: 10px; font-weight: 500; padding: 2px 8px; border-radius: 4px;">Suggested first step</span>
+              <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 12px; margin-top: 4px;">
+                <div style="width: 34px; height: 34px; border-radius: 8px; background: var(--app-sonarr-bg); display: flex; align-items: center; justify-content: center; font-size: 13px; font-weight: 500; color: var(--app-sonarr-fg);">So</div>
+                <div>
+                  <div style="font-size: 14px; font-weight: 500;">Sonarr</div>
+                  <div style="font-size: 12px; color: var(--text-2);">TV series collection manager</div>
+                </div>
+              </div>
+              <button style="width: 100%; padding: 8px; border-radius: 6px; border: none; background: var(--accent); color: var(--on-accent); font-size: 12px; font-weight: 500; cursor: pointer;">Enable Sonarr&hellip;</button>
+            </div>
+            <div style="background: var(--surface); border: 0.5px dashed var(--border); border-radius: 10px; padding: 16px; opacity: 0.75;">
+              <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 12px;">
+                <div style="width: 34px; height: 34px; border-radius: 8px; background: var(--app-radarr-bg); display: flex; align-items: center; justify-content: center; font-size: 13px; font-weight: 500; color: var(--app-radarr-fg);">Ra</div>
+                <div>
+                  <div style="font-size: 14px; font-weight: 500;">Radarr</div>
+                  <div style="font-size: 12px; color: var(--text-2);">Movie collection manager</div>
+                </div>
+              </div>
+              <button style="width: 100%; padding: 8px; border-radius: 6px; border: 0.5px solid var(--border); background: transparent; color: var(--text); font-size: 12px; font-weight: 500; cursor: pointer;">Enable Radarr&hellip;</button>
+            </div>
+            <div style="background: var(--surface); border: 0.5px dashed var(--border); border-radius: 10px; padding: 16px; opacity: 0.75;">
+              <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 12px;">
+                <div style="width: 34px; height: 34px; border-radius: 8px; background: var(--app-prowlarr-bg); display: flex; align-items: center; justify-content: center; font-size: 13px; font-weight: 500; color: var(--app-prowlarr-fg);">Pr</div>
+                <div>
+                  <div style="font-size: 14px; font-weight: 500;">Prowlarr</div>
+                  <div style="font-size: 12px; color: var(--text-2);">Indexer manager</div>
+                </div>
+              </div>
+              <button style="width: 100%; padding: 8px; border-radius: 6px; border: 0.5px solid var(--border); background: transparent; color: var(--text); font-size: 12px; font-weight: 500; cursor: pointer;">Enable Prowlarr&hellip;</button>
+            </div>
+            <div style="background: var(--surface); border: 0.5px dashed var(--border); border-radius: 10px; padding: 16px; opacity: 0.75;">
+              <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 12px;">
+                <div style="width: 34px; height: 34px; border-radius: 8px; background: var(--app-qbittorrent-bg); display: flex; align-items: center; justify-content: center; font-size: 13px; font-weight: 500; color: var(--app-qbittorrent-fg);">qB</div>
+                <div>
+                  <div style="font-size: 14px; font-weight: 500;">qBittorrent</div>
+                  <div style="font-size: 12px; color: var(--text-2);">Download client</div>
+                </div>
+              </div>
+              <button style="width: 100%; padding: 8px; border-radius: 6px; border: 0.5px solid var(--border); background: transparent; color: var(--text); font-size: 12px; font-weight: 500; cursor: pointer;">Enable qBittorrent&hellip;</button>
+            </div>
+            <div style="background: var(--surface); border: 0.5px dashed var(--border); border-radius: 10px; padding: 16px; opacity: 0.75;">
+              <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 12px;">
+                <div style="width: 34px; height: 34px; border-radius: 8px; background: var(--app-sabnzbd-bg); display: flex; align-items: center; justify-content: center; font-size: 13px; font-weight: 500; color: var(--app-sabnzbd-fg);">Sa</div>
+                <div>
+                  <div style="font-size: 14px; font-weight: 500;">SABnzbd</div>
+                  <div style="font-size: 12px; color: var(--text-2);">Download client</div>
+                </div>
+              </div>
+              <button style="width: 100%; padding: 8px; border-radius: 6px; border: 0.5px solid var(--border); background: transparent; color: var(--text); font-size: 12px; font-weight: 500; cursor: pointer;">Enable SABnzbd&hellip;</button>
+            </div>
+            <div style="background: var(--surface); border: 0.5px dashed var(--border); border-radius: 10px; padding: 16px; opacity: 0.75;">
+              <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 12px;">
+                <div style="width: 34px; height: 34px; border-radius: 8px; background: var(--app-jellyfin-bg); display: flex; align-items: center; justify-content: center; font-size: 13px; font-weight: 500; color: var(--app-jellyfin-fg);">Je</div>
+                <div>
+                  <div style="font-size: 14px; font-weight: 500;">Jellyfin</div>
+                  <div style="font-size: 12px; color: var(--text-2);">Media server</div>
+                </div>
+              </div>
+              <button style="width: 100%; padding: 8px; border-radius: 6px; border: 0.5px solid var(--border); background: transparent; color: var(--text); font-size: 12px; font-weight: 500; cursor: pointer;">Enable Jellyfin&hellip;</button>
+            </div>
+            <div style="background: var(--surface); border: 0.5px dashed var(--border); border-radius: 10px; padding: 16px; opacity: 0.75;">
+              <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 12px;">
+                <div style="width: 34px; height: 34px; border-radius: 8px; background: var(--app-plex-bg); display: flex; align-items: center; justify-content: center; font-size: 13px; font-weight: 500; color: var(--app-plex-fg);">Pl</div>
+                <div>
+                  <div style="font-size: 14px; font-weight: 500;">Plex</div>
+                  <div style="font-size: 12px; color: var(--text-2);">Media server</div>
+                </div>
+              </div>
+              <button style="width: 100%; padding: 8px; border-radius: 6px; border: 0.5px solid var(--border); background: transparent; color: var(--text); font-size: 12px; font-weight: 500; cursor: pointer;">Enable Plex&hellip;</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div></div>
+  </div>
+
+
+  <div>
+    <p class="screen-label">3. Dashboard — mixed enabled/available, one pending change</p>
+    <div class="screen-frame"><div class="inner">
+<div style="min-width: 1040px; padding-bottom: 40px;">
+
+  <div style="display: flex; align-items: center; justify-content: space-between; padding: 14px 28px; border-bottom: 0.5px solid var(--border);">
+    <div style="display: flex; align-items: center; gap: 28px;">
+      <div style="display: flex; align-items: center; gap: 8px;">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="2" aria-hidden="true"><path d="M12 2 4 6v6c0 5 3.4 8.7 8 10 4.6-1.3 8-5 8-10V6l-8-4z"/></svg>
+        <span style="font-size: 15px; font-weight: 500; letter-spacing: 0.3px;">ferrum</span>
+      </div>
+      <div style="display: flex; gap: 4px;">
+        <div style="padding: 6px 14px; border-radius: 6px; background: var(--surface-2); font-size: 13px; font-weight: 500;">Apps</div>
+        <div style="padding: 6px 14px; border-radius: 6px; font-size: 13px; color: var(--text-2);">Jobs</div>
+        <div style="padding: 6px 14px; border-radius: 6px; font-size: 13px; color: var(--text-2);">Settings</div>
+        <div style="padding: 6px 14px; border-radius: 6px; font-size: 13px; color: var(--text-2);">Secrets</div>
+      </div>
+    </div>
+    <div style="display: flex; align-items: center; gap: 14px;">
+      <div style="display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text-2);">
+        <span style="width: 7px; height: 7px; border-radius: 50%; background: var(--green); display: inline-block;" aria-hidden="true"></span>
+        <span>generation 47 &middot; up to date</span>
+      </div>
+      <div style="width: 30px; height: 30px; border-radius: 50%; background: var(--surface-2); display: flex; align-items: center; justify-content: center; font-size: 12px; font-weight: 500; color: var(--text-2);">A</div>
+    </div>
+  </div>
+
+  <div style="padding: 24px 28px;">
+    <div style="display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 14px;">
+      <h1 style="font-size: 18px; font-weight: 500; margin: 0;">Apps</h1>
+      <span style="font-size: 13px; color: var(--text-2);">4 healthy &middot; 1 degraded &middot; 2 available</span>
+    </div>
+
+    <div style="display: flex; align-items: center; justify-content: space-between; background: var(--surface-2); border: 0.5px solid var(--border); border-radius: 8px; padding: 10px 14px; margin-bottom: 18px;">
+      <div style="display: flex; align-items: center; gap: 8px; font-size: 13px;">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="var(--amber)" stroke-width="2" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M12 8v4M12 16h.01"/></svg>
+        <span>1 pending change &middot; SABnzbd disabled</span>
+        <span style="color: var(--text-2);">&mdash; nothing takes effect until you apply</span>
+      </div>
+      <button style="padding: 7px 16px; border-radius: 6px; border: none; background: var(--accent); color: var(--on-accent); font-size: 12px; font-weight: 500; cursor: pointer; flex-shrink: 0;">Review &amp; apply</button>
+    </div>
+
+    <div style="display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px;">
+
+      <div style="background: var(--surface); border: 0.5px solid var(--border); border-radius: 10px; padding: 16px;">
+        <div style="display: flex; align-items: flex-start; justify-content: space-between; margin-bottom: 12px;">
+          <div style="display: flex; align-items: center; gap: 10px;">
+            <div style="width: 34px; height: 34px; border-radius: 8px; background: var(--app-sonarr-bg); display: flex; align-items: center; justify-content: center; font-size: 13px; font-weight: 500; color: var(--app-sonarr-fg);">So</div>
+            <div>
+              <div style="font-size: 14px; font-weight: 500;">Sonarr</div>
+              <div style="font-size: 12px; color: var(--text-2);">media-automation</div>
+            </div>
+          </div>
+          <div style="width: 34px; height: 18px; border-radius: 9px; background: var(--accent); position: relative; flex-shrink: 0;">
+            <div style="width: 14px; height: 14px; border-radius: 50%; background: var(--knob); position: absolute; top: 2px; right: 2px;" aria-hidden="true"></div>
+          </div>
+        </div>
+        <div style="display: flex; align-items: center; gap: 6px; margin-bottom: 10px;">
+          <span style="width: 7px; height: 7px; border-radius: 50%; background: var(--green); display: inline-block;" aria-hidden="true"></span>
+          <span style="font-size: 12px; color: var(--green);">Healthy</span>
+        </div>
+        <div class="mono" style="font-size: 12px; color: var(--text-3); display: flex; justify-content: space-between;">
+          <span>sonarr.home.arpa</span>
+          <span>:8989</span>
+        </div>
+        <div style="display: flex; align-items: center; justify-content: flex-end; gap: 6px; margin-top: 12px; padding-top: 10px; border-top: 0.5px solid var(--border);">
+          <a href="#" style="display: flex; align-items: center; gap: 4px; font-size: 12px; text-decoration: none; padding: 4px 8px; border-radius: 5px;">
+            Open
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M7 17 17 7M8 7h9v9"/></svg>
+          </a>
+          <button style="width: 26px; height: 26px; border-radius: 5px; border: none; background: transparent; color: var(--text-2); display: flex; align-items: center; justify-content: center; cursor: pointer;" aria-label="Configure Sonarr">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+          </button>
+        </div>
+      </div>
+
+      <div style="background: var(--surface); border: 0.5px solid var(--border); border-radius: 10px; padding: 16px;">
+        <div style="display: flex; align-items: flex-start; justify-content: space-between; margin-bottom: 12px;">
+          <div style="display: flex; align-items: center; gap: 10px;">
+            <div style="width: 34px; height: 34px; border-radius: 8px; background: var(--app-radarr-bg); display: flex; align-items: center; justify-content: center; font-size: 13px; font-weight: 500; color: var(--app-radarr-fg);">Ra</div>
+            <div>
+              <div style="font-size: 14px; font-weight: 500;">Radarr</div>
+              <div style="font-size: 12px; color: var(--text-2);">media-automation</div>
+            </div>
+          </div>
+          <div style="width: 34px; height: 18px; border-radius: 9px; background: var(--accent); position: relative; flex-shrink: 0;">
+            <div style="width: 14px; height: 14px; border-radius: 50%; background: var(--knob); position: absolute; top: 2px; right: 2px;" aria-hidden="true"></div>
+          </div>
+        </div>
+        <div style="display: flex; align-items: center; gap: 6px; margin-bottom: 10px;">
+          <span style="width: 7px; height: 7px; border-radius: 50%; background: var(--green); display: inline-block;" aria-hidden="true"></span>
+          <span style="font-size: 12px; color: var(--green);">Healthy</span>
+        </div>
+        <div class="mono" style="font-size: 12px; color: var(--text-3); display: flex; justify-content: space-between;">
+          <span>radarr.home.arpa</span>
+          <span>:7878</span>
+        </div>
+        <div style="display: flex; align-items: center; justify-content: flex-end; gap: 6px; margin-top: 12px; padding-top: 10px; border-top: 0.5px solid var(--border);">
+          <a href="#" style="display: flex; align-items: center; gap: 4px; font-size: 12px; text-decoration: none; padding: 4px 8px; border-radius: 5px;">
+            Open
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M7 17 17 7M8 7h9v9"/></svg>
+          </a>
+          <button style="width: 26px; height: 26px; border-radius: 5px; border: none; background: transparent; color: var(--text-2); display: flex; align-items: center; justify-content: center; cursor: pointer;" aria-label="Configure Radarr">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+          </button>
+        </div>
+      </div>
+
+      <div style="background: var(--surface); border: 0.5px solid var(--border); border-radius: 10px; padding: 16px;">
+        <div style="display: flex; align-items: flex-start; justify-content: space-between; margin-bottom: 12px;">
+          <div style="display: flex; align-items: center; gap: 10px;">
+            <div style="width: 34px; height: 34px; border-radius: 8px; background: var(--app-prowlarr-bg); display: flex; align-items: center; justify-content: center; font-size: 13px; font-weight: 500; color: var(--app-prowlarr-fg);">Pr</div>
+            <div>
+              <div style="font-size: 14px; font-weight: 500;">Prowlarr</div>
+              <div style="font-size: 12px; color: var(--text-2);">media-automation</div>
+            </div>
+          </div>
+          <div style="width: 34px; height: 18px; border-radius: 9px; background: var(--accent); position: relative; flex-shrink: 0;">
+            <div style="width: 14px; height: 14px; border-radius: 50%; background: var(--knob); position: absolute; top: 2px; right: 2px;" aria-hidden="true"></div>
+          </div>
+        </div>
+        <div style="display: flex; align-items: center; gap: 6px; margin-bottom: 10px;">
+          <span style="width: 7px; height: 7px; border-radius: 50%; background: var(--green); display: inline-block;" aria-hidden="true"></span>
+          <span style="font-size: 12px; color: var(--green);">Healthy</span>
+        </div>
+        <div class="mono" style="font-size: 12px; color: var(--text-3); display: flex; justify-content: space-between;">
+          <span>prowlarr.home.arpa</span>
+          <span>:9696</span>
+        </div>
+        <div style="display: flex; align-items: center; justify-content: flex-end; gap: 6px; margin-top: 12px; padding-top: 10px; border-top: 0.5px solid var(--border);">
+          <a href="#" style="display: flex; align-items: center; gap: 4px; font-size: 12px; text-decoration: none; padding: 4px 8px; border-radius: 5px;">
+            Open
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M7 17 17 7M8 7h9v9"/></svg>
+          </a>
+          <button style="width: 26px; height: 26px; border-radius: 5px; border: none; background: transparent; color: var(--text-2); display: flex; align-items: center; justify-content: center; cursor: pointer;" aria-label="Configure Prowlarr">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+          </button>
+        </div>
+      </div>
+
+      <div style="background: var(--surface); border: 0.5px solid var(--border); border-radius: 10px; padding: 16px;">
+        <div style="display: flex; align-items: flex-start; justify-content: space-between; margin-bottom: 12px;">
+          <div style="display: flex; align-items: center; gap: 10px;">
+            <div style="width: 34px; height: 34px; border-radius: 8px; background: var(--app-qbittorrent-bg); display: flex; align-items: center; justify-content: center; font-size: 13px; font-weight: 500; color: var(--app-qbittorrent-fg);">qB</div>
+            <div>
+              <div style="font-size: 14px; font-weight: 500;">qBittorrent</div>
+              <div style="font-size: 12px; color: var(--text-2);">download-client</div>
+            </div>
+          </div>
+          <div style="width: 34px; height: 18px; border-radius: 9px; background: var(--accent); position: relative; flex-shrink: 0;">
+            <div style="width: 14px; height: 14px; border-radius: 50%; background: var(--knob); position: absolute; top: 2px; right: 2px;" aria-hidden="true"></div>
+          </div>
+        </div>
+        <div style="display: flex; align-items: center; gap: 6px; margin-bottom: 10px;">
+          <span style="width: 7px; height: 7px; border-radius: 50%; background: var(--amber); display: inline-block;" aria-hidden="true"></span>
+          <span style="font-size: 12px; color: var(--amber);">Degraded &middot; VPN tunnel down</span>
+        </div>
+        <div class="mono" style="font-size: 12px; color: var(--text-3); display: flex; justify-content: space-between;">
+          <span>qbit.home.arpa</span>
+          <span>:8080</span>
+        </div>
+        <div style="display: flex; align-items: center; justify-content: flex-end; gap: 6px; margin-top: 12px; padding-top: 10px; border-top: 0.5px solid var(--border);">
+          <a href="#" style="display: flex; align-items: center; gap: 4px; font-size: 12px; text-decoration: none; padding: 4px 8px; border-radius: 5px;">
+            Open
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M7 17 17 7M8 7h9v9"/></svg>
+          </a>
+          <button style="width: 26px; height: 26px; border-radius: 5px; border: none; background: transparent; color: var(--text-2); display: flex; align-items: center; justify-content: center; cursor: pointer;" aria-label="Configure qBittorrent">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+          </button>
+        </div>
+      </div>
+
+      <div style="background: var(--surface); border: 0.5px solid var(--border); border-radius: 10px; padding: 16px;">
+        <div style="display: flex; align-items: flex-start; justify-content: space-between; margin-bottom: 12px;">
+          <div style="display: flex; align-items: center; gap: 10px;">
+            <div style="width: 34px; height: 34px; border-radius: 8px; background: var(--app-sabnzbd-bg); display: flex; align-items: center; justify-content: center; font-size: 13px; font-weight: 500; color: var(--app-sabnzbd-fg);">Sa</div>
+            <div>
+              <div style="font-size: 14px; font-weight: 500;">SABnzbd</div>
+              <div style="font-size: 12px; color: var(--text-2);">download-client</div>
+            </div>
+          </div>
+          <div style="width: 34px; height: 18px; border-radius: 9px; background: var(--surface-2); border: 1.5px solid var(--amber); position: relative; flex-shrink: 0;" title="Disable pending &mdash; not applied yet">
+            <div style="width: 12px; height: 12px; border-radius: 50%; background: var(--amber); position: absolute; top: 1.5px; left: 2px;" aria-hidden="true"></div>
+          </div>
+        </div>
+        <div style="display: flex; align-items: center; gap: 6px; margin-bottom: 10px;">
+          <span style="width: 7px; height: 7px; border-radius: 50%; background: var(--green); display: inline-block;" aria-hidden="true"></span>
+          <span style="font-size: 12px; color: var(--green);">Healthy</span>
+          <span style="font-size: 11px; color: var(--amber); background: var(--amber-bg); padding: 1px 6px; border-radius: 4px;">disable pending</span>
+        </div>
+        <div class="mono" style="font-size: 12px; color: var(--text-3); display: flex; justify-content: space-between;">
+          <span>sab.home.arpa</span>
+          <span>:8081</span>
+        </div>
+        <div style="display: flex; align-items: center; justify-content: flex-end; gap: 6px; margin-top: 12px; padding-top: 10px; border-top: 0.5px solid var(--border);">
+          <a href="#" style="display: flex; align-items: center; gap: 4px; font-size: 12px; text-decoration: none; padding: 4px 8px; border-radius: 5px;">
+            Open
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M7 17 17 7M8 7h9v9"/></svg>
+          </a>
+          <button style="width: 26px; height: 26px; border-radius: 5px; border: none; background: transparent; color: var(--text-2); display: flex; align-items: center; justify-content: center; cursor: pointer;" aria-label="Configure SABnzbd">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+          </button>
+        </div>
+      </div>
+
+      <div style="background: var(--surface); border: 0.5px dashed var(--border); border-radius: 10px; padding: 16px; opacity: 0.75;">
+        <div style="display: flex; align-items: flex-start; justify-content: space-between; margin-bottom: 12px;">
+          <div style="display: flex; align-items: center; gap: 10px;">
+            <div style="width: 34px; height: 34px; border-radius: 8px; background: var(--app-plex-bg); display: flex; align-items: center; justify-content: center; font-size: 13px; font-weight: 500; color: var(--app-plex-fg);">Pl</div>
+            <div>
+              <div style="font-size: 14px; font-weight: 500;">Plex</div>
+              <div style="font-size: 12px; color: var(--text-2);">media-server</div>
+            </div>
+          </div>
+        </div>
+        <p style="font-size: 12px; color: var(--text-2); margin: 0 0 14px; line-height: 1.5;">Not yet enabled on this host.</p>
+        <button style="width: 100%; padding: 8px; border-radius: 6px; border: 0.5px solid var(--border); background: transparent; color: var(--text); font-size: 12px; font-weight: 500; cursor: pointer;">Enable Plex&hellip;</button>
+      </div>
+
+      <div style="background: var(--surface); border: 0.5px dashed var(--border); border-radius: 10px; padding: 16px; opacity: 0.75;">
+        <div style="display: flex; align-items: flex-start; justify-content: space-between; margin-bottom: 12px;">
+          <div style="display: flex; align-items: center; gap: 10px;">
+            <div style="width: 34px; height: 34px; border-radius: 8px; background: var(--app-jellyfin-bg); display: flex; align-items: center; justify-content: center; font-size: 13px; font-weight: 500; color: var(--app-jellyfin-fg);">Je</div>
+            <div>
+              <div style="font-size: 14px; font-weight: 500;">Jellyfin</div>
+              <div style="font-size: 12px; color: var(--text-2);">media-server</div>
+            </div>
+          </div>
+        </div>
+        <p style="font-size: 12px; color: var(--text-2); margin: 0 0 14px; line-height: 1.5;">Not yet enabled on this host.</p>
+        <button style="width: 100%; padding: 8px; border-radius: 6px; border: 0.5px solid var(--border); background: transparent; color: var(--text); font-size: 12px; font-weight: 500; cursor: pointer;">Enable Jellyfin&hellip;</button>
+      </div>
+
+    </div>
+  </div>
+</div>
+    </div></div>
+  </div>
+
+  <div>
+    <p class="screen-label">4. App detail — Sonarr</p>
+    <div class="screen-frame"><div class="inner">
+<div style="min-width: 720px; padding-bottom: 40px;">
+
+  <div style="display: flex; align-items: center; gap: 10px; padding: 14px 28px; border-bottom: 0.5px solid var(--border); font-size: 13px; color: var(--text-2);">
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M15 18l-6-6 6-6"/></svg>
+    <span>Apps</span>
+    <span style="color: var(--text-3);">/</span>
+    <span style="color: var(--text);">Sonarr</span>
+  </div>
+
+  <div style="padding: 24px 28px; max-width: 640px;">
+
+    <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 20px;">
+      <div style="display: flex; align-items: center; gap: 12px;">
+        <div style="width: 40px; height: 40px; border-radius: 9px; background: var(--app-sonarr-bg); display: flex; align-items: center; justify-content: center; font-size: 14px; font-weight: 500; color: var(--app-sonarr-fg);">So</div>
+        <div>
+          <div style="font-size: 17px; font-weight: 500;">Sonarr</div>
+          <div style="font-size: 12px; color: var(--text-2); display: flex; align-items: center; gap: 6px;">
+            <span style="width: 6px; height: 6px; border-radius: 50%; background: var(--green); display: inline-block;" aria-hidden="true"></span>
+            Healthy &middot; TV series collection manager
+          </div>
+        </div>
+      </div>
+      <div style="display: flex; align-items: center; gap: 8px;">
+        <a href="#" style="display: flex; align-items: center; gap: 6px; font-size: 13px; text-decoration: none; padding: 8px 14px; border-radius: 6px; border: 0.5px solid var(--border);">
+          Open Sonarr
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M7 17 17 7M8 7h9v9"/></svg>
+        </a>
+        <a href="#" style="font-size: 12px; text-decoration: none; color: var(--text-2);">Docs &#8599;</a>
+      </div>
+    </div>
+
+    <div class="section">
+      <p class="section-title">General</p>
+      <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px;">
+        <span style="font-size: 13px;">Enable Sonarr</span>
+        <div style="width: 34px; height: 18px; border-radius: 9px; background: var(--accent); position: relative;">
+          <div style="width: 14px; height: 14px; border-radius: 50%; background: var(--knob); position: absolute; top: 2px; right: 2px;" aria-hidden="true"></div>
+        </div>
+      </div>
+      <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 16px;">
+        <div>
+          <label class="field-label">Port</label>
+          <input class="field-input" value="8989" readonly>
+        </div>
+        <div>
+          <label class="field-label">Subdomain</label>
+          <input class="field-input" value="sonarr" readonly>
+        </div>
+      </div>
+    </div>
+
+    <div class="section">
+      <p class="section-title">Access</p>
+      <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 16px;">
+        <div>
+          <label class="field-label">Exposure</label>
+          <select class="field-select"><option>lan &mdash; restricted to trusted networks</option></select>
+        </div>
+        <div>
+          <label class="field-label">Auth policy</label>
+          <select class="field-select"><option>two_factor</option></select>
+        </div>
+      </div>
+    </div>
+
+    <div class="section">
+      <p class="section-title">Media &amp; resources</p>
+      <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 16px;">
+        <div>
+          <label class="field-label">Media access</label>
+          <select class="field-select"><option>readwrite</option></select>
+        </div>
+        <div>
+          <label class="field-label">Memory limit</label>
+          <input class="field-input" value="2G" placeholder="unlimited">
+        </div>
+        <div>
+          <label class="field-label">CPU quota</label>
+          <input class="field-input" value="" placeholder="unlimited">
+        </div>
+      </div>
+    </div>
+
+    <div class="section">
+      <p class="section-title">Sonarr settings</p>
+      <div>
+        <label class="field-label">URL base</label>
+        <input class="field-input" value="" placeholder="/sonarr">
+      </div>
+    </div>
+
+    <div class="section" style="border-color: var(--info-border); background: var(--info-bg);">
+      <p class="section-title" style="display: flex; align-items: center; gap: 8px;">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="var(--text-2)" stroke-width="2" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M12 8v4M12 16h.01"/></svg>
+        Integrations
+      </p>
+      <p style="font-size: 13px; color: var(--text-2); margin: 0; line-height: 1.6;">Registered as an application in <b style="color: var(--text);">Prowlarr</b> &middot; pulls downloads from <b style="color: var(--text);">qBittorrent</b>, <b style="color: var(--text);">SABnzbd</b></p>
+    </div>
+
+    <div style="display: flex; justify-content: flex-end; gap: 10px; margin-top: 20px;">
+      <button style="padding: 9px 18px; border-radius: 6px; border: 0.5px solid var(--border); background: transparent; color: var(--text-2); font-size: 13px; cursor: pointer;">Discard</button>
+      <button style="padding: 9px 18px; border-radius: 6px; border: none; background: var(--accent); color: var(--on-accent); font-size: 13px; font-weight: 500; cursor: pointer;">Review changes</button>
+    </div>
+
+  </div>
+</div>
+    </div></div>
+  </div>
+
+  <div>
+    <p class="screen-label">5. App detail — qBittorrent, VPN setup</p>
+    <div class="screen-frame"><div class="inner">
+<div style="min-width: 720px; padding-bottom: 40px;">
+
+  <div style="display: flex; align-items: center; gap: 10px; padding: 14px 28px; border-bottom: 0.5px solid var(--border); font-size: 13px; color: var(--text-2);">
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M15 18l-6-6 6-6"/></svg>
+    <span>Apps</span>
+    <span style="color: var(--text-3);">/</span>
+    <span style="color: var(--text);">qBittorrent</span>
+  </div>
+
+  <div style="padding: 24px 28px; max-width: 640px;">
+
+    <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 20px;">
+      <div style="display: flex; align-items: center; gap: 12px;">
+        <div style="width: 40px; height: 40px; border-radius: 9px; background: var(--app-qbittorrent-bg); display: flex; align-items: center; justify-content: center; font-size: 14px; font-weight: 500; color: var(--app-qbittorrent-fg);">qB</div>
+        <div>
+          <div style="font-size: 17px; font-weight: 500;">qBittorrent</div>
+          <div style="font-size: 12px; color: var(--text-2); display: flex; align-items: center; gap: 6px;">
+            <span style="width: 6px; height: 6px; border-radius: 50%; background: var(--amber); display: inline-block;" aria-hidden="true"></span>
+            Degraded &middot; VPN tunnel down
+          </div>
+        </div>
+      </div>
+      <div style="display: flex; align-items: center; gap: 8px;">
+        <a href="#" style="display: flex; align-items: center; gap: 6px; font-size: 13px; text-decoration: none; padding: 8px 14px; border-radius: 6px; border: 0.5px solid var(--border);">
+          Open qBittorrent
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M7 17 17 7M8 7h9v9"/></svg>
+        </a>
+      </div>
+    </div>
+
+    <div class="section" style="border-color: var(--info-border); background: var(--info-bg);">
+      <p style="font-size: 13px; color: var(--text); margin: 0; line-height: 1.6;"><b>The VPN tunnel is down, so downloads are blocked.</b> qBittorrent's kill switch keeps it that way on purpose &mdash; it never falls back to your real IP.</p>
+    </div>
+
+    <div class="section">
+      <p class="section-title">VPN kill switch</p>
+      <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 18px;">
+        <div>
+          <span style="font-size: 13px; display: block;">Route traffic through a WireGuard tunnel</span>
+          <span style="font-size: 12px; color: var(--text-3);">qBittorrent only reaches the network through this tunnel &mdash; no leak path if it drops.</span>
+        </div>
+        <div class="toggle-on" style="margin-top: 2px;"><div class="knob" aria-hidden="true"></div></div>
+      </div>
+
+      <div style="margin-bottom: 16px;">
+        <label class="field-label">Provider</label>
+        <select class="field-select"><option>Mullvad</option></select>
+      </div>
+
+      <div style="display: flex; align-items: center; justify-content: space-between; background: var(--surface-2); border: 0.5px solid var(--border); border-radius: 8px; padding: 10px 14px; margin-bottom: 16px;">
+        <span style="font-size: 12px; color: var(--text-2);">Need a config? Mullvad publishes ready-made WireGuard files per server.</span>
+        <a href="#" style="display: flex; align-items: center; gap: 4px; font-size: 12px; text-decoration: none; white-space: nowrap; margin-left: 12px;">
+          Get config
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M7 17 17 7M8 7h9v9"/></svg>
+        </a>
+      </div>
+
+      <div>
+        <label class="field-label">WireGuard config</label>
+        <textarea class="field-input" rows="4" placeholder="[Interface]&#10;PrivateKey = ...&#10;Address = ...&#10;&#10;[Peer]&#10;PublicKey = ...&#10;Endpoint = ..." style="font-size: 12px; resize: vertical;"></textarea>
+        <p style="font-size: 11px; color: var(--text-3); margin: 8px 0 0; display: flex; align-items: center; gap: 5px;">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="3" y="11" width="18" height="10" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+          Encrypted immediately on save. ferrumd can write this but can never read it back.
+        </p>
+      </div>
+    </div>
+
+    <div style="display: flex; justify-content: flex-end; gap: 10px; margin-top: 20px;">
+      <button style="padding: 9px 18px; border-radius: 6px; border: 0.5px solid var(--border); background: transparent; color: var(--text-2); font-size: 13px; cursor: pointer;">Discard</button>
+      <button style="padding: 9px 18px; border-radius: 6px; border: none; background: var(--accent); color: var(--on-accent); font-size: 13px; font-weight: 500; cursor: pointer;">Save VPN config</button>
+    </div>
+
+  </div>
+</div>
+    </div></div>
+  </div>
+
+  <div>
+    <p class="screen-label">6. Apply flow — review + live progress</p>
+    <div class="screen-frame"><div class="inner">
+<div style="min-width: 640px; padding: 28px; box-sizing: border-box;">
+
+  <div style="max-width: 560px; margin: 0 auto;">
+
+    <h1 style="font-size: 17px; font-weight: 500; margin: 0 0 4px;">Apply changes</h1>
+    <p style="font-size: 13px; color: var(--text-2); margin: 0 0 20px;">1 pending change &middot; will rebuild and restart affected apps</p>
+
+    <div style="background: var(--surface); border: 0.5px solid var(--border); border-radius: 10px; padding: 16px 18px; margin-bottom: 20px;">
+      <div style="font-size: 13px; font-weight: 500; margin-bottom: 10px;">Sonarr</div>
+      <div class="mono" style="font-size: 12px; display: flex; justify-content: space-between; padding: 4px 0;">
+        <span style="color: var(--text-2);">exposure</span>
+        <span><span style="color: var(--red); text-decoration: line-through; opacity: 0.6;">local</span> &rarr; <span style="color: var(--green);">lan</span></span>
+      </div>
+    </div>
+
+    <div style="display: flex; justify-content: flex-end; gap: 10px; margin-bottom: 28px;">
+      <button style="padding: 9px 18px; border-radius: 6px; border: 0.5px solid var(--border); background: transparent; color: var(--text-2); font-size: 13px; cursor: pointer;">Cancel</button>
+      <button style="padding: 9px 18px; border-radius: 6px; border: none; background: var(--accent); color: var(--on-accent); font-size: 13px; font-weight: 500; cursor: pointer;">Apply now</button>
+    </div>
+
+    <div style="border-top: 0.5px solid var(--border); padding-top: 20px;">
+      <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 16px;">
+        <div style="width: 14px; height: 14px; border-radius: 50%; border: 2px solid var(--amber); border-top-color: transparent; animation: none;" aria-hidden="true"></div>
+        <span style="font-size: 13px; font-weight: 500;">Applying &middot; generation 47 &rarr; 48</span>
+      </div>
+
+      <div style="display: flex; flex-direction: column; gap: 2px;">
+
+        <div style="display: flex; align-items: center; gap: 10px; padding: 7px 0;">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="var(--green)" stroke-width="2" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg>
+          <span style="font-size: 13px; color: var(--text-2);">ensuring generated secrets exist</span>
+        </div>
+        <div style="display: flex; align-items: center; gap: 10px; padding: 7px 0;">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="var(--green)" stroke-width="2" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg>
+          <span style="font-size: 13px; color: var(--text-2);">building the new system closure</span>
+        </div>
+        <div style="display: flex; align-items: center; gap: 10px; padding: 7px 0;">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="var(--green)" stroke-width="2" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg>
+          <span style="font-size: 13px; color: var(--text-2);">checking free space and snapshot subvolumes</span>
+        </div>
+        <div style="display: flex; align-items: center; gap: 10px; padding: 7px 0;">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="var(--green)" stroke-width="2" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg>
+          <span style="font-size: 13px; color: var(--text-2);">stopping affected apps</span>
+        </div>
+        <div style="display: flex; align-items: center; gap: 10px; padding: 7px 0;">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="var(--green)" stroke-width="2" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg>
+          <span style="font-size: 13px; color: var(--text-2);">snapshotting application state</span>
+        </div>
+        <div style="display: flex; align-items: center; gap: 10px; padding: 7px 0; background: var(--surface); margin: 0 -12px; padding-left: 12px; padding-right: 12px; border-radius: 6px;">
+          <div style="width: 16px; height: 16px; border-radius: 50%; border: 2px solid var(--amber); border-top-color: transparent;" aria-hidden="true"></div>
+          <span style="font-size: 13px; color: var(--text);">running switch-to-configuration</span>
+        </div>
+        <div style="display: flex; align-items: center; gap: 10px; padding: 7px 0;">
+          <span style="width: 16px; height: 16px; display: inline-flex; align-items: center; justify-content: center;" aria-hidden="true"><span style="width: 5px; height: 5px; border-radius: 50%; background: var(--text-3); display: inline-block;"></span></span>
+          <span style="font-size: 13px; color: var(--text-3);">restarting apps</span>
+        </div>
+        <div style="display: flex; align-items: center; gap: 10px; padding: 7px 0;">
+          <span style="width: 16px; height: 16px; display: inline-flex; align-items: center; justify-content: center;" aria-hidden="true"><span style="width: 5px; height: 5px; border-radius: 50%; background: var(--text-3); display: inline-block;"></span></span>
+          <span style="font-size: 13px; color: var(--text-3);">waiting for every managed unit to become active</span>
+        </div>
+
+      </div>
+    </div>
+
+  </div>
+</div>
+    </div></div>
+  </div>
+
+  <div>
+    <p class="screen-label">7. Updates</p>
+    <div class="screen-frame"><div class="inner">
+<div style="min-width: 640px; padding-bottom: 40px;">
+
+  <div style="padding: 24px 28px; max-width: 560px;">
+
+    <h1 style="font-size: 18px; font-weight: 500; margin: 0 0 4px;">Updates</h1>
+    <p style="font-size: 13px; color: var(--text-2); margin: 0 0 20px;">Every app shares one pinned package set &mdash; updating brings all of them forward together.</p>
+
+    <div style="background: var(--surface); border: 0.5px solid var(--border); border-radius: 10px; padding: 16px 18px; margin-bottom: 16px;">
+      <div style="display: flex; align-items: center; justify-content: space-between;">
+        <div>
+          <div style="font-size: 13px; color: var(--text-2); margin-bottom: 2px;">Current</div>
+          <div class="mono" style="font-size: 13px;">generation 47 &middot; ferrum 2026.34</div>
+        </div>
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="var(--text-3)" stroke-width="2" aria-hidden="true"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
+        <div style="text-align: right;">
+          <div style="font-size: 13px; color: var(--green); margin-bottom: 2px;">Available</div>
+          <div class="mono" style="font-size: 13px; color: var(--green);">ferrum 2026.35</div>
+        </div>
+      </div>
+    </div>
+
+    <p style="font-size: 12px; color: var(--text-2); text-transform: uppercase; letter-spacing: 0.4px; margin: 0 0 10px;">What's changing</p>
+
+    <div style="background: var(--surface); border: 0.5px solid var(--border); border-radius: 10px; margin-bottom: 20px; overflow: hidden;">
+
+      <div style="display: flex; align-items: center; justify-content: space-between; padding: 12px 16px; border-bottom: 0.5px solid var(--border);">
+        <div style="display: flex; align-items: center; gap: 10px;">
+          <div style="width: 26px; height: 26px; border-radius: 6px; background: var(--app-sonarr-bg); display: flex; align-items: center; justify-content: center; font-size: 11px; font-weight: 500; color: var(--app-sonarr-fg);">So</div>
+          <span style="font-size: 13px;">Sonarr</span>
+        </div>
+        <span class="mono" style="font-size: 12px; color: var(--text-2);">4.0.1 &rarr; 4.0.3</span>
+      </div>
+
+      <div style="display: flex; align-items: center; justify-content: space-between; padding: 12px 16px; border-bottom: 0.5px solid var(--border);">
+        <div style="display: flex; align-items: center; gap: 10px;">
+          <div style="width: 26px; height: 26px; border-radius: 6px; background: var(--app-radarr-bg); display: flex; align-items: center; justify-content: center; font-size: 11px; font-weight: 500; color: var(--app-radarr-fg);">Ra</div>
+          <span style="font-size: 13px;">Radarr</span>
+        </div>
+        <span class="mono" style="font-size: 12px; color: var(--text-2);">5.2.0 &rarr; 5.3.1</span>
+      </div>
+
+      <div style="display: flex; align-items: center; justify-content: space-between; padding: 12px 16px;">
+        <div style="display: flex; align-items: center; gap: 10px;">
+          <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="1.7" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 8v4M12 16h.01"/></svg>
+          <div>
+            <span style="font-size: 13px; display: block;">Immich</span>
+            <span style="font-size: 11px; color: var(--text-3);">newly available in the catalog</span>
+          </div>
+        </div>
+        <span style="font-size: 11px; color: var(--accent);">new</span>
+      </div>
+
+    </div>
+
+    <div class="section" style="background: var(--info-bg); border: 0.5px solid var(--info-border); border-radius: 10px; padding: 14px 16px; margin-bottom: 20px;">
+      <p style="font-size: 12px; color: var(--text-2); margin: 0; line-height: 1.6;">This is a real generation switch, same as any other apply &mdash; state is snapshotted first, and a rollback restores both the closure and the data together.</p>
+    </div>
+
+    <div style="display: flex; justify-content: flex-end; gap: 10px;">
+      <button style="padding: 9px 18px; border-radius: 6px; border: 0.5px solid var(--border); background: transparent; color: var(--text-2); font-size: 13px; cursor: pointer;">Not now</button>
+      <button style="padding: 9px 18px; border-radius: 6px; border: none; background: var(--accent); color: var(--on-accent); font-size: 13px; font-weight: 500; cursor: pointer;">Review &amp; update</button>
+    </div>
+
+  </div>
+</div>
+    </div></div>
+  </div>
+
+  <div>
+    <p class="screen-label">8. Settings</p>
+    <div class="screen-frame"><div class="inner">
+<div style="min-width: 720px; padding-bottom: 40px;">
+
+  <div style="padding: 24px 28px; max-width: 640px;">
+
+    <h1 style="font-size: 18px; font-weight: 500; margin: 0 0 4px;">Settings</h1>
+    <p style="font-size: 13px; color: var(--text-2); margin: 0 0 20px;">Host-wide configuration &mdash; changes here also require Review &amp; apply</p>
+
+    <div class="section">
+      <p class="section-title">Proxy &amp; domain</p>
+      <p class="section-sub">Enables nginx + real ACME certs for lan/public apps.</p>
+      <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px;">
+        <span style="font-size: 13px;">Enable reverse proxy</span>
+        <div class="toggle-on"><div class="knob" aria-hidden="true"></div></div>
+      </div>
+      <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 16px;">
+        <div>
+          <label class="field-label">Base domain</label>
+          <input class="field-input" value="home.arpa">
+        </div>
+        <div>
+          <label class="field-label">ACME email</label>
+          <input class="field-input" value="admin@home.arpa">
+        </div>
+      </div>
+      <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 16px;">
+        <div>
+          <label class="field-label">DNS provider</label>
+          <select class="field-select"><option>cloudflare</option></select>
+        </div>
+        <div>
+          <label class="field-label">Trusted networks</label>
+          <input class="field-input" value="10.0.0.0/8, 192.168.0.0/16">
+        </div>
+      </div>
+    </div>
+
+    <div class="section">
+      <p class="section-title">Authentication</p>
+      <p class="section-sub">Authelia forward-auth for apps set to one_factor or two_factor.</p>
+      <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px;">
+        <span style="font-size: 13px;">Enable Authelia</span>
+        <div class="toggle-on"><div class="knob" aria-hidden="true"></div></div>
+      </div>
+      <div>
+        <label class="field-label">Admin email</label>
+        <input class="field-input" value="admin@home.arpa">
+      </div>
+    </div>
+
+    <div class="section">
+      <p class="section-title">Backups</p>
+      <p class="section-sub">Scheduled, encrypted state backups via restic.</p>
+      <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px;">
+        <span style="font-size: 13px;">Enable scheduled backups</span>
+        <div class="toggle-off"><div class="knob" aria-hidden="true"></div></div>
+      </div>
+      <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 16px;">
+        <div>
+          <label class="field-label">Repository</label>
+          <input class="field-input" value="" placeholder="s3:...">
+        </div>
+        <div>
+          <label class="field-label">Schedule</label>
+          <select class="field-select"><option>daily</option></select>
+        </div>
+      </div>
+    </div>
+
+    <div class="section">
+      <p class="section-title">Apply behavior</p>
+      <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px;">
+        <div>
+          <span style="font-size: 13px; display: block;">Auto-rollback on failed health check</span>
+          <span style="font-size: 12px; color: var(--text-3);">Off by default &mdash; health checks aren't mature enough to trust with an automatic reboot yet.</span>
+        </div>
+        <div class="toggle-off" style="margin-top: 2px;"><div class="knob" aria-hidden="true"></div></div>
+      </div>
+      <div style="max-width: 200px;">
+        <label class="field-label">Health check timeout</label>
+        <input class="field-input" value="120s">
+      </div>
+    </div>
+
+    <div class="section" style="border-color: var(--info-border); background: var(--info-bg);">
+      <p class="section-title" style="display: flex; align-items: center; gap: 8px;">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="var(--amber)" stroke-width="2" aria-hidden="true"><path d="M12 9v4M12 17h.01M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/></svg>
+        This daemon
+      </p>
+      <p style="font-size: 13px; color: var(--text-2); margin: 0; line-height: 1.6;">Port, listen address, and subdomain are read-only here &mdash; ferrumd can't safely reconfigure its own listener from inside its own request. Edit them in <span class="mono" style="color: var(--text);">custom/</span> directly.</p>
+    </div>
+
+    <div style="display: flex; justify-content: flex-end; gap: 10px; margin-top: 20px;">
+      <button style="padding: 9px 18px; border-radius: 6px; border: 0.5px solid var(--border); background: transparent; color: var(--text-2); font-size: 13px; cursor: pointer;">Discard</button>
+      <button style="padding: 9px 18px; border-radius: 6px; border: none; background: var(--accent); color: var(--on-accent); font-size: 13px; font-weight: 500; cursor: pointer;">Review changes</button>
+    </div>
+
+  </div>
+</div>
+    </div></div>
+  </div>
+
+</div>
+
+</body></html>

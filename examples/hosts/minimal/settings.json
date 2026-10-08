@@ -13,22 +13,32 @@
       "exposure": "lan"
     },
     "radarr": {
-      "enable": true
+      "enable": true,
+      "exposure": "lan"
     },
     "prowlarr": {
-      "enable": true
+      "enable": true,
+      "exposure": "lan"
     },
     "jellyfin": {
-      "enable": true
+      "enable": true,
+      "exposure": "lan"
     },
     "plex": {
-      "enable": true
+      "enable": true,
+      "exposure": "lan"
     },
     "sabnzbd": {
-      "enable": true
+      "enable": true,
+      "exposure": "lan"
     },
     "qbittorrent": {
-      "enable": true
+      "enable": true,
+      "exposure": "lan"
     }
+  },
+  "daemon": {
+    "enable": true,
+    "publish": false
   }
 }

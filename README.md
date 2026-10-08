@@ -2,24 +2,67 @@
 
 A NixOS-based, rollback-safe alternative to [Saltbox](https://github.com/saltyorg/Saltbox) for self-hosted media and automation servers.
 
-**Status: pre-alpha — working engine, no install path, never run on real hardware.**
+**Status: pre-alpha — installs and runs on real hardware; the installer's own VM tests have never passed.**
 
-Built and tested: the rollback engine, the seven-app catalog, the reverse proxy with TLS and SSO, sops secrets, the cross-app reconciler, and `ferrumd` (the unprivileged daemon with its polkit privilege boundary). 118 Rust unit tests and eight NixOS VM tests cover them.
+Built and tested: the rollback engine, the eight-app catalog, the reverse proxy with TLS and SSO, sops secrets, the cross-app reconciler, storage pooling over several disks, `ferrumd` (the unprivileged daemon with its polkit privilege boundary), the schema-driven web UI, and an installer that takes a bare machine to a published, logged-in system, and update discovery, preview and commit. Parity over those disks is built too: SnapRAID, with the parity disk structurally kept out of the pool, an exclusion list derived from ferrum's own layout, self-healing sync and scrub timers, and a staleness report that says how many files are not protected and as of when. Parity is not a backup and nothing in ferrum says it is — see [`docs/storage/parity.md`](docs/storage/parity.md). 1,161 Rust unit tests, 54 Nix checks wired into CI and nine NixOS VM tests cover them.
 
-Not built: the web UI (`ui/` does not exist yet) and the install path. `ferrum-apply gc` is a stub, so **application-state snapshots are never pruned and will fill a disk over time**.
+Proven on a real machine, not just in CI: a rollback that reverted both the system closure and application state together; Plex reachable on a real domain with a real Let's Encrypt certificate, served through ferrum's own nginx vhost from a typed `settings.json` with no hand-written Nix.
 
-Nothing here has ever been installed on a real machine end to end — [`examples/hosts/homelab-btrfs`](examples/hosts/homelab-btrfs) is a reference disk layout that has not been provisioned. **Do not point this at a server holding data you care about.**
+Updates are built. App versions come from the nixpkgs revision ferrum's own flake pins, so there is no per-app update and ferrum does not pretend otherwise: a pending update is one host-wide event listing every affected app's delta together, because accepting it advances the single pin they all share. `check-update` reports what would change without touching anything; committing advances only `flake.lock` and then runs the ordinary apply pipeline, so an update is an ordinary generation rather than a special case. If the rebuilt system turns out identical to the one already running, you are told "no change — nothing to apply" and no generation is created. See [the Phase 1.6 spec](docs/superpowers/specs/2026-09-16-phase-1-6-updates-design.md).
+
+Every generation records the ferrum revision it was built from, because rollback reverts the closure and not the pin. Without that record, rolling back a bad update and then changing any unrelated setting a week later would quietly reinstall it. Instead the next apply stops and names the revision it would move you to, and you decide.
+
+`ferrum-apply gc` **is** implemented (it was a stub until 2026-09-15) and prunes to `ferrum.storage.keepGenerations`, default 10. No timer runs it, so it is operator-triggered. It protects the *currently-running* generation's snapshot, and every unconfirmed update's pre-image — so an update's way back is not retired by the next ten applies, and you release those by confirming the update is good. Any other generation's snapshot can still be pruned, after which that generation becomes unrollbackable.
+
+It has now been installed on a real machine end to end, and rollback has been exercised there for real. That is one machine, run by its author — **still do not point this at a server holding data you care about.**
+
+One gap worth knowing before you try it: the installer's own VM tests (`tests/stage2`) have never passed in CI, so the install path is proven by one person on one machine rather than mechanically.
+
+**DNS is ferrum's to manage now.** It creates and reconciles one record per published app, plus `auth` when SSO is on and `ferrum` for the daemon itself — on every apply, and on a timer if you enable the dynamic-address updater. The records it wrote carry a marker in their Cloudflare `comment`, and that marker is the whole permission model: a record without it is *yours*, so ferrum reports it, leaves it exactly as it is, and never writes to or deletes it — unless you name that one hostname at the install gate and hand it over explicitly. A record of a type ferrum does not model (an `AAAA`, say) sharing one of those names is disclosed in the plan rather than silently stepped around. **Cloudflare is the only provider**, which ferrum already required for ACME DNS-01.
+
+Turn the updater on (`ferrum.proxy.dns.ddnsUpdater.enable`) and ferrum finds your public IPv4 address itself rather than republishing one you typed in once — set `staticAddress` or don't, your call, but if you set one and it disagrees you get told, naming both, rather than one of them quietly winning. Finding the address is a trust decision, not a lookup: a wrong answer republishes *every* one of your hostnames at somebody else's server, with certificates ferrum obtained itself, which is worse than a record that is merely out of date. So it asks three services run by three different companies, needs at least two of those companies to answer, and publishes only if every answer that arrived agrees. A private or reserved answer is refused outright, a lookup that fails exits non-zero instead of looking like "nothing to do", and published changes are capped at three a day so a flapping line can't spend your Cloudflare quota. What ferrum still can't tell you is whether traffic *to* that address reaches your box — behind CGNAT, or a router with no port forward, the records are right and the apps are still dark — so it says exactly that when the address moves instead of implying it checked.
+
+Split-horizon DNS is out of scope: every record points at the public address, so reaching these names from inside your own LAN depends on your router supporting NAT hairpin, and many do not.
 
 ## Why
 
-Saltbox deploys Plex/Jellyfin, the *arr apps, download clients and a reverse proxy onto a dedicated Ubuntu box via Ansible, and it works, but it has no rollback of any kind, destroys local edits on every update (`git clean -df && git reset --hard`, twice, no stash), and ships secrets in plaintext YAML.
+Saltbox deploys Plex/Jellyfin, the *arr apps, download clients and a reverse proxy onto a dedicated Ubuntu box via Ansible, and it works. It has a far larger catalog than ferrum — roughly 300 installable roles against ferrum's eight — and nine years of accumulated edge cases behind it.
+
+What it does not have is rollback of any kind: its own recovery documentation is to delete the application's directory and restore a backup. It has **zero releases and zero tags**, and 171 of its roles pin a floating image tag, so running the same install next week installs different software. Its update resets both role repositories to upstream with no stash, so edits to tracked role files are destroyed — though its inventory system and `/opt/saltbox_mod` are sanctioned override surfaces that survive by design. Secrets are plaintext YAML, hardened to `0600` rather than encrypted.
+
+The fuller comparison, including the rows where Saltbox wins and three claims ferrum itself had wrong, is in [`docs/competitive/saltbox.md`](docs/competitive/saltbox.md).
 
 ferrum's two goals:
 
-1. **Atomic updates with real rollback.** NixOS generations only roll back the system closure, not application state or databases — rolling back a migrated database just moves the outage. ferrum pairs every update with a btrfs snapshot of application state, keyed to the generation, so a rollback restores *both* together.
-2. **Setup and maintenance without hand-editing config.** A local web UI reads and writes a typed `settings.json`; it never generates Nix. A `custom/` directory holds hand-written Nix the UI never touches, so — unlike Saltbox — your customisations survive an update.
+1. **Atomic updates with real rollback.** NixOS generations only roll back the system closure, not application state or databases — rolling back a migrated database just moves the outage. ferrum pairs every update with a btrfs snapshot of application state, keyed to the generation, so a rollback restores *both* together, and the apps are stopped before the snapshot is taken so it is a clean image rather than a crash image.
+
+   **This is not a first, and ferrum does not claim one.** Ubuntu's ZSys shipped system-plus-user rollback as two literal GRUB entries before being removed from the archive in 2025. TrueNAS offers it today as a per-app checkbox — though *"data in mounted host paths is not rolled back"*, which is exactly where a homelab keeps its configuration. Start9 snapshots before every service update, but only to undo a failure, not to go back on request. Each of those fails a different clause of what ferrum does, and the narrower claim is the one that holds: **ferrum is the only one that does it for the whole machine, operator-initiated, at any generation, including host-path data.** Who else is in this space, and what each actually ships, is in [`docs/competitive/landscape.md`](docs/competitive/landscape.md).
+2. **Setup and maintenance without hand-editing config.** A local web UI reads and writes a typed `settings.json`; it never generates Nix. A `custom/` directory holds hand-written Nix the UI never touches, and `sb update`'s equivalent here cannot reach it. Saltbox has a sanctioned override surface too — its inventory system and `/opt/saltbox_mod` both survive an update by design — so the narrower, accurate difference is that ferrum's unit of customisation is a declarative module evaluated with everything else, not a variable the maintainers chose to expose.
 
 The full design, including why each of these choices was made, is in [`docs/design/2026-08-19-phase-1-design.md`](docs/design/2026-08-19-phase-1-design.md).
+
+## What leaves the machine
+
+**ferrum has no telemetry, no analytics, no crash reporting and no version ping**, and there is no
+ferrum-operated service of any kind for one to talk to. The dashboard makes no external request at
+all — no CDN, no web font, no absolute URL anywhere in `ui/`. What a ferrum host *does* contact is
+your DNS provider, your certificate authority, the Nix binary cache, and — only if you turn it on —
+three address-echo services; everything else is an app you installed doing the job you installed it
+for. The full table, every row traced to the line of code it came from and the unverified ones
+marked as unverified, is in [`docs/EGRESS.md`](docs/EGRESS.md).
+
+**ferrum connects the apps to each other, and you do not have to.** Prowlarr pushes indexers to
+Sonarr and Radarr, both download clients register with all three, and every app is told where the
+media tree is — derived from the catalog on every apply, not configured by you. What that covers,
+what needs the `custom/` escape hatch instead, and what ferrum deliberately does not do, is in
+[`docs/WHATS-ALREADY-WIRED.md`](docs/WHATS-ALREADY-WIRED.md).
+
+That page also carries the warning ferrum did not previously make: publishing an app puts its
+hostname in **public, permanently searchable Certificate Transparency logs**, so the list of what
+runs on your domain is readable by anyone. Whether ferrum should issue one wildcard instead of a
+certificate per app — what each discloses, what each costs when a renewal fails, and a
+recommendation — is argued in
+[`docs/CERTIFICATE-TRANSPARENCY.md`](docs/CERTIFICATE-TRANSPARENCY.md).
 
 ## Platform
 
@@ -35,22 +78,72 @@ modules/             the NixOS module tree — the product
   core/              cross-cutting ferrum.* options, storage, generations
   apps/<name>/       one directory per catalog app: meta.nix + service.nix
 crates/              Rust workspace: ferrum-apply (the rollback engine), ferrumd (the
-                     daemon), ferrum-reconcile (cross-app registration), ferrum-secrets
-ui/                  the web UI — not started (Phase 1.5b)
+                     daemon), ferrum-install (the installer), ferrum-reconcile
+                     (cross-app registration), ferrum-secrets, ferrum-state
+ui/                  the web UI — hand-written HTML/CSS/ES modules, no build step
 tests/               NixOS VM tests
 examples/hosts/      example settings.json + host config used by the guard checks
 docs/design/         the approved design spec
+docs/storage/        operator storage procedures (parity, restoring a disk)
 ```
 
 ## Secrets
 
 Every secret on a ferrum host is a [sops](https://github.com/getsops/sops)-encrypted file under `ferrum.secretsDir` (default `/etc/ferrum/secrets`), decrypted at boot into a runtime-only path by [sops-nix](https://github.com/Mic92/sops-nix). The box's age decryption identity is derived from its own SSH host key — nothing to provision or lose track of separately.
 
+**Installing a host takes one command.** `ferrum-install` ships as a Docker
+image, so Docker is the only thing your own machine needs. It inventories the
+target, makes you type the serial of the disk it will erase, generates the
+whole host repository, installs, enables the apps behind single sign-on, and
+prints the URLs and both first-run passwords. See `docs/INSTALL.md`; the manual
+path is still documented there for anyone modifying ferrum itself.
+
+```bash
+docker run --rm -it -v ~/.ssh:/ssh:ro -v ~/ferrum-host:/host \
+  ghcr.io/syms-dev/ferrum-install root@YOUR-TARGET
+```
+
+**Operator-supplied secrets go in with `ferrum-apply put-secret <name>`**, which
+reads the value from stdin (never argv, so it stays out of `ps` and shell
+history) and encrypts it to the host's own age recipient. The Cloudflare DNS-01
+token is the one you will need; the installer handles it for you.
+
 **Sonarr, Radarr and Prowlarr's API keys are fully automatic.** `ferrum-apply` generates and encrypts a random key for each enabled app on first apply; there is nothing an operator needs to do.
+
+**And ferrum spends them on your behalf.** Decluttarr — which clears downloads that cannot finish out of the Sonarr and Radarr queues — normally wants a hand-written `config.yaml` carrying every \*arr's URL and API key. Enabling `decluttarr` writes all of it, because ferrum already knows all of it. It has no web interface, so it gets no subdomain, no certificate and no DNS record; watch it with `journalctl -u decluttarr -f`. Its defaults, and the jobs deliberately left off, are in [`docs/WHATS-ALREADY-WIRED.md`](docs/WHATS-ALREADY-WIRED.md).
+
+### Plex's claim token
+
+Plex will not serve anybody but localhost until the server is claimed by a Plex account, and ferrum opens no port you could claim it from on the LAN — so ferrum claims it for you. If you enable Plex and set a base domain, the installer asks for a token from [plex.tv/claim](https://plex.tv/claim) and sends it to the host as the `plex-claim` secret; `ferrum-reconcile` uses it on the next apply and is a no-op on a server that is already claimed. It is a secret and not a `settings.json` value on purpose: it associates the server with somebody's Plex account, and `settings.json` is world-readable by design.
+
+That token expires **four minutes** after plex.tv issues it, and the system build between the question and the claim usually takes longer — so coming up unclaimed is the ordinary outcome rather than a fault. The closing report asks the host whether Plex is actually claimed and says so plainly when it is not, with the commands that finish the job:
+
+```bash
+ferrum-apply put-secret plex-claim --replace   # paste a fresh token on stdin
+ferrum-apply apply
+```
+
+Skipping the question is one keystroke, and is reported the same way rather than silently — but the recovery is one step longer, because nothing declared the secret. Add it to `secrets` in `/etc/ferrum/settings.json` first:
+
+```json
+"plex-claim": { "description": "plex.tv claim token" }
+```
+
+then `ferrum-apply put-secret plex-claim` (no `--replace`, there is nothing there yet) and `ferrum-apply apply`. The declaration is what `modules/apps/plex/service.nix` and `modules/core/reconciler.nix` both key on; without it the secret is written and never read.
 
 ### qBittorrent VPN kill switch
 
-qBittorrent's VPN kill-switch config is operator-provided, since it's your own WireGuard peer's config, not something ferrum can generate. To enable it:
+qBittorrent's VPN kill-switch config is operator-provided, since it's your own WireGuard peer's config, not something ferrum can generate.
+
+**The short way: paste it into the dashboard.** Open **Apps → qBittorrent** and paste the whole file
+your provider issued into *VPN config*. ferrumd declares the secret for you, encrypts the text to
+this host's own key, and writes it — then apply. It is encrypted the moment it is saved, and
+**ferrumd can write it but can never read it back**: there is no endpoint that returns a secret, by
+construction, which is why that screen cannot show you what is already stored. The same screen
+reports what ferrum can establish about the tunnel, and when it last established it — see
+*What the VPN reading does and does not prove* below.
+
+The manual way, for a host whose dashboard is not up yet:
 
 1. Get this host's age recipient (its SSH host key's public half, converted):
    ```bash
@@ -64,6 +157,46 @@ qBittorrent's VPN kill-switch config is operator-provided, since it's your own W
    ```
 3. Add `"qbittorrent-vpn"` to `ferrum.secrets` in `settings.json` — this is what actually enables qBittorrent's VPN-gated network namespace; the file's mere presence on disk is not enough on its own.
 4. Re-apply. qBittorrent's traffic now routes exclusively through the tunnel; see `modules/apps/qbittorrent/service.nix` for the kill-switch mechanism itself.
+
+Its WebUI moves with it. Inside the namespace it is no longer on the host's loopback, so the reverse
+proxy and the cross-app reconciler reach it across the management veth pair instead — one shared
+value, `modules/lib/app-address.nix`, that both of them read. The `netns-apps-are-proxied-reachably`
+check holds them together: it derives "this app is in a namespace" from the generated systemd units
+and fails if anything proxies such an app at an address that cannot reach it.
+
+Encrypt the provider's file exactly as it was issued — there is nothing to edit out of it. A config
+carrying several comma-separated addresses (`Address = 10.2.0.2/32, 2a07:b944::2:2/128`, which is
+what Proton and most other providers hand out) is applied one entry at a time. **IPv6 entries in
+`Address` and `DNS` are deliberately skipped**, because the namespace qBittorrent runs in is routed
+IPv4-only; each skip is named in `journalctl -u qbt-vpn-netns-setup` so it is a visible decision
+rather than a silent drop. An IPv4 entry the kernel would refuse, or a config with no IPv4 address
+at all, fails the unit at setup time quoting the offending config line.
+
+#### What the VPN reading does and does not prove
+
+`GET /api/vpn` — and the panel on the app's own page — reports a **live reading taken per request**,
+carrying `checkedAt`, the second it was taken. The dashboard ages that on screen ("checked 4 minutes
+ago") rather than painting a dot that cannot go stale. A kill switch last verified before the last
+reboot is not a verified kill switch.
+
+What is actually measured is the state of **one systemd unit**, `qbt-vpn-netns-setup.service`, named
+by qBittorrent's own catalog metadata rather than hard-coded anywhere:
+
+| State | What it means | What to do |
+|---|---|---|
+| `not-configured` | No VPN secret is declared. No tunnel, no kill switch. | Paste a config. |
+| `not-applied` | A config is saved and systemd knows no such unit — this host has not been rebuilt since. | Apply. |
+| `starting` | The unit is coming up or going down. | Wait, re-check. |
+| `tunnel-configured` | The setup script ran all the way through: the namespace exists and the interface in it was configured from your config. | Nothing. |
+| `tunnel-down` | The tunnel is not set up. qBittorrent is bound to that unit, so it is **stopped** rather than left running outside the tunnel — downloads are blocked on purpose. | Read `journalctl -u qbt-vpn-netns-setup`. |
+| `unknown` | ferrumd could not reach the system bus, so nothing was measured. | Not the same as down. |
+
+**`tunnel-configured` is not "traffic is flowing".** WireGuard is connectionless: an interface is up
+from the moment it is configured, peer or no peer, handshake or no handshake. Proving the tunnel
+carries traffic would mean reading `wg show`'s last handshake from *inside* the namespace, and
+ferrumd is deliberately unprivileged (`User=ferrum`, `CapabilityBoundingSet=""`), so it cannot enter
+a namespace or run `wg(8)`. That limit is stated on the screen itself rather than left for you to
+infer.
 
 If this host's SSH host key is ever regenerated, every existing `.sops` file under `ferrum.secretsDir` becomes permanently undecryptable — back up `/etc/ssh/ssh_host_ed25519_key` the same way you'd back up any other credential this box depends on. Auto-generated servarr keys recover on their own (delete the stale `.sops` file and re-apply; a fresh key is generated); a lost `qbittorrent-vpn.sops` must be re-encrypted from your original WireGuard config via the steps above.
 
@@ -98,6 +231,291 @@ ssh <host> sudo cat /var/lib/authelia-main/authelia-setup-password
 ```
 
 Log in at `https://auth.<ferrum.proxy.baseDomain>/`, then change the password from Authelia's own UI — the setup file is never regenerated or deleted automatically once `users_database.yml` exists, so treat it as sensitive until you remove it by hand.
+
+### Getting in when SSH is down — the console password
+
+**Write this one down before you need it.** Every other credential on this page gets you into something over the network; this is the one that works when the network does not.
+
+`ferrum-apply` gives root a random console password on any apply where root has no usable one, and writes the plaintext once to `/var/lib/ferrum/root-console-password` (mode `0400`, root-only). The installer prints it at the end of an install, under `console login`. Read it again any time:
+
+```bash
+ssh <host> sudo cat /var/lib/ferrum/root-console-password
+```
+
+Then, at the machine's own keyboard and monitor, log in as `root` with that password at the `<host> login:` prompt.
+
+Two things about it:
+
+- **A password you set yourself is never replaced.** The guard is `passwd -S root`, the account's real state — not the presence of the file. Run `passwd` at the console to choose your own, and every later apply leaves it alone. (The file then still holds the old generated value, so delete it once you have changed the password.)
+- **It survives rebuilds.** `users.mutableUsers` is left at NixOS's default of `true`, so a password set at runtime is not wiped by the next `ferrum-apply apply`.
+
+This exists because it did not, and a real host was unreachable because of it: SSH stopped answering, the machine still reached its login prompt, and the prompt accepted nothing — root had no password and never had one. The only remaining route was editing the bootloader to boot `init=/bin/sh`, which then broke the USB keyboard, because that path never starts systemd and so udev never loads the HID driver. `a-host-always-has-a-way-in` in `nix/modules/flake/checks.nix` fails the build if ferrum ever ships that shape again.
+
+### Apply refuses to lock you out
+
+`a-host-always-has-a-way-in` fails the *build* if ferrum's own module tree ever ships that shape. It cannot see your `custom/` modules. So the same question is asked again, on your machine, about the generation an apply is **about to** produce — before anything is built, stopped, snapshotted or switched, with rollback still a no-op.
+
+This is a check only a declarative system can write. Everything an apply would change is evaluable before any of it exists, so `ferrum-apply` reads the *final, merged* configuration — `services.openssh.openFirewall` has already contributed its ports, a `custom/` `mkForce` has already won or lost — and asks whether anyone could still get in.
+
+It refuses **only** when every route is shut at once:
+
+| Route | Shut when |
+|-------|-----------|
+| The console password | `users.mutableUsers = false` **and** root carries no password in the resulting configuration — so the password `ferrum-apply` writes to `/var/lib/ferrum/root-console-password` is erased by this activation and nothing will ever set another |
+| SSH | `services.openssh.enable = false`, **or** the firewall admits nothing on sshd's port, **or** no account that can reach a shell has an authorized key (declared or already on disk) or a usable password |
+
+Either one alone is a legitimate configuration, not a lockout, and is never refused. **The dashboard is deliberately not a route here**: it cannot restore SSH or a console password, and a dashboard that is merely broken — Authelia down, a bad certificate — is exactly what the SSH tunnel below is the answer to. A gate that fired on a degraded host would teach you to bypass it, which is worse than not having it.
+
+A predicate it cannot evaluate has not failed. A firewall carrying hand-written `ACCEPT` rules, an `AuthorizedKeysCommand` that could supply a key from anywhere, an authorized-keys file it could not read, a `nix eval` that did not answer — each is *unknown*, and the apply proceeds.
+
+The refusal names both closed routes and what would reopen each, and the Apply view offers one button that proceeds anyway. That button sends back the exact lockout it showed you (`console-locked+ssh-disabled` and the like), so an acknowledgement given for one lockout cannot pass a different one later. Over SSH, the same thing:
+
+```bash
+ferrum-apply apply --accept-no-way-in console-locked+ssh-disabled
+```
+
+The gate exists to make the decision visible, not to prevent it — you may genuinely have a route ferrum cannot see.
+
+### Reaching the dashboard when the proxy or Authelia is broken
+
+ferrumd keeps listening on loopback (`ferrum.daemon.listenAddress`, `127.0.0.1` by default) whether or not it is published. Publishing means nginx reaches it, not that it binds a public interface — so the SSH tunnel remains the recovery route for exactly the situation where you need the UI most: the proxy is down, Authelia will not start, or a bad certificate has made `ferrum.<baseDomain>` unusable.
+
+```bash
+ssh -L 7788:127.0.0.1:7788 <host>
+```
+
+Then browse **`http://127.0.0.1:7788`** (or `http://localhost:7788`).
+
+Forward to the **loopback address specifically**. The session cookie is `Secure`, and a browser will only store and send a `Secure` cookie over plain HTTP when the origin is *potentially trustworthy* — which, under [W3C Secure Contexts](https://www.w3.org/TR/secure-contexts/), `127.0.0.1` and `localhost` are and a LAN address such as `192.168.1.10` is not. So a tunnel forwarded to a LAN IP will log you out on every request: the browser drops the cookie, and it is correct to do so.
+
+That is expected behaviour, not a bug, and the fix is to use the loopback address — **not** to drop `Secure` from the cookie. Weakening it would re-open the attack it exists to close (below), to save one word in an SSH command.
+
+### What Authelia does and does not defend
+
+Authelia issues **two** session cookies on a host that publishes the dashboard (`session.cookies`, `modules/proxy/authelia.nix`):
+
+| Cookie | Scope | Issued at | Covers |
+|--------|-------|-----------|--------|
+| `authelia_session` | `<baseDomain>` | `auth.<baseDomain>` | every published catalog app |
+| `ferrum_control_session` | `ferrum.<baseDomain>` | `auth.ferrum.<baseDomain>` | the control plane, and nothing else |
+
+The first is what makes single sign-on single across the apps: log in once at `auth.<baseDomain>` and every app under that domain accepts you. The second is deliberately **not** part of that: it is a separate scope with a separate cookie name and a portal hostname of its own, so a cookie obtained in an app's context is not a cookie for the dashboard.
+
+That separation is the fix for `SEC-M02` (`docs/security/SEC-M02_authelia-cookie-scope.md`), and it costs a second interactive login at the control plane — which is exactly what the risk acceptance said it would cost, and why it was deferred until something needed it.
+
+Its price is also structural rather than optional. Authelia refuses an `authelia_url` that sits outside the cookie scope it serves, so the control plane's portal cannot be `auth.<baseDomain>`; it needs its own vhost (`modules/proxy/nginx.nix`), its own certificate (`modules/proxy/acme.nix`) and its own DNS record (`modules/proxy/dns.nix`). All four files are held in agreement by the `authelia-cookie-scope`, `daemon-vhost-enforced` and `dns-record-set` checks.
+
+The consequence for the **apps** is worth stating plainly, because the natural assumption is the opposite one. **Within the base domain's own scope, Authelia defends against the unauthenticated stranger from the internet, and against nothing else.** A *compromised app already behind the same SSO* — a sonarr with a remote-code-execution bug, say — holds a cookie every other app under that domain accepts. Authelia is not a boundary between two apps on one base domain; it never was. What it is now is a boundary between the apps and the control plane.
+
+Three things stand between a compromised sibling app and this host's settings, secrets and system generations:
+
+- **The dashboard's Authelia cookie scope is not the apps'.** A sibling app's `authelia_session` is not a `ferrum_control_session`, so it does not clear the control plane's edge gate at all. This is the newest of the three and the only one of them that stops the request at nginx.
+- **ferrumd serves no CORS headers at all.** No `Access-Control-Allow-Origin` means a script running on `sonarr.<baseDomain>` cannot *read* any response it provokes from `ferrum.<baseDomain>`. This is enforced by a test that fails if such a header ever appears, rather than by the fact that nobody has added one.
+- **The session cookie is `__Host-ferrumd_session`, with `Secure`, `HttpOnly`, `SameSite=Strict` and `Path=/`.** `SameSite=Strict` stops a sibling origin's requests from carrying it; `HttpOnly` stops script from reading it; and the `__Host-` prefix makes browsers reject any version of that cookie sent with a `Domain` attribute — which is what stops a compromised sibling from *planting* a session cookie for the whole base domain and having ferrumd honour it.
+
+ferrumd also requires its own valid session on every request regardless of what Authelia concluded, and it trusts no `Remote-User` header on any request it receives. Nothing on this host runs in a network namespace that would stop a local process from talking straight to `127.0.0.1:7788`, so a header set by nginx would be a header any compromised app could forge.
+
+### Single sign-on for the dashboard
+
+Where the dashboard is published and Authelia is on, `POST /api/sso` turns an Authelia login into a ferrumd session, so the control plane takes one login rather than two.
+
+It does **not** work by trusting a forwarded identity header, for the reason in the paragraph above. ferrumd takes the cookie the caller presented and asks Authelia, over loopback, who it belongs to — so what a forger would have to produce is not a header but a valid Authelia session cookie **in the dashboard's own cookie scope**, which is the thing the two-cookie split above makes unobtainable from an app's context. The two halves are one feature: `crates/ferrumd/src/sso.rs` is only safe because `ferrum_control_session` exists.
+
+That is measured rather than asserted. The `authelia-asserts-only-its-own-scope` check starts the real Authelia on the real generated configuration and proves five things on every build: the dashboard's own cookie is accepted at the dashboard's URL and names its user; **an apps-scoped cookie is refused there**; an anonymous request is refused; the same apps cookie still works at an app's own URL (so the refusal is about scope, not a dud cookie); and a cookie logged out at Authelia stops verifying.
+
+Three consequences worth knowing:
+
+- **A session obtained this way is re-checked against Authelia on every request.** Logging out of Authelia therefore stops it working immediately. The cost is one loopback round trip per API call, and a brief window of `503` while `authelia-main.service` restarts — a `503`, deliberately, never a `401`: Authelia being down must not look like your login failing.
+- **An Authelia identity ferrum has no account for is refused, never provisioned.** `ferrum-apply` creates one ferrumd account and one Authelia account, both `admin`, so the matching case is the one ferrum builds. Auto-creating one would make Authelia's user database ferrumd's authorization source.
+- **The SSH-tunnel recovery route is untouched.** A tunnel-only host (`ferrum.daemon.publish = false`) gets no `FERRUMD_SSO_ORIGIN`, so `POST /api/sso` answers `404` and the password login is all there is — which is exactly right for the way in you use when the proxy is broken. A password session never consults Authelia even on a host that has it.
+
+## Dashboard API
+
+Everything the UI does, it does through these. The authority is `build_router`
+(`crates/ferrumd/src/main.rs`); this table is a hand-kept mirror of it, and nothing mechanical
+checks that the two agree — so where they disagree, the router is right.
+
+| Method | Path | What it does | Auth |
+|--------|------|--------------|------|
+| POST | `/api/login` | Exchanges a username and password for a session cookie and a CSRF token | none |
+| POST | `/api/logout` | Clears the session | none (see `logout_is_still_unguarded_and_the_ui_still_depends_on_that`) |
+| POST | `/api/sso` | Exchanges an Authelia session for a ferrumd one. `404` where single sign-on is off, `401` where Authelia recognises nobody, `403` where it recognises somebody ferrum has no account for, `503` where it cannot be reached | an Authelia cookie in the dashboard's own scope — verified by asking Authelia, never by reading a header |
+| GET | `/api/session` | The current session's user and CSRF token | session |
+| POST | `/api/password` | Changes the signed-in user's password | session + CSRF |
+| GET | `/api/catalog` | The app catalog and the settings JSON Schema the UI renders its form from | session |
+| GET | `/api/settings` | The host's current `settings.json` | session |
+| PUT | `/api/settings` | Replaces `settings.json` after schema validation | session + CSRF |
+| POST | `/api/secrets/:name` | Writes one sops-encrypted secret | session + CSRF |
+| GET | `/api/generations` | The system generations and their snapshots, for rollback | session |
+| GET | `/api/updates` | The most recent update-check report, or `?job=<uuid>` for one run's own | session |
+| GET | `/api/parity` | The most recent SnapRAID parity status report | session |
+| GET | `/api/vpn` | A live reading of each VPN-declaring app's tunnel, with the second it was taken | session |
+| GET | `/api/app-health` | A live reading of whether each catalog app is answering, with the second it was taken | session |
+| POST | `/api/jobs` | Starts a privileged `ferrum-apply` job | session + CSRF |
+| GET | `/api/jobs` | Recent jobs (`?limit=`) | session |
+| GET | `/api/jobs/:id` | One job's summary and its progress events | session |
+| GET | `/api/jobs/:id/stream` | That job's progress as server-sent events | session |
+| GET | `/api/health` | Liveness. `200` as soon as the server is up | **none** |
+| GET | `/api/ready` | Readiness, with every dependency reported separately | **none** |
+
+### Health and readiness
+
+`GET /api/health` is liveness and is **dependency-free**: it touches no database, no systemd, no
+catalog and no file, and answers `200 {"status":"alive"}` as soon as ferrumd is serving. It is the
+endpoint that tells you the process is alive and the *dependency* is what is broken.
+
+`GET /api/ready` is readiness, and reports four statuses:
+
+| `status` | HTTP | Meaning |
+|----------|------|---------|
+| `ready` | 200 | Every check passed |
+| `applying` | 200 | An apply, rollback or other interlock-taking job owns the system right now; `job` carries its id |
+| `degraded` | 200 | At least one dependency failed; `checks` names which |
+| `unready` | 503 | ferrumd's own database is unusable, so nothing it does works |
+
+**A degraded answer still returns 200, so read the body.** This is deliberate and it is the
+decision that matters most here: a watcher's reflex on 503 is to restart the process, and
+restarting repairs no dependency. 503 is reserved for the one state that means *cannot serve at
+all*.
+
+**Point no watchdog, no `Restart=` policy and no alerting automation at `/api/ready`.** An apply
+switches to a new generation, and that switch can restart ferrumd while the apply is still running
+— so readiness is legitimately not `ready` during an apply. Anything that restarts ferrumd on an
+unready answer turns every apply into a restart loop. ferrum ships no `WatchdogSec=` wiring, and
+none should be added. Readiness is a thing to **read**, never a thing to act on automatically.
+
+The `applying` status is why: `AppState.interlock` already holds the UUID of the job that owns the
+system, so ferrum reports an apply in flight as its own status rather than leaving an operator to
+infer it from logs. A watcher can tell *mid-switch* from *broken* without reading anything.
+
+```json
+{ "status": "degraded", "job": null,
+  "checks": { "database":       { "ok": true,  "reason": null },
+              "catalog":        { "ok": false, "reason": "unparseable" },
+              "settingsSchema": { "ok": true,  "reason": null },
+              "systemd":        { "ok": false, "reason": "unavailable" },
+              "generation":     { "ok": true,  "reason": null } } }
+```
+
+`reason` is one of `unset`, `unreadable`, `unparseable`, `unavailable`, `unresolved`, and is
+`null` on a passing check.
+
+#### What readiness does **not** check
+
+An undocumented health endpoint manufactures false confidence rather than removing it, so this
+list is part of the feature. A green `/api/ready` means ferrumd's own dependencies answered. It
+does **not** mean:
+
+- that any app is running, serving or reachable — readiness asks nothing about Sonarr, Plex,
+  qBittorrent or any other unit. That is `GET /api/app-health`'s question, and it is a
+  **separate, session-gated endpoint** rather than part of this one (see below);
+- that the qBittorrent VPN kill switch is intact, or that any app's network namespace is correct;
+- that the media pool is mounted, that every mergerfs branch is present, or that there is free
+  space;
+- that nginx, Authelia, ACME or DNS are healthy;
+- that the catalog and settings schema are *semantically* usable — the check is "readable and
+  parseable" only;
+- that polkit would authorize an apply — the systemd check proves the bus is reachable, never that
+  `StartUnit` would be permitted;
+- that the last apply succeeded, or that the running generation is good.
+
+Every check is taken live, per request; no answer in the body is a cached or last-known reading.
+
+#### Reachability and what they disclose
+
+Both routes are **unauthenticated** — the only `/api/` routes besides login, logout and sso that
+are — and on a published host both bypass Authelia's forward-auth at the proxy. A health endpoint
+behind SSO is not secured, it is broken: a monitor follows the redirect to the portal, receives the
+portal's own HTML with a `200`, and reports a dead box healthy forever. On a tunnel-only host (no
+`ferrum.proxy.baseDomain`) there is no vhost at all and both are reachable only through the SSH
+tunnel, unchanged.
+
+Because they are unauthenticated, the response body is a **closed vocabulary**: the status words,
+the fixed check names, booleans, the fixed reason words, and the UUID of an apply in flight. No
+path, hostname, version, generation number, secret name or error string ever reaches it. Both
+locations are rate-limited at the proxy (60/min, burst 10) because every readiness probe does real
+work.
+
+### Per-app health
+
+`GET /api/app-health` answers the question `/api/ready` deliberately refuses: **is each app
+actually answering?** It is a separate endpoint because it needs a different trade. Readiness buys
+its unauthenticated reach with a closed vocabulary that names no host and no port; this body names
+a catalog app and the `host:port` it was dialled at, so it is **session-gated**, like `/api/vpn`.
+No watchdog is pointed at it either — it is a thing to read.
+
+Each enabled app is probed with one HTTP `GET` to the path **its own catalog metadata declares**
+(`meta.healthCheck.path` — `/ping` for the \*arrs, `/identity` for Plex, `/health` for Jellyfin), at
+the address `modules/lib/app-address.nix` says it listens on. That shared table is what makes the
+reading right for qBittorrent on a VPN host, where the WebUI binds inside a network namespace and
+nothing answers on loopback. An app ferrum has no address for is reported as `address-unknown` and
+dialled nowhere, rather than guessed at.
+
+**No credential is ever sent.** Every app's declared health path was measured to need none, and an
+endpoint that answers `401`/`403` is still a good liveness signal — the app is up enough to refuse
+you — so it is reported as `unauthenticated`, not as down. This matters: SABnzbd takes its API key
+as a URL query parameter and logs the failing URL verbatim, so a probe that carried one would put
+it in the journal every time SABnzbd hiccuped.
+
+Nine states, each with a different next action, and none of them collapsed into another: `healthy`,
+`unauthenticated`, `unhealthy` (answered, wrongly), `refused` (nothing listening), `timed-out`
+(accepted the connection, then said nothing — not the same as down), `unreachable`,
+`address-unknown`, `not-enabled`, and `not-measurable` (the app publishes no HTTP endpoint).
+
+Every app is probed **concurrently** with a 3-second ceiling, so one wedged app cannot hold up the
+answer about the rest, and the document carries `checkedAt` — stamped **after** the slowest probe,
+so a timeout cannot overstate how fresh the reading is. The dashboard ages that on screen and says
+"checked N minutes ago" rather than painting a dot that cannot go stale. Before the first reading
+arrives it says "not checked yet", which is a different fact from "healthy".
+
+`GET /api/updates` serves a document ferrum-apply's `check_update` job wrote; ferrumd only reads
+it, and runs no `nix` of its own. It answers `200` with
+`{"status":"report","jobId":...,"report":{...}}`, or `200` with
+`{"status":"never-checked","jobId":null,"report":null}` on a host where no check has ever run —
+an explicit state rather than an empty body, so the UI can tell "never checked" from "checked,
+and up to date". Reports are read from `FERRUM_UPDATE_REPORT_DIR`, falling back to
+`FERRUM_JOBS_DIR` and then to `/var/lib/ferrum/jobs`, which is where the job writes them today.
+
+`POST /api/jobs` takes a body of exactly `{"kind": "<kind>"}` — `preflight`, `apply` (plus an
+optional `"acceptPinChange": "<40-hex revision>"`), `rollback` (plus `"to": <generation>`),
+`restore_state`, `gc`, `check_update`, `update`, `confirm_update`, `parity_sync`, or
+`parity_status`. Every kind but the two read-only ones — `check_update` and `parity_status` —
+claims the daemon's single-job interlock and gets `409` while one is running; those two are exempt
+because a rollback must never be blocked by a check that only reads.
+
+`acceptPinChange` is the operator's acknowledgement that this rebuild also moves the host to a
+different ferrum revision. **A rollback reverts the system closure and never
+`/etc/ferrum/flake.lock`**, while every apply rebuilds from whatever the lock pins — so without
+this an unrelated settings change days later would quietly reinstall the update that was rolled
+back. `apply` therefore compares the on-disk pin with the pin the running generation was built
+from (`built_pin`/`built_toplevel` in the snapshot journal) and refuses, before anything is built,
+when they differ and the operator has not acknowledged the on-disk revision by name. The gate is
+passable, not a wall; the Apply view offers the acknowledged retry. A `400` names the required
+shape for anything that is not a full lowercase hex revision. **Either pin being unknown — which
+is every generation applied before ferrum recorded one — proceeds silently: an absence is an
+artifact of age, not a disagreement.** `GET /api/updates`'s `pinProvenance` block reports the same
+comparison as a first-class state (`matches`, `differs`, `on-disk-unknown`, `running-unknown`,
+`both-unknown`), never an error.
+
+`confirm_update` says the update this host is running is good, and releases the snapshots `gc` was
+holding back for it. An update's way back is the state snapshot taken immediately before its pin
+moved, and `ferrum.storage.keepGenerations` (default 10) would retire that after ten more applies
+— so the update commit marks its pre-image and `gc` refuses to prune a marked snapshot. The
+Generations view shows how many are being held and offers the one control that releases them;
+confirming deletes nothing, it returns them to ordinary retention. It carries no fields: a
+per-snapshot form would put a snapshot name, which becomes a path component on the privileged
+side, into the request file for no gain.
+
+`update` is the commit path for an update: it advances the `ferrum` input in
+`/etc/ferrum/flake.lock` with `nix flake lock --update-input ferrum` and then runs the ordinary
+apply pipeline, as one action. It carries no fields — the repository and ref come from the
+operator's own root-owned `/etc/ferrum/flake.nix`, which ferrumd cannot write and which this path
+never writes either. It refuses, leaving `flake.lock` byte-for-byte untouched, when `/etc/ferrum`
+has uncommitted changes, when the candidate is not strictly newer than what the host runs, when
+the advance would repoint the input at a different repository, or when it lands on a revision
+other than the one just resolved. When the advanced pin builds the closure already running,
+`apply::run` returns early and the job reports "no change — nothing to apply": no new generation
+was created, and none is claimed.
 
 ## Development
 

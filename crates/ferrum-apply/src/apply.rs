@@ -1,4 +1,4 @@
-use crate::journal::{self, JournalEntry};
+use ferrum_state::journal::{self, JournalEntry};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -14,17 +14,75 @@ pub enum ApplyResult {
 /// summary into a classification. See Global Constraints in the plan for
 /// what each exit code means: 0 = ok, 2 = activation script failed,
 /// 4 = one or more units failed to start/restart.
+/// Turns the switch's exit code and the post-settle health into a verdict.
+///
+/// Exit 4 means "a unit failed to start or restart" AT THE MOMENT THE
+/// SWITCH FINISHED, which is not the same as a unit that is broken. A
+/// service with Restart=on-failure that exits non-zero once and succeeds
+/// on its next attempt is reported as failed by switch-to-configuration
+/// and is perfectly healthy thirty seconds later.
+///
+/// ferrum-reconcile does exactly that on every apply: it races the apps it
+/// registers, exits 1 when they are not listening yet, and succeeds on the
+/// retry. Five consecutive applies on a working host reported
+/// "apply degraded" about a service that had already fixed itself -- and a
+/// warning that is usually wrong is how a real one gets ignored.
+///
+/// So exit 4 defers to the health check, which polls until the units
+/// settle. A unit that is still not active when that times out is a real
+/// failure and is still reported.
+///
+/// # Arguments
+/// * `switch_exit_code` - what switch-to-configuration returned.
+/// * `all_units_active` - whether the managed units are active AFTER the
+///   settle window, not at the instant the switch returned.
 fn classify(switch_exit_code: i32, all_units_active: bool) -> ApplyResult {
     match switch_exit_code {
         0 if all_units_active => ApplyResult::Succeeded,
         0 => ApplyResult::Degraded(
             "one or more managed units failed to become active".to_string(),
         ),
+        // The activation SCRIPT failing is not a restart race -- nothing
+        // retries it, so this stays immediate.
         2 => ApplyResult::Degraded("activation script failed (exit 2)".to_string()),
+        4 if all_units_active => ApplyResult::Succeeded,
         4 => ApplyResult::Degraded(
-            "one or more units failed to start or restart (exit 4)".to_string(),
+            "one or more units failed to start or restart, and were still not \
+             active after the health-check window (exit 4)"
+                .to_string(),
         ),
         other => ApplyResult::Degraded(format!("switch-to-configuration exited {other}")),
+    }
+}
+
+/// Folds the DNS reconcile step's outcome into the switch's own verdict
+/// (decision D-08).
+///
+/// DNS runs as a step inside this binary rather than as its own systemd unit
+/// precisely so its failures arrive here with a per-record breakdown intact,
+/// instead of being absorbed by `all_managed_units_active()`'s single
+/// boolean. A record that could not be created is a published app that
+/// nobody can reach, which is the failure R1 exists to fix -- so it degrades
+/// the apply even when the switch and the health check were both clean.
+///
+/// # Arguments
+/// * `base` - the verdict `classify` produced from the switch.
+/// * `dns` - `None` when there is nothing to report, or the breakdown.
+///
+/// # Returns
+/// `base` unchanged when DNS is clean. Otherwise `Degraded`, with the DNS
+/// reason appended to any reason `base` already carried -- a failing switch
+/// and a failing DNS reconcile are two facts and the operator needs both.
+/// `Failed` is left alone: an apply that never got as far as switching is
+/// not degraded *by DNS*, and relabelling it would hide the real cause.
+fn fold_degradation(base: ApplyResult, reason: Option<String>) -> ApplyResult {
+    let Some(reason) = reason else {
+        return base;
+    };
+    match base {
+        ApplyResult::Succeeded => ApplyResult::Degraded(reason),
+        ApplyResult::Degraded(existing) => ApplyResult::Degraded(format!("{existing}; {reason}")),
+        ApplyResult::Failed(existing) => ApplyResult::Failed(existing),
     }
 }
 
@@ -79,7 +137,19 @@ pub(crate) fn current_generation() -> anyhow::Result<(u32, PathBuf)> {
 /// app does NOT make `systemctl is-active ferrum-apps.target` report
 /// inactive -- checking the target alone would make a fully-dead system
 /// after a switch still look healthy.
-fn all_managed_units_active() -> anyhow::Result<bool> {
+///
+/// Which units those are is decided by [`units_to_check`], not by the
+/// listing alone: a listing that printed nothing used to make this return
+/// `Ok(true)` without interrogating a single unit.
+///
+/// # Arguments
+/// * `expected` - the app names the settings document enables, used as
+///   independent evidence of what ought to be running.
+///
+/// # Errors
+/// When `systemctl list-dependencies` fails, or a unit's status cannot be
+/// queried.
+fn all_managed_units_active(expected: &[String]) -> anyhow::Result<bool> {
     let list_output = Command::new("systemctl")
         .args([
             "list-dependencies",
@@ -94,21 +164,81 @@ fn all_managed_units_active() -> anyhow::Result<bool> {
             String::from_utf8_lossy(&list_output.stderr)
         );
     }
-    let units: Vec<String> = String::from_utf8_lossy(&list_output.stdout)
+    let listed: Vec<String> = String::from_utf8_lossy(&list_output.stdout)
         .lines()
         .map(|l| l.trim().to_string())
         .filter(|l| !l.is_empty())
         .collect();
 
-    for unit in &units {
+    for unit in units_to_check(expected, &listed) {
         let status = Command::new("systemctl")
-            .args(["is-active", "--quiet", unit])
+            .args(["is-active", "--quiet", &unit])
             .status()?;
         if !status.success() {
             return Ok(false);
         }
     }
     Ok(true)
+}
+
+/// The units a health check must actually interrogate.
+///
+/// The old code checked exactly what `systemctl list-dependencies` printed,
+/// which made an EMPTY listing a clean bill of health: the loop did not
+/// execute and the function returned `Ok(true)`. A closure that wired up no
+/// app units at all -- or a `list-dependencies` that printed nothing for
+/// any other reason -- was reported as a successful apply on a dead host.
+///
+/// It also left a question that could not be settled in a sandbox: whether
+/// `list-dependencies --plain --no-legend <target>` includes the root unit
+/// line varies by systemd version. **That question is now moot rather than
+/// answered.** The expectation is stated explicitly and unioned with
+/// whatever the listing happened to contain, so `ferrum-apps.target` is
+/// interrogated whether or not systemd chose to print it, and the result
+/// does not depend on which behaviour the host's systemd has. This does not
+/// claim the version question was resolved -- it was not, and nothing here
+/// needs it to be.
+///
+/// The expectation comes from the settings document, not from the listing,
+/// which is what makes it independent evidence: `FERRUM_SERVARR_APPS` is
+/// set from `enabledServarrApps` in modules/core/overlays.nix, so each name
+/// corresponds to a real `systemd.services.<app>`.
+///
+/// The union, not just the expectation: apps outside the servarr set
+/// (sabnzbd, plex, jellyfin, qbittorrent) are not named to this process as
+/// a list, so the listing is still the only thing that covers them. It is
+/// no longer the only thing that covers anything.
+///
+/// # Arguments
+/// * `expected` - app names from the settings document.
+/// * `listed` - unit names as `systemctl list-dependencies` reported them.
+///
+/// # Returns
+/// A deduplicated set of unit names, never empty: it always contains
+/// `ferrum-apps.target`.
+fn units_to_check(expected: &[String], listed: &[String]) -> Vec<String> {
+    let mut units: std::collections::BTreeSet<String> =
+        std::iter::once("ferrum-apps.target".to_string()).collect();
+    units.extend(
+        expected
+            .iter()
+            // A name that is not a plausible unit name is dropped rather
+            // than passed through. FERRUM_SERVARR_APPS reaches this process
+            // as `--set-default`, so the environment can override it, and a
+            // value beginning with `-` would be read by systemctl as an
+            // OPTION rather than a unit -- `is-active --quiet --version`
+            // exits 0.
+            .filter(|app| {
+                !app.is_empty()
+                    && !app.starts_with('-')
+                    && app
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || "._-@".contains(c))
+            })
+            .map(|app| format!("{app}.service")),
+    );
+    units.extend(listed.iter().filter(|u| !u.starts_with('-')).cloned());
+    units.into_iter().collect()
 }
 
 /// Polls `check` until it reports healthy or `timeout` elapses, sleeping
@@ -135,8 +265,10 @@ fn wait_for_healthy_with<F: FnMut() -> anyhow::Result<bool>>(
     }
 }
 
-fn wait_for_healthy(timeout: Duration) -> anyhow::Result<bool> {
-    wait_for_healthy_with(timeout, Duration::from_millis(500), all_managed_units_active)
+fn wait_for_healthy(timeout: Duration, expected: &[String]) -> anyhow::Result<bool> {
+    wait_for_healthy_with(timeout, Duration::from_millis(500), || {
+        all_managed_units_active(expected)
+    })
 }
 
 pub struct StorageConfig {
@@ -154,6 +286,21 @@ pub struct StorageConfig {
     pub admin_email: String,
     pub sabnzbd_state_dir: Option<PathBuf>,
     pub sabnzbd_port: u16,
+    /// Where the generated root console password's one-time plaintext is
+    /// written. Not optional and not gated on anything: being able to log
+    /// in at the physical console is the recovery path for every failure
+    /// that takes SSH away, so there is no host configuration for which it
+    /// is the wrong thing to do.
+    pub root_password_file: PathBuf,
+    /// Whether the snapshot this apply takes is an update's PRE-image --
+    /// the host as it was immediately before its ferrum pin moved.
+    ///
+    /// Set by the `update` job only (`main.rs::run_update`), and carried
+    /// through to the journal entry so `gc::plan` can keep that snapshot out
+    /// of ordinary retention pruning until the operator confirms the update
+    /// is good. An ordinary apply leaves it false and nothing changes for
+    /// it.
+    pub update_pre_image: bool,
 }
 
 /// Names the `ApplyResult` variant without its payload, for the terminal
@@ -201,6 +348,30 @@ fn run_inner(
     // checks file existence at Nix EVAL time, inside the build step right
     // after this.
     progress.event("secrets", "ensuring generated secrets exist");
+
+    // The console password comes first, and unconditionally. Every other
+    // credential here opens something that is only reachable while the
+    // network is; this one opens the machine itself, which is what the
+    // operator needs precisely when the rest has stopped answering. Doing
+    // it before the build also means a host whose build then fails has
+    // still gained a way in.
+    // NOT `?`. A console password that could not be set must not stop an
+    // apply, for the same reason a failed DNS reconcile must not: the host
+    // still switched, and refusing to apply leaves the operator unable to fix
+    // anything -- on a box whose recovery path is exactly what is broken.
+    // That is the trade the owner already ruled on for exit 3 today, and this
+    // is the same shape. It degrades loudly instead, and the reason names the
+    // consequence rather than the syscall.
+    let console_password: Option<String> = match
+        crate::secrets::ensure_root_password(&storage.root_password_file)
+    {
+        Ok(()) => None,
+        Err(e) => Some(format!(
+            "could not set a console password for root ({e}) -- this host has \
+             no way in if SSH stops. Set one by hand with `passwd root`"
+        )),
+    };
+
     let servarr_refs: Vec<&str> = storage.servarr_apps.iter().map(String::as_str).collect();
     crate::secrets::ensure_all(&storage.secrets_dir, &storage.host_key_pub, &servarr_refs)?;
     if storage.auth_enabled {
@@ -247,13 +418,32 @@ fn run_inner(
     }
     let toplevel = String::from_utf8(build_output.stdout)?.trim().to_string();
 
+    // Read immediately after the build, from the same flake directory the
+    // build just resolved, so the recorded pin is the one that produced
+    // `toplevel` rather than whatever the lock says minutes later. `None`
+    // when the flake reference is not a local directory (a remote flakeref
+    // has no on-disk lock to read) or the lock cannot be read -- see pin.rs
+    // for why that is never an error here.
+    let built_pin = built_pin_for(flake_ref);
+
     let (current, running_toplevel) = current_generation()?;
     if Path::new(&toplevel) == running_toplevel {
         // Nothing to switch. But a *prior* apply may have left the system
         // degraded (e.g. an app crashed after activation) -- report real
         // health instead of a bare, potentially-false "succeeded".
         progress.event("health-check", "already on the target closure; checking health only");
-        return Ok(classify(0, wait_for_healthy(storage.health_check_timeout)?));
+        let healthy = classify(
+            0,
+            wait_for_healthy(storage.health_check_timeout, &storage.servarr_apps)?,
+        );
+        // DNS is reconciled here too, and that is load-bearing rather than
+        // symmetric: an apply whose records failed (a refused token, an
+        // unreachable API) leaves the closure unchanged, so the operator's
+        // retry after fixing the credential lands on exactly this path. If
+        // it skipped reconciliation there would be no way to converge
+        // without an unrelated configuration change.
+        let dns = crate::dns_reconcile::reconcile_for_apply(&toplevel, progress);
+        return Ok(fold_degradation(fold_degradation(healthy, dns), console_password));
     }
 
     // 2. Preflight, before touching anything.
@@ -296,6 +486,16 @@ fn run_inner(
             toplevel: running_toplevel.display().to_string(),
             taken_at: chrono_taken_at(),
             quiesced: true,
+            built_pin: built_pin.clone(),
+            // The closure this apply produced, recorded so `built_pin` can
+            // be attributed to a generation later: a generation's own
+            // `system-<N>-link` resolves to exactly this path, and nothing
+            // else in the entry identifies the generation the apply created.
+            built_toplevel: Some(toplevel.clone()),
+            // Marked only when this apply is the second half of an update
+            // commit, so `gc` keeps the way back until the operator says the
+            // update is good.
+            update_pre_image: storage.update_pre_image,
         };
         journal::write(&storage.journal_dir, &entry)?;
 
@@ -332,8 +532,44 @@ fn run_inner(
     })?;
 
     progress.event("health-check", "waiting for every managed unit to become active");
-    let healthy = wait_for_healthy(storage.health_check_timeout)?;
-    Ok(classify(switch_exit_code, healthy))
+    let healthy = wait_for_healthy(storage.health_check_timeout, &storage.servarr_apps)?;
+
+    // 8. Reconcile the DNS records the new closure publishes (R1, D-08).
+    // After the switch, so the document read is the one this generation
+    // activated; after the health check, so a host that cannot serve its
+    // apps is not also told its records are wrong. Deliberately not `?`:
+    // Cloudflare being unreachable must degrade the verdict, never turn a
+    // completed switch into an apply error.
+    let dns = crate::dns_reconcile::reconcile_for_apply(&toplevel, progress);
+    Ok(fold_degradation(
+        fold_degradation(classify(switch_exit_code, healthy), dns),
+        console_password,
+    ))
+}
+
+/// The `ferrum` pin the flake reference an apply just built from records.
+///
+/// R8's first criterion: a generation must carry the pin it was built from,
+/// because nothing else in the system records it -- `rollback.rs` never
+/// mentions `flake.nix`, `flake.lock` or `FERRUM_FLAKE_REF`, while every
+/// apply rebuilds from the live on-disk flake, so a rolled-back host whose
+/// pin was advanced will silently return to the rejected revision on the
+/// next unrelated settings apply. This field is what makes that detectable.
+/// It does not yet gate anything; the gate is a separate story.
+///
+/// # Arguments
+/// * `flake_ref` - the reference `nix build` was given, e.g.
+///   `/etc/ferrum#nixosConfigurations.default.config.system.build.toplevel`.
+///
+/// # Returns
+/// The pin, or `None` when the reference names no local directory (a remote
+/// flakeref has no on-disk lock to read) or the lock cannot be read.
+fn built_pin_for(flake_ref: &str) -> Option<ferrum_state::journal::Pin> {
+    let (flake_dir, _) = crate::update_check::split_flake_ref(flake_ref);
+    crate::pin::read(
+        &Path::new(&flake_dir).join("flake.lock"),
+        crate::update_candidate::FERRUM_INPUT,
+    )
 }
 
 /// Unix-seconds-as-a-string, e.g. "1770000000". Not RFC3339 -- deliberately
@@ -347,6 +583,43 @@ fn chrono_taken_at() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const A_LOCK: &str = r#"{"nodes":{
+        "root":{"inputs":{"ferrum":"ferrum"}},
+        "ferrum":{"locked":{"rev":"3333333333333333333333333333333333333333",
+                            "narHash":"sha256-APPLY="}}}}"#;
+
+    /// The pin an apply records comes from the flake.lock sitting beside
+    /// the flake it built, resolved out of the SAME reference `nix build`
+    /// was given rather than from a second environment variable that could
+    /// disagree with it.
+    #[test]
+    fn the_recorded_pin_is_read_from_the_built_flakes_own_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("flake.lock"), A_LOCK).unwrap();
+        let flake_ref = format!(
+            "{}#nixosConfigurations.default.config.system.build.toplevel",
+            dir.path().display()
+        );
+        let pin = built_pin_for(&flake_ref).expect("the lock beside the flake pins ferrum");
+        assert_eq!(pin.rev, "3".repeat(40));
+        assert_eq!(pin.nar_hash, "sha256-APPLY=");
+    }
+
+    /// Anti-vacuity for the test above: it must be reading THAT directory's
+    /// lock, not any lock it can find. A reference naming a directory with
+    /// no lock records no pin rather than borrowing another one.
+    #[test]
+    fn a_flake_reference_with_no_lock_beside_it_records_no_pin() {
+        let dir = tempfile::tempdir().unwrap();
+        let flake_ref = format!(
+            "{}#nixosConfigurations.default.config.system.build.toplevel",
+            dir.path().display()
+        );
+        assert!(built_pin_for(&flake_ref).is_none());
+        // And a remote flakeref, which has no on-disk lock at all.
+        assert!(built_pin_for("github:owner/repo#nixosConfigurations.default").is_none());
+    }
 
     #[test]
     fn exit_0_with_all_units_active_is_succeeded() {
@@ -369,12 +642,39 @@ mod tests {
         );
     }
 
+    /// Exit 4 with everything healthy AFTER the settle window is a
+    /// success, not a degradation.
+    ///
+    /// switch-to-configuration reports exit 4 for a unit that failed at
+    /// the instant it finished. ferrum-reconcile does that on every apply
+    /// -- it races the apps it registers, exits 1, and succeeds on the
+    /// retry seconds later. Five consecutive applies on a healthy host
+    /// said "apply degraded" about a service that had already fixed
+    /// itself.
+    ///
+    /// Mutation check: return Degraded for exit 4 regardless and this
+    /// fails.
     #[test]
-    fn exit_4_is_degraded_units() {
-        assert_eq!(
-            classify(4, true),
-            ApplyResult::Degraded("one or more units failed to start or restart (exit 4)".to_string())
-        );
+    fn exit_4_that_settles_is_not_degraded() {
+        assert_eq!(classify(4, true), ApplyResult::Succeeded);
+    }
+
+    /// ...but a unit still down after the window is a real failure, and
+    /// the message says the window was given.
+    #[test]
+    fn exit_4_that_does_not_settle_is_still_degraded() {
+        let ApplyResult::Degraded(reason) = classify(4, false) else {
+            panic!("a unit that never came up must be reported");
+        };
+        assert!(reason.contains("still not active"), "{reason}");
+        assert!(reason.contains("exit 4"), "{reason}");
+    }
+
+    /// An activation SCRIPT failure is not a restart race -- nothing
+    /// retries it -- so it must not be softened by the same rule.
+    #[test]
+    fn exit_2_is_never_softened_by_the_settle_check() {
+        assert!(matches!(classify(2, true), ApplyResult::Degraded(_)));
     }
 
     #[test]
@@ -385,6 +685,167 @@ mod tests {
         );
     }
 
+    /// A console password that could not be set degrades the apply; it does
+    /// not fail it.
+    ///
+    /// The host still switched. Failing here would leave the operator unable
+    /// to apply anything at all -- on a machine whose way in is precisely
+    /// what is broken, which is the situation this whole feature exists to
+    /// prevent. The reason has to reach the operator, though, because an
+    /// apply that quietly succeeded without a console password would hand
+    /// back the same trap with a green tick on it.
+    #[test]
+    fn a_console_password_that_could_not_be_set_degrades_rather_than_fails() {
+        let r = fold_degradation(
+            ApplyResult::Succeeded,
+            Some("could not set a console password for root (no chpasswd)".to_string()),
+        );
+        match r {
+            ApplyResult::Degraded(reason) => {
+                assert!(reason.contains("console password"), "{reason}");
+            }
+            other => panic!("a switched host must not be reported as failed: {other:?}"),
+        }
+    }
+
+    /// And it composes with a DNS reason rather than replacing it: two things
+    /// went wrong and the operator needs both, which is the property the
+    /// helper was written for and the reason it is not DNS-specific.
+    #[test]
+    fn a_failed_record_and_a_missing_console_password_both_reach_the_operator() {
+        let r = fold_degradation(
+            fold_degradation(ApplyResult::Succeeded, Some("dns record failed".to_string())),
+            Some("could not set a console password".to_string()),
+        );
+        match r {
+            ApplyResult::Degraded(reason) => {
+                assert!(reason.contains("dns record failed"), "{reason}");
+                assert!(reason.contains("console password"), "{reason}");
+            }
+            other => panic!("expected both causes: {other:?}"),
+        }
+    }
+
+    /// D-08. A switch and a health check that both passed do not make the
+    /// apply a success if the records nobody can reach were never created --
+    /// that is precisely the shape of the incident R1 exists to fix.
+    ///
+    /// Mutation check: return `base` unchanged whatever `dns` says and this
+    /// fails.
+    #[test]
+    fn a_clean_switch_with_a_failed_record_is_degraded_not_succeeded() {
+        assert_eq!(
+            fold_degradation(
+                ApplyResult::Succeeded,
+                Some("1 of 2 DNS record(s) could not be reconciled: auth.example.com (create): refused".to_string()),
+            ),
+            ApplyResult::Degraded(
+                "1 of 2 DNS record(s) could not be reconciled: auth.example.com (create): refused"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn a_clean_reconcile_leaves_the_switchs_own_verdict_alone() {
+        assert_eq!(
+            fold_degradation(ApplyResult::Succeeded, None),
+            ApplyResult::Succeeded
+        );
+        assert_eq!(
+            fold_degradation(ApplyResult::Degraded("a unit is down".to_string()), None),
+            ApplyResult::Degraded("a unit is down".to_string())
+        );
+    }
+
+    /// Two failures are two facts. Collapsing them would leave whichever one
+    /// the operator did not see unfixed.
+    #[test]
+    fn a_degraded_switch_and_a_failed_record_report_both_causes() {
+        let ApplyResult::Degraded(reason) = fold_degradation(
+            ApplyResult::Degraded("a unit is down".to_string()),
+            Some("auth.example.com (create): refused".to_string()),
+        ) else {
+            panic!("two failures must still be a degradation");
+        };
+        assert!(reason.contains("a unit is down"), "{reason}");
+        assert!(reason.contains("auth.example.com"), "{reason}");
+    }
+
+    /// A build that never switched is not degraded *by DNS*; relabelling it
+    /// would bury the real cause.
+    #[test]
+    fn a_failed_apply_keeps_its_own_cause() {
+        assert_eq!(
+            fold_degradation(
+                ApplyResult::Failed("nix build failed".to_string()),
+                Some("auth.example.com (create): refused".to_string()),
+            ),
+            ApplyResult::Failed("nix build failed".to_string())
+        );
+    }
+
+    fn owned(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// An empty `systemctl list-dependencies` must not read as health.
+    ///
+    /// `all_managed_units_active` checked exactly the units the listing
+    /// printed, so an empty listing meant the loop never ran and the
+    /// function returned `Ok(true)` -- a closure that wired up no app units
+    /// was reported as a clean apply on a dead host.
+    #[test]
+    fn an_empty_dependency_listing_still_checks_something() {
+        let units = units_to_check(&owned(&["sonarr", "radarr"]), &[]);
+        assert!(
+            units.contains(&"ferrum-apps.target".to_string()),
+            "{units:?}"
+        );
+        assert!(units.contains(&"sonarr.service".to_string()), "{units:?}");
+        assert!(units.contains(&"radarr.service".to_string()), "{units:?}");
+    }
+
+    /// ...and with no apps configured either, the target itself is still
+    /// interrogated, so the check can never be vacuous.
+    #[test]
+    fn the_set_to_check_is_never_empty() {
+        assert_eq!(units_to_check(&[], &[]), vec!["ferrum-apps.target"]);
+    }
+
+    /// Whether `list-dependencies --plain --no-legend` prints the root unit
+    /// varies by systemd version, and that question is sidestepped rather
+    /// than answered: the target is asserted explicitly, so both behaviours
+    /// produce the same set.
+    #[test]
+    fn the_target_is_checked_whether_or_not_systemd_lists_it() {
+        let with_root = units_to_check(&owned(&["sonarr"]), &owned(&["ferrum-apps.target", "sonarr.service"]));
+        let without_root = units_to_check(&owned(&["sonarr"]), &owned(&["sonarr.service"]));
+        assert_eq!(with_root, without_root);
+        assert_eq!(with_root, vec!["ferrum-apps.target", "sonarr.service"]);
+    }
+
+    /// The listing still contributes: sabnzbd, plex, jellyfin and
+    /// qbittorrent are not named to this process as a list, so it is the
+    /// only thing covering them.
+    #[test]
+    fn units_only_systemd_knows_about_are_still_checked() {
+        let units = units_to_check(&owned(&["sonarr"]), &owned(&["sabnzbd.service", "plex.service"]));
+        assert!(units.contains(&"sabnzbd.service".to_string()), "{units:?}");
+        assert!(units.contains(&"plex.service".to_string()), "{units:?}");
+    }
+
+    /// `FERRUM_SERVARR_APPS` reaches this process as `--set-default`, so the
+    /// environment can override it -- and a name beginning with `-` would be
+    /// read by systemctl as an OPTION, not a unit. `is-active --quiet
+    /// --version` exits 0, which would turn the health check into a
+    /// guaranteed pass.
+    #[test]
+    fn a_name_that_would_be_read_as_an_option_is_dropped() {
+        let units = units_to_check(&owned(&["--version", "sonarr"]), &owned(&["--all"]));
+        assert_eq!(units, vec!["ferrum-apps.target", "sonarr.service"]);
+    }
+
     #[test]
     fn wait_for_healthy_returns_true_immediately_when_already_healthy() {
         let mut calls = 0;
@@ -392,7 +853,7 @@ mod tests {
             calls += 1;
             Ok(true)
         });
-        assert_eq!(result.unwrap(), true);
+        assert!(result.unwrap());
         assert_eq!(calls, 1, "must not poll again once healthy");
     }
 
@@ -407,7 +868,7 @@ mod tests {
                 Ok(true)
             }
         });
-        assert_eq!(result.unwrap(), true);
+        assert!(result.unwrap());
     }
 
     #[test]
@@ -415,7 +876,7 @@ mod tests {
         let result = wait_for_healthy_with(Duration::from_millis(20), Duration::from_millis(5), || {
             Ok(false)
         });
-        assert_eq!(result.unwrap(), false);
+        assert!(!result.unwrap());
     }
 
     #[test]

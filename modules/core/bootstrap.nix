@@ -43,7 +43,11 @@
 # declared under options.ferrum is walked by checks.schema-uniformity and
 # forms part of the settings surface the security thesis reasons about. This
 # value is build-time plumbing, not a setting.
-{ config, lib, pkgs, ferrumSettingsSeed ? null, ... }:
+#
+# Its null default is declared in modules/default.nix via mkDefault, NOT as a
+# `? null` in this signature -- see that file for why the signature form
+# silently does not work.
+{ config, lib, pkgs, ferrumSettingsSeed, ... }:
 let
   ferrum = config.ferrum;
 
@@ -85,6 +89,26 @@ in
     # module's, from the moment it first exists.
   ] ++ lib.optional haveSeed
     "C /etc/ferrum/settings.json 0664 root ${ferrumdGroup} - ${seedSettings}"
+
+  # ...and then FIX the ownership of whatever is there, seeded or not.
+  #
+  # `C` only acts when the path does not exist, so on any host whose
+  # settings.json arrived by another route it is a no-op -- and the file
+  # keeps the ownership that route gave it. That case was assumed rare
+  # ("a host provisioned before this module existed"), but it is now the
+  # NORMAL path: ferrum-install ships settings.json through
+  # nixos-anywhere's --extra-files, which extracts it as root:root 0644.
+  # So every single fresh install ended activation printing "ferrumd will
+  # not be able to save settings changes", and it was right -- the web UI
+  # could not write its own settings file on a brand-new host.
+  #
+  # `z` adjusts mode/ownership of an existing path WITHOUT creating it and
+  # without touching contents, which is exactly the missing half. It is
+  # deliberately not `Z`: recursion here would walk secrets/ and custom/,
+  # whose ownership is set separately and differently below.
+  ++ [
+    "z /etc/ferrum/settings.json 0664 root ${ferrumdGroup} - -"
+  ]
   ++ [
 
     # Owned by ferrum, not root: ferrumd CREATES files in here (one .sops
@@ -98,20 +122,19 @@ in
     "d /etc/ferrum/custom 0755 root root - -"
   ];
 
-  # A host that was provisioned before this module existed has a
-  # settings.json at whatever ownership nixos-anywhere's operator gave it,
-  # and `C` above will not touch an existing file -- so its mode is NOT
-  # corrected by the rule. Rather than silently leaving ferrumd unable to
-  # write its own settings file, say so at activation, where an operator
-  # running nixos-rebuild actually sees it.
-  system.activationScripts.ferrumSettingsOwnership = lib.mkIf ferrum.daemon.enable ''
-    if [ -e /etc/ferrum/settings.json ]; then
-      if [ ! -w /etc/ferrum/settings.json ] || \
-         [ "$(${pkgs.coreutils}/bin/stat -c %G /etc/ferrum/settings.json)" != "ferrum" ]; then
-        echo "ferrum: /etc/ferrum/settings.json is not group-writable by 'ferrum';" >&2
-        echo "        ferrumd will not be able to save settings changes." >&2
-        echo "        Fix with: chown root:ferrum /etc/ferrum/settings.json && chmod 0664 /etc/ferrum/settings.json" >&2
-      fi
-    fi
-  '';
+  # The activation warning that used to live here is GONE, and its
+  # absence is the fix rather than a regression.
+  #
+  # It checked settings.json's ownership during activation and told the
+  # operator to repair it by hand. Two things make that wrong now. The `z`
+  # rule above enforces the ownership on every activation, so there is
+  # nothing left to repair. And the check ran BEFORE
+  # systemd-tmpfiles-resetup applied that rule, so on any activation where
+  # the file had just been rewritten -- by the installer, by an operator
+  # editing it, by `jq > tmp && mv` -- it warned about a condition that was
+  # corrected seconds later in the same apply.
+  #
+  # It fired on every install and on five consecutive applies of a host
+  # that was entirely healthy. A warning that is usually wrong is worse
+  # than no warning: it is how a real one gets ignored.
 }

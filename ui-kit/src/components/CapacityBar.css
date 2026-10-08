@@ -1,0 +1,10 @@
+.fk-cap-track {
+  height: 9px; border-radius: 99px; background: var(--ferrum-line);
+  overflow: hidden; margin: .55rem 0 .3rem;
+}
+.fk-cap-track > i { display: block; height: 100%; background: var(--ferrum-accent); }
+.fk-cap[data-tone="danger"] .fk-cap-track > i { background: var(--ferrum-danger); }
+.fk-cap-label {
+  margin: 0; font-size: .82rem; color: var(--ferrum-muted);
+  font-variant-numeric: tabular-nums;
+}

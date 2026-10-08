@@ -73,9 +73,14 @@
             #
             #   boot.loader.grub = {
             #     enable = true;
-            #     devices = [ "/dev/disk/by-id/<the OS disk>" ];
             #     efiSupport = false;
             #   };
+            #
+            # Do NOT add `devices` here. disko sets
+            # boot.loader.grub.devices from disko.nix's own `device`
+            # whenever it creates the EF02 bios-boot partition, and naming
+            # the same disk twice fails evaluation with "You cannot have
+            # duplicated devices in mirroredBoots".
             boot.loader.systemd-boot.enable = true;
             boot.loader.efi.canTouchEfiVariables = true;
 

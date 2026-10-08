@@ -35,13 +35,23 @@
 # closures through the SAME runNixOSTest node config guarantees identical
 # test instrumentation in both, so the switch never disrupts the driver's
 # own connection to the guest.
-{ pkgs, ... }:
+# NOTE (2026-09-15): this test imports the whole ferrum module tree, which
+# since Phase 1.4a includes app modules declaring `sops.secrets` -- so it
+# needs sops-nix's own module alongside, exactly as tests/privilege-boundary.nix
+# already does. Without it evaluation fails with "The option
+# `nodes.machine.sops' does not exist".
+#
+# It was broken this way from the moment 1.4a landed and nobody found out,
+# because .github/workflows/vm-tests.yml only ever built smoke-vm -- this
+# check was defined in checks.nix and never once run by CI. It surfaced
+# within two minutes of the workflow actually building it.
+{ pkgs, sopsNix, ... }:
 let
   # The full node config shared between the real VM (generation A) and the
   # throwaway second closure (generation B) -- identical except for the
   # marker file, which is this test's entire point of comparison.
   mkNode = markerValue: { config, lib, pkgs, utils, ... }: {
-    imports = [ ../modules ];
+    imports = [ ../modules sopsNix.nixosModules.sops ];
     environment.etc."ferrum-test-marker".text = markerValue;
 
     virtualisation.emptyDiskImages = [ 4096 ];

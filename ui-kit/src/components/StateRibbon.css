@@ -1,0 +1,12 @@
+.fk-ribbon {
+  display: flex; align-items: baseline; gap: .45rem;
+  font-size: .85rem; padding: .5rem .9rem;
+  background: var(--ferrum-wash-ok); color: var(--ferrum-text);
+  border-bottom: 1px solid var(--ferrum-line);
+}
+.fk-ribbon[data-armed="true"] { background: var(--ferrum-wash-danger); }
+.fk-ribbon-dot {
+  width: .5rem; height: .5rem; border-radius: 50%;
+  background: var(--ferrum-ok); flex: 0 0 auto;
+}
+.fk-ribbon[data-armed="true"] .fk-ribbon-dot { background: var(--ferrum-danger); }

@@ -36,7 +36,17 @@
 #      is the companion that closes this specific gap: a real switch
 #      between two genuinely different closures, proving the CLOSURE half
 #      of the atomic pair this file proves the STATE half of.
-{ pkgs, ... }:
+# NOTE (2026-09-15): this test imports the whole ferrum module tree, which
+# since Phase 1.4a includes app modules declaring `sops.secrets` -- so it
+# needs sops-nix's own module alongside, exactly as tests/privilege-boundary.nix
+# already does. Without it evaluation fails with "The option
+# `nodes.machine.sops' does not exist".
+#
+# It was broken this way from the moment 1.4a landed and nobody found out,
+# because .github/workflows/vm-tests.yml only ever built smoke-vm -- this
+# check was defined in checks.nix and never once run by CI. It surfaced
+# within two minutes of the workflow actually building it.
+{ pkgs, sopsNix, ... }:
 pkgs.testers.runNixOSTest {
   name = "ferrum-rollback";
 
@@ -52,7 +62,7 @@ pkgs.testers.runNixOSTest {
   node.pkgsReadOnly = false;
 
   nodes.machine = { config, lib, pkgs, utils, ... }: {
-    imports = [ ../modules ];
+    imports = [ ../modules sopsNix.nixosModules.sops ];
 
     virtualisation.emptyDiskImages = [ 4096 ];
     virtualisation.useBootLoader = true;

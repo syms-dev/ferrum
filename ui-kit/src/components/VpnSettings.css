@@ -1,0 +1,34 @@
+.fk-vpnset {
+  border: 1px solid var(--ferrum-line); border-radius: var(--ferrum-radius);
+  background: var(--ferrum-panel); padding: 1.1rem 1.25rem; display: grid; gap: .6rem;
+  max-width: 44rem;
+}
+.fk-vpnset-head { display: flex; flex-wrap: wrap; gap: .6rem; align-items: baseline; }
+.fk-vpnset-head h3 { margin: 0; font-size: 1.05rem; }
+.fk-vpnset-state {
+  margin-left: auto; font-family: var(--ferrum-mono); font-size: .75rem;
+  text-transform: uppercase; letter-spacing: .06em; color: var(--ferrum-danger);
+}
+.fk-vpnset-state[data-on="true"] { color: var(--ferrum-ok); }
+.fk-vpnset-label { font-size: .8rem; font-weight: 700; margin-top: .3rem; }
+.fk-vpnset select, .fk-vpnset input, .fk-vpnset textarea {
+  font: inherit; font-size: .9rem; padding: .45rem .6rem; width: 100%;
+  border: 1px solid var(--ferrum-line); border-radius: var(--ferrum-radius-sm);
+  background: var(--ferrum-bg); color: var(--ferrum-text);
+}
+.fk-vpnset textarea { font-family: var(--ferrum-mono); font-size: .8rem; resize: vertical; }
+.fk-vpnset-field { display: grid; gap: .2rem; }
+.fk-vpnset-field label { font-size: .8rem; font-weight: 700; }
+.fk-vpnset-hint, .fk-vpnset-note {
+  font-size: .82rem; line-height: 1.45; color: var(--ferrum-muted); margin: 0;
+}
+.fk-vpnset-actions { display: flex; flex-wrap: wrap; gap: .5rem; margin-top: .3rem; }
+.fk-vpnset-actions button {
+  font: inherit; font-size: .85rem; cursor: pointer; padding: .5rem .95rem;
+  border-radius: var(--ferrum-radius-sm); border: 1px solid var(--ferrum-line);
+  background: transparent; color: var(--ferrum-text);
+}
+.fk-vpnset-actions button:disabled { opacity: .55; cursor: default; }
+.fk-vpnset-save { border-color: var(--ferrum-accent); color: var(--ferrum-accent); font-weight: 700; }
+.fk-vpnset-off { border-color: var(--ferrum-danger); color: var(--ferrum-danger); }
+.fk-vpnset-warn { margin: 0; font-size: .82rem; line-height: 1.45; color: var(--ferrum-muted); }

@@ -25,15 +25,28 @@
 # services.openssh.openFirewall = false in custom/ without affecting the
 # age-identity mechanism above, which only needs the host key to exist,
 # not the port to be open.
-{ config, lib, ... }:
+#
+# ferrum.secretsDir's SHAPE is not checked here, and the assertion that
+# used to check it has been deleted rather than moved.
+#
+# It read "must be an absolute path with no trailing slash", and justified
+# itself with "a relative or trailing-slash value produces a confusing eval
+# error far from this option". Both halves stopped being true when the
+# option gained modules/lib/hostnames.nix's `absolutePath` type, whose
+# pattern -- `(/[A-Za-z0-9_][A-Za-z0-9._-]*)+` -- requires a leading slash
+# and forbids a trailing one at the OPTION. Confirmed by evaluating the type
+# directly: "etc/ferrum/secrets" and "/etc/ferrum/secrets/" are both
+# refused, "/etc/ferrum/secrets" is accepted.
+#
+# So the assertion could not fire, and the error it promised to prevent now
+# arrives AT the option with the option's own name on it -- which is nearer
+# than this module, not further. Deleted rather than rewritten because an
+# assertion that cannot fail is indistinguishable from no assertion at all,
+# except that it reads as coverage. The type is the control, and
+# modules/lib/settings-schema.json's `pattern` on the same field is what
+# stops ferrumd's PUT /api/settings composing a bad value in the first
+# place.
+{ lib, ... }:
 {
   services.openssh.enable = lib.mkDefault true;
-
-  assertions = [
-    {
-      assertion = lib.hasPrefix "/" config.ferrum.secretsDir
-        && !lib.hasSuffix "/" config.ferrum.secretsDir;
-      message = "ferrum.secretsDir must be an absolute path with no trailing slash (got: ${config.ferrum.secretsDir}) -- every sops.secrets.<name>.sopsFile in this tree is built by concatenating it with a filename via `/. + \"\${ferrum.secretsDir}/...\"`, and a relative or trailing-slash value produces a confusing eval error far from this option.";
-    }
-  ];
 }

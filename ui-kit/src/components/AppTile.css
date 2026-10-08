@@ -1,0 +1,23 @@
+.fk-tile {
+  border: 1px solid var(--ferrum-line); border-radius: var(--ferrum-radius);
+  padding: .85rem 1rem; background: var(--ferrum-panel);
+}
+.fk-tile[data-enabled="false"] { opacity: .78; }
+.fk-tile-head { display: flex; align-items: baseline; gap: .75rem; }
+.fk-tile-name { margin: 0; font-size: 1rem; }
+.fk-tile-switch {
+  margin-left: auto; display: flex; align-items: center; gap: .4rem;
+  font-size: .8rem; color: var(--ferrum-muted); cursor: pointer;
+}
+.fk-tile-summary { color: var(--ferrum-muted); font-size: .88rem; margin: .4rem 0 .5rem; }
+.fk-tile-badges { display: flex; gap: .4rem; flex-wrap: wrap; margin-bottom: .6rem; }
+.fk-tile-foot { display: flex; align-items: center; gap: .6rem; flex-wrap: wrap; }
+.fk-tile-link { font-family: var(--ferrum-mono); font-size: .85rem; color: var(--ferrum-accent); }
+.fk-tile-local { font-size: .85rem; color: var(--ferrum-muted); }
+.fk-tile-foot button {
+  margin-left: auto; font: inherit; font-size: .85rem; cursor: pointer;
+  background: transparent; color: var(--ferrum-text);
+  border: 1px solid var(--ferrum-line); border-radius: var(--ferrum-radius-sm);
+  padding: .3rem .7rem;
+}
+.fk-tile-foot button:hover { border-color: var(--ferrum-accent); color: var(--ferrum-accent); }

@@ -10,6 +10,20 @@ let
   claimToken = app.settings.claimToken or "";
 in
 lib.mkIf app.enable {
+  # The plex.tv claim token, when the operator supplied one.
+  #
+  # A secret rather than a settings value: it associates this server with
+  # a Plex account, and settings.json is world-readable by design. Read
+  # once by ferrum-reconcile, which claims the server if it is unclaimed;
+  # inert afterwards. Claim tokens expire four minutes after issue, so a
+  # stale one here is normal and is reported rather than fatal.
+  sops.secrets = lib.mkIf (ferrum.secrets ? "plex-claim") {
+    "plex-claim" = {
+      sopsFile = /. + "${ferrum.secretsDir}/plex-claim.sops";
+      format = "binary";
+    };
+  };
+
   # Unfree-package allowance for plexmediaserver lives centrally in
   # modules/core/overlays.nix (aggregated from every catalog app's
   # meta.nix `unfreePackages`), not here -- see that file's comment.
@@ -37,6 +51,15 @@ lib.mkIf app.enable {
     serviceConfig = lib.filterAttrs (_: v: v != null) {
       MemoryMax = app.resources.memoryMax;
       CPUQuota = app.resources.cpuQuota;
+    } // lib.optionalAttrs (app.mediaAccess != "none") {
+      # The other half of the shared-tree recipe modules/core/storage.nix's
+      # tmpfiles rules carry the setgid half of. Same predicate as the
+      # media-group membership above, because it is the same fact: a unit in
+      # that group creates files in the shared tree, and 0002 is what keeps
+      # them group-WRITABLE -- systemd's default 0022 leaves them group-read-
+      # only, so another app can import from them and then never delete
+      # them. See storage.nix for the whole failure.
+      UMask = "0002";
     };
   };
 }

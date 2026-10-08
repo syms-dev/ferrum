@@ -33,6 +33,23 @@ impl Progress {
         Self { file }
     }
 
+    /// Test-only constructor writing to an explicit path.
+    ///
+    /// `open()` resolves its path from `FERRUM_JOB_ID`/`FERRUM_JOBS_DIR`, and
+    /// those are process-wide: a second test mutating them races the
+    /// serialized env test below. Ordering tests need a real file, not a real
+    /// environment, so they take this instead and stay independent.
+    #[cfg(test)]
+    pub fn to_path(path: &std::path::Path) -> Self {
+        Self {
+            file: std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .ok(),
+        }
+    }
+
     pub fn event(&mut self, event: &str, detail: &str) {
         if let Some(f) = &mut self.file {
             let line = serde_json::json!({

@@ -9,6 +9,52 @@ let
   ferrum = config.ferrum;
   authEnabled = ferrum.auth.enable;
   stateDir = "/var/lib/authelia-main";
+  proxyLib = import ./lib.nix { inherit lib; };
+
+  # R5, first half -- the fix SEC-M02 deferred.
+  #
+  # This used to be `session.domain = ferrum.proxy.baseDomain`: ONE cookie
+  # covering every published name on the host, including the control plane at
+  # ferrum.<baseDomain>. Several catalog apps deliberately carry
+  # unauthenticated bypass locations, so a cookie obtained in one app's
+  # context was presentable at the dashboard's edge gate. That was accepted
+  # as a Medium only because ferrumd's own `__Host-ferrumd_session` sat
+  # underneath as a compensating control -- and R5's second half spends that
+  # control, so this has to land first and does.
+  #
+  # Three properties of the list below are load-bearing, and the first two
+  # are enforced by Authelia itself while the third is not. All three are
+  # held by nix/modules/flake/checks.nix's authelia-cookie-scope, which runs
+  # Authelia's own `validate-config` over the generated file:
+  #
+  #   1. Each entry's `authelia_url` must sit inside that entry's own cookie
+  #      scope, which is why the control plane needs a portal hostname of its
+  #      own. See modules/proxy/lib.nix's autheliaPortalFor.
+  #   2. The more specific scope must be listed FIRST. Reversing these two is
+  #      refused with "option 'domain' shares the same cookie domain scope as
+  #      another configured session domain".
+  #   3. The two cookies must have DIFFERENT names. Authelia accepts a
+  #      duplicate name across scopes; a browser then sends both to
+  #      ferrum.<baseDomain> under one name and RFC 6265 does not say which
+  #      the server reads, which is SEC-M02 rebuilt inside its own fix.
+  daemonPublished = proxyLib.daemonPublished ferrum;
+  controlCookieDomain = proxyLib.controlPlaneCookieDomain ferrum;
+
+  appsCookie = {
+    domain = ferrum.proxy.baseDomain;
+    authelia_url = "https://${proxyLib.autheliaPortalFor ferrum.proxy.baseDomain}";
+    name = "authelia_session";
+  };
+
+  # Only on a host that actually publishes the dashboard. With
+  # ferrum.daemon.publish = false -- the installer's stage-1 shape, and the
+  # tunnel-only host -- nothing serves ferrum.<baseDomain>, so a scope for it
+  # would name a portal URL with no vhost, no certificate and no record.
+  controlCookie = {
+    domain = controlCookieDomain;
+    authelia_url = "https://${proxyLib.autheliaPortalFor controlCookieDomain}";
+    name = "ferrum_control_session";
+  };
 in
 lib.mkIf authEnabled {
   assertions = [
@@ -53,7 +99,7 @@ lib.mkIf authEnabled {
       # explicitly name (there shouldn't be any once Task 3 lands, but
       # Authelia requires SOME default_policy to start at all).
       access_control.default_policy = "deny";
-      session.domain = ferrum.proxy.baseDomain;
+      session.cookies = lib.optional daemonPublished controlCookie ++ [ appsCookie ];
       storage.local.path = "${stateDir}/db.sqlite3";
       # Filesystem notifier, not SMTP -- ferrum assumes no mail server.
       # Password-reset/notification emails just aren't a Phase 1
@@ -72,7 +118,6 @@ lib.mkIf authEnabled {
   # must precede the app's own general-policy rule.
   services.authelia.instances.main.settings.access_control.rules =
     let
-      proxyLib = import ./lib.nix { inherit lib; };
       exposedAppsAuth = proxyLib.exposedApps ferrum;
       vhostNameFor = proxyLib.vhostNameFor ferrum;
 
@@ -88,9 +133,28 @@ lib.mkIf authEnabled {
         domain = vhostNameFor app;
         policy = app.auth.policy;
       };
+
+      # D1/A2. The control plane needs a rule of its own, because the
+      # generator above is driven by exposedApps and the daemon is not a
+      # catalog app. Without this, access_control.default_policy = "deny"
+      # above applies to ferrum.<baseDomain>, and an auth_request-wired
+      # daemon vhost then denies EVERYONE, ALWAYS -- the dashboard would be
+      # unopenable rather than merely weakly gated, which is a non-functional
+      # ship rather than a security finding.
+      #
+      # Built by calling the SAME appRule on lib.nix's synthetic daemonApp,
+      # deliberately, rather than by writing the rule shape out a second time:
+      # when that generator grows a field, the daemon gets it too instead of
+      # drifting. Appended alongside the app rules, never in place of them.
+      # No bypass rules accompany it -- daemonApp's bypassPaths is empty by
+      # design (D4), so the daemon exempts no path from the edge gate.
+      daemonRules = lib.optional
+        (proxyLib.daemonPublished ferrum)
+        (appRule null (proxyLib.daemonApp ferrum));
     in
     lib.concatLists (lib.mapAttrsToList bypassRules exposedAppsAuth)
-    ++ lib.mapAttrsToList appRule exposedAppsAuth;
+    ++ lib.mapAttrsToList appRule exposedAppsAuth
+    ++ daemonRules;
 
   systemd.tmpfiles.rules = [
     "d '${stateDir}' 0750 authelia-main authelia-main - -"

@@ -107,17 +107,30 @@ const FERRUM_APPLY_PATTERN: &str = "ferrum-apply@*.service";
 /// `apply` job can switch to a generation containing a new ferrumd, which
 /// restarts ferrumd *while its own job is still running*: the restarted
 /// process would otherwise believe nothing is in flight and admit a second,
-/// concurrent job. Seeding the flag from this query at startup closes that
-/// window. It deliberately does not try to recover the running job's UUID
-/// or reattach its progress stream -- the only guarantee being restored is
-/// "refuse a new job while one is genuinely still running".
+/// concurrent job. Seeding the flag from this query closes that window. It
+/// deliberately does not try to recover the running job's UUID or reattach
+/// its progress stream -- the only guarantee being restored is "refuse a
+/// new job while one is genuinely still running".
+///
+/// M3. This takes an EXISTING proxy rather than opening its own connection,
+/// and that is the whole point of the signature. The answer it returns is
+/// only durable if the caller is already subscribed to `JobRemoved` when it
+/// is asked: a job that finishes between the query and the subscription
+/// sends its signal to nobody, and the interlock this seeds then stays
+/// closed for the rest of the process lifetime. Handing the proxy in makes
+/// "subscribe first, then ask" something the caller has to have already
+/// done to be able to call this at all -- see `main.rs`'s `attach_and_watch`.
 ///
 /// An empty `states` filter is passed on purpose: the state classification
 /// lives in `is_running_state` here, where it is unit-tested, rather than
 /// depending on systemd's own filter semantics matching what we mean.
-pub async fn ferrum_apply_job_is_running() -> anyhow::Result<bool> {
-    let connection = Connection::system().await?;
-    let proxy = SystemdManagerProxy::new(&connection).await?;
+///
+/// # Arguments
+/// * `proxy` - a systemd manager proxy that has already called `subscribe`.
+///
+/// # Errors
+/// Any D-Bus failure listing units.
+pub async fn ferrum_apply_job_is_running(proxy: &SystemdManagerProxy<'_>) -> anyhow::Result<bool> {
     let units = proxy
         .list_units_by_patterns(&[], &[FERRUM_APPLY_PATTERN])
         .await
@@ -133,6 +146,33 @@ pub async fn start_ferrum_apply_unit(uuid: &str) -> anyhow::Result<()> {
         .await
         .map_err(|e| anyhow::anyhow!("failed to start ferrum-apply@{uuid}.service: {e}"))?;
     Ok(())
+}
+
+/// Whether the system bus answers at all, within a bounded wait.
+///
+/// The readiness probe's systemd check. It opens a connection and discards
+/// it, rather than calling a method: the one method ferrumd really needs is
+/// `StartUnit`, which is privileged, polkit-gated, and would actually START
+/// something -- so a probe cannot exercise it, and readiness deliberately
+/// does not claim to. What a successful connect does prove is the half that
+/// fails in practice: that the bus socket exists, that it is accepting, and
+/// that the unprivileged `ferrum` user can authenticate to it. `main.rs`
+/// already treats "systemd did not answer" as a real startup state worth
+/// printing a warning about; this is the steady-state form of that question.
+///
+/// Bounded because the caller is UNAUTHENTICATED (`health.rs`). An unbounded
+/// connect would let anyone who can reach the endpoint park a request -- and
+/// a tokio task, and a half-open socket -- in ferrumd per probe, against a
+/// bus that is hung rather than refusing. Timing out IS the answer here:
+/// a bus that cannot answer inside the deadline cannot serve an apply either.
+///
+/// # Arguments
+/// * `within` - how long to wait before calling the bus unreachable.
+///
+/// # Returns
+/// `true` if a system bus connection was established inside `within`.
+pub async fn system_bus_is_reachable(within: std::time::Duration) -> bool {
+    matches!(tokio::time::timeout(within, Connection::system()).await, Ok(Ok(_)))
 }
 
 #[cfg(test)]

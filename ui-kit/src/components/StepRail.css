@@ -1,0 +1,26 @@
+.fk-steps { display: grid; gap: .75rem; }
+.fk-steps-count {
+  margin: 0; font-family: var(--ferrum-mono); font-size: .75rem;
+  letter-spacing: .08em; text-transform: uppercase; color: var(--ferrum-muted);
+}
+.fk-steps ol { list-style: none; margin: 0; padding: 0; display: grid; gap: .9rem; }
+.fk-steps li { display: flex; gap: .8rem; align-items: flex-start; }
+.fk-steps-num {
+  flex: none; width: 1.9rem; height: 1.9rem; border-radius: 50%;
+  display: grid; place-items: center;
+  font-family: var(--ferrum-mono); font-size: .85rem; font-weight: 700;
+  border: 1px solid var(--ferrum-line); color: var(--ferrum-muted);
+}
+.fk-steps li[data-state="now"] .fk-steps-num {
+  border-color: var(--ferrum-accent); background: var(--ferrum-accent); color: var(--ferrum-bg);
+}
+.fk-steps li[data-state="done"] .fk-steps-num { border-color: var(--ferrum-ok); color: var(--ferrum-ok); }
+.fk-steps-body { display: grid; gap: .2rem; padding-top: .3rem; min-width: 0; }
+.fk-steps-label { font-size: .95rem; color: var(--ferrum-muted); }
+.fk-steps li[data-state="now"] .fk-steps-label { color: var(--ferrum-text); font-weight: 700; }
+.fk-steps-body button {
+  font: inherit; font-size: .95rem; text-align: left; padding: 0; cursor: pointer;
+  background: none; border: none; color: var(--ferrum-ok); text-decoration: underline;
+  text-underline-offset: 3px;
+}
+.fk-steps-detail { font-size: .85rem; line-height: 1.45; color: var(--ferrum-muted); max-width: 46ch; }
