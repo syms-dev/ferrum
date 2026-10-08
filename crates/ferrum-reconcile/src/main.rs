@@ -43,7 +43,28 @@ struct Pair {
     category: Option<String>,
 }
 
+/// The whole config modules/core/reconciler.nix generates.
+///
+/// `rename_all = "camelCase"` is load-bearing and was missing. Nix writes
+/// `rootFolders` and `downloadPaths`; these fields are `root_folders` and
+/// `download_paths`; and both carry `#[serde(default)]`, so serde matched
+/// neither key and filled in an empty Vec instead of failing. The binary
+/// then reported success having registered not one root folder and not one
+/// download path -- on every host, since the day the fields were added.
+///
+/// That is why the two things those loops exist to prevent were both
+/// visible on the owner's host: the *arrs had no root folder, and the
+/// download clients were never driven to <mediaDir> at all. Every sibling
+/// struct here (PlexConfig, PlexLibrary, DownloadPath, RootFolder) already
+/// carries this attribute; this one was the exception.
+///
+/// `#[serde(default)]` is what made it silent. It is kept, because a host
+/// with no *arr genuinely has no root folders -- so the guard against it
+/// happening again is `the_config_nix_writes_is_the_config_this_binary_reads`
+/// below, which parses the real emitted shape and asserts the fields arrive
+/// populated.
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct ReconcileConfig {
     apps: HashMap<String, AppConnInfo>,
     pairs: Vec<Pair>,
@@ -1278,6 +1299,100 @@ mod tests {
         assert!(
             registration_needing_category_fix(&before, "tvCategory", None).is_none(),
             "an absent field with no category wanted is already correct"
+        );
+    }
+
+    /// A config in the shape modules/core/reconciler.nix really emits --
+    /// taken verbatim from the rendered ferrum-reconcile-config.json of a
+    /// host with sonarr, radarr, prowlarr, qbittorrent and sabnzbd enabled.
+    fn real_shaped_config() -> ReconcileConfig {
+        serde_json::from_str(
+            r#"{
+              "apps": {
+                "qbittorrent": { "host": "127.0.0.1", "port": 8090, "apiKeySecretPath": null },
+                "sabnzbd": { "host": "127.0.0.1", "port": 8080, "apiKeySecretPath": null }
+              },
+              "pairs": [
+                { "kind": "application", "consumer": "prowlarr", "provider": "sonarr" },
+                { "kind": "downloadClient", "consumer": "prowlarr", "provider": "qbittorrent", "category": null },
+                { "kind": "downloadClient", "consumer": "prowlarr", "provider": "sabnzbd", "category": null },
+                { "kind": "downloadClient", "consumer": "radarr", "provider": "qbittorrent", "category": "movies" },
+                { "kind": "downloadClient", "consumer": "radarr", "provider": "sabnzbd", "category": "movies" },
+                { "kind": "downloadClient", "consumer": "sonarr", "provider": "qbittorrent", "category": "tv" },
+                { "kind": "downloadClient", "consumer": "sonarr", "provider": "sabnzbd", "category": "tv" }
+              ],
+              "rootFolders": [
+                { "app": "radarr", "path": "/data/media/movies" },
+                { "app": "sonarr", "path": "/data/media/tv" }
+              ],
+              "downloadPaths": [
+                { "app": "qbittorrent", "path": "/data/torrents" },
+                { "app": "sabnzbd", "path": "/data/usenet/complete", "incompletePath": "/data/usenet/incomplete" }
+              ]
+            }"#,
+        )
+        .expect("the fixture parses as a real config")
+    }
+
+    /// The two names Nix writes must be the two names this binary reads.
+    ///
+    /// They were not. `ReconcileConfig` had no `rename_all`, so `rootFolders`
+    /// matched no field and `downloadPaths` matched no field; `#[serde(default)]`
+    /// then supplied an empty Vec for each and the binary ran to completion
+    /// reporting success, having set not one root folder and pointed not one
+    /// download client at <mediaDir>. Silent on every host, for as long as
+    /// those fields have existed.
+    ///
+    /// Asserted against the real emitted KEY NAMES rather than against a
+    /// round-trip of this program's own serialization, because a round-trip
+    /// would have agreed with itself and proved nothing -- the two sides that
+    /// have to agree are Nix's writer and this reader.
+    #[test]
+    fn the_config_nix_writes_is_the_config_this_binary_reads() {
+        let config = real_shaped_config();
+        assert_eq!(
+            config.root_folders.len(),
+            2,
+            "rootFolders did not reach the field that registers root folders"
+        );
+        assert_eq!(
+            config.download_paths.len(),
+            2,
+            "downloadPaths did not reach the field that drives the download clients"
+        );
+        assert_eq!(config.pairs.len(), 7);
+
+        // And the nested values arrive intact, not merely the outer arrays.
+        let sab = config
+            .download_paths
+            .iter()
+            .find(|dp| dp.app == "sabnzbd")
+            .expect("sabnzbd's download path");
+        assert_eq!(sab.path, "/data/usenet/complete");
+        assert_eq!(
+            sab.incomplete_path.as_deref(),
+            Some("/data/usenet/incomplete"),
+            "incompletePath is the camelCase case inside the nested struct too"
+        );
+    }
+
+    /// Anti-vacuity for the test above, in the other direction: the empty
+    /// result it now rejects is genuinely what the WRONG key names produce,
+    /// rather than something no realistic input could reach. If serde had
+    /// been strict about unknown fields all along, the defect would have
+    /// been a parse error on the first apply instead of eight months of
+    /// quiet success.
+    #[test]
+    fn the_wrong_key_names_deserialize_to_nothing_rather_than_failing() {
+        let snake: ReconcileConfig = serde_json::from_str(
+            r#"{ "apps": {}, "pairs": [],
+                 "root_folders": [ { "app": "sonarr", "path": "/data/media/tv" } ],
+                 "download_paths": [ { "app": "qbittorrent", "path": "/data/torrents" } ] }"#,
+        )
+        .expect("serde accepts unknown fields, which is exactly why this was silent");
+        assert!(
+            snake.root_folders.is_empty() && snake.download_paths.is_empty(),
+            "a key name this binary does not read is dropped without a word"
         );
     }
 
